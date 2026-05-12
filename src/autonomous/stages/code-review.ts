@@ -5,6 +5,12 @@ import { requiredRounds, nextReviewer } from "../review-depth.js";
 import { clearCache } from "../review-lenses/cache.js";
 import { accumulateVerificationCounters } from "../review-lenses/verification-log.js";
 import { writeReviewVerdict, readReviewVerdict, buildTier1Verdict, type ReviewVerdictArtifact } from "../review-verdict.js";
+import {
+  nativeCodexReportInstruction,
+  nativeCodexReviewCommand,
+  reviewBackendsForClient,
+  shouldUseNativeCodexReview,
+} from "./codex-native.js";
 
 /**
  * CODE_REVIEW stage — independent reviewer evaluates the implementation.
@@ -20,7 +26,7 @@ export class CodeReviewStage implements WorkflowStage {
   readonly id = "CODE_REVIEW";
 
   async enter(ctx: StageContext): Promise<StageResult> {
-    const backends = ctx.state.config.reviewBackends;
+    const backends = reviewBackendsForClient(ctx.state.config);
     const codeReviews = ctx.state.reviews.code;
     const roundNum = codeReviews.length + 1;
     const reviewer = nextReviewer(codeReviews, backends, ctx.state.codexUnavailable, ctx.state.codexUnavailableSince);
@@ -72,6 +78,30 @@ export class CodeReviewStage implements WorkflowStage {
       };
     }
 
+    if (shouldUseNativeCodexReview(reviewer, ctx.state.config)) {
+      const command = nativeCodexReviewCommand("code", ctx.state.sessionId);
+      return {
+        instruction: [
+          `# Native Codex ${issueHeader} - Round ${roundNum} of ${rounds} minimum`,
+          "",
+          `Capture baseline context with: ${diffCommand}`,
+          "",
+          "Run native Codex code review:",
+          "```bash",
+          command,
+          "```",
+          "",
+          nativeCodexReportInstruction(ctx.state.sessionId),
+        ].join("\n"),
+        reminders: [
+          diffReminder,
+          "The helper writes the diff to .story/sessions/<id>/review/diff.patch and runs Codex with read-only sandboxing.",
+          "If native Codex fails, fall back to the next configured reviewer if available; otherwise use agent review and include 'codex unavailable' in notes.",
+        ],
+        transitionedFrom: ctx.state.previousState ?? undefined,
+      };
+    }
+
     return {
       instruction: [
         `# ${issueHeader} — Round ${roundNum} of ${rounds} minimum`,
@@ -102,7 +132,7 @@ export class CodeReviewStage implements WorkflowStage {
     const codeReviews = [...ctx.state.reviews.code];
     const roundNum = codeReviews.length + 1;
     const findings = report.findings ?? [];
-    const backends = ctx.state.config.reviewBackends;
+    const backends = reviewBackendsForClient(ctx.state.config);
     const computedReviewer = nextReviewer(codeReviews, backends, ctx.state.codexUnavailable, ctx.state.codexUnavailableSince);
     // ISS-102: Use actual reviewer from report, infer from notes, or fall back to computed
     const reviewerBackend = report.reviewer

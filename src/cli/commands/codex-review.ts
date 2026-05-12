@@ -1,0 +1,320 @@
+import { execFileSync, spawn } from "node:child_process";
+import { existsSync } from "node:fs";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { discoverProjectRoot } from "../../core/project-root-discovery.js";
+import { readSession, sessionDir } from "../../autonomous/session.js";
+import type { Finding, GuideReportInput } from "../../autonomous/session-types.js";
+
+export type CodexReviewKind = "plan" | "code";
+export type CodexReviewFormat = "guide-report";
+
+interface CodexFinding {
+  readonly severity: "critical" | "major" | "minor" | "suggestion" | "nitpick";
+  readonly category?: string;
+  readonly description?: string;
+  readonly issue?: string;
+  readonly file?: string | null;
+  readonly line?: number | null;
+  readonly suggestion?: string | null;
+  readonly recommendedNextState?: "PLAN" | "IMPLEMENT";
+}
+
+interface CodexReviewOutput {
+  readonly verdict: "approve" | "revise" | "request_changes" | "reject";
+  readonly summary?: string;
+  readonly findings?: readonly CodexFinding[];
+}
+
+export interface CodexReviewOptions {
+  readonly kind: CodexReviewKind;
+  readonly sessionId: string;
+  readonly format?: CodexReviewFormat;
+}
+
+function reviewSchema(verdicts: readonly string[]): object {
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: ["verdict", "summary", "findings"],
+    properties: {
+      verdict: { type: "string", enum: verdicts },
+      summary: { type: "string" },
+      findings: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: ["severity", "category", "description", "file", "line", "suggestion"],
+          properties: {
+            severity: { type: "string", enum: ["critical", "major", "minor", "suggestion", "nitpick"] },
+            category: { type: "string" },
+            description: { type: "string" },
+            file: { anyOf: [{ type: "string" }, { type: "null" }] },
+            line: { anyOf: [{ type: "integer", minimum: 1 }, { type: "null" }] },
+            suggestion: { anyOf: [{ type: "string" }, { type: "null" }] },
+            recommendedNextState: { type: "string", enum: ["PLAN", "IMPLEMENT"] },
+          },
+        },
+      },
+    },
+  };
+}
+
+const PLAN_REVIEW_VERDICTS = ["approve", "revise", "reject"] as const;
+const CODE_REVIEW_VERDICTS = ["approve", "request_changes", "reject"] as const;
+
+const PLAN_REVIEW_SCHEMA = reviewSchema(PLAN_REVIEW_VERDICTS);
+const CODE_REVIEW_SCHEMA = reviewSchema(CODE_REVIEW_VERDICTS);
+
+export function verdictsForKind(kind: CodexReviewKind): readonly string[] {
+  return kind === "plan" ? PLAN_REVIEW_VERDICTS : CODE_REVIEW_VERDICTS;
+}
+
+export function schemaForKind(kind: CodexReviewKind): object {
+  return kind === "plan" ? PLAN_REVIEW_SCHEMA : CODE_REVIEW_SCHEMA;
+}
+
+const CODEX_REVIEW_TIMEOUT_MS: Record<CodexReviewKind, number> = {
+  plan: 5 * 60 * 1000,
+  code: 10 * 60 * 1000,
+};
+
+function commandExists(command: string): boolean {
+  try {
+    execFileSync(command, ["--version"], { stdio: "pipe", timeout: 5000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function formatExecError(command: string, args: string[], err: unknown): string {
+  const details = err as { stderr?: Buffer | string; stdout?: Buffer | string; message?: string; status?: number | null };
+  const stderr = Buffer.isBuffer(details.stderr) ? details.stderr.toString("utf-8") : details.stderr;
+  const stdout = Buffer.isBuffer(details.stdout) ? details.stdout.toString("utf-8") : details.stdout;
+  const message = [stderr, stdout, details.message].filter(Boolean).join("\n").trim();
+  const status = typeof details.status === "number" ? ` exited with status ${details.status}` : " failed";
+  return `${command} ${args.join(" ")}${status}${message ? `: ${message.split("\n")[0]}` : ""}`;
+}
+
+function runGit(root: string, args: string[]): string {
+  try {
+    return execFileSync("git", args, {
+      cwd: root,
+      encoding: "utf-8",
+      stdio: "pipe",
+      maxBuffer: 50 * 1024 * 1024,
+    });
+  } catch (err: unknown) {
+    throw new Error(formatExecError("git", args, err));
+  }
+}
+
+function runGitDiffAllowExitOne(root: string, args: string[]): string {
+  try {
+    return execFileSync("git", args, {
+      cwd: root,
+      encoding: "utf-8",
+      stdio: "pipe",
+      maxBuffer: 50 * 1024 * 1024,
+    });
+  } catch (err: unknown) {
+    const details = err as { stdout?: Buffer | string; status?: number | null };
+    if (details.status === 1) {
+      const stdout = Buffer.isBuffer(details.stdout) ? details.stdout.toString("utf-8") : details.stdout;
+      return stdout ?? "";
+    }
+    throw err;
+  }
+}
+
+function isSafeRelativeGitPath(path: string): boolean {
+  return path.length > 0 && !path.startsWith("/") && !path.split(/[\\/]/).includes("..");
+}
+
+export function buildCodeReviewDiffArtifact(root: string, diffBase: string): string {
+  const diff = runGit(root, ["diff", diffBase]);
+  const untrackedFiles = runGit(root, ["ls-files", "--others", "--exclude-standard"])
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const sections = [diff.trimEnd()].filter(Boolean);
+  for (const file of untrackedFiles) {
+    if (!isSafeRelativeGitPath(file)) {
+      sections.push(`Untracked file skipped because it is not a safe relative path: ${file}`);
+      continue;
+    }
+    const patch = runGitDiffAllowExitOne(root, ["diff", "--no-index", "--", "/dev/null", file]).trimEnd();
+    sections.push(patch || `Untracked file with no textual diff: ${file}`);
+  }
+
+  const artifact = sections.join("\n\n");
+  if (!artifact.trim()) {
+    throw new Error(`No code diff found for review against ${diffBase}`);
+  }
+  return artifact + "\n";
+}
+
+export function planPrompt(sessionId: string): string {
+  return [
+    "You are an independent Storybloq plan reviewer.",
+    `Read .story/sessions/${sessionId}/plan.md and any referenced files.`,
+    "Do not edit files.",
+    "Review for correctness, scope, missing risks, feasibility, and testability.",
+    "Return only JSON matching the provided schema.",
+    "Use verdict approve, revise, or reject.",
+    "If there are no blocking issues, return findings as an empty array.",
+  ].join(" ");
+}
+
+export function codePrompt(sessionId: string): string {
+  return [
+    "You are an independent Storybloq code reviewer.",
+    `Review the current ticket diff in .story/sessions/${sessionId}/review/diff.patch and the session artifacts under .story/sessions/${sessionId}/.`,
+    "Do not edit files.",
+    "Focus on bugs, regressions, security issues, missing tests, and behavior mismatches with the plan.",
+    "Return only JSON matching the provided schema.",
+    "Use verdict approve, request_changes, or reject.",
+    "Include file and line when available.",
+  ].join(" ");
+}
+
+async function runCodexExec(
+  root: string,
+  prompt: string,
+  schemaPath: string,
+  outputPath: string,
+  timeoutMs: number,
+): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn("codex", [
+      "exec",
+      "--ephemeral",
+      "--sandbox",
+      "read-only",
+      "-C",
+      root,
+      "--output-schema",
+      schemaPath,
+      "-o",
+      outputPath,
+      "-",
+    ], {
+      cwd: root,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    let stderr = "";
+    let timedOut = false;
+    let settled = false;
+    let forceKillTimer: NodeJS.Timeout | null = null;
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGTERM");
+      forceKillTimer = setTimeout(() => child.kill("SIGKILL"), 5000);
+    }, timeoutMs);
+    const finish = (fn: () => void): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      if (forceKillTimer) clearTimeout(forceKillTimer);
+      fn();
+    };
+
+    child.stdout.on("data", () => { /* drain */ });
+    child.stderr.on("data", (chunk) => { stderr += String(chunk); });
+    child.on("error", (err) => finish(() => reject(err)));
+    child.on("close", (code) => {
+      if (timedOut) {
+        finish(() => reject(new Error(`codex exec timed out after ${Math.round(timeoutMs / 1000)} seconds`)));
+      } else if (code === 0) {
+        finish(() => resolve());
+      } else {
+        finish(() => reject(new Error(`codex exec exited with status ${code}: ${stderr.trim()}`)));
+      }
+    });
+    child.stdin.end(prompt);
+  });
+}
+
+function normalizeFinding(finding: CodexFinding, index: number): Finding {
+  const severity = finding.severity === "nitpick" ? "suggestion" : finding.severity;
+  const location = finding.file
+    ? `${finding.file}${finding.line ? `:${finding.line}` : ""}: `
+    : "";
+  const suggestion = finding.suggestion ? ` Suggestion: ${finding.suggestion}` : "";
+  const description = finding.description ?? finding.issue ?? "Codex review finding";
+  return {
+    id: `codex-${index + 1}`,
+    severity,
+    category: finding.category ?? "review",
+    description: `${location}${description}${suggestion}`,
+    disposition: "open",
+    recommendedNextState: finding.recommendedNextState,
+  };
+}
+
+export async function handleCodexReview(options: CodexReviewOptions): Promise<GuideReportInput> {
+  if (options.format && options.format !== "guide-report") {
+    throw new Error(`Unsupported format: ${options.format}`);
+  }
+  if (!commandExists("codex")) {
+    throw new Error("codex CLI is not available on PATH");
+  }
+
+  const root = discoverProjectRoot();
+  if (!root) {
+    throw new Error("No .story project found");
+  }
+
+  const dir = sessionDir(root, options.sessionId);
+  const state = readSession(dir);
+  if (!state) {
+    throw new Error(`Session not found or invalid: ${options.sessionId}`);
+  }
+
+  const reviewDir = join(dir, "review");
+  await mkdir(reviewDir, { recursive: true });
+  const schemaPath = join(reviewDir, `${options.kind}-schema.json`);
+  const promptPath = join(reviewDir, `${options.kind}-prompt.txt`);
+  const outputPath = join(reviewDir, `${options.kind}-codex-output.json`);
+  await writeFile(schemaPath, JSON.stringify(schemaForKind(options.kind), null, 2) + "\n", "utf-8");
+
+  const prompt = options.kind === "plan" ? planPrompt(options.sessionId) : codePrompt(options.sessionId);
+  await writeFile(promptPath, prompt + "\n", "utf-8");
+
+  if (options.kind === "plan") {
+    const planPath = join(dir, "plan.md");
+    if (!existsSync(planPath)) throw new Error(`Plan file not found: ${planPath}`);
+  } else {
+    const diffBase = state.git.mergeBase ?? "HEAD";
+    await writeFile(
+      join(reviewDir, "diff.patch"),
+      buildCodeReviewDiffArtifact(root, diffBase),
+      "utf-8",
+    );
+  }
+
+  await runCodexExec(root, prompt, schemaPath, outputPath, CODEX_REVIEW_TIMEOUT_MS[options.kind]);
+  const raw = await readFile(outputPath, "utf-8");
+  let parsed: CodexReviewOutput;
+  try {
+    parsed = JSON.parse(raw) as CodexReviewOutput;
+  } catch {
+    throw new Error("Codex output was not valid JSON");
+  }
+
+  if (!verdictsForKind(options.kind).includes(parsed.verdict)) {
+    throw new Error("Codex output did not include a valid verdict");
+  }
+
+  return {
+    completedAction: options.kind === "plan" ? "plan_review_round" : "code_review_round",
+    verdict: parsed.verdict,
+    findings: (parsed.findings ?? []).map(normalizeFinding),
+    reviewer: "codex",
+    notes: [`route=native`, parsed.summary ?? ""].filter(Boolean).join("; "),
+  };
+}

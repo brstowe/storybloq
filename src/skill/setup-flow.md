@@ -408,7 +408,8 @@ What to do:
 - Surface undecided tech choices
 
 **Step B: Run independent review (if user chose "Refine + review").** This step is REQUIRED when the user selected the review option. Do NOT skip it.
-- If `review_plan` MCP tool is available, call it with the full refined proposal.
+- If native Codex CLI is available, run a read-only `codex exec --output-schema` review of the full refined proposal.
+- If native Codex is unavailable and `review_plan` MCP tool is available, call it with the full refined proposal.
 - Otherwise spawn an independent Claude agent to audit for gaps.
 - If neither is available, note "Review skipped -- no review backends available."
 - Maximum 2 review rounds.

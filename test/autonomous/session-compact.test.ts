@@ -5,7 +5,7 @@
  */
 import { describe, it, expect, afterEach } from "vitest";
 import { mkdtemp, rm, mkdir } from "node:fs/promises";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -19,6 +19,8 @@ import {
 } from "../../src/autonomous/session.js";
 import { evaluatePressure } from "../../src/autonomous/context-pressure.js";
 import { WORKFLOW_STATES, type FullSessionState } from "../../src/autonomous/session-types.js";
+import { handleSessionResumePrompt } from "../../src/cli/commands/session-compact.js";
+import { discoverProjectRoot } from "../../src/core/project-root-discovery.js";
 
 // ---------------------------------------------------------------------------
 // Helper: build a minimal session state
@@ -187,6 +189,7 @@ describe("findResumableSession", () => {
     testRoot = await mkdtemp(join(tmpdir(), "storybloq-compact-"));
     const sessDir = join(testRoot, ".story", "sessions", "00000000-0000-0000-0000-000000000001");
     mkdirSync(sessDir, { recursive: true });
+    writeFileSync(join(testRoot, ".story", "config.json"), JSON.stringify({ name: "test" }), "utf-8");
 
     const state = makeState({
       state: "COMPACT",
@@ -242,6 +245,57 @@ describe("findResumableSession", () => {
     // No .story/ directory
     const result = findResumableSession(testRoot);
     expect(result).toBeNull();
+  });
+});
+
+describe("handleSessionResumePrompt", () => {
+  it("emits Codex SessionStart hook JSON when requested", async () => {
+    testRoot = await mkdtemp(join(tmpdir(), "storybloq-compact-"));
+    const sessDir = join(testRoot, ".story", "sessions", "00000000-0000-0000-0000-000000000001");
+    mkdirSync(sessDir, { recursive: true });
+    writeFileSync(join(testRoot, ".story", "config.json"), JSON.stringify({ name: "test" }), "utf-8");
+    const state = makeState({
+      state: "COMPACT",
+      compactPending: true,
+      compactPreparedAt: new Date().toISOString(),
+      preCompactState: "IMPLEMENT",
+      lease: {
+        workspaceId: realpathSync(testRoot),
+        lastHeartbeat: new Date().toISOString(),
+        expiresAt: new Date(Date.now() + 45 * 60 * 1000).toISOString(),
+      },
+    });
+    writeSessionSync(sessDir, state);
+    expect(findResumableSession(testRoot)?.info.state.sessionId).toBe(state.sessionId);
+
+    const cwd = process.cwd();
+    const oldStoryRoot = process.env.STORYBLOQ_PROJECT_ROOT;
+    const oldClaudeRoot = process.env.CLAUDESTORY_PROJECT_ROOT;
+    const chunks: string[] = [];
+    const oldWrite = process.stdout.write;
+    process.stdout.write = ((chunk: string | Uint8Array) => {
+      chunks.push(String(chunk));
+      return true;
+    }) as typeof process.stdout.write;
+    try {
+      delete process.env.STORYBLOQ_PROJECT_ROOT;
+      delete process.env.CLAUDESTORY_PROJECT_ROOT;
+      process.chdir(testRoot);
+      expect(discoverProjectRoot()).toBe(realpathSync(testRoot));
+      await handleSessionResumePrompt({ codexHookJson: true });
+    } finally {
+      process.chdir(cwd);
+      if (oldStoryRoot === undefined) delete process.env.STORYBLOQ_PROJECT_ROOT;
+      else process.env.STORYBLOQ_PROJECT_ROOT = oldStoryRoot;
+      if (oldClaudeRoot === undefined) delete process.env.CLAUDESTORY_PROJECT_ROOT;
+      else process.env.CLAUDESTORY_PROJECT_ROOT = oldClaudeRoot;
+      process.stdout.write = oldWrite;
+    }
+
+    const parsed = JSON.parse(chunks.join(""));
+    expect(parsed.hookSpecificOutput.hookEventName).toBe("SessionStart");
+    expect(parsed.hookSpecificOutput.additionalContext).toContain("storybloq_autonomous_guide");
+    expect(parsed.hookSpecificOutput.additionalContext).toContain(state.sessionId);
   });
 });
 

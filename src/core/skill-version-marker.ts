@@ -2,13 +2,13 @@
  * ISS-570 G3: Skill-dir version marker + silent auto-refresh.
  *
  * The /story skill lives at ~/.claude/skills/story/. After `storybloq
- * setup-skill`, the skill contains a copy of SKILL.md, setup-flow.md,
+ * setup --client claude`, the skill contains a copy of SKILL.md, setup-flow.md,
  * autonomous-mode.md, reference.md, and review-lenses content from
  * whichever version of the CLI wrote them.
  *
  * When a user runs `npm install -g @storybloq/storybloq@latest`, the CLI
  * binary updates but the skill dir stays on the OLD skill files until
- * `storybloq setup-skill` is re-run. Easy to forget.
+ * `storybloq setup --client claude` is re-run. Easy to forget.
  *
  * This module writes a small `.storybloq-version` text file into the
  * skill dir recording the CLI version that generated it. On every CLI
@@ -66,7 +66,7 @@ export function isSkillStale(runningVersion: string): boolean {
  *
  * Returns true if a refresh was performed, false otherwise. Prints one
  * line to stderr on success so users see what happened without being
- * spammed with the full setup-skill output.
+ * spammed with the full setup output.
  *
  * Errors are logged to stderr but do not throw -- a stale skill dir is
  * a UX degradation, not a blocker. The user's original command still
@@ -134,7 +134,7 @@ export async function autoRefreshSkillIfStale(runningVersion: string): Promise<b
         const sweepMsg = sweepErr instanceof Error ? sweepErr.message : String(sweepErr);
         process.stderr.write(
           `storybloq: legacy hook sweep or register failed (non-fatal): ${sweepMsg}\n` +
-          `  Run 'storybloq setup-skill' manually to retry.\n`,
+          `  Run 'storybloq setup --client all' manually to retry.\n`,
         );
       }
     }
@@ -144,7 +144,7 @@ export async function autoRefreshSkillIfStale(runningVersion: string): Promise<b
     const msg = err instanceof Error ? err.message : String(err);
     process.stderr.write(
       `storybloq: skill refresh failed (non-fatal): ${msg}\n` +
-      `  Run 'storybloq setup-skill' manually to sync.\n`,
+      `  Run 'storybloq setup --client all' manually to sync.\n`,
     );
     return false;
   }

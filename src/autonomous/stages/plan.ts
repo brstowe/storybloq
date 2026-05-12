@@ -3,6 +3,13 @@ import { join } from "node:path";
 import type { WorkflowStage, StageResult, StageAdvance, StageContext } from "./types.js";
 import type { GuideReportInput } from "../session-types.js";
 import { assessRisk, requiredRounds, nextReviewer } from "../review-depth.js";
+import {
+  currentStorybloqClient,
+  nativeCodexReportInstruction,
+  nativeCodexReviewCommand,
+  reviewBackendsForClient,
+  shouldUseNativeCodexReview,
+} from "./codex-native.js";
 
 /** Read a file, return empty string on error. */
 function readFileSafe(path: string): string {
@@ -99,30 +106,48 @@ export class PlanStage implements WorkflowStage {
     });
 
     // Produce PLAN_REVIEW instruction (advance with result for hybrid dispatch)
-    const backends = ctx.state.config.reviewBackends;
+    const backends = reviewBackendsForClient(ctx.state.config);
     const existingPlanReviews = ctx.state.reviews.plan;
     const roundNum = existingPlanReviews.length + 1;
     const reviewer = nextReviewer(existingPlanReviews, backends);
     const minRounds = requiredRounds(risk);
 
+    const nativeCodex = shouldUseNativeCodexReview(reviewer, ctx.state.config);
+    const bridgeCodex = currentStorybloqClient() === "claude" && reviewer === "codex";
     return {
       action: "advance",
       result: {
-        instruction: [
-          `# Plan Review — Round ${roundNum} of ${Math.max(minRounds, roundNum)} minimum`,
-          "",
-          `Run a plan review using **${reviewer}**.`,
-          "",
-          reviewer === "codex"
-            ? `Call \`review_plan\` MCP tool with the plan content.`
-            : `Launch a code review agent to review the plan.`,
-          "",
-          "When done, call `storybloq_autonomous_guide` with:",
-          '```json',
-          `{ "sessionId": "${ctx.state.sessionId}", "action": "report", "report": { "completedAction": "plan_review_round", "verdict": "<approve|revise|request_changes|reject>", "findings": [...] } }`,
-          '```',
-        ].join("\n"),
-        reminders: ["Report the exact verdict and findings from the reviewer."],
+        instruction: nativeCodex
+          ? [
+            `# Native Codex Plan Review - Round ${roundNum} of ${Math.max(minRounds, roundNum)} minimum`,
+            "",
+            "Run native Codex plan review:",
+            "```bash",
+            nativeCodexReviewCommand("plan", ctx.state.sessionId),
+            "```",
+            "",
+            nativeCodexReportInstruction(ctx.state.sessionId),
+          ].join("\n")
+          : [
+            `# Plan Review — Round ${roundNum} of ${Math.max(minRounds, roundNum)} minimum`,
+            "",
+            `Run a plan review using **${reviewer}**.`,
+            "",
+            bridgeCodex
+              ? `Call \`review_plan\` MCP tool with the plan content.`
+              : `Launch a code review agent to review the plan.`,
+            "",
+            "When done, call `storybloq_autonomous_guide` with:",
+            '```json',
+            `{ "sessionId": "${ctx.state.sessionId}", "action": "report", "report": { "completedAction": "plan_review_round", "verdict": "<approve|revise|reject>", "findings": [...] } }`,
+            '```',
+          ].join("\n"),
+        reminders: nativeCodex
+          ? [
+            "The helper uses `codex exec --output-schema` and read-only sandboxing.",
+            "If native Codex fails, fall back to the next configured reviewer if available; otherwise use agent review and include 'codex unavailable' in notes.",
+          ]
+          : ["Report the exact verdict and findings from the reviewer."],
         transitionedFrom: "PLAN",
       },
     };

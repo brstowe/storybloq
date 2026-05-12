@@ -232,9 +232,22 @@ export const COMMANDS: readonly CommandEntry[] = [
     usage: "storybloq selftest [--format json|md]",
   },
   {
+    name: "codex-review",
+    description: "Run native Codex plan or code review for an autonomous session",
+    usage: "storybloq codex-review plan|code --session <id> --format guide-report",
+    flags: ["--session", "--format"],
+  },
+  {
+    name: "setup",
+    description: "Install Storybloq skill, MCP, and hooks for Claude, Codex, or both",
+    usage: "storybloq setup [--client claude|codex|all] [--skip-hooks]",
+    flags: ["--client", "--skip-hooks"],
+  },
+  {
     name: "setup-skill",
-    description: "Install the /story skill globally for Claude Code",
-    usage: "storybloq setup-skill",
+    description: "Compatibility alias for `storybloq setup --client claude`",
+    usage: "storybloq setup-skill [--skip-hooks]",
+    flags: ["--skip-hooks"],
   },
 ];
 

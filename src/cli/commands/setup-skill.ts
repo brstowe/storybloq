@@ -446,6 +446,20 @@ export interface SetupSkillOptions {
   skipHooks?: boolean;
 }
 
+export type SetupClient = "claude" | "codex" | "all";
+
+export interface SetupOptions extends SetupSkillOptions {
+  client?: SetupClient;
+}
+
+export function formatClaudeSessionStartCommand(binPath: string): string {
+  return formatHookCommand(binPath, SESSIONSTART_SUBCOMMAND);
+}
+
+export function formatCodexSessionStartCommand(binPath: string): string {
+  return formatHookCommand(binPath, `${SESSIONSTART_SUBCOMMAND} --codex-hook-json`);
+}
+
 /**
  * Installs the /story skill globally for Claude Code.
  *
@@ -456,7 +470,7 @@ export interface SetupSkillOptions {
  *
  * Idempotent — safe to re-run (overwrites with latest).
  */
-export async function handleSetupSkill(options: SetupSkillOptions = {}): Promise<void> {
+async function handleSetupClaude(options: SetupSkillOptions = {}): Promise<void> {
   const { skipHooks = false } = options;
   const skillDir = join(homedir(), ".claude", "skills", "story");
   await mkdir(skillDir, { recursive: true });
@@ -593,7 +607,7 @@ export async function handleSetupSkill(options: SetupSkillOptions = {}): Promise
 
     // Precompute new command strings so migration can preserve exact matches.
     const precompactCmd = formatHookCommand(resolvedBin, PRECOMPACT_SUBCOMMAND);
-    const sessionStartCmd = formatHookCommand(resolvedBin, SESSIONSTART_SUBCOMMAND);
+    const sessionStartCmd = formatClaudeSessionStartCommand(resolvedBin);
     const stopCmd = formatHookCommand(resolvedBin, STOP_SUBCOMMAND);
 
     const migratedPre = await migrateLegacyHookVariants("PreCompact", PRECOMPACT_SUBCOMMAND, precompactCmd);
@@ -654,4 +668,529 @@ export async function handleSetupSkill(options: SetupSkillOptions = {}): Promise
   } else {
     log("Skill installed. After registering MCP, restart Claude Code and type /story.");
   }
+}
+
+export const CODEX_READ_ONLY_APPROVAL_TOOLS = [
+  "storybloq_status",
+  "storybloq_phase_list",
+  "storybloq_phase_current",
+  "storybloq_phase_tickets",
+  "storybloq_ticket_list",
+  "storybloq_ticket_get",
+  "storybloq_ticket_next",
+  "storybloq_ticket_blocked",
+  "storybloq_issue_list",
+  "storybloq_issue_get",
+  "storybloq_note_list",
+  "storybloq_note_get",
+  "storybloq_lesson_list",
+  "storybloq_lesson_get",
+  "storybloq_lesson_digest",
+  "storybloq_handover_list",
+  "storybloq_handover_latest",
+  "storybloq_handover_get",
+  "storybloq_blocker_list",
+  "storybloq_validate",
+  "storybloq_recap",
+  "storybloq_recommend",
+  "storybloq_export",
+  "storybloq_session_report",
+] as const;
+
+function commandErrorText(err: unknown): string {
+  if (typeof err === "object" && err !== null) {
+    const e = err as { message?: string; stderr?: Buffer | string; stdout?: Buffer | string };
+    const stderr = Buffer.isBuffer(e.stderr) ? e.stderr.toString("utf-8") : e.stderr;
+    const stdout = Buffer.isBuffer(e.stdout) ? e.stdout.toString("utf-8") : e.stdout;
+    return [stderr, stdout, e.message].filter(Boolean).join("\n");
+  }
+  return String(err);
+}
+
+function codexHome(): string {
+  return process.env.CODEX_HOME ?? join(homedir(), ".codex");
+}
+
+function codexHooksPath(): string {
+  return join(codexHome(), "hooks.json");
+}
+
+function codexConfigPath(): string {
+  return join(codexHome(), "config.toml");
+}
+
+function parseCodexVersion(output: string): string | null {
+  const match = output.match(/(\d+\.\d+\.\d+)/);
+  return match?.[1] ?? null;
+}
+
+function compareVersions(a: string, b: string): number {
+  const av = a.split(".").map((part) => Number.parseInt(part, 10));
+  const bv = b.split(".").map((part) => Number.parseInt(part, 10));
+  for (let i = 0; i < 3; i++) {
+    const ai = Number.isFinite(av[i]) ? av[i]! : 0;
+    const bi = Number.isFinite(bv[i]) ? bv[i]! : 0;
+    if (ai !== bi) return ai - bi;
+  }
+  return 0;
+}
+
+export async function ensureCodexToolApprovals(
+  configPath = codexConfigPath(),
+  tools: readonly string[] = CODEX_READ_ONLY_APPROVAL_TOOLS,
+): Promise<"updated" | "exists" | "skipped"> {
+  let raw = "";
+  if (existsSync(configPath)) {
+    try {
+      raw = await readFile(configPath, "utf-8");
+    } catch {
+      process.stderr.write(`Could not read ${configPath} - skipping Codex MCP approval config.\n`);
+      return "skipped";
+    }
+  }
+
+  let next = raw;
+  let changedExisting = false;
+  const additions: string[] = [];
+  for (const tool of tools) {
+    const header = `[mcp_servers.storybloq.tools.${tool}]`;
+    const block = findTomlTableBlock(next, header);
+    if (block) {
+      const existing = next.slice(block.start, block.end);
+      const updated = ensureTomlApprovalMode(existing);
+      if (updated !== existing) {
+        next = next.slice(0, block.start) + updated + next.slice(block.end);
+        changedExisting = true;
+      }
+      continue;
+    }
+    additions.push(`${header}\napproval_mode = "approve"\n`);
+  }
+
+  if (additions.length === 0 && !changedExisting) return "exists";
+
+  if (additions.length > 0) {
+    if (next.length > 0 && !next.endsWith("\n")) next += "\n";
+    if (next.length > 0 && !next.endsWith("\n\n")) next += "\n";
+    next += additions.join("\n");
+  }
+
+  const tmpPath = `${configPath}.${process.pid}.tmp`;
+  try {
+    await mkdir(dirname(configPath), { recursive: true });
+    await writeFile(tmpPath, next, "utf-8");
+    await rename(tmpPath, configPath);
+  } catch (err: unknown) {
+    try { await unlink(tmpPath); } catch { /* ignore */ }
+    const message = err instanceof Error ? err.message : String(err);
+    process.stderr.write(`Failed to write Codex config.toml: ${message}\n`);
+    return "skipped";
+  }
+
+  return "updated";
+}
+
+function findTomlTableBlock(raw: string, header: string): { start: number; end: number } | null {
+  const lines = raw.match(/[^\n]*(?:\n|$)/g) ?? [];
+  let offset = 0;
+  let start: number | null = null;
+
+  for (const line of lines) {
+    if (line.length === 0) continue;
+    const trimmed = line.trim();
+    const headerCandidate = (trimmed.split("#", 1)[0] ?? "").trim();
+    const isHeader = headerCandidate.startsWith("[") && headerCandidate.endsWith("]");
+    if (isHeader) {
+      if (start !== null) return { start, end: offset };
+      if (headerCandidate === header) start = offset;
+    }
+    offset += line.length;
+  }
+
+  return start === null ? null : { start, end: raw.length };
+}
+
+function ensureTomlApprovalMode(block: string): string {
+  if (/^\s*approval_mode\s*=\s*"approve"\s*(?:#.*)?$/m.test(block)) return block;
+
+  const approvalLine = /^(\s*)approval_mode\s*=.*?(\s*(?:#.*)?)$/m;
+  const match = block.match(approvalLine);
+  if (match) {
+    const indent = match[1] ?? "";
+    const comment = match[2] ?? "";
+    return block.replace(approvalLine, `${indent}approval_mode = "approve"${comment}`);
+  }
+
+  const separator = block.endsWith("\n") ? "" : "\n";
+  return `${block}${separator}approval_mode = "approve"\n`;
+}
+
+function ensureTomlStringValue(block: string, key: string, value: string): string {
+  const escaped = value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  const desired = `${key} = "${escaped}"`;
+  const exact = new RegExp(`^\\s*${key}\\s*=\\s*"${escaped.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}"\\s*(?:#.*)?$`, "m");
+  if (exact.test(block)) return block;
+
+  const line = new RegExp(`^(\\s*)${key}\\s*=.*?(\\s*(?:#.*)?)$`, "m");
+  const match = block.match(line);
+  if (match) {
+    const indent = match[1] ?? "";
+    const comment = match[2] ?? "";
+    return block.replace(line, `${indent}${desired}${comment}`);
+  }
+
+  const separator = block.endsWith("\n") ? "" : "\n";
+  return `${block}${separator}${desired}\n`;
+}
+
+export async function ensureCodexClientEnv(
+  configPath = codexConfigPath(),
+): Promise<"updated" | "exists" | "skipped"> {
+  let raw = "";
+  if (existsSync(configPath)) {
+    try {
+      raw = await readFile(configPath, "utf-8");
+    } catch {
+      process.stderr.write(`Could not read ${configPath} - skipping Codex MCP env config.\n`);
+      return "skipped";
+    }
+  }
+
+  const header = "[mcp_servers.storybloq.env]";
+  const block = findTomlTableBlock(raw, header);
+  let next = raw;
+  if (block) {
+    const existing = next.slice(block.start, block.end);
+    const updated = ensureTomlStringValue(existing, "STORYBLOQ_CLIENT", "codex");
+    if (updated === existing) return "exists";
+    next = next.slice(0, block.start) + updated + next.slice(block.end);
+  } else {
+    if (next.length > 0 && !next.endsWith("\n")) next += "\n";
+    if (next.length > 0 && !next.endsWith("\n\n")) next += "\n";
+    next += `${header}\nSTORYBLOQ_CLIENT = "codex"\n`;
+  }
+
+  const tmpPath = `${configPath}.${process.pid}.tmp`;
+  try {
+    await mkdir(dirname(configPath), { recursive: true });
+    await writeFile(tmpPath, next, "utf-8");
+    await rename(tmpPath, configPath);
+  } catch (err: unknown) {
+    try { await unlink(tmpPath); } catch { /* ignore */ }
+    const message = err instanceof Error ? err.message : String(err);
+    process.stderr.write(`Failed to write Codex config.toml: ${message}\n`);
+    return "skipped";
+  }
+
+  return "updated";
+}
+
+export async function migrateCodexHookVariants(
+  hookType: "SessionStart" | "Stop",
+  acceptedRests: readonly string[],
+  newCommand: string,
+  hooksPath = codexHooksPath(),
+): Promise<number> {
+  if (!existsSync(hooksPath)) return 0;
+
+  let raw: string;
+  try {
+    raw = await readFile(hooksPath, "utf-8");
+  } catch {
+    return 0;
+  }
+
+  let settings: Record<string, unknown>;
+  try {
+    settings = JSON.parse(raw) as Record<string, unknown>;
+    if (typeof settings !== "object" || settings === null || Array.isArray(settings)) return 0;
+  } catch {
+    return 0;
+  }
+
+  if (!("hooks" in settings) || typeof settings.hooks !== "object" || settings.hooks === null) return 0;
+  const hooks = settings.hooks as Record<string, unknown>;
+  if (!(hookType in hooks) || !Array.isArray(hooks[hookType])) return 0;
+
+  const hookArray = hooks[hookType] as unknown[];
+  let removedCount = 0;
+  for (const group of hookArray) {
+    if (typeof group !== "object" || group === null) continue;
+    const g = group as MatcherGroup;
+    if (!Array.isArray(g.hooks)) continue;
+    const before = g.hooks.length;
+    g.hooks = g.hooks.filter((entry) => {
+      if (typeof entry !== "object" || entry === null) return true;
+      const e = entry as HookEntry;
+      if (e.type !== "command" || typeof e.command !== "string") return true;
+      const cmd = e.command.trim();
+      if (cmd === newCommand.trim()) return true;
+      const parsed = parseHookCommand(cmd);
+      if (parsed === null) return true;
+      if (!STORYBLOQ_LEGACY_BASENAMES.has(parsed.binBasename)) return true;
+      return !acceptedRests.includes(parsed.rest);
+    });
+    removedCount += before - g.hooks.length;
+  }
+
+  if (removedCount === 0) return 0;
+
+  const tmpPath = `${hooksPath}.${process.pid}.tmp`;
+  try {
+    await mkdir(dirname(hooksPath), { recursive: true });
+    await writeFile(tmpPath, JSON.stringify(settings, null, 2) + "\n", "utf-8");
+    await rename(tmpPath, hooksPath);
+  } catch {
+    try { await unlink(tmpPath); } catch { /* ignore */ }
+    return 0;
+  }
+
+  return removedCount;
+}
+
+export async function registerCodexHook(
+  hookType: "SessionStart" | "Stop",
+  hookEntry: HookEntry,
+  hooksPath = codexHooksPath(),
+  matcher?: string,
+): Promise<"registered" | "exists" | "skipped"> {
+  let raw = "{}";
+  if (existsSync(hooksPath)) {
+    try {
+      raw = await readFile(hooksPath, "utf-8");
+    } catch {
+      process.stderr.write(`Could not read ${hooksPath} - skipping Codex hook registration.\n`);
+      return "skipped";
+    }
+  }
+
+  let settings: Record<string, unknown>;
+  try {
+    settings = JSON.parse(raw) as Record<string, unknown>;
+    if (typeof settings !== "object" || settings === null || Array.isArray(settings)) {
+      process.stderr.write(`${hooksPath} is not a JSON object - skipping Codex hook registration.\n`);
+      return "skipped";
+    }
+  } catch {
+    process.stderr.write(`${hooksPath} contains invalid JSON - skipping Codex hook registration.\n`);
+    return "skipped";
+  }
+
+  if ("hooks" in settings) {
+    if (typeof settings.hooks !== "object" || settings.hooks === null || Array.isArray(settings.hooks)) {
+      process.stderr.write(`${hooksPath} has unexpected hooks format - skipping Codex hook registration.\n`);
+      return "skipped";
+    }
+  } else {
+    settings.hooks = {};
+  }
+
+  const hooks = settings.hooks as Record<string, unknown>;
+  if (hookType in hooks) {
+    if (!Array.isArray(hooks[hookType])) {
+      process.stderr.write(`${hooksPath} has unexpected hooks.${hookType} format - skipping Codex hook registration.\n`);
+      return "skipped";
+    }
+  } else {
+    hooks[hookType] = [];
+  }
+
+  const hookArray = hooks[hookType] as unknown[];
+  const hookCommand = hookEntry.command;
+  if (hookCommand) {
+    for (const group of hookArray) {
+      if (typeof group !== "object" || group === null) continue;
+      const g = group as MatcherGroup;
+      if (!Array.isArray(g.hooks)) continue;
+      for (const entry of g.hooks) {
+        if (isHookWithCommand(entry, hookCommand)) return "exists";
+      }
+    }
+  }
+
+  const targetMatcher = matcher ?? "";
+  let appended = false;
+  for (const group of hookArray) {
+    if (typeof group !== "object" || group === null) continue;
+    const g = group as MatcherGroup;
+    if ((g.matcher ?? "") === targetMatcher && Array.isArray(g.hooks)) {
+      g.hooks.push(hookEntry);
+      appended = true;
+      break;
+    }
+  }
+  if (!appended) {
+    const group: MatcherGroup = { hooks: [hookEntry] };
+    if (targetMatcher) group.matcher = targetMatcher;
+    hookArray.push(group);
+  }
+
+  const tmpPath = `${hooksPath}.${process.pid}.tmp`;
+  try {
+    await mkdir(dirname(hooksPath), { recursive: true });
+    await writeFile(tmpPath, JSON.stringify(settings, null, 2) + "\n", "utf-8");
+    await rename(tmpPath, hooksPath);
+  } catch (err: unknown) {
+    try { await unlink(tmpPath); } catch { /* ignore */ }
+    const message = err instanceof Error ? err.message : String(err);
+    process.stderr.write(`Failed to write Codex hooks.json: ${message}\n`);
+    return "skipped";
+  }
+
+  return "registered";
+}
+
+async function handleSetupCodex(options: SetupSkillOptions = {}): Promise<void> {
+  const { skipHooks = false } = options;
+
+  let srcSkillDir: string;
+  try {
+    srcSkillDir = resolveSkillSourceDir();
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    process.stderr.write(`Error: ${message}\n`);
+    process.stderr.write("This may indicate a corrupt installation. Try: npm install -g @storybloq/storybloq@latest\n");
+    process.exitCode = 1;
+    return;
+  }
+
+  const skillDir = join(homedir(), ".agents", "skills", "story");
+  const existed = existsSync(join(skillDir, "SKILL.md"));
+  const writtenFiles = await copyDirRecursive(srcSkillDir, skillDir);
+  log(`${existed ? "Updated" : "Installed"} $story skill at ${skillDir}/`);
+  log(`  ${writtenFiles.join(" + ")} written`);
+
+  const compatSkillDir = join(codexHome(), "skills", "story");
+  if (existsSync(join(compatSkillDir, "SKILL.md"))) {
+    const compatFiles = await copyDirRecursive(srcSkillDir, compatSkillDir);
+    log(`  Refreshed existing Codex skill copy at ${compatSkillDir}/ (${compatFiles.length} files)`);
+  }
+
+  let cliInPath = false;
+  try {
+    execFileSync("storybloq", ["--version"], { stdio: "pipe", timeout: 5000 });
+    cliInPath = true;
+  } catch {
+    // storybloq not in PATH
+  }
+
+  let codexInPath = false;
+  try {
+    const versionOutput = execFileSync("codex", ["--version"], { encoding: "utf-8", stdio: "pipe", timeout: 5000 });
+    codexInPath = true;
+    const version = parseCodexVersion(versionOutput);
+    if (!version || compareVersions(version, "0.130.0") < 0) {
+      log(`  Warning: Codex CLI ${version ?? "version unknown"} detected. Storybloq Codex hooks require Codex 0.130.0 or newer.`);
+      log("  If hooks do not run, add [features] codex_hooks = true to ~/.codex/config.toml.");
+    }
+  } catch {
+    // codex not in PATH
+  }
+
+  if (cliInPath && codexInPath) {
+    let mcpReadyForConfig = false;
+    try {
+      execFileSync("codex", ["mcp", "add", "storybloq", "--env", "STORYBLOQ_CLIENT=codex", "--", "storybloq", "--mcp"], {
+        stdio: "pipe",
+        timeout: 10000,
+      });
+      mcpReadyForConfig = true;
+      log("  Codex MCP server registered globally");
+    } catch (err: unknown) {
+      const message = commandErrorText(err);
+      const isAlreadyRegistered = /already exists|already configured|duplicate/i.test(message);
+      if (isAlreadyRegistered) {
+        mcpReadyForConfig = true;
+        log("  Codex MCP server already registered globally");
+      } else {
+        log("");
+        log(`Codex MCP registration failed: ${message.split("\n")[0]}`);
+        log("  To register manually: codex mcp add storybloq --env STORYBLOQ_CLIENT=codex -- storybloq --mcp");
+      }
+    }
+
+    if (mcpReadyForConfig) {
+      const envResult = await ensureCodexClientEnv();
+      if (envResult === "updated") {
+        log("  Codex Storybloq MCP client identity configured");
+      }
+
+      const approvalResult = await ensureCodexToolApprovals();
+      if (approvalResult === "updated") {
+        log("  Codex read-only Storybloq MCP tools configured for approval-free use");
+      } else if (approvalResult === "exists") {
+        log("  Codex read-only Storybloq MCP tool approvals already configured");
+      }
+    }
+  } else {
+    log("");
+    if (!cliInPath) log("Codex MCP registration skipped - `storybloq` not found in PATH.");
+    if (!codexInPath) log("Codex MCP registration skipped - `codex` CLI not found in PATH.");
+    log("Install globally first, then register MCP:");
+    if (!cliInPath) log("  npm install -g @storybloq/storybloq@latest");
+    if (!codexInPath) log("  npm install -g @openai/codex");
+    log("  codex mcp add storybloq --env STORYBLOQ_CLIENT=codex -- storybloq --mcp");
+  }
+
+  const resolvedBin = resolveStorybloqBin();
+  if (!skipHooks && resolvedBin !== null) {
+    const sessionStartCmd = formatCodexSessionStartCommand(resolvedBin);
+    const stopCmd = formatHookCommand(resolvedBin, STOP_SUBCOMMAND);
+    const migratedStart = await migrateCodexHookVariants(
+      "SessionStart",
+      [SESSIONSTART_SUBCOMMAND, `${SESSIONSTART_SUBCOMMAND} --codex-hook-json`],
+      sessionStartCmd,
+    );
+    if (migratedStart > 0) log(`  Migrated ${migratedStart} stale Codex SessionStart hook entr${migratedStart === 1 ? "y" : "ies"}`);
+    const migratedStop = await migrateCodexHookVariants("Stop", [STOP_SUBCOMMAND], stopCmd);
+    if (migratedStop > 0) log(`  Migrated ${migratedStop} stale Codex Stop hook entr${migratedStop === 1 ? "y" : "ies"}`);
+
+    const sessionStartResult = await registerCodexHook(
+      "SessionStart",
+      { type: "command", command: sessionStartCmd, statusMessage: "Loading Storybloq session" },
+      undefined,
+      "startup|resume|clear",
+    );
+    if (sessionStartResult === "registered") log("  Codex SessionStart hook registered");
+    if (sessionStartResult === "exists") log("  Codex SessionStart hook already configured");
+
+    const stopResult = await registerCodexHook(
+      "Stop",
+      { type: "command", command: stopCmd, statusMessage: "Updating Storybloq status" },
+    );
+    if (stopResult === "registered") log("  Codex Stop hook registered - status.json refreshed after Codex turns");
+    if (stopResult === "exists") log("  Codex Stop hook already configured");
+  } else if (skipHooks) {
+    log("  Codex hook registration skipped (--skip-hooks)");
+  } else {
+    log("");
+    log("Codex hook registration skipped - `storybloq` binary not found.");
+    log("Install globally first, then re-run setup:");
+    log("  npm install -g @storybloq/storybloq@latest");
+    log("  storybloq setup --client codex");
+  }
+
+  log("");
+  log("Done! Restart Codex, then invoke $story in any project.");
+}
+
+export async function handleSetup(options: SetupOptions = {}): Promise<void> {
+  const client = options.client ?? "all";
+  if (!["claude", "codex", "all"].includes(client)) {
+    process.stderr.write(`Invalid client "${client}". Expected claude, codex, or all.\n`);
+    process.exitCode = 1;
+    return;
+  }
+
+  if (client === "claude" || client === "all") {
+    await handleSetupClaude(options);
+  }
+  if (client === "all") log("");
+  if (client === "codex" || client === "all") {
+    await handleSetupCodex(options);
+  }
+}
+
+export async function handleSetupSkill(options: SetupSkillOptions = {}): Promise<void> {
+  await handleSetup({ ...options, client: "claude" });
 }

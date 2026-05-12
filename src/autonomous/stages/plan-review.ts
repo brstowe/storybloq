@@ -4,6 +4,13 @@ import type { GuideReportInput } from "../session-types.js";
 import { requiredRounds, nextReviewer } from "../review-depth.js";
 import { accumulateVerificationCounters } from "../review-lenses/verification-log.js";
 import { writeReviewVerdict, readReviewVerdict, buildTier1Verdict, type ReviewVerdictArtifact } from "../review-verdict.js";
+import {
+  currentStorybloqClient,
+  nativeCodexReportInstruction,
+  nativeCodexReviewCommand,
+  reviewBackendsForClient,
+  shouldUseNativeCodexReview,
+} from "./codex-native.js";
 
 /**
  * PLAN_REVIEW stage — independent reviewer evaluates the plan.
@@ -16,7 +23,7 @@ export class PlanReviewStage implements WorkflowStage {
   readonly id = "PLAN_REVIEW";
 
   async enter(ctx: StageContext): Promise<StageResult> {
-    const backends = ctx.state.config.reviewBackends;
+    const backends = reviewBackendsForClient(ctx.state.config);
     const existingReviews = ctx.state.reviews.plan;
     const roundNum = existingReviews.length + 1;
     const reviewer = nextReviewer(existingReviews, backends, ctx.state.codexUnavailable, ctx.state.codexUnavailableSince);
@@ -55,19 +62,41 @@ export class PlanReviewStage implements WorkflowStage {
       };
     }
 
+    if (shouldUseNativeCodexReview(reviewer, ctx.state.config)) {
+      const command = nativeCodexReviewCommand("plan", ctx.state.sessionId);
+      return {
+        instruction: [
+          `# Native Codex Plan Review - Round ${roundNum} of ${Math.max(minRounds, roundNum)} minimum`,
+          "",
+          "Run native Codex plan review:",
+          "```bash",
+          command,
+          "```",
+          "",
+          nativeCodexReportInstruction(ctx.state.sessionId),
+        ].join("\n"),
+        reminders: [
+          "The helper uses `codex exec --output-schema` and read-only sandboxing.",
+          "If native Codex fails, fall back to the next configured reviewer if available; otherwise use agent review and include 'codex unavailable' in notes.",
+        ],
+        transitionedFrom: ctx.state.previousState ?? undefined,
+      };
+    }
+
+    const bridgeCodex = currentStorybloqClient() === "claude" && reviewer === "codex";
     return {
       instruction: [
         `# Plan Review — Round ${roundNum} of ${Math.max(minRounds, roundNum)} minimum`,
         "",
         `Run a plan review using **${reviewer}**.`,
         "",
-        reviewer === "codex"
+        bridgeCodex
           ? `Call \`review_plan\` MCP tool with the plan content.`
           : `Launch a code review agent to review the plan.`,
         "",
         "When done, call `storybloq_autonomous_guide` with:",
         '```json',
-        `{ "sessionId": "${ctx.state.sessionId}", "action": "report", "report": { "completedAction": "plan_review_round", "verdict": "<approve|revise|request_changes|reject>", "findings": [...] } }`,
+        `{ "sessionId": "${ctx.state.sessionId}", "action": "report", "report": { "completedAction": "plan_review_round", "verdict": "<approve|revise|reject>", "findings": [...] } }`,
         '```',
       ].join("\n"),
       reminders: [
@@ -89,7 +118,7 @@ export class PlanReviewStage implements WorkflowStage {
     const planReviews = [...ctx.state.reviews.plan];
     const roundNum = planReviews.length + 1;
     const findings = report.findings ?? [];
-    const backends = ctx.state.config.reviewBackends;
+    const backends = reviewBackendsForClient(ctx.state.config);
     const computedReviewer = nextReviewer(planReviews, backends, ctx.state.codexUnavailable, ctx.state.codexUnavailableSince);
     // ISS-102: Use actual reviewer from report, infer from notes, or fall back to computed
     const reviewerBackend = report.reviewer

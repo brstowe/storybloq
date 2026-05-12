@@ -59,6 +59,7 @@ export interface SessionConfig {
   maxTicketsPerSession?: number;
   compactThreshold?: string;
   reviewBackends?: string[];
+  codexReviewBackends?: string[];
   mode?: "auto" | "review" | "plan" | "guided";
   handoverInterval?: number;
   stageOverrides?: Record<string, Record<string, unknown>>;
@@ -115,6 +116,7 @@ export function createSession(
       maxTicketsPerSession: configOverrides?.maxTicketsPerSession ?? 0,
       compactThreshold: configOverrides?.compactThreshold ?? "high",
       reviewBackends: configOverrides?.reviewBackends ?? ["codex", "agent"],
+      codexReviewBackends: configOverrides?.codexReviewBackends,
       handoverInterval: configOverrides?.handoverInterval ?? 3,
     },
   };

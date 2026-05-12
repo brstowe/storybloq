@@ -56,6 +56,7 @@ export interface ResolvedRecipe {
     readonly maxTicketsPerSession: number;
     readonly compactThreshold: string;
     readonly reviewBackends: readonly string[];
+    readonly codexReviewBackends?: readonly string[];
   };
 }
 

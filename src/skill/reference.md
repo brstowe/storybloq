@@ -282,11 +282,25 @@ Run integration smoke test — create/update/delete cycle across all entity type
 storybloq selftest [--format json|md]
 ```
 
-### setup-skill
-Install the /story skill globally for Claude Code
+### codex-review
+Run native Codex plan or code review for an autonomous session
 
 ```
-storybloq setup-skill
+storybloq codex-review plan|code --session <id> --format guide-report
+```
+
+### setup
+Install Storybloq skill, MCP, and hooks for Claude, Codex, or both
+
+```
+storybloq setup [--client claude|codex|all] [--skip-hooks]
+```
+
+### setup-skill
+Compatibility alias for `storybloq setup --client claude`
+
+```
+storybloq setup-skill [--skip-hooks]
 ```
 
 ## MCP Tools
@@ -358,13 +372,13 @@ Creates issues automatically when storybloq MCP tools or CLI are available. Chec
 2. `storybloq handover create --content <md>` — write session handover
 
 ### Project Setup
-1. `npm install -g @storybloq/storybloq` — install CLI
-2. `storybloq setup-skill` — install /story skill for Claude Code
-3. `storybloq init --name my-project` — initialize .story/ in your project
+1. `npm install -g @storybloq/storybloq` - install CLI
+2. `storybloq setup --client all` - install Storybloq skill, MCP, and hooks for Claude Code and Codex
+3. `storybloq init --name my-project` - initialize .story/ in your project
 
 ## Troubleshooting
 
-- **MCP not connected:** Run `claude mcp add storybloq -s user -- storybloq --mcp`
+- **MCP not connected:** Run `storybloq setup --client all`
 - **CLI not found:** Run `npm install -g @storybloq/storybloq`
 - **Stale data:** Run `storybloq validate` to check integrity
-- **/story not available:** Run `storybloq setup-skill` to install the skill
+- **Storybloq skill not available:** Run `storybloq setup --client all` to install the skill

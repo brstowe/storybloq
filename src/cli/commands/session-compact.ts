@@ -87,7 +87,7 @@ export async function handleSessionCompactPrepare(): Promise<void> {
  * - Stale (>1hr): outputs stale recovery message
  * - No match: silent (no output)
  */
-export async function handleSessionResumePrompt(): Promise<void> {
+export async function handleSessionResumePrompt(options: { codexHookJson?: boolean } = {}): Promise<void> {
   const root = discoverProjectRoot();
   if (!root) return; // No .story/ — silent
 
@@ -100,11 +100,23 @@ export async function handleSessionResumePrompt(): Promise<void> {
 
   const { info, stale } = match;
   const sessionId = info.state.sessionId;
+  const writeResumeMessage = (message: string): void => {
+    if (options.codexHookJson) {
+      process.stdout.write(JSON.stringify({
+        hookSpecificOutput: {
+          hookEventName: "SessionStart",
+          additionalContext: message,
+        },
+      }) + "\n");
+      return;
+    }
+    process.stdout.write(message);
+  };
 
   // Stale check first — stale sessions get stale message regardless of resumeBlocked
   if (stale) {
     // Stale session — output recovery message (not silence)
-    process.stdout.write(
+    writeResumeMessage(
       `Stale compacted session ${sessionId} found (never resumed).\n` +
       `Run "storybloq session clear-compact ${sessionId}" to recover, ` +
       `or call storybloq_autonomous_guide with:\n` +
@@ -115,7 +127,7 @@ export async function handleSessionResumePrompt(): Promise<void> {
 
   if (info.state.resumeBlocked) {
     // Blocked resume — output recovery instructions
-    process.stdout.write(
+    writeResumeMessage(
       `Autonomous session ${sessionId} has a blocked resume (git validation failed).\n` +
       `Run "storybloq session clear-compact ${sessionId}" to recover, ` +
       `or check git status and call storybloq_autonomous_guide with:\n` +
@@ -125,7 +137,7 @@ export async function handleSessionResumePrompt(): Promise<void> {
   }
 
   // Fresh session — output normal resume instruction
-  process.stdout.write(
+  writeResumeMessage(
     `Continue the autonomous coding session. Call \`storybloq_autonomous_guide\` with:\n` +
     `{"sessionId": "${sessionId}", "action": "resume"}\n`,
   );

@@ -8,7 +8,8 @@
  * All diagnostic output goes to stderr.
  *
  * Project root discovery:
- * - CLAUDESTORY_PROJECT_ROOT env var (explicit, highest priority)
+ * - STORYBLOQ_PROJECT_ROOT env var (explicit, highest priority)
+ * - CLAUDESTORY_PROJECT_ROOT env var (deprecated fallback)
  * - Walk-up from cwd to find .story/config.json
  * - If neither found, server starts in degraded mode with storybloq_init + error status
  */
@@ -22,7 +23,8 @@ import { registerAllTools } from "./tools.js";
 import { initProject } from "../core/init.js";
 import { startInboxWatcher, stopInboxWatcher } from "../channel/inbox-watcher.js";
 
-const ENV_VAR = "CLAUDESTORY_PROJECT_ROOT";
+const ENV_VAR = "STORYBLOQ_PROJECT_ROOT";
+const LEGACY_ENV_VAR = "CLAUDESTORY_PROJECT_ROOT";
 const CONFIG_PATH = ".story/config.json";
 
 // Version injected at build time by tsup define
@@ -33,10 +35,11 @@ const version = process.env.CLAUDESTORY_VERSION ?? "0.0.0-dev";
  * Never exits — the server stays alive even without a project.
  */
 function tryDiscoverRoot(): string | null {
-  const envRoot = process.env[ENV_VAR];
+  const envRoot = process.env[ENV_VAR] ?? process.env[LEGACY_ENV_VAR];
+  const envName = process.env[ENV_VAR] ? ENV_VAR : LEGACY_ENV_VAR;
   if (envRoot) {
     if (!isAbsolute(envRoot)) {
-      process.stderr.write(`Warning: ${ENV_VAR} must be an absolute path, got: ${envRoot}\n`);
+      process.stderr.write(`Warning: ${envName} must be an absolute path, got: ${envRoot}\n`);
       return null;
     }
     const resolved = resolve(envRoot);
@@ -47,7 +50,7 @@ function tryDiscoverRoot(): string | null {
       }
       process.stderr.write(`Warning: No .story/config.json at ${canonical}\n`);
     } catch {
-      process.stderr.write(`Warning: ${ENV_VAR} path does not exist: ${resolved}\n`);
+      process.stderr.write(`Warning: ${envName} path does not exist: ${resolved}\n`);
     }
     return null;
   }

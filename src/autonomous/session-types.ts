@@ -505,6 +505,7 @@ export const SessionStateSchema = z.object({
     handoverInterval: z.number().min(0).default(3),
     compactThreshold: z.string().default("high"),
     reviewBackends: z.array(z.string()).default(["codex", "agent"]),
+    codexReviewBackends: z.array(z.string()).optional(),
     // T-181: Multi-lens review config
     lensConfig: z.object({
       lenses: z.union([z.literal("auto"), z.array(z.string())]).default("auto"),
@@ -582,6 +583,7 @@ export const SessionStateSchema = z.object({
     maxTicketsPerSession: z.number(),
     compactThreshold: z.string(),
     reviewBackends: z.array(z.string()),
+    codexReviewBackends: z.array(z.string()).optional(),
     handoverInterval: z.number().optional(),
   }).optional(),
 

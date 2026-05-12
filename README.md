@@ -40,29 +40,29 @@ The real cost isn't wasted setup time. It's repeated mistakes, relitigated desig
 Every project gets a `.story/` directory of JSON and markdown files. Tickets, issues, roadmap phases, session handovers, and lessons learned all live there, tracked by git, readable by any AI.
 
 - **CLI:** `storybloq` - inspect and mutate `.story/` from the terminal.
-- **MCP server:** 43 tools Claude Code calls directly, no subprocess spawning.
-- **Skill:** `/story` loads project state at the start of every session so Claude Code picks up exactly where the last session left off.
-- **Mac app:** native sidebar that watches `.story/` and updates live while Claude works (separate product, free on the App Store).
+- **MCP server:** 43 tools Claude Code and Codex can call directly, no subprocess spawning.
+- **Skill:** `/story` in Claude Code or `$story` in Codex loads project state at the start of every session.
+- **Mac app:** native sidebar that watches `.story/` and updates live while your AI client works (separate product, free on the App Store).
 
 ## Install
 
 ```bash
 npm install -g @storybloq/storybloq@latest
-storybloq setup-skill
+storybloq setup --client all
 ```
 
-Requires Node.js 20+ and Claude Code. Package lives on npm at [**@storybloq/storybloq**](https://www.npmjs.com/package/@storybloq/storybloq); releases are tagged on this repo at [github.com/Storybloq/storybloq/releases](https://github.com/Storybloq/storybloq/releases).
+Requires Node.js 20+ and at least one AI client: Claude Code or Codex CLI 0.130.0+. Package lives on npm at [**@storybloq/storybloq**](https://www.npmjs.com/package/@storybloq/storybloq); releases are tagged on this repo at [github.com/Storybloq/storybloq/releases](https://github.com/Storybloq/storybloq/releases).
 
-`setup-skill` installs the `/story` skill globally to `~/.claude/skills/story/`, registers this package as an MCP server, and configures a PreCompact hook that auto-snapshots state before context compaction. Re-running it is safe.
+`setup --client all` installs the Storybloq skill for Claude and Codex, registers this package as an MCP server, and configures available client hooks. Re-running it is safe. `setup-skill` remains as a compatibility alias for Claude-only setup.
 
 ## Upgrading
 
 ```bash
 npm install -g @storybloq/storybloq@latest
-storybloq setup-skill
+storybloq setup --client all
 ```
 
-Same two commands as a fresh install — `@latest` pulls the newest version, and re-running `setup-skill` refreshes the `/story` skill files, re-registers the MCP server, and sweeps any stale hook entries from prior installs.
+Same two commands as a fresh install: `@latest` pulls the newest version, and re-running setup refreshes the Storybloq skill files, re-registers the MCP server, and sweeps any stale hook entries from prior installs.
 
 You'll usually see a one-line banner on the next `storybloq` invocation whenever a newer version is on npm:
 
@@ -73,7 +73,7 @@ Update: npm install -g @storybloq/storybloq@latest
 
 The CLI also silently refreshes the skill dir and migrates any legacy hook entries (for example, from the pre-rename `@anthropologies/claudestory` package) on the first run after an upgrade — no manual cleanup needed.
 
-Alternative install via the Claude Code plugin system: see [Storybloq/plugin-archive](https://github.com/Storybloq/plugin-archive) (legacy path; `setup-skill` is the recommended install).
+Alternative install via the Claude Code plugin system: see [Storybloq/plugin-archive](https://github.com/Storybloq/plugin-archive) (legacy path; `storybloq setup --client all` is the recommended install).
 
 ## Bootstrap a project
 
@@ -128,7 +128,8 @@ All commands accept `--format json|md` (default `md`). Pipe JSON through `jq` fo
 | `storybloq init [--name] [--force]` | Scaffold `.story/` in the current directory |
 | `storybloq status` | Project summary with phase statuses, counts, and risks |
 | `storybloq validate` | Reference integrity + schema checks |
-| `storybloq setup-skill [--skip-hooks]` | Install `/story` skill + register MCP + PreCompact hook |
+| `storybloq setup --client claude\|codex\|all [--skip-hooks]` | Install Storybloq skills, register MCP, and configure client hooks |
+| `storybloq setup-skill [--skip-hooks]` | Compatibility alias for `storybloq setup --client claude` |
 | `storybloq recommend --count N` | Context-aware work suggestions |
 
 ### Phases
@@ -185,10 +186,11 @@ All commands accept `--format json|md` (default `md`). Pipe JSON through `jq` fo
 
 ## MCP server reference
 
-Register with Claude Code (done automatically by `setup-skill`):
+Register with Claude Code or Codex (done automatically by setup):
 
 ```bash
 claude mcp add storybloq -s user -- storybloq --mcp
+codex mcp add storybloq --env STORYBLOQ_CLIENT=codex -- storybloq --mcp
 ```
 
 The server imports the same TypeScript modules as the CLI directly, so there's no subprocess overhead. It auto-discovers the project root by walking up from the working directory to the nearest `.story/` parent.
@@ -217,7 +219,7 @@ The server imports the same TypeScript modules as the CLI directly, so there's n
 
 ## Hooks
 
-### PreCompact (auto-snapshot, set up by `setup-skill`)
+### PreCompact (Claude-only auto-snapshot, set up by setup)
 
 Runs `storybloq snapshot --quiet` before context compaction so `recap` always reflects the latest state. Manually:
 
@@ -232,7 +234,7 @@ Runs `storybloq snapshot --quiet` before context compaction so `recap` always re
 }
 ```
 
-Skip with `storybloq setup-skill --skip-hooks`.
+Skip with `storybloq setup --client all --skip-hooks`.
 
 ### SessionStart (optional recap injection)
 

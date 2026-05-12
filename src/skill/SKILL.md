@@ -3,9 +3,11 @@ name: story
 description: Track tickets, issues, and progress for your project. Load project context, manage sessions, guide setup.
 ---
 
-# /story -- Project Context & Session Management
+# Storybloq - Project Context & Session Management
 
 storybloq tracks tickets, issues, roadmap, and handovers in a `.story/` directory so every AI coding session builds on the last instead of starting from zero.
+
+Invocation differs by client: use `/story` in Claude Code, `$story` in Codex, or ask naturally to use the Storybloq skill.
 
 ## Step 0.5: Active session guard (runs BEFORE argument routing)
 
@@ -36,19 +38,19 @@ This guard has precedence over every "do not ask the user" rule elsewhere in thi
 `/story` is one smart command. Parse the user's intent from context:
 
 - `/story` -> full context load (default, see Step 2 below)
-- `/story auto` -> start autonomous mode (read `autonomous-mode.md` in the same directory as this skill file; if not found, tell user to run `storybloq setup-skill`)
+- `/story auto` -> start autonomous mode (read `autonomous-mode.md` in the same directory as this skill file; if not found, tell user to run `storybloq setup --client all`)
 - `/story auto T-183 T-184 ISS-077` -> start targeted autonomous mode with ONLY those items in order (read `autonomous-mode.md`; pass the IDs as `targetWork` array in the start call)
-- `/story review T-XXX` -> start review mode for a ticket (read `autonomous-mode.md` in the same directory as this skill file; if not found, tell user to run `storybloq setup-skill`)
-- `/story plan T-XXX` -> start plan mode for a ticket (read `autonomous-mode.md` in the same directory as this skill file; if not found, tell user to run `storybloq setup-skill`)
+- `/story review T-XXX` -> start review mode for a ticket (read `autonomous-mode.md` in the same directory as this skill file; if not found, tell user to run `storybloq setup --client all`)
+- `/story plan T-XXX` -> start plan mode for a ticket (read `autonomous-mode.md` in the same directory as this skill file; if not found, tell user to run `storybloq setup --client all`)
 - `/story handover` -> draft a session handover. Summarize the session's work, then call `storybloq_handover_create` with the drafted content and a descriptive slug
 - `/story snapshot` -> save project state (call `storybloq_snapshot` MCP tool)
 - `/story export` -> export project for sharing. Ask the user whether to export the current phase or the full project, then call `storybloq_export` with either `phase` or `all` set
 - `/story status` -> quick status check (call `storybloq_status` MCP tool)
 - `/story settings` -> manage project settings (see Settings section below)
-- `/story design` -> evaluate frontend design (read `design/design.md` in the same directory as this skill file; if not found, tell user to run `storybloq setup-skill`)
+- `/story design` -> evaluate frontend design (read `design/design.md` in the same directory as this skill file; if not found, tell user to run `storybloq setup --client all`)
 - `/story design <platform>` -> evaluate for specific platform: web, ios, macos, android (read `design/design.md` in the same directory as this skill file)
-- `/story review-lenses` -> run multi-lens review on current diff (read `review-lenses/review-lenses.md` in the same directory as this skill file; if not found, tell user to run `storybloq setup-skill`). Note: the autonomous guide invokes lenses automatically when `reviewBackends` includes `"lenses"` -- this command is for manual/debug use.
-- `/story help` -> show all capabilities (read `reference.md` in the same directory as this skill file; if not found, tell user to run `storybloq setup-skill`)
+- `/story review-lenses` -> run multi-lens review on current diff (read `review-lenses/review-lenses.md` in the same directory as this skill file; if not found, tell user to run `storybloq setup --client all`). Note: the autonomous guide invokes lenses automatically when `reviewBackends` includes `"lenses"` -- this command is for manual/debug use.
+- `/story help` -> show all capabilities (read `reference.md` in the same directory as this skill file; if not found, tell user to run `storybloq setup --client all`)
 
 If the user's intent doesn't match any of these, use the full context load.
 
@@ -69,11 +71,11 @@ Check if the storybloq MCP tools are available.
    - Check `node --version` and `npm --version` -- both must be available
    - If Node.js is missing, tell the user to install Node.js 20+ first
    - Otherwise, with user permission, run: `npm install -g @storybloq/storybloq@latest`
-   - Then run: `claude mcp add storybloq -s user -- storybloq --mcp`
-   - Tell the user to restart Claude Code and run `/story` again
+   - Then run: `storybloq setup --client all`
+   - Tell the user to restart the AI client and run `/story` in Claude Code or `$story` in Codex
 3. If CLI IS installed but MCP not registered:
-   - With user permission, run: `claude mcp add storybloq -s user -- storybloq --mcp`
-   - Tell the user to restart Claude Code and run `/story` again
+   - With user permission, run: `storybloq setup --client all`
+   - Tell the user to restart the AI client and run `/story` in Claude Code or `$story` in Codex
 
 **Important:** Always use `npm install -g` (pinned to `@latest`), never `npx`, for the CLI. The MCP server and the configured hooks call `storybloq` as a global binary; going through `npx` per invocation would add cold-start latency on every hook fire (PreCompact, SessionStart, Stop).
 
@@ -89,7 +91,7 @@ Check if the storybloq MCP tools are available.
 ## Step 1: Check Project
 
 - If `.story/` exists in the current working directory (or a parent) -> proceed to Step 2
-- If no `.story/` but project indicators exist (code, manifest, .git) -> read `setup-flow.md` in the same directory as this skill file and follow the AI-Assisted Setup Flow (if not found, tell user to run `storybloq setup-skill`)
+- If no `.story/` but project indicators exist (code, manifest, .git) -> read `setup-flow.md` in the same directory as this skill file and follow the AI-Assisted Setup Flow (if not found, tell user to run `storybloq setup --client all`)
 - If no `.story/` and no project indicators -> explain what storybloq is and suggest navigating to a project
 
 ## Step 2: Load Context (Default /story Behavior)
@@ -257,7 +259,7 @@ Never auto-select. Never skip the question. Never write to any active session's 
 
 **Never modify or overwrite existing handover files.** Handovers are append-only historical records. Always create new handover files -- never edit, replace, or write to an existing one. If you need to correct something from a previous session, create a new handover that references the correction. This prevents accidental data loss during sessions.
 
-Before writing a handover at the end of a session, run `storybloq snapshot` first. This ensures the next session's recap can show what changed. If `setup-skill` has been run, a PreCompact hook auto-takes snapshots before context compaction.
+Before writing a handover at the end of a session, run `storybloq snapshot` first. This ensures the next session's recap can show what changed. If Claude setup has been run, a PreCompact hook auto-takes snapshots before context compaction.
 
 **Lessons** capture non-obvious process learnings that should carry forward across sessions. At the end of a significant session, review what you learned and create lessons via `storybloq_lesson_create` for:
 - Patterns that worked (or failed) and why

@@ -18,7 +18,7 @@ When invoked via `/story design`:
 
 2. **Accept platform override**: `/story design web`, `/story design ios`, `/story design macos`, `/story design android`.
 
-3. **Load platform reference**: Read `references/<platform>.md` in the same directory as this file. If not found, tell the user to run `storybloq setup-skill` to update skill files.
+3. **Load platform reference**: Read `references/<platform>.md` in the same directory as this file. If not found, tell the user to run `storybloq setup --client all` to update skill files.
 
 4. **Check existing design issues**: Before creating new issues, list existing open issues with component "design" (via `storybloq_issue_list` MCP tool or `storybloq issue list --component design` CLI). Match findings against existing issues by title and location. Update existing issues instead of creating duplicates. Mark resolved issues when the underlying code no longer violates the rule.
 

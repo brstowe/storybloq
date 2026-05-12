@@ -18,6 +18,7 @@ interface RawRecipe {
     maxTicketsPerSession?: number;
     compactThreshold?: string;
     reviewBackends?: string[];
+    codexReviewBackends?: string[];
   };
 }
 
@@ -38,6 +39,7 @@ const DEFAULT_DEFAULTS = {
   maxTicketsPerSession: 0,
   compactThreshold: "high" as const,
   reviewBackends: ["codex", "agent"] as readonly string[],
+  codexReviewBackends: ["lenses"] as readonly string[],
 };
 
 // ---------------------------------------------------------------------------
@@ -73,6 +75,7 @@ export function resolveRecipe(
     maxTicketsPerSession?: number;
     compactThreshold?: string;
     reviewBackends?: string[];
+    codexReviewBackends?: string[];
     stages?: Record<string, Record<string, unknown>>;
   },
 ): ResolvedRecipe {
@@ -168,6 +171,9 @@ export function resolveRecipe(
     reviewBackends: projectOverrides?.reviewBackends
       ?? recipeDefaults.reviewBackends
       ?? [...DEFAULT_DEFAULTS.reviewBackends],
+    codexReviewBackends: projectOverrides?.codexReviewBackends
+      ?? recipeDefaults.codexReviewBackends
+      ?? [...DEFAULT_DEFAULTS.codexReviewBackends],
   };
 
   return {

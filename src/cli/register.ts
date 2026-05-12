@@ -7,6 +7,8 @@
  * import this module.
  */
 import type { Argv } from "yargs";
+import type { CodexReviewKind } from "./commands/codex-review.js";
+import type { SetupClient } from "./commands/setup-skill.js";
 import { runReadCommand, runDeleteCommand, writeOutput } from "./run.js";
 import {
   addFormatOption,
@@ -2329,18 +2331,94 @@ export function registerSelftestCommand(yargs: Argv): Argv {
 }
 
 // ---------------------------------------------------------------------------
+// codex-review
+// ---------------------------------------------------------------------------
+
+export function registerCodexReviewCommand(yargs: Argv): Argv {
+  return yargs.command(
+    "codex-review <kind>",
+    "Run native Codex review and emit an autonomous guide report",
+    (y) =>
+      y
+        .positional("kind", {
+          type: "string",
+          choices: ["plan", "code"] as const,
+          demandOption: true,
+          describe: "Review kind",
+        })
+        .option("session", {
+          type: "string",
+          demandOption: true,
+          describe: "Storybloq session ID",
+        })
+        .option("format", {
+          type: "string",
+          default: "guide-report",
+          choices: ["guide-report"] as const,
+          describe: "Output format",
+        }),
+    async (argv) => {
+      try {
+        const { handleCodexReview } = await import("./commands/codex-review.js");
+        const result = await handleCodexReview({
+          kind: argv.kind as CodexReviewKind,
+          sessionId: argv.session as string,
+          format: "guide-report",
+        });
+        writeOutput(JSON.stringify(result, null, 2));
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        writeOutput(formatError("io_error", message, "json"));
+        process.exitCode = ExitCode.USER_ERROR;
+      }
+    },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// setup
+// ---------------------------------------------------------------------------
+
+export function registerSetupCommand(yargs: Argv): Argv {
+  return yargs.command(
+    "setup",
+    "Install Storybloq skill, MCP, and hooks for AI clients",
+    (y) =>
+      y
+        .option("client", {
+          type: "string",
+          default: "all",
+          choices: ["claude", "codex", "all"] as const,
+          description: "Client to configure",
+        })
+        .option("skip-hooks", {
+          type: "boolean",
+          default: false,
+          description: "Skip hook registration",
+        }),
+    async (argv) => {
+      const { handleSetup } = await import("./commands/setup-skill.js");
+      await handleSetup({
+        client: argv.client as SetupClient,
+        skipHooks: argv["skip-hooks"] === true,
+      });
+    },
+  );
+}
+
+// ---------------------------------------------------------------------------
 // setup-skill
 // ---------------------------------------------------------------------------
 
 export function registerSetupSkillCommand(yargs: Argv): Argv {
   return yargs.command(
     "setup-skill",
-    "Install the /story skill globally for Claude Code",
+    "Compatibility alias for `storybloq setup --client claude`",
     (y) =>
       y.option("skip-hooks", {
         type: "boolean",
         default: false,
-        description: "Skip hook registration (PreCompact + Stop)",
+        description: "Skip hook registration",
       }),
     async (argv) => {
       const { handleSetupSkill } = await import("./commands/setup-skill.js");
@@ -2443,10 +2521,15 @@ export function registerSessionCommand(yargs: Argv): Argv {
         .command(
           "resume-prompt",
           "Output resume instruction after compaction (SessionStart hook)",
-          () => {},
-          async () => {
+          (y2) =>
+            y2.option("codex-hook-json", {
+              type: "boolean",
+              default: false,
+              describe: "Emit Codex SessionStart hook JSON instead of plain text",
+            }),
+          async (argv) => {
             const { handleSessionResumePrompt } = await import("./commands/session-compact.js");
-            await handleSessionResumePrompt();
+            await handleSessionResumePrompt({ codexHookJson: argv["codex-hook-json"] === true });
           },
         )
         .command(

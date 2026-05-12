@@ -2,7 +2,8 @@ import { existsSync, accessSync, constants } from "node:fs";
 import { resolve, dirname, join } from "node:path";
 import { ProjectLoaderError } from "./errors.js";
 
-const ENV_VAR = "CLAUDESTORY_PROJECT_ROOT";
+const ENV_VAR = "STORYBLOQ_PROJECT_ROOT";
+const LEGACY_ENV_VAR = "CLAUDESTORY_PROJECT_ROOT";
 const STORY_DIR = ".story";
 const CONFIG_PATH = ".story/config.json";
 
@@ -10,13 +11,14 @@ const CONFIG_PATH = ".story/config.json";
  * Discovers the project root by walking up from `startDir` (default: cwd)
  * looking for `.story/config.json`.
  *
- * CLAUDESTORY_PROJECT_ROOT env var overrides walk-up discovery.
+ * STORYBLOQ_PROJECT_ROOT env var overrides walk-up discovery.
+ * CLAUDESTORY_PROJECT_ROOT is retained as a deprecated fallback.
  * Returns the canonical absolute path, or null if not found.
  * Throws ProjectLoaderError if .story/ exists but is unreadable.
  */
 export function discoverProjectRoot(startDir?: string): string | null {
   // 1. Check env var override
-  const envRoot = process.env[ENV_VAR];
+  const envRoot = process.env[ENV_VAR] ?? process.env[LEGACY_ENV_VAR];
   if (envRoot) {
     const resolved = resolve(envRoot);
     return checkRoot(resolved);

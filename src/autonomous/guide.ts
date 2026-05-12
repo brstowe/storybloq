@@ -754,6 +754,7 @@ async function handleStart(root: string, args: GuideInput): Promise<McpToolResul
       if (typeof overrides.maxTicketsPerSession === "number") sessionConfig.maxTicketsPerSession = overrides.maxTicketsPerSession;
       if (typeof overrides.compactThreshold === "string") sessionConfig.compactThreshold = overrides.compactThreshold;
       if (Array.isArray(overrides.reviewBackends)) sessionConfig.reviewBackends = overrides.reviewBackends as string[];
+      if (Array.isArray(overrides.codexReviewBackends)) sessionConfig.codexReviewBackends = overrides.codexReviewBackends as string[];
       if (typeof overrides.handoverInterval === "number") sessionConfig.handoverInterval = overrides.handoverInterval;
       if (overrides.stages && typeof overrides.stages === "object") {
         sessionConfig.stageOverrides = overrides.stages as Record<string, Record<string, unknown>>;
@@ -776,6 +777,7 @@ async function handleStart(root: string, args: GuideInput): Promise<McpToolResul
     maxTicketsPerSession: sessionConfig.maxTicketsPerSession,
     compactThreshold: sessionConfig.compactThreshold,
     reviewBackends: sessionConfig.reviewBackends,
+    codexReviewBackends: sessionConfig.codexReviewBackends,
     stages: sessionConfig.stageOverrides,
   });
 
@@ -897,6 +899,9 @@ async function handleStart(root: string, args: GuideInput): Promise<McpToolResul
         maxTicketsPerSession: resolvedRecipe.defaults.maxTicketsPerSession,
         compactThreshold: resolvedRecipe.defaults.compactThreshold,
         reviewBackends: [...resolvedRecipe.defaults.reviewBackends],
+        codexReviewBackends: resolvedRecipe.defaults.codexReviewBackends
+          ? [...resolvedRecipe.defaults.codexReviewBackends]
+          : undefined,
       },
     };
 
@@ -1351,6 +1356,9 @@ function resolveRecipeFromState(state: FullSessionState): import("./stages/types
       maxTicketsPerSession: state.config.maxTicketsPerSession,
       compactThreshold: state.config.compactThreshold,
       reviewBackends: [...state.config.reviewBackends],
+      codexReviewBackends: state.config.codexReviewBackends
+        ? [...state.config.codexReviewBackends]
+        : undefined,
     },
   };
 }

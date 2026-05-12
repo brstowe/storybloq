@@ -19,6 +19,7 @@
     "maxTicketsPerSession": 0,
     "compactThreshold": "high",
     "reviewBackends": ["lenses", "codex", "agent"],
+    "codexReviewBackends": ["lenses"],
     "handoverInterval": 3
   }
 }

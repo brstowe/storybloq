@@ -1341,3 +1341,171 @@ describe("sweepLegacyHooks", () => {
     expect(total).toBe(2);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Codex setup
+// ---------------------------------------------------------------------------
+
+describe("Codex setup helpers", () => {
+  let tempDir: string;
+  let configPath: string;
+
+  beforeEach(async () => {
+    tempDir = join(tmpdir(), `storybloq-codex-setup-${randomUUID()}`);
+    await mkdir(tempDir, { recursive: true });
+    configPath = join(tempDir, "config.toml");
+  });
+
+  afterEach(async () => {
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  it("auto-approves read-only MCP tools and excludes mutating tools", async () => {
+    const { CODEX_READ_ONLY_APPROVAL_TOOLS } = await import("../../../src/cli/commands/setup-skill.js");
+
+    expect(CODEX_READ_ONLY_APPROVAL_TOOLS).toContain("storybloq_status");
+    expect(CODEX_READ_ONLY_APPROVAL_TOOLS).toContain("storybloq_session_report");
+    expect(CODEX_READ_ONLY_APPROVAL_TOOLS).not.toContain("storybloq_snapshot");
+    expect(CODEX_READ_ONLY_APPROVAL_TOOLS).not.toContain("storybloq_selftest");
+    expect(CODEX_READ_ONLY_APPROVAL_TOOLS).not.toContain("storybloq_autonomous_guide");
+    expect(CODEX_READ_ONLY_APPROVAL_TOOLS).not.toContain("storybloq_ticket_create");
+    expect(CODEX_READ_ONLY_APPROVAL_TOOLS).not.toContain("storybloq_register_subprocess");
+  });
+
+  it("uses plain SessionStart output for Claude and hook JSON output for Codex", async () => {
+    const {
+      formatClaudeSessionStartCommand,
+      formatCodexSessionStartCommand,
+    } = await import("../../../src/cli/commands/setup-skill.js");
+
+    const claudeCommand = formatClaudeSessionStartCommand("/usr/local/bin/storybloq");
+    const codexCommand = formatCodexSessionStartCommand("/usr/local/bin/storybloq");
+
+    expect(claudeCommand).toBe("/usr/local/bin/storybloq session resume-prompt");
+    expect(claudeCommand).not.toContain("--codex-hook-json");
+    expect(codexCommand).toBe("/usr/local/bin/storybloq session resume-prompt --codex-hook-json");
+  });
+
+  it("normalizes and appends Codex per-tool approval blocks idempotently", async () => {
+    await writeFile(configPath, [
+      "[mcp_servers.storybloq] # registered by storybloq",
+      'command = "storybloq"',
+      'args = ["--mcp"]',
+      "",
+      "[mcp_servers.storybloq.tools.storybloq_status] # keep this comment",
+      'approval_mode = "ask"',
+      "",
+    ].join("\n"), "utf-8");
+
+    const { ensureCodexToolApprovals } = await import("../../../src/cli/commands/setup-skill.js");
+    const first = await ensureCodexToolApprovals(configPath, [
+      "storybloq_status",
+      "storybloq_phase_list",
+    ]);
+    const second = await ensureCodexToolApprovals(configPath, [
+      "storybloq_status",
+      "storybloq_phase_list",
+    ]);
+
+    const content = await readFile(configPath, "utf-8");
+    expect(first).toBe("updated");
+    expect(second).toBe("exists");
+    expect(content.match(/\[mcp_servers\.storybloq\.tools\.storybloq_status\]/g)).toHaveLength(1);
+    expect(content.match(/\[mcp_servers\.storybloq\.tools\.storybloq_phase_list\]/g)).toHaveLength(1);
+    expect(content).not.toContain('approval_mode = "ask"');
+    expect(content).toContain('[mcp_servers.storybloq.tools.storybloq_status] # keep this comment');
+    expect(content).toContain('approval_mode = "approve"');
+    expect(content).toContain('[mcp_servers.storybloq.tools.storybloq_phase_list]\napproval_mode = "approve"');
+  });
+
+  it("adds Codex Storybloq client env idempotently", async () => {
+    await writeFile(configPath, [
+      "[mcp_servers.storybloq]",
+      'command = "storybloq"',
+      'args = ["--mcp"]',
+      "",
+      "[mcp_servers.storybloq.env] # existing table",
+      'STORYBLOQ_CLIENT = "claude"',
+      "",
+    ].join("\n"), "utf-8");
+
+    const { ensureCodexClientEnv } = await import("../../../src/cli/commands/setup-skill.js");
+    const first = await ensureCodexClientEnv(configPath);
+    const second = await ensureCodexClientEnv(configPath);
+
+    const content = await readFile(configPath, "utf-8");
+    expect(first).toBe("updated");
+    expect(second).toBe("exists");
+    expect(content.match(/\[mcp_servers\.storybloq\.env\]/g)).toHaveLength(1);
+    expect(content).toContain('STORYBLOQ_CLIENT = "codex"');
+    expect(content).not.toContain('STORYBLOQ_CLIENT = "claude"');
+  });
+
+  it("migrates stale Codex hook variants before registering the JSON hook", async () => {
+    const hooksPath = join(tempDir, "hooks.json");
+    await writeFile(hooksPath, JSON.stringify({
+      hooks: {
+        SessionStart: [{
+          matcher: "startup|resume|clear",
+          hooks: [
+            { type: "command", command: "storybloq session resume-prompt" },
+            { type: "command", command: "/usr/local/bin/storybloq session resume-prompt --codex-hook-json" },
+          ],
+        }],
+      },
+    }, null, 2), "utf-8");
+
+    const { formatCodexSessionStartCommand, migrateCodexHookVariants, registerCodexHook } = await import("../../../src/cli/commands/setup-skill.js");
+    const command = formatCodexSessionStartCommand("/usr/local/bin/storybloq");
+    const removed = await migrateCodexHookVariants(
+      "SessionStart",
+      ["session resume-prompt", "session resume-prompt --codex-hook-json"],
+      command,
+      hooksPath,
+    );
+    const registered = await registerCodexHook(
+      "SessionStart",
+      { type: "command", command, statusMessage: "Loading Storybloq session" },
+      hooksPath,
+      "startup|resume|clear",
+    );
+
+    const settings = JSON.parse(await readFile(hooksPath, "utf-8")) as {
+      hooks: { SessionStart: Array<{ hooks: Array<{ command: string }> }> };
+    };
+    expect(removed).toBe(1);
+    expect(registered).toBe("exists");
+    expect(settings.hooks.SessionStart[0]!.hooks).toHaveLength(1);
+    expect(settings.hooks.SessionStart[0]!.hooks[0]!.command).toBe(command);
+  });
+
+  it("registers Codex SessionStart hooks with JSON resume output", async () => {
+    const hooksPath = join(tempDir, "hooks.json");
+    const {
+      formatCodexSessionStartCommand,
+      registerCodexHook,
+    } = await import("../../../src/cli/commands/setup-skill.js");
+    const command = formatCodexSessionStartCommand("/usr/local/bin/storybloq");
+
+    const first = await registerCodexHook(
+      "SessionStart",
+      { type: "command", command, statusMessage: "Loading Storybloq session" },
+      hooksPath,
+      "startup|resume|clear",
+    );
+    const second = await registerCodexHook(
+      "SessionStart",
+      { type: "command", command, statusMessage: "Loading Storybloq session" },
+      hooksPath,
+      "startup|resume|clear",
+    );
+
+    const settings = JSON.parse(await readFile(hooksPath, "utf-8")) as {
+      hooks: { SessionStart: Array<{ matcher?: string; hooks: Array<{ command: string }> }> };
+    };
+    expect(first).toBe("registered");
+    expect(second).toBe("exists");
+    expect(settings.hooks.SessionStart[0]!.matcher).toBe("startup|resume|clear");
+    expect(settings.hooks.SessionStart[0]!.hooks[0]!.command).toContain("--codex-hook-json");
+  });
+});
