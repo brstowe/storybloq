@@ -56,6 +56,43 @@ export class PlanStage implements WorkflowStage {
   }
 
   async report(ctx: StageContext, _report: GuideReportInput): Promise<StageAdvance> {
+    if (_report.completedAction === "skip_ticket") {
+      const ticketId = ctx.state.ticket?.id ?? "unknown";
+      const reason = _report.notes ?? "Ticket cannot be completed in this session.";
+
+      if (ctx.state.ticket) {
+        try {
+          const { withProjectLock, writeTicketUnlocked } = await import("../../core/project-loader.js");
+          await withProjectLock(ctx.root, { strict: false }, async ({ state: ps }) => {
+            const ticket = ps.ticketByID(ticketId);
+            if (ticket && (ticket as Record<string, unknown>).claimedBySession === ctx.state.sessionId) {
+              writeTicketUnlocked(ctx.root, { ...ticket, status: "open", claimedBySession: undefined } as Record<string, unknown>);
+            }
+          });
+        } catch { /* best-effort */ }
+      }
+
+      ctx.updateDraft({ ticket: undefined, reviews: { plan: [], code: [] } });
+
+      return {
+        action: "goto",
+        target: "HANDOVER",
+        result: {
+          instruction: [
+            `# Ticket Skipped: ${ticketId}`,
+            "",
+            `**Reason:** ${reason}`,
+            "",
+            "Write a handover documenting why this ticket was skipped and what the next session should know.",
+            "",
+            'Call `storybloq_autonomous_guide` with completedAction: "handover_written" and include the content in handoverContent.',
+          ].join("\n"),
+          reminders: [],
+          transitionedFrom: "PLAN",
+        },
+      };
+    }
+
     // Verify plan exists
     const planPath = join(ctx.dir, "plan.md");
     if (!existsSync(planPath)) {

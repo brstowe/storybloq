@@ -105,6 +105,12 @@ export function writeReviewVerdict(
 
     const result = withTelemLock(sessionDir, () => {
       if (existsSync(filePath)) {
+        try {
+          const existing = JSON.parse(readFileSync(filePath, "utf-8"));
+          if (existing._contentHash && typeof existing._contentHash === "string") {
+            return { status: "exists" as const, contentHash: existing._contentHash as string };
+          }
+        } catch { /* fall through */ }
         return { status: "exists" as const, contentHash };
       }
 

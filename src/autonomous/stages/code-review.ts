@@ -124,6 +124,49 @@ export class CodeReviewStage implements WorkflowStage {
   }
 
   async report(ctx: StageContext, report: GuideReportInput): Promise<StageAdvance> {
+    if (report.completedAction === "skip_ticket") {
+      const ticketId = ctx.state.ticket?.id ?? ctx.state.currentIssue?.id ?? "unknown";
+      const reason = report.notes ?? "Ticket cannot be completed in this session.";
+
+      if (ctx.state.ticket) {
+        try {
+          const { withProjectLock, writeTicketUnlocked } = await import("../../core/project-loader.js");
+          await withProjectLock(ctx.root, { strict: false }, async ({ state: ps }) => {
+            const ticket = ps.ticketByID(ticketId);
+            if (ticket && (ticket as Record<string, unknown>).claimedBySession === ctx.state.sessionId) {
+              writeTicketUnlocked(ctx.root, { ...ticket, status: "open", claimedBySession: undefined } as Record<string, unknown>);
+            }
+          });
+        } catch { /* best-effort */ }
+      }
+
+      if (ctx.state.currentIssue) {
+        try {
+          const { handleIssueUpdate } = await import("../../cli/commands/issue.js");
+          await handleIssueUpdate(ctx.state.currentIssue.id, { status: "open" }, "json", ctx.root);
+        } catch { /* best-effort */ }
+      }
+
+      ctx.updateDraft({ ticket: undefined, currentIssue: null, reviews: { plan: [], code: [] } });
+      return {
+        action: "goto",
+        target: "HANDOVER",
+        result: {
+          instruction: [
+            `# Ticket Skipped: ${ticketId}`,
+            "",
+            `**Reason:** ${reason}`,
+            "",
+            "Write a handover documenting why this ticket was skipped and what the next session should know.",
+            "",
+            'Call `storybloq_autonomous_guide` with completedAction: "handover_written" and include the content in handoverContent.',
+          ].join("\n"),
+          reminders: [],
+          transitionedFrom: "CODE_REVIEW",
+        },
+      };
+    }
+
     const verdict = report.verdict;
     if (!verdict || !["approve", "revise", "request_changes", "reject"].includes(verdict)) {
       return { action: "retry", instruction: 'Invalid verdict. Re-submit with verdict: "approve", "revise", "request_changes", or "reject".' };
