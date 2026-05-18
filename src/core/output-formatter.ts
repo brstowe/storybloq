@@ -107,6 +107,19 @@ export function fencedBlock(content: string, lang?: string): string {
   return `${fence}${lang ?? ""}\n${content}\n${fence}`;
 }
 
+function formatConfigHints(state: ProjectState): string[] {
+  const overrides = state.config.recipeOverrides as Record<string, unknown> | undefined;
+  const backends = overrides?.reviewBackends as string[] | undefined;
+  const lines: string[] = [];
+  if (backends && backends.length > 0) {
+    lines.push(`Review backends: ${backends.join(", ")}`);
+  } else {
+    lines.push("Review backends: codex, agent (default). Change with `/story settings` or `storybloq config set-overrides --json '{\"reviewBackends\": [\"codex\", \"agent\"]}'`");
+  }
+  lines.push("");
+  return lines;
+}
+
 // --- Format Functions ---
 
 export function formatStatus(
@@ -150,6 +163,7 @@ export function formatStatus(
     `Lessons: ${state.activeLessonCount} active, ${state.deprecatedLessonCount} deprecated`,
     `Handovers: ${state.handoverFilenames.length}`,
     "",
+    ...formatConfigHints(state),
     "## Phases",
     "",
   ];
