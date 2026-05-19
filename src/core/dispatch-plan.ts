@@ -146,3 +146,67 @@ export function buildDispatchPlan(
     claudeVersionOk,
   };
 }
+
+// ---------------------------------------------------------------------------
+// Federation plan builder
+// ---------------------------------------------------------------------------
+
+export function buildFederationDispatchPlan(
+  nodeRecommendations: Map<string, { root: string; recommendations: readonly Recommendation[] }>,
+  maxAgents: number,
+  claudeVersion: string | null,
+): DispatchPlan {
+  const skipped: { id: string; reason: string }[] = [];
+
+  const candidates: Array<{ target: DispatchTarget; cwd: string; score: number; node: string }> = [];
+  const seen = new Set<string>();
+
+  for (const [nodeName, { root, recommendations }] of nodeRecommendations) {
+    for (const rec of recommendations) {
+      if (rec.kind === "action") {
+        skipped.push({ id: rec.id, reason: `action (not dispatchable) [${nodeName}]` });
+        continue;
+      }
+      if (seen.has(rec.id)) {
+        skipped.push({ id: rec.id, reason: `duplicate across nodes [${nodeName}]` });
+        continue;
+      }
+      seen.add(rec.id);
+      candidates.push({
+        target: {
+          id: rec.id,
+          kind: rec.kind as "ticket" | "issue",
+          title: rec.title,
+          reason: `${nodeName}: ${rec.reason}`,
+        },
+        cwd: root,
+        score: rec.score,
+        node: nodeName,
+      });
+    }
+  }
+
+  candidates.sort((a, b) => b.score - a.score);
+
+  for (const c of candidates.slice(maxAgents)) {
+    skipped.push({ id: c.target.id, reason: `exceeds maxParallelAgents (${maxAgents}) [${c.node}]` });
+  }
+
+  const entries: DispatchPlanEntry[] = candidates
+    .slice(0, maxAgents)
+    .map((c) => ({
+      target: c.target,
+      cwd: c.cwd,
+      prompt: c.target.id,
+    }));
+
+  const claudeVersionOk = claudeVersion !== null && supportsAgentView(claudeVersion);
+
+  return {
+    mode: "parallel",
+    entries,
+    skipped,
+    claudeVersion,
+    claudeVersionOk,
+  };
+}

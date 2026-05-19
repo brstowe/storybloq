@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { buildDispatchPlan, supportsAgentView } from "../../src/core/dispatch-plan.js";
+import { buildDispatchPlan, buildFederationDispatchPlan, supportsAgentView } from "../../src/core/dispatch-plan.js";
 import type { Recommendation } from "../../src/core/recommend.js";
 
 function makeRec(overrides: Partial<Recommendation> & { id: string }): Recommendation {
@@ -175,5 +175,81 @@ describe("buildDispatchPlan", () => {
       const plan = buildDispatchPlan(RECS, [], "/project", "2.1.140", 3);
       expect(plan.entries).toHaveLength(0);
     });
+  });
+});
+
+describe("buildFederationDispatchPlan (T-336)", () => {
+  const engineRecs: Recommendation[] = [
+    makeRec({ id: "T-061", title: "replaceAudio", score: 90 }),
+    makeRec({ id: "T-073", title: "changePace", score: 60 }),
+  ];
+
+  const cloudRecs: Recommendation[] = [
+    makeRec({ id: "T-052", kind: "issue", title: "webhook retry", score: 80 }),
+  ];
+
+  it("builds plan with entries from multiple nodes", () => {
+    const nodeRecs = new Map([
+      ["engine", { root: "/dev/engine", recommendations: engineRecs }],
+      ["cloud", { root: "/dev/cloud", recommendations: cloudRecs }],
+    ]);
+    const plan = buildFederationDispatchPlan(nodeRecs, 5, "2.1.140");
+    expect(plan.entries.length).toBe(3);
+    const cwds = plan.entries.map((e) => e.cwd);
+    expect(cwds).toContain("/dev/engine");
+    expect(cwds).toContain("/dev/cloud");
+  });
+
+  it("sorts by score across all nodes (highest first)", () => {
+    const nodeRecs = new Map([
+      ["engine", { root: "/dev/engine", recommendations: engineRecs }],
+      ["cloud", { root: "/dev/cloud", recommendations: cloudRecs }],
+    ]);
+    const plan = buildFederationDispatchPlan(nodeRecs, 5, "2.1.140");
+    const scores = plan.entries.map((e) => {
+      const allRecs = [...engineRecs, ...cloudRecs];
+      return allRecs.find((r) => r.id === e.target.id)?.score ?? 0;
+    });
+    for (let i = 1; i < scores.length; i++) {
+      expect(scores[i]!).toBeLessThanOrEqual(scores[i - 1]!);
+    }
+  });
+
+  it("caps at maxAgents globally", () => {
+    const nodeRecs = new Map([
+      ["engine", { root: "/dev/engine", recommendations: engineRecs }],
+      ["cloud", { root: "/dev/cloud", recommendations: cloudRecs }],
+    ]);
+    const plan = buildFederationDispatchPlan(nodeRecs, 2, "2.1.140");
+    expect(plan.entries).toHaveLength(2);
+    expect(plan.skipped.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("sets claudeVersionOk false when version is too old", () => {
+    const nodeRecs = new Map([
+      ["engine", { root: "/dev/engine", recommendations: engineRecs }],
+    ]);
+    const plan = buildFederationDispatchPlan(nodeRecs, 5, "2.0.0");
+    expect(plan.claudeVersionOk).toBe(false);
+  });
+
+  it("filters out action recommendations", () => {
+    const recsWithAction: Recommendation[] = [
+      makeRec({ id: "T-061", title: "replaceAudio", score: 90 }),
+      makeRec({ id: "DEBT_TREND", kind: "action", title: "Review debt", score: 30, category: "debt_trend" }),
+    ];
+    const nodeRecs = new Map([
+      ["engine", { root: "/dev/engine", recommendations: recsWithAction }],
+    ]);
+    const plan = buildFederationDispatchPlan(nodeRecs, 5, "2.1.140");
+    expect(plan.entries.every((e) => e.target.kind !== "action")).toBe(true);
+  });
+
+  it("handles empty node recommendations", () => {
+    const nodeRecs = new Map([
+      ["engine", { root: "/dev/engine", recommendations: [] }],
+    ]);
+    const plan = buildFederationDispatchPlan(nodeRecs, 5, "2.1.140");
+    expect(plan.entries).toHaveLength(0);
   });
 });
