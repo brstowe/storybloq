@@ -116,4 +116,53 @@ describe("TicketSchema", () => {
       }
     });
   });
+
+  describe("crossNodeBlockedBy (T-337)", () => {
+    const validTicket = {
+      id: "T-100", title: "Test", description: "", type: "task",
+      status: "open", phase: null, order: 10, createdDate: "2026-01-01",
+      completedDate: null, blockedBy: [],
+    };
+
+    it("accepts ticket with crossNodeBlockedBy field", () => {
+      const data = { ...validTicket, crossNodeBlockedBy: ["engine:T-061", "cloud:ISS-005"] };
+      const result = TicketSchema.safeParse(data);
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.crossNodeBlockedBy).toEqual(["engine:T-061", "cloud:ISS-005"]);
+      }
+    });
+
+    it("accepts ticket without crossNodeBlockedBy (optional)", () => {
+      const result = TicketSchema.safeParse(validTicket);
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.crossNodeBlockedBy).toBeUndefined();
+      }
+    });
+
+    it("rejects invalid cross-node ref format (missing node prefix)", () => {
+      const data = { ...validTicket, crossNodeBlockedBy: ["T-061"] };
+      const result = TicketSchema.safeParse(data);
+      expect(result.success).toBe(false);
+    });
+
+    it("rejects uppercase node name in ref", () => {
+      const data = { ...validTicket, crossNodeBlockedBy: ["Engine:T-061"] };
+      const result = TicketSchema.safeParse(data);
+      expect(result.success).toBe(false);
+    });
+
+    it("accepts suffixed ticket ID in ref", () => {
+      const data = { ...validTicket, crossNodeBlockedBy: ["engine:T-012a"] };
+      const result = TicketSchema.safeParse(data);
+      expect(result.success).toBe(true);
+    });
+
+    it("accepts issue ID in ref", () => {
+      const data = { ...validTicket, crossNodeBlockedBy: ["cloud:ISS-042"] };
+      const result = TicketSchema.safeParse(data);
+      expect(result.success).toBe(true);
+    });
+  });
 });

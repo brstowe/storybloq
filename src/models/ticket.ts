@@ -6,6 +6,8 @@ import {
   TicketIdSchema,
 } from "./types.js";
 
+export const CROSS_NODE_REF_REGEX = /^[a-z][a-z0-9_-]{0,63}:(T-\d+[a-z]?|ISS-\d+)$/;
+
 export const TicketSchema = z
   .object({
     id: TicketIdSchema,
@@ -25,6 +27,7 @@ export const TicketSchema = z
     lastModifiedBy: z.string().nullable().optional(),
     // ISS-027: Autonomous session ownership — set when ticket claimed as inprogress
     claimedBySession: z.string().nullable().optional(),
+    crossNodeBlockedBy: z.array(z.string().regex(CROSS_NODE_REF_REGEX, "Cross-node ref must match node:ID format")).optional(),
   })
   .passthrough();
 

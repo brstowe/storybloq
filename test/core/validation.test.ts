@@ -1,6 +1,8 @@
 import { describe, it, expect } from "vitest";
 import { validateProject, mergeValidation } from "../../src/core/validation.js";
 import { makeTicket, makeIssue, makeNote, makeLesson, makeState, makeRoadmap, makePhase } from "./test-factories.js";
+import { ProjectState } from "../../src/core/project-state.js";
+import type { Config } from "../../src/models/config.js";
 import type { LoadWarning } from "../../src/core/errors.js";
 
 describe("validateProject", () => {
@@ -284,5 +286,53 @@ describe("mergeValidation", () => {
     const base = validateProject(makeState());
     const merged = mergeValidation(base, []);
     expect(merged).toBe(base); // same reference
+  });
+});
+
+describe("crossNodeBlockedBy validation (T-337)", () => {
+  const orchConfig: Config = {
+    version: 2, schemaVersion: 2, project: "studio", type: "orchestrator", language: "typescript",
+    features: { tickets: true, issues: true, handovers: true, roadmap: true, reviews: true },
+    nodes: {
+      engine: { path: "~/Dev/engine", health: "green", dependsOn: [] },
+      cloud: { path: "~/Dev/cloud", health: "yellow", dependsOn: ["engine"] },
+    },
+  };
+
+  function makeOrchestratorState(tickets: ReturnType<typeof makeTicket>[]): ProjectState {
+    return new ProjectState({
+      tickets,
+      issues: [],
+      notes: [],
+      lessons: [],
+      roadmap: { version: 2, phases: [{ id: "p1", name: "Phase 1", order: 10, description: "" }], blockers: [] },
+      config: orchConfig,
+      handoverFilenames: [],
+    });
+  }
+
+  it("passes validation for valid cross-node refs", () => {
+    const ticket = makeTicket({ id: "T-001", phase: "p1" });
+    (ticket as Record<string, unknown>).crossNodeBlockedBy = ["engine:T-061"];
+    const state = makeOrchestratorState([ticket]);
+    const result = validateProject(state);
+    expect(result.findings.filter((f) => f.code.includes("cross_node"))).toHaveLength(0);
+  });
+
+  it("flags ref to non-existent node", () => {
+    const ticket = makeTicket({ id: "T-001", phase: "p1" });
+    (ticket as Record<string, unknown>).crossNodeBlockedBy = ["nonexistent:T-001"];
+    const state = makeOrchestratorState([ticket]);
+    const result = validateProject(state);
+    expect(result.findings.some((f) => f.code === "unknown_cross_node_ref")).toBe(true);
+  });
+
+  it("does not check cross-node refs on non-orchestrator projects", () => {
+    const state = makeState({
+      tickets: [makeTicket({ id: "T-001", phase: "p1" })],
+      roadmap: makeRoadmap([makePhase({ id: "p1" })]),
+    });
+    const result = validateProject(state);
+    expect(result.findings.filter((f) => f.code.includes("cross_node"))).toHaveLength(0);
   });
 });

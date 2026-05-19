@@ -260,6 +260,34 @@ export function validateProject(state: ProjectState): ValidationResult {
     }
   }
 
+  // Cross-node ref validation (orchestrator only)
+  if (
+    state.config.type === "orchestrator" &&
+    state.config.nodes != null &&
+    typeof state.config.nodes === "object"
+  ) {
+    const nodeNames = new Set(Object.keys(state.config.nodes));
+    const crossNodeRefPattern = /^([a-z][a-z0-9_-]{0,63}):(T-\d+[a-z]?|ISS-\d+)$/;
+    for (const ticket of state.tickets) {
+      const refs = (ticket as Record<string, unknown>).crossNodeBlockedBy;
+      if (!Array.isArray(refs)) continue;
+      for (const ref of refs) {
+        if (typeof ref !== "string") continue;
+        const match = crossNodeRefPattern.exec(ref);
+        if (!match) continue;
+        const nodeName = match[1]!;
+        if (!nodeNames.has(nodeName)) {
+          findings.push({
+            level: "warning",
+            code: "unknown_cross_node_ref",
+            message: `${ticket.id}: crossNodeBlockedBy references unknown node "${nodeName}" in "${ref}".`,
+            entity: ticket.id,
+          });
+        }
+      }
+    }
+  }
+
   const errorCount = findings.filter((f) => f.level === "error").length;
   const warningCount = findings.filter((f) => f.level === "warning").length;
   const infoCount = findings.filter((f) => f.level === "info").length;
