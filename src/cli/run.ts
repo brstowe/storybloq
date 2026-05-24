@@ -95,6 +95,40 @@ export async function runReadCommand(
   }
 }
 
+export async function runReadCommandWithRoot(
+  format: OutputFormat,
+  explicitRoot: string,
+  handler: (ctx: CommandContext) => Promise<CommandResult> | CommandResult,
+): Promise<void> {
+  try {
+    const { state, warnings } = await loadProject(explicitRoot);
+    const handoversDir = join(explicitRoot, ".story", "handovers");
+
+    const result = await handler({ state, warnings, root: explicitRoot, handoversDir, format });
+    writeOutput(result.output);
+
+    let exitCode = result.exitCode ?? ExitCode.OK;
+    if (exitCode === ExitCode.OK && hasIntegrityWarnings(warnings)) {
+      exitCode = ExitCode.PARTIAL;
+    }
+    process.exitCode = exitCode;
+  } catch (err: unknown) {
+    if (err instanceof ProjectLoaderError) {
+      writeOutput(formatError(err.code, err.message, format));
+      process.exitCode = ExitCode.USER_ERROR;
+      return;
+    }
+    if (err instanceof CliValidationError) {
+      writeOutput(formatError(err.code, err.message, format));
+      process.exitCode = ExitCode.USER_ERROR;
+      return;
+    }
+    const message = err instanceof Error ? err.message : String(err);
+    writeOutput(formatError("io_error", message, format));
+    process.exitCode = ExitCode.USER_ERROR;
+  }
+}
+
 /**
  * Pipeline for delete commands. Non-strict loading so deletes work on
  * partially corrupt projects. When integrity warnings present and

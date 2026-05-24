@@ -12,6 +12,7 @@ import {
   type ErrorCode,
 } from "../models/types.js";
 import type { Argv } from "yargs";
+import { resolveNodeRoot, checkNodeWritePermission, readOrchestratorConfig } from "../mcp/node-resolution.js";
 
 export class CliValidationError extends Error {
   constructor(
@@ -209,6 +210,25 @@ export function normalizeTags(raw: unknown[]): string[] {
  * Reads all content from stdin (piped input).
  * Throws CliValidationError if stdin is a TTY or content is empty.
  */
+export function resolveCliNodeRoot(
+  orchestratorRoot: string,
+  nodeName: string,
+  requireWrite: boolean,
+): { ok: true; root: string } | { ok: false; error: string; code: ErrorCode } {
+  const resolved = resolveNodeRoot(orchestratorRoot, nodeName);
+  if (!resolved.ok) {
+    return { ok: false, error: resolved.error, code: resolved.errorCode as ErrorCode };
+  }
+  if (requireWrite && !checkNodeWritePermission(orchestratorRoot)) {
+    return {
+      ok: false,
+      error: "Node writes are disabled. Run: storybloq config set-federation --allow-node-writes",
+      code: "invalid_input",
+    };
+  }
+  return { ok: true, root: resolved.root };
+}
+
 export async function readStdinContent(): Promise<string> {
   if (process.stdin.isTTY) {
     throw new CliValidationError(

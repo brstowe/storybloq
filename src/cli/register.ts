@@ -9,7 +9,7 @@
 import type { Argv } from "yargs";
 import type { CodexReviewKind } from "./commands/codex-review.js";
 import type { SetupClient } from "./commands/setup-skill.js";
-import { runReadCommand, runDeleteCommand, writeOutput } from "./run.js";
+import { runReadCommand, runReadCommandWithRoot, runDeleteCommand, writeOutput } from "./run.js";
 import {
   addFormatOption,
   parseOutputFormat,
@@ -20,6 +20,7 @@ import {
   normalizeArrayOption,
   normalizeTags,
   readStdinContent,
+  resolveCliNodeRoot,
   CliValidationError,
 } from "./helpers.js";
 import { parseMetadataValue } from "./commands/metadata.js";
@@ -107,6 +108,27 @@ import { handleReference } from "./commands/reference.js";
 
 // Selftest command
 import { handleSelftest } from "./commands/selftest.js";
+
+function addNodeOption<T>(y: Argv<T>): Argv<T & { node: string | undefined }> {
+  return y.option("node", {
+    type: "string",
+    describe: "Node name (orchestrator only). Operates on that node's .story/ instead of the orchestrator's.",
+  }) as Argv<T & { node: string | undefined }>;
+}
+
+function resolveRootWithNode(
+  orchRoot: string,
+  nodeName: string | undefined,
+  requireWrite: boolean,
+  format: string,
+): { ok: true; root: string } | { ok: false; output: string } {
+  if (!nodeName) return { ok: true, root: orchRoot };
+  const resolved = resolveCliNodeRoot(orchRoot, nodeName, requireWrite);
+  if (!resolved.ok) {
+    return { ok: false, output: formatError(resolved.code, resolved.error, format) };
+  }
+  return { ok: true, root: resolved.root };
+}
 
 // ---------------------------------------------------------------------------
 // status
@@ -537,7 +559,7 @@ export function registerTicketCommand(yargs: Argv): Argv {
           "list",
           "List tickets",
           (y2) =>
-            addFormatOption(
+            addNodeOption(addFormatOption(
               y2
                 .option("status", {
                   type: "string",
@@ -551,19 +573,23 @@ export function registerTicketCommand(yargs: Argv): Argv {
                   type: "string",
                   describe: "Filter by type",
                 }),
-            ),
+            )),
           async (argv) => {
             const format = parseOutputFormat(argv.format);
-            await runReadCommand(format, (ctx) =>
-              handleTicketList(
-                {
-                  status: argv.status as string | undefined,
-                  phase: argv.phase as string | undefined,
-                  type: argv.type as string | undefined,
-                },
-                ctx,
-              ),
-            );
+            const nodeName = argv.node as string | undefined;
+            if (nodeName) {
+              const orchRoot = (await import("../core/project-root-discovery.js")).discoverProjectRoot();
+              if (!orchRoot) { writeOutput(formatError("not_found", "No .story/ project found.", format)); process.exitCode = ExitCode.USER_ERROR; return; }
+              const eff = resolveRootWithNode(orchRoot, nodeName, false, format);
+              if (!eff.ok) { writeOutput(eff.output); process.exitCode = ExitCode.USER_ERROR; return; }
+              await runReadCommandWithRoot(format, eff.root, (ctx) =>
+                handleTicketList({ status: argv.status as string | undefined, phase: argv.phase as string | undefined, type: argv.type as string | undefined }, ctx),
+              );
+            } else {
+              await runReadCommand(format, (ctx) =>
+                handleTicketList({ status: argv.status as string | undefined, phase: argv.phase as string | undefined, type: argv.type as string | undefined }, ctx),
+              );
+            }
           },
         )
         .command(
@@ -611,7 +637,7 @@ export function registerTicketCommand(yargs: Argv): Argv {
           "create",
           "Create a new ticket",
           (y2) =>
-            addFormatOption(
+            addNodeOption(addFormatOption(
               y2
                 .option("title", {
                   type: "string",
@@ -645,13 +671,13 @@ export function registerTicketCommand(yargs: Argv): Argv {
                   describe: "Parent ticket ID (makes this a sub-ticket)",
                 })
                 .conflicts("description", "stdin"),
-            ),
+            )),
           async (argv) => {
             const format = parseOutputFormat(argv.format);
-            const root = (
+            const orchRoot = (
               await import("../core/project-root-discovery.js")
             ).discoverProjectRoot();
-            if (!root) {
+            if (!orchRoot) {
               writeOutput(
                 formatError(
                   "not_found",
@@ -659,6 +685,12 @@ export function registerTicketCommand(yargs: Argv): Argv {
                   format,
                 ),
               );
+              process.exitCode = ExitCode.USER_ERROR;
+              return;
+            }
+            const eff = resolveRootWithNode(orchRoot, argv.node as string | undefined, true, format);
+            if (!eff.ok) {
+              writeOutput(eff.output);
               process.exitCode = ExitCode.USER_ERROR;
               return;
             }
@@ -680,7 +712,7 @@ export function registerTicketCommand(yargs: Argv): Argv {
                     argv["parent-ticket"] === "" ? null : (argv["parent-ticket"] as string | undefined) ?? null,
                 },
                 format,
-                root,
+                eff.root,
               );
               writeOutput(result.output);
               process.exitCode = result.exitCode ?? ExitCode.OK;
@@ -758,15 +790,19 @@ export function registerTicketCommand(yargs: Argv): Argv {
                   type: "string",
                   describe: "Parent ticket ID",
                 })
+                .option("node", {
+                  type: "string",
+                  describe: "Node name (orchestrator only)",
+                })
                 .conflicts("description", "stdin"),
             ),
           async (argv) => {
             const format = parseOutputFormat(argv.format);
             const id = parseTicketId(argv.id as string);
-            const root = (
+            const orchRoot = (
               await import("../core/project-root-discovery.js")
             ).discoverProjectRoot();
-            if (!root) {
+            if (!orchRoot) {
               writeOutput(
                 formatError(
                   "not_found",
@@ -774,6 +810,12 @@ export function registerTicketCommand(yargs: Argv): Argv {
                   format,
                 ),
               );
+              process.exitCode = ExitCode.USER_ERROR;
+              return;
+            }
+            const eff = resolveRootWithNode(orchRoot, argv.node as string | undefined, true, format);
+            if (!eff.ok) {
+              writeOutput(eff.output);
               process.exitCode = ExitCode.USER_ERROR;
               return;
             }
@@ -807,7 +849,7 @@ export function registerTicketCommand(yargs: Argv): Argv {
                   parentTicket: argv["parent-ticket"] === "" ? null : argv["parent-ticket"] as string | undefined,
                 },
                 format,
-                root,
+                eff.root,
               );
               writeOutput(result.output);
               process.exitCode = result.exitCode ?? ExitCode.OK;
@@ -1401,10 +1443,19 @@ export function registerPhaseCommand(yargs: Argv): Argv {
         .command(
           "list",
           "List all phases",
-          (y2) => addFormatOption(y2),
+          (y2) => addNodeOption(addFormatOption(y2)),
           async (argv) => {
             const format = parseOutputFormat(argv.format);
-            await runReadCommand(format, handlePhaseList);
+            const nodeName = argv.node as string | undefined;
+            if (nodeName) {
+              const orchRoot = (await import("../core/project-root-discovery.js")).discoverProjectRoot();
+              if (!orchRoot) { writeOutput(formatError("not_found", "No .story/ project found.", format)); process.exitCode = ExitCode.USER_ERROR; return; }
+              const eff = resolveRootWithNode(orchRoot, nodeName, false, format);
+              if (!eff.ok) { writeOutput(eff.output); process.exitCode = ExitCode.USER_ERROR; return; }
+              await runReadCommandWithRoot(format, eff.root, handlePhaseList);
+            } else {
+              await runReadCommand(format, handlePhaseList);
+            }
           },
         )
         .command(
@@ -1473,14 +1524,18 @@ export function registerPhaseCommand(yargs: Argv): Argv {
                   type: "boolean",
                   default: false,
                   describe: "Insert at the beginning",
+                })
+                .option("node", {
+                  type: "string",
+                  describe: "Node name (orchestrator only)",
                 }),
             ),
           async (argv) => {
             const format = parseOutputFormat(argv.format);
-            const root = (
+            const orchRoot = (
               await import("../core/project-root-discovery.js")
             ).discoverProjectRoot();
-            if (!root) {
+            if (!orchRoot) {
               writeOutput(
                 formatError(
                   "not_found",
@@ -1488,6 +1543,12 @@ export function registerPhaseCommand(yargs: Argv): Argv {
                   format,
                 ),
               );
+              process.exitCode = ExitCode.USER_ERROR;
+              return;
+            }
+            const eff = resolveRootWithNode(orchRoot, argv.node as string | undefined, true, format);
+            if (!eff.ok) {
+              writeOutput(eff.output);
               process.exitCode = ExitCode.USER_ERROR;
               return;
             }
@@ -1503,7 +1564,7 @@ export function registerPhaseCommand(yargs: Argv): Argv {
                   atStart: argv.atStart as boolean,
                 },
                 format,
-                root,
+                eff.root,
               );
               writeOutput(result.output);
               process.exitCode = result.exitCode ?? ExitCode.OK;
