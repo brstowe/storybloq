@@ -3543,3 +3543,94 @@ export function registerSessionCommand(yargs: Argv): Argv {
     () => {},
   );
 }
+
+// MARK: - Feedback Command
+
+export function registerFeedbackCommand(yargs: Argv): Argv {
+  return yargs.command(
+    "feedback [subcommand]",
+    "Community feedback via GitHub Issues",
+    (y) =>
+      y
+        .command(
+          "list",
+          "List community feedback",
+          (sub) =>
+            sub
+              .option("category", {
+                type: "string",
+                choices: ["bug", "feature", "idea"] as const,
+                describe: "Filter by category",
+              })
+              .option("format", {
+                type: "string",
+                default: "md",
+                choices: ["md", "json"] as const,
+                describe: "Output format",
+              }),
+          async (argv) => {
+            const { handleFeedbackList } = await import("./commands/feedback.js");
+            const result = await handleFeedbackList(
+              { category: argv.category as "bug" | "feature" | "idea" | undefined },
+              argv.format as "md" | "json",
+            );
+            process.stdout.write(result.output + "\n");
+            if (result.exitCode) process.exitCode = result.exitCode;
+          },
+        )
+        .command(
+          "create",
+          "Create new feedback (opens browser)",
+          (sub) =>
+            sub
+              .option("title", {
+                type: "string",
+                demandOption: true,
+                describe: "Feedback title",
+              })
+              .option("category", {
+                type: "string",
+                choices: ["bug", "feature", "idea"] as const,
+                describe: "Feedback category",
+              })
+              .option("body", {
+                type: "string",
+                describe: "Feedback body",
+              }),
+          async (argv) => {
+            const { handleFeedbackCreate } = await import("./commands/feedback.js");
+            const result = await handleFeedbackCreate(
+              argv.title as string,
+              argv.category as string | undefined,
+              argv.body as string | undefined,
+            );
+            process.stdout.write(result.output + "\n");
+            if (result.exitCode) process.exitCode = result.exitCode;
+          },
+        )
+        .command(
+          "vote <number>",
+          "Vote on feedback (opens browser)",
+          (sub) =>
+            sub.positional("number", {
+              type: "number",
+              demandOption: true,
+              describe: "Issue number",
+            }),
+          async (argv) => {
+            const { handleFeedbackVote } = await import("./commands/feedback.js");
+            const result = await handleFeedbackVote(argv.number as number);
+            process.stdout.write(result.output + "\n");
+            if (result.exitCode) process.exitCode = result.exitCode;
+          },
+        ),
+    async (argv) => {
+      if (!argv.subcommand || argv.subcommand === "feedback") {
+        const { handleFeedbackOpen } = await import("./commands/feedback.js");
+        const result = await handleFeedbackOpen();
+        process.stdout.write(result.output + "\n");
+        if (result.exitCode) process.exitCode = result.exitCode;
+      }
+    },
+  );
+}
