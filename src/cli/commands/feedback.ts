@@ -1,16 +1,10 @@
 import { spawn } from "node:child_process";
-import { fetchIssues, FeedbackClientError } from "../../feedback/github-client.js";
+import { fetchIssues, FeedbackClientError, CATEGORY_TO_LABEL } from "../../feedback/github-client.js";
 import type { OutputFormat } from "../../models/types.js";
 import { ExitCode, successEnvelope } from "../../core/output-formatter.js";
 import type { CommandResult } from "../types.js";
 
 const REPO_URL = "https://github.com/Storybloq/storybloq";
-
-const CATEGORY_TO_LABEL: Record<string, string> = {
-  bug: "bug",
-  feature: "enhancement",
-  idea: "idea",
-};
 
 function labelToCategory(labels: { name: string }[]): string {
   for (const l of labels) {
@@ -40,8 +34,8 @@ export function openBrowser(url: string): void {
     cmd = "open";
     args = [url];
   } else if (platform === "win32") {
-    cmd = "cmd";
-    args = ["/c", "start", "", url];
+    cmd = "powershell.exe";
+    args = ["-NoProfile", "-Command", "Start-Process $args[0]", "-args", url];
   } else {
     cmd = "xdg-open";
     args = [url];

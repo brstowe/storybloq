@@ -6,16 +6,24 @@ import {
   buildCreateURL,
 } from "../../../src/cli/commands/feedback.js";
 
-vi.mock("../../../src/feedback/github-client.js", () => ({
-  fetchIssues: vi.fn(),
-  FeedbackClientError: class FeedbackClientError extends Error {
-    code: string;
-    constructor(code: string, message: string) {
-      super(message);
-      this.code = code;
-    }
-  },
+vi.mock("node:child_process", () => ({
+  spawn: vi.fn(() => ({ unref: vi.fn() })),
 }));
+
+vi.mock("../../../src/feedback/github-client.js", async () => {
+  const actual = await vi.importActual<typeof import("../../../src/feedback/github-client.js")>("../../../src/feedback/github-client.js");
+  return {
+    ...actual,
+    fetchIssues: vi.fn(),
+    FeedbackClientError: class FeedbackClientError extends Error {
+      code: string;
+      constructor(code: string, message: string) {
+        super(message);
+        this.code = code;
+      }
+    },
+  };
+});
 
 import { fetchIssues } from "../../../src/feedback/github-client.js";
 

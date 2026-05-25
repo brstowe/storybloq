@@ -9,6 +9,7 @@ export interface GitHubIssue {
   reactions: { "+1": number };
   created_at: string;
   html_url: string;
+  pull_request?: unknown;
 }
 
 export interface FetchIssuesResult {
@@ -21,7 +22,7 @@ export interface FetchIssuesOptions {
   limit?: number;
 }
 
-const CATEGORY_TO_LABEL: Record<string, string> = {
+export const CATEGORY_TO_LABEL: Record<string, string> = {
   bug: "bug",
   feature: "enhancement",
   idea: "idea",
@@ -77,6 +78,8 @@ export async function fetchIssues(options: FetchIssuesOptions): Promise<FetchIss
   } catch {
     throw new FeedbackClientError("parse_error", "Failed to parse GitHub API response");
   }
+
+  data = data.filter((issue) => !issue.pull_request);
 
   let rateLimitWarning: string | null = null;
   const remaining = response.headers.get("X-RateLimit-Remaining");
