@@ -342,6 +342,39 @@ function checkConflictsPresent(state: ProjectState, _ctx: DoctorContext): Doctor
   }];
 }
 
+function checkMergeDriverConfig(state: ProjectState, ctx: DoctorContext): DoctorFinding[] {
+  const rawTeam = (state.config as Record<string, unknown>).team;
+  const team = rawTeam && typeof rawTeam === "object" && !Array.isArray(rawTeam) ? rawTeam as Record<string, unknown> : undefined;
+  if (!team?.mergeDriverVersion) return [];
+
+  const { execFileSync } = require("node:child_process") as typeof import("node:child_process");
+  const { existsSync, readFileSync } = require("node:fs") as typeof import("node:fs");
+  const { join } = require("node:path") as typeof import("node:path");
+  const findings: DoctorFinding[] = [];
+  const storyDir = join(ctx.root, ".story");
+
+  try {
+    const driver = execFileSync("git", ["config", "--local", "--get", "merge.storybloq-json.driver"], { cwd: ctx.root, encoding: "utf-8", timeout: 5000 }).trim();
+    if (driver !== "storybloq merge-driver %O %A %B %P") {
+      findings.push({ severity: "warning", code: "merge_driver_mismatch", message: `Merge driver command mismatch: "${driver}"`, entity: null, repair: { command: ["storybloq", "team", "setup"] } });
+    }
+  } catch {
+    findings.push({ severity: "warning", code: "merge_driver_missing", message: "Git merge driver not configured. Run storybloq team setup.", entity: null, repair: { command: ["storybloq", "team", "setup"] } });
+  }
+
+  const attrsPath = join(storyDir, ".gitattributes");
+  if (!existsSync(attrsPath)) {
+    findings.push({ severity: "warning", code: "gitattributes_missing", message: ".story/.gitattributes not found. Run storybloq team setup.", entity: null, repair: { command: ["storybloq", "team", "setup"] } });
+  } else {
+    const content = readFileSync(attrsPath, "utf-8");
+    if (!content.includes("# storybloq-merge-begin")) {
+      findings.push({ severity: "warning", code: "gitattributes_no_block", message: ".story/.gitattributes missing managed merge block.", entity: null, repair: { command: ["storybloq", "team", "setup"] } });
+    }
+  }
+
+  return findings;
+}
+
 registerDoctorCheck(checkDuplicateCanonicalIds);
 registerDoctorCheck(checkDuplicateDisplayIds);
 registerDoctorCheck(checkMissingDisplayId);
@@ -351,3 +384,4 @@ registerDoctorCheck(checkLoadWarnings);
 registerDoctorCheck(checkStaleClaims);
 registerDoctorCheck(checkStaleTombstones);
 registerDoctorCheck(checkConflictsPresent);
+registerDoctorCheck(checkMergeDriverConfig);

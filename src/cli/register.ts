@@ -454,6 +454,21 @@ export function registerTeamCommand(yargs: Argv): Argv {
           }
         },
       )
+      .command(
+        "setup",
+        "Install git merge driver and .gitattributes for team mode",
+        (y2) =>
+          y2
+            .option("format", { type: "string", choices: ["md", "json"], default: "md", describe: "Output format" }),
+        async (argv) => {
+          const root = (await import("../core/project-root-discovery.js")).discoverProjectRoot();
+          if (!root) { writeOutput("No .story/ project found."); process.exitCode = ExitCode.USER_ERROR; return; }
+          const { handleTeamSetup } = await import("./commands/team-setup.js");
+          const result = await handleTeamSetup(root, { format: (argv.format as "md" | "json") ?? "md" });
+          writeOutput(result.output);
+          if (result.exitCode !== 0) process.exitCode = result.exitCode;
+        },
+      )
       .demandCommand(1, ""),
     () => {},
   );
