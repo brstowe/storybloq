@@ -2,11 +2,15 @@ import { z } from "zod";
 
 // --- ID format regexes ---
 
-/** Matches T-001, T-077a, T-079b */
+/** Matches legacy T-001, T-077a, T-079b */
 export const TICKET_ID_REGEX = /^T-\d+[a-z]?$/;
+/** Matches canonical t-[crockford16] */
+export const TICKET_CANONICAL_ID_REGEX = /^t-[0-9a-hjkmnp-tvwxyz]{16}$/;
 
-/** Matches ISS-001, ISS-009 */
+/** Matches legacy ISS-001, ISS-009 */
 export const ISSUE_ID_REGEX = /^ISS-\d+$/;
+/** Matches canonical i-[crockford16] */
+export const ISSUE_CANONICAL_ID_REGEX = /^i-[0-9a-hjkmnp-tvwxyz]{16}$/;
 
 // --- Ticket enums ---
 
@@ -29,9 +33,13 @@ export type IssueSeverity = (typeof ISSUE_SEVERITIES)[number];
 export const NOTE_STATUSES = ["active", "archived"] as const;
 export type NoteStatus = (typeof NOTE_STATUSES)[number];
 export const NOTE_ID_REGEX = /^N-\d+$/;
+export const NOTE_CANONICAL_ID_REGEX = /^n-[0-9a-hjkmnp-tvwxyz]{16}$/;
 export const NoteIdSchema = z
   .string()
-  .regex(NOTE_ID_REGEX, "Note ID must match N-NNN");
+  .refine(
+    (v) => NOTE_ID_REGEX.test(v) || NOTE_CANONICAL_ID_REGEX.test(v),
+    "Note ID must match N-NNN or n-[canonical]",
+  );
 
 // --- Lesson enums ---
 
@@ -40,9 +48,13 @@ export type LessonStatus = (typeof LESSON_STATUSES)[number];
 export const LESSON_SOURCES = ["review", "correction", "postmortem", "manual"] as const;
 export type LessonSource = (typeof LESSON_SOURCES)[number];
 export const LESSON_ID_REGEX = /^L-\d+$/;
+export const LESSON_CANONICAL_ID_REGEX = /^l-[0-9a-hjkmnp-tvwxyz]{16}$/;
 export const LessonIdSchema = z
   .string()
-  .regex(LESSON_ID_REGEX, "Lesson ID must match L-NNN");
+  .refine(
+    (v) => LESSON_ID_REGEX.test(v) || LESSON_CANONICAL_ID_REGEX.test(v),
+    "Lesson ID must match L-NNN or l-[canonical]",
+  );
 
 // --- Team-mode enums ---
 
@@ -105,8 +117,14 @@ export const DateSchema = z
 
 export const TicketIdSchema = z
   .string()
-  .regex(TICKET_ID_REGEX, "Ticket ID must match T-NNN or T-NNNx");
+  .refine(
+    (v) => TICKET_ID_REGEX.test(v) || TICKET_CANONICAL_ID_REGEX.test(v),
+    "Ticket ID must match T-NNN, T-NNNx, or t-[canonical]",
+  );
 
 export const IssueIdSchema = z
   .string()
-  .regex(ISSUE_ID_REGEX, "Issue ID must match ISS-NNN");
+  .refine(
+    (v) => ISSUE_ID_REGEX.test(v) || ISSUE_CANONICAL_ID_REGEX.test(v),
+    "Issue ID must match ISS-NNN or i-[canonical]",
+  );

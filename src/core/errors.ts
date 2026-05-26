@@ -20,7 +20,8 @@ export type LoadWarningType =
   | "schema_error"
   | "duplicate_id"
   | "naming_convention"
-  | "filename_id_mismatch";
+  | "filename_id_mismatch"
+  | "filename_classification_mismatch";
 
 /** Integrity warnings fail strict mode. Cosmetic warnings are collected but never block. */
 export const INTEGRITY_WARNING_TYPES: readonly LoadWarningType[] = [

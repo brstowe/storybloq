@@ -22,7 +22,12 @@ import { LessonSchema, type Lesson } from "../models/lesson.js";
 import { RoadmapSchema, type Roadmap } from "../models/roadmap.js";
 import { ConfigSchema, type Config } from "../models/config.js";
 import { validateOrchestratorOverlay } from "../models/federation-config.js";
-import { TICKET_ID_REGEX, ISSUE_ID_REGEX, NOTE_ID_REGEX, LESSON_ID_REGEX } from "../models/types.js";
+import {
+  TICKET_ID_REGEX, TICKET_CANONICAL_ID_REGEX,
+  ISSUE_ID_REGEX, ISSUE_CANONICAL_ID_REGEX,
+  NOTE_ID_REGEX, NOTE_CANONICAL_ID_REGEX,
+  LESSON_ID_REGEX, LESSON_CANONICAL_ID_REGEX,
+} from "../models/types.js";
 import { ProjectState } from "./project-state.js";
 import {
   ProjectLoaderError,
@@ -46,6 +51,7 @@ export interface LoadOptions {
 export interface LoadResult {
   readonly state: ProjectState;
   readonly warnings: readonly LoadWarning[];
+  readonly fileClassifications: ReadonlyMap<string, "legacy" | "team">;
 }
 
 // --- Read Operations ---
@@ -130,11 +136,14 @@ export async function loadProject(
   }
 
   // 6. Load tickets (best-effort)
+  const fileClassifications = new Map<string, "legacy" | "team">();
   const tickets = await loadDirectory<Ticket>(
     join(wrapDir, "tickets"),
     absRoot,
     TicketSchema,
     warnings,
+    "ticket",
+    fileClassifications,
   );
 
   // 7. Load issues (best-effort)
@@ -143,6 +152,8 @@ export async function loadProject(
     absRoot,
     IssueSchema,
     warnings,
+    "issue",
+    fileClassifications,
   );
 
   // 7b. Load notes (best-effort)
@@ -151,6 +162,8 @@ export async function loadProject(
     absRoot,
     NoteSchema,
     warnings,
+    "note",
+    fileClassifications,
   );
 
   // 7c. Load lessons (best-effort — empty array if directory absent)
@@ -159,6 +172,8 @@ export async function loadProject(
     absRoot,
     LessonSchema,
     warnings,
+    "lesson",
+    fileClassifications,
   );
 
   // 8. List handovers
@@ -193,7 +208,7 @@ export async function loadProject(
     handoverFilenames,
   });
 
-  return { state, warnings };
+  return { state, warnings, fileClassifications };
 }
 
 // --- Write Operations ---
@@ -835,13 +850,61 @@ async function loadProjectUnlocked(absRoot: string): Promise<LoadResult> {
   const config = await loadSingletonFile<Config>("config.json", wrapDir, absRoot, ConfigSchema);
   const roadmap = await loadSingletonFile<Roadmap>("roadmap.json", wrapDir, absRoot, RoadmapSchema);
   const warnings: LoadWarning[] = [];
-  const tickets = await loadDirectory<Ticket>(join(wrapDir, "tickets"), absRoot, TicketSchema, warnings);
-  const issues = await loadDirectory<Issue>(join(wrapDir, "issues"), absRoot, IssueSchema, warnings);
-  const notes = await loadDirectory<Note>(join(wrapDir, "notes"), absRoot, NoteSchema, warnings);
-  const lessons = await loadDirectory<Lesson>(join(wrapDir, "lessons"), absRoot, LessonSchema, warnings);
+  const fileClassifications = new Map<string, "legacy" | "team">();
+  const tickets = await loadDirectory<Ticket>(join(wrapDir, "tickets"), absRoot, TicketSchema, warnings, "ticket", fileClassifications);
+  const issues = await loadDirectory<Issue>(join(wrapDir, "issues"), absRoot, IssueSchema, warnings, "issue", fileClassifications);
+  const notes = await loadDirectory<Note>(join(wrapDir, "notes"), absRoot, NoteSchema, warnings, "note", fileClassifications);
+  const lessons = await loadDirectory<Lesson>(join(wrapDir, "lessons"), absRoot, LessonSchema, warnings, "lesson", fileClassifications);
   const handoverFilenames = await listHandovers(join(wrapDir, "handovers"), absRoot, warnings);
   const state = new ProjectState({ tickets, issues, notes, lessons, roadmap, config, handoverFilenames });
-  return { state, warnings };
+  return { state, warnings, fileClassifications };
+}
+
+// --- Filename Classification ---
+
+type EntityType = "ticket" | "issue" | "note" | "lesson";
+
+const LEGACY_FILENAME_REGEXES: Record<EntityType, RegExp> = {
+  ticket: /^T-\d+[a-z]?\.json$/,
+  issue: /^ISS-\d+\.json$/,
+  note: /^N-\d+\.json$/,
+  lesson: /^L-\d+\.json$/,
+};
+
+const TEAM_FILENAME_REGEXES: Record<EntityType, RegExp> = {
+  ticket: /^t-[0-9a-hjkmnp-tvwxyz]{16}\.json$/,
+  issue: /^i-[0-9a-hjkmnp-tvwxyz]{16}\.json$/,
+  note: /^n-[0-9a-hjkmnp-tvwxyz]{16}\.json$/,
+  lesson: /^l-[0-9a-hjkmnp-tvwxyz]{16}\.json$/,
+};
+
+const CANONICAL_ID_REGEXES: Record<EntityType, RegExp> = {
+  ticket: TICKET_CANONICAL_ID_REGEX,
+  issue: ISSUE_CANONICAL_ID_REGEX,
+  note: NOTE_CANONICAL_ID_REGEX,
+  lesson: LESSON_CANONICAL_ID_REGEX,
+};
+
+const LEGACY_ID_REGEXES: Record<EntityType, RegExp> = {
+  ticket: TICKET_ID_REGEX,
+  issue: ISSUE_ID_REGEX,
+  note: NOTE_ID_REGEX,
+  lesson: LESSON_ID_REGEX,
+};
+
+export function classifyFilename(
+  filename: string,
+  entityType: EntityType,
+): "legacy" | "team" | null {
+  if (LEGACY_FILENAME_REGEXES[entityType].test(filename)) return "legacy";
+  if (TEAM_FILENAME_REGEXES[entityType].test(filename)) return "team";
+  return null;
+}
+
+function classifyId(id: string, entityType: EntityType): "legacy" | "team" | null {
+  if (LEGACY_ID_REGEXES[entityType].test(id)) return "legacy";
+  if (CANONICAL_ID_REGEXES[entityType].test(id)) return "team";
+  return null;
 }
 
 // --- Internal Helpers ---
@@ -896,6 +959,8 @@ async function loadDirectory<T>(
   root: string,
   schema: ZodType<T>,
   warnings: LoadWarning[],
+  entityType: EntityType,
+  classifications: Map<string, "legacy" | "team">,
 ): Promise<T[]> {
   if (!existsSync(dirPath)) return [];
 
@@ -913,6 +978,7 @@ async function loadDirectory<T>(
   // Sort lexicographically for deterministic collision handling
   entries.sort();
 
+  const entityDir = basename(dirPath);
   const results: T[] = [];
   for (const entry of entries) {
     if (entry.startsWith(".")) continue;
@@ -936,12 +1002,31 @@ async function loadDirectory<T>(
       const data = result.data as Record<string, unknown>;
       if (typeof data.id === "string") {
         const stem = basename(entry, ".json");
-        if (stem !== data.id) {
+        const stemMatchesId = stem === data.id;
+        if (!stemMatchesId) {
           warnings.push({
             file: relPath,
             message: `Filename stem "${stem}" does not match content id "${data.id}"`,
             type: "filename_id_mismatch",
           });
+        }
+
+        if (stemMatchesId) {
+          const fileClass = classifyFilename(entry, entityType);
+          const idClass = classifyId(data.id as string, entityType);
+
+          if (fileClass && idClass && fileClass !== idClass) {
+            warnings.push({
+              file: relPath,
+              message: `Filename classified as ${fileClass} but id "${data.id}" classified as ${idClass}`,
+              type: "filename_classification_mismatch",
+            });
+          } else if (fileClass) {
+            classifications.set(`${entityDir}/${entry}`, fileClass);
+            if (fileClass === "legacy" && data.displayId == null) {
+              (data as Record<string, unknown>).displayId = data.id;
+            }
+          }
         }
       }
       results.push(result.data);

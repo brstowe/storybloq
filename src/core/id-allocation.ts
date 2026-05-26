@@ -4,6 +4,7 @@ import type { Note } from "../models/note.js";
 import type { Lesson } from "../models/lesson.js";
 import type { ProjectState } from "./project-state.js";
 import { TICKET_ID_REGEX, ISSUE_ID_REGEX, NOTE_ID_REGEX, LESSON_ID_REGEX } from "../models/types.js";
+import { generateCanonicalId, type CanonicalPrefix } from "./canonical-id.js";
 
 const TICKET_NUMERIC_REGEX = /^T-(\d+)[a-z]?$/;
 const ISSUE_NUMERIC_REGEX = /^ISS-(\d+)$/;
@@ -77,6 +78,91 @@ export function nextLessonID(lessons: readonly Lesson[]): string {
     }
   }
   return `L-${String(max + 1).padStart(3, "0")}`;
+}
+
+// --- Team-mode allocators ---
+
+interface Resolvable {
+  id: string;
+  displayId?: string | null;
+  previousDisplayIds?: string[] | null;
+}
+
+const MAX_COLLISION_RETRIES = 10;
+
+export function maxSequentialNumber(
+  items: readonly Resolvable[],
+  numericRegex: RegExp,
+): number {
+  let max = 0;
+  const extract = (s: string) => {
+    const m = s.match(numericRegex);
+    if (m?.[1]) {
+      const n = parseInt(m[1], 10);
+      if (n > max) max = n;
+    }
+  };
+  for (const item of items) {
+    extract(item.id);
+    if (item.displayId) extract(item.displayId);
+    if (item.previousDisplayIds) {
+      for (const prev of item.previousDisplayIds) extract(prev);
+    }
+  }
+  return max;
+}
+
+function allocateTeamId(
+  prefix: CanonicalPrefix,
+  displayPrefix: string,
+  items: readonly Resolvable[],
+  numericRegex: RegExp,
+  genFn?: () => string,
+): { id: string; displayId: string } {
+  const gen = genFn ?? (() => generateCanonicalId(prefix));
+  const existingIds = new Set(items.map((i) => i.id));
+  let id: string | undefined;
+  for (let attempt = 0; attempt < MAX_COLLISION_RETRIES; attempt++) {
+    const candidate = gen();
+    if (!existingIds.has(candidate)) {
+      id = candidate;
+      break;
+    }
+  }
+  if (!id) {
+    throw new Error(`allocation_failed: could not generate unique ${prefix}- ID after ${MAX_COLLISION_RETRIES} attempts`);
+  }
+  const max = maxSequentialNumber(items, numericRegex);
+  const displayId = `${displayPrefix}${String(max + 1).padStart(3, "0")}`;
+  return { id, displayId };
+}
+
+export function allocateTeamTicketId(
+  items: readonly Ticket[],
+  genFn?: () => string,
+): { id: string; displayId: string } {
+  return allocateTeamId("t", "T-", items, TICKET_NUMERIC_REGEX, genFn);
+}
+
+export function allocateTeamIssueId(
+  items: readonly Issue[],
+  genFn?: () => string,
+): { id: string; displayId: string } {
+  return allocateTeamId("i", "ISS-", items, ISSUE_NUMERIC_REGEX, genFn);
+}
+
+export function allocateTeamNoteId(
+  items: readonly Note[],
+  genFn?: () => string,
+): { id: string; displayId: string } {
+  return allocateTeamId("n", "N-", items, NOTE_NUMERIC_REGEX, genFn);
+}
+
+export function allocateTeamLessonId(
+  items: readonly Lesson[],
+  genFn?: () => string,
+): { id: string; displayId: string } {
+  return allocateTeamId("l", "L-", items, LESSON_NUMERIC_REGEX, genFn);
 }
 
 /**
