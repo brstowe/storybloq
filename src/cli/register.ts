@@ -372,6 +372,33 @@ export function registerGcCommand(yargs: Argv): Argv {
 }
 
 // ---------------------------------------------------------------------------
+// merge-driver
+// ---------------------------------------------------------------------------
+
+export function registerMergeDriverCommand(yargs: Argv): Argv {
+  return yargs.command(
+    "merge-driver <ancestor> <ours> <theirs> <pathname>",
+    "Git merge driver for .story/ JSON files",
+    (y) =>
+      y
+        .positional("ancestor", { type: "string", demandOption: true, describe: "Base (common ancestor) file path" })
+        .positional("ours", { type: "string", demandOption: true, describe: "Our (HEAD) file path" })
+        .positional("theirs", { type: "string", demandOption: true, describe: "Their (incoming) file path" })
+        .positional("pathname", { type: "string", demandOption: true, describe: "Logical file path (%P)" }),
+    async (argv) => {
+      const { handleMergeDriver } = await import("./commands/merge-driver.js");
+      const exitCode = await handleMergeDriver(
+        argv.ancestor as string,
+        argv.ours as string,
+        argv.theirs as string,
+        argv.pathname as string,
+      );
+      process.exitCode = exitCode;
+    },
+  );
+}
+
+// ---------------------------------------------------------------------------
 // team
 // ---------------------------------------------------------------------------
 
