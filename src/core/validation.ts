@@ -32,6 +32,12 @@ export function validateProject(state: ProjectState): ValidationResult {
   const phaseIDs = new Set(state.roadmap.phases.map((p) => p.id));
   const ticketIDs = new Set<string>();
   const issueIDs = new Set<string>();
+  const deletedTicketIDs = new Set<string>();
+  for (const t of state.tickets) {
+    if ((t as Record<string, unknown>).lifecycle === "deleted") {
+      deletedTicketIDs.add(t.id);
+    }
+  }
 
   // Duplicate ticket IDs
   const ticketIDCounts = new Map<string, number>();
@@ -169,6 +175,13 @@ export function validateProject(state: ProjectState): ValidationResult {
           message: `Ticket ${t.id} blockedBy references nonexistent ticket ${bid}.`,
           entity: t.id,
         });
+      } else if (deletedTicketIDs.has(bid)) {
+        findings.push({
+          level: "warning",
+          code: "blocked_by_deleted",
+          message: `Ticket ${t.id} blockedBy references deleted ticket ${bid}.`,
+          entity: t.id,
+        });
       } else if (state.umbrellaIDs.has(bid)) {
         findings.push({
           level: "error",
@@ -195,6 +208,13 @@ export function validateProject(state: ProjectState): ValidationResult {
           message: `Ticket ${t.id} parentTicket references nonexistent ticket ${t.parentTicket}.`,
           entity: t.id,
         });
+      } else if (deletedTicketIDs.has(t.parentTicket)) {
+        findings.push({
+          level: "warning",
+          code: "parent_deleted",
+          message: `Ticket ${t.id} parentTicket references deleted ticket ${t.parentTicket}.`,
+          entity: t.id,
+        });
       }
     }
   }
@@ -213,6 +233,13 @@ export function validateProject(state: ProjectState): ValidationResult {
           level: "error",
           code: "invalid_related_ticket_ref",
           message: `Issue ${i.id} relatedTickets references nonexistent ticket ${tref}.`,
+          entity: i.id,
+        });
+      } else if (deletedTicketIDs.has(tref)) {
+        findings.push({
+          level: "warning",
+          code: "related_ticket_deleted",
+          message: `Issue ${i.id} relatedTickets references deleted ticket ${tref}.`,
           entity: i.id,
         });
       }

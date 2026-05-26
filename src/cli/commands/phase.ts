@@ -259,8 +259,8 @@ export async function handlePhaseDelete(
       throw new CliValidationError("not_found", `Phase "${id}" not found`);
     }
 
-    const affectedTickets = state.tickets.filter((t) => t.phase === id);
-    const affectedIssues = state.issues.filter((i) => i.phase === id);
+    const affectedTickets = state.activeTickets.filter((t) => t.phase === id);
+    const affectedIssues = state.activeIssues.filter((i) => i.phase === id);
 
     if ((affectedTickets.length > 0 || affectedIssues.length > 0) && !reassign) {
       const parts: string[] = [];

@@ -116,7 +116,7 @@ export async function handleSelftest(
       }
 
       try {
-        await deleteTicket(ticketId, root, { force: true });
+        await deleteTicket(ticketId, root, { force: true, hard: true });
         createdIds.splice(createdIds.findIndex((c) => c.id === ticketId), 1);
         record("ticket", "delete", true, `Deleted ${ticketId}`);
       } catch (err) {
@@ -194,7 +194,7 @@ export async function handleSelftest(
       }
 
       try {
-        await deleteIssue(issueId, root);
+        await deleteIssue(issueId, root, { hard: true });
         createdIds.splice(createdIds.findIndex((c) => c.id === issueId), 1);
         record("issue", "delete", true, `Deleted ${issueId}`);
       } catch (err) {
@@ -266,7 +266,7 @@ export async function handleSelftest(
       }
 
       try {
-        await deleteNote(noteId, root);
+        await deleteNote(noteId, root, { hard: true });
         createdIds.splice(createdIds.findIndex((c) => c.id === noteId), 1);
         record("note", "delete", true, `Deleted ${noteId}`);
       } catch (err) {
@@ -286,9 +286,9 @@ export async function handleSelftest(
     // Best-effort cleanup of any entities still tracked
     for (const { type, id } of createdIds.reverse()) {
       try {
-        if (type === "ticket") await deleteTicket(id, root, { force: true });
-        else if (type === "issue") await deleteIssue(id, root);
-        else await deleteNote(id, root);
+        if (type === "ticket") await deleteTicket(id, root, { force: true, hard: true });
+        else if (type === "issue") await deleteIssue(id, root, { hard: true });
+        else await deleteNote(id, root, { hard: true });
       } catch (err) {
         cleanupErrors.push(`Failed to delete ${type} ${id}: ${errMsg(err)}`);
       }

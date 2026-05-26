@@ -78,7 +78,7 @@ export function handleIssueList(
   filters: { status?: string; severity?: string; component?: string },
   ctx: CommandContext,
 ): CommandResult {
-  let issues = [...ctx.state.issues];
+  let issues = [...ctx.state.activeIssues];
 
   if (filters.status) {
     if (!ISSUE_STATUSES.includes(filters.status as IssueStatus)) {
@@ -462,8 +462,9 @@ export async function handleIssueDelete(
   id: string,
   format: string,
   root: string,
+  hard?: boolean,
 ): Promise<CommandResult> {
-  await deleteIssue(id, root);
+  await deleteIssue(id, root, { hard });
   if (format === "json") {
     return { output: JSON.stringify(successEnvelope({ id, deleted: true }), null, 2) };
   }

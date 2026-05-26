@@ -1093,7 +1093,7 @@ function formatPhaseExport(
   }
 
   // Related issues
-  const relatedIssues = state.issues.filter(
+  const relatedIssues = state.activeIssues.filter(
     (i) =>
       i.status !== "resolved" &&
       (i.phase === phaseId ||

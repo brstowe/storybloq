@@ -53,7 +53,7 @@ export function handleNoteList(
   filters: { status?: string; tag?: string },
   ctx: CommandContext,
 ): CommandResult {
-  let notes = [...ctx.state.notes];
+  let notes = [...ctx.state.activeNotes];
 
   if (filters.status) {
     if (!NOTE_STATUSES.includes(filters.status as NoteStatus)) {
@@ -200,7 +200,8 @@ export async function handleNoteDelete(
   id: string,
   format: OutputFormat,
   root: string,
+  hard?: boolean,
 ): Promise<CommandResult> {
-  await deleteNote(id, root);
+  await deleteNote(id, root, { hard });
   return { output: formatNoteDeleteResult(id, format) };
 }

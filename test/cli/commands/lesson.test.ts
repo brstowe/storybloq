@@ -345,7 +345,7 @@ describe("handleLessonDelete", () => {
     expect(result.output).toContain("Deleted lesson L-001");
   });
 
-  it("blocks delete when referenced by supersedes", async () => {
+  it("blocks hard delete when referenced by supersedes", async () => {
     const dir = await mkdtemp(join(tmpdir(), "lesson-delete-"));
     tmpDirs.push(dir);
     await initProject(dir, { name: "test" });
@@ -358,8 +358,24 @@ describe("handleLessonDelete", () => {
       "md", dir,
     );
     await expect(
-      handleLessonDelete("L-001", "md", dir),
+      handleLessonDelete("L-001", "md", dir, true),
     ).rejects.toThrow("referenced");
+  });
+
+  it("allows soft delete when referenced by supersedes in team mode", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "lesson-delete-"));
+    tmpDirs.push(dir);
+    await initProject(dir, { name: "test" });
+    await handleLessonCreate(
+      { title: "Original", content: "Old.", context: "T-001", source: "manual" },
+      "md", dir,
+    );
+    await handleLessonCreate(
+      { title: "Replacement", content: "New.", context: "T-002", source: "manual", supersedes: "L-001" },
+      "md", dir,
+    );
+    const result = await handleLessonDelete("L-001", "md", dir);
+    expect(result.output).toContain("L-001");
   });
 
   it("throws for missing lesson", async () => {

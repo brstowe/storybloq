@@ -48,6 +48,12 @@ export interface LoadOptions {
   maxSchemaVersion?: number;
 }
 
+export interface DeleteOptions {
+  hard?: boolean;
+  actor?: string;
+  force?: boolean;
+}
+
 export interface LoadResult {
   readonly state: ProjectState;
   readonly warnings: readonly LoadWarning[];
@@ -337,6 +343,26 @@ export async function writeConfig(
   });
 }
 
+async function isTeamMode(root: string): Promise<boolean | "error"> {
+  try {
+    const raw = await readFile(join(resolve(root, ".story"), "config.json"), "utf-8");
+    const config = JSON.parse(raw);
+    return typeof config.schemaVersion === "number" && config.schemaVersion >= 2;
+  } catch {
+    return "error";
+  }
+}
+
+async function resolveActor(root: string, explicit?: string): Promise<string> {
+  if (explicit) return explicit;
+  try {
+    const { gitUserEmail } = await import("../autonomous/git-inspector.js");
+    const email = await gitUserEmail(resolve(root));
+    if (email) return email;
+  } catch { /* git not available */ }
+  return "unknown";
+}
+
 /**
  * Deletes a ticket file with referential integrity checks.
  * Acquires lock, reloads fresh state from disk, checks all references.
@@ -345,7 +371,7 @@ export async function writeConfig(
 export async function deleteTicket(
   id: string,
   root: string,
-  options?: { force?: boolean },
+  options?: DeleteOptions,
 ): Promise<void> {
   if (!TICKET_ID_REGEX.test(id)) {
     throw new ProjectLoaderError(
@@ -358,8 +384,13 @@ export async function deleteTicket(
   await guardPath(targetPath, wrapDir);
 
   await withLock(wrapDir, async () => {
-    if (!options?.force) {
-      // Reload fresh state under lock for safety checks (bypass loadProject to avoid nested lock)
+    const teamModeResult = options?.hard ? false : await isTeamMode(root);
+    if (teamModeResult === "error" && !options?.hard) {
+      throw new ProjectLoaderError("io_error", `Cannot determine team mode for ${id}: failed to read .story/config.json. Use --hard to force physical removal.`);
+    }
+    const teamMode = teamModeResult === true;
+
+    if (!options?.force && !teamMode) {
       const { state } = await loadProjectUnlocked(resolve(root));
 
       const blocking = state.ticketsBlocking(id);
@@ -394,13 +425,22 @@ export async function deleteTicket(
       );
     }
 
-    await unlink(targetPath);
+    if (teamMode) {
+      const raw = JSON.parse(await readFile(targetPath, "utf-8"));
+      raw.lifecycle = "deleted";
+      raw.deletedAt = new Date().toISOString();
+      raw.deletedBy = await resolveActor(root, options?.actor);
+      await atomicWrite(targetPath, serializeJSON(raw));
+    } else {
+      await unlink(targetPath);
+    }
   });
 }
 
 export async function deleteIssue(
   id: string,
   root: string,
+  options?: DeleteOptions,
 ): Promise<void> {
   if (!ISSUE_ID_REGEX.test(id)) {
     throw new ProjectLoaderError(
@@ -413,6 +453,12 @@ export async function deleteIssue(
   await guardPath(targetPath, wrapDir);
 
   await withLock(wrapDir, async () => {
+    const teamModeResult = options?.hard ? false : await isTeamMode(root);
+    if (teamModeResult === "error" && !options?.hard) {
+      throw new ProjectLoaderError("io_error", `Cannot determine team mode for ${id}: failed to read .story/config.json. Use --hard to force physical removal.`);
+    }
+    const teamMode = teamModeResult === true;
+
     try {
       await stat(targetPath);
     } catch {
@@ -421,7 +467,15 @@ export async function deleteIssue(
         `Issue file not found: issues/${id}.json`,
       );
     }
-    await unlink(targetPath);
+    if (teamMode) {
+      const raw = JSON.parse(await readFile(targetPath, "utf-8"));
+      raw.lifecycle = "deleted";
+      raw.deletedAt = new Date().toISOString();
+      raw.deletedBy = await resolveActor(root, options?.actor);
+      await atomicWrite(targetPath, serializeJSON(raw));
+    } else {
+      await unlink(targetPath);
+    }
   });
 }
 
@@ -466,6 +520,7 @@ export async function writeNote(
 export async function deleteNote(
   id: string,
   root: string,
+  options?: DeleteOptions,
 ): Promise<void> {
   if (!NOTE_ID_REGEX.test(id)) {
     throw new ProjectLoaderError(
@@ -478,6 +533,12 @@ export async function deleteNote(
   await guardPath(targetPath, wrapDir);
 
   await withLock(wrapDir, async () => {
+    const teamModeResult = options?.hard ? false : await isTeamMode(root);
+    if (teamModeResult === "error" && !options?.hard) {
+      throw new ProjectLoaderError("io_error", `Cannot determine team mode for ${id}: failed to read .story/config.json. Use --hard to force physical removal.`);
+    }
+    const teamMode = teamModeResult === true;
+
     try {
       await stat(targetPath);
     } catch {
@@ -486,7 +547,15 @@ export async function deleteNote(
         `Note file not found: notes/${id}.json`,
       );
     }
-    await unlink(targetPath);
+    if (teamMode) {
+      const raw = JSON.parse(await readFile(targetPath, "utf-8"));
+      raw.lifecycle = "deleted";
+      raw.deletedAt = new Date().toISOString();
+      raw.deletedBy = await resolveActor(root, options?.actor);
+      await atomicWrite(targetPath, serializeJSON(raw));
+    } else {
+      await unlink(targetPath);
+    }
   });
 }
 
@@ -535,6 +604,7 @@ export async function writeLesson(
 export async function deleteLessonUnlocked(
   id: string,
   root: string,
+  options?: DeleteOptions,
 ): Promise<void> {
   if (!LESSON_ID_REGEX.test(id)) {
     throw new ProjectLoaderError(
@@ -554,16 +624,31 @@ export async function deleteLessonUnlocked(
       `Lesson file not found: lessons/${id}.json`,
     );
   }
-  await unlink(targetPath);
+
+  const teamModeResult = options?.hard ? false : await isTeamMode(root);
+  if (teamModeResult === "error" && !options?.hard) {
+    throw new ProjectLoaderError("io_error", `Cannot determine team mode for ${id}: failed to read .story/config.json. Use --hard to force physical removal.`);
+  }
+  const teamMode = teamModeResult === true;
+  if (teamMode) {
+    const raw = JSON.parse(await readFile(targetPath, "utf-8"));
+    raw.lifecycle = "deleted";
+    raw.deletedAt = new Date().toISOString();
+    raw.deletedBy = await resolveActor(root, options?.actor);
+    await atomicWrite(targetPath, serializeJSON(raw));
+  } else {
+    await unlink(targetPath);
+  }
 }
 
 export async function deleteLesson(
   id: string,
   root: string,
+  options?: DeleteOptions,
 ): Promise<void> {
   const wrapDir = resolve(root, ".story");
   await withLock(wrapDir, async () => {
-    await deleteLessonUnlocked(id, root);
+    await deleteLessonUnlocked(id, root, options);
   });
 }
 

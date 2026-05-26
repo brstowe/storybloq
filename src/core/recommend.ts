@@ -200,7 +200,7 @@ function generateValidationSuggestions(
 }
 
 function generateCriticalIssues(state: ProjectState): Recommendation[] {
-  const issues = state.issues
+  const issues = state.activeIssues
     .filter(
       (i) =>
         i.status !== "resolved" &&
@@ -369,7 +369,7 @@ function generateQuickWins(state: ProjectState, phaseIndex: Map<string, number>,
 }
 
 function generateOpenIssues(state: ProjectState): Recommendation[] {
-  const issues = state.issues
+  const issues = state.activeIssues
     .filter(
       (i) =>
         i.status !== "resolved" &&
@@ -656,7 +656,7 @@ function generateDebtTrend(
 ): Recommendation[] {
   if (options?.previousOpenIssueCount == null) return [];
 
-  const currentOpen = state.issues.filter((i) => i.status !== "resolved").length;
+  const currentOpen = state.activeIssues.filter((i) => i.status !== "resolved").length;
   const previous = options.previousOpenIssueCount;
   if (previous <= 0) return [];
 

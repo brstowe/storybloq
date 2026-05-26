@@ -507,13 +507,14 @@ export async function handleTicketDelete(
   force: boolean,
   format: string,
   root: string,
+  hard?: boolean,
 ): Promise<CommandResult> {
   if (force) {
     process.stderr.write(
       `Warning: force-deleting ${id} may leave dangling references. Run \`storybloq validate\` to check.\n`,
     );
   }
-  await deleteTicket(id, root, { force });
+  await deleteTicket(id, root, { force, hard });
   if (format === "json") {
     return { output: JSON.stringify(successEnvelope({ id, deleted: true }), null, 2) };
   }

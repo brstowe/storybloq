@@ -1046,14 +1046,20 @@ export function registerTicketCommand(yargs: Argv): Argv {
                   type: "boolean",
                   default: false,
                   describe: "Force delete even with integrity issues",
+                })
+                .option("hard", {
+                  type: "boolean",
+                  default: false,
+                  describe: "Force physical removal (skip soft delete in team mode)",
                 }),
             ),
           async (argv) => {
             const format = parseOutputFormat(argv.format);
             const id = parseTicketId(argv.id as string);
             const force = argv.force as boolean;
+            const hard = argv.hard as boolean;
             await runDeleteCommand(format, force, async (ctx) =>
-              handleTicketDelete(id, force, format, ctx.root),
+              handleTicketDelete(id, force, format, ctx.root, hard),
             );
           },
         )
@@ -1470,17 +1476,24 @@ export function registerIssueCommand(yargs: Argv): Argv {
           "Delete an issue",
           (y2) =>
             addFormatOption(
-              y2.positional("id", {
-                type: "string",
-                demandOption: true,
-                describe: "Issue ID (e.g. ISS-001)",
-              }),
+              y2
+                .positional("id", {
+                  type: "string",
+                  demandOption: true,
+                  describe: "Issue ID (e.g. ISS-001)",
+                })
+                .option("hard", {
+                  type: "boolean",
+                  default: false,
+                  describe: "Force physical removal (skip soft delete in team mode)",
+                }),
             ),
           async (argv) => {
             const format = parseOutputFormat(argv.format);
             const id = parseIssueId(argv.id as string);
+            const hard = argv.hard as boolean;
             await runDeleteCommand(format, false, async (ctx) =>
-              handleIssueDelete(id, format, ctx.root),
+              handleIssueDelete(id, format, ctx.root, hard),
             );
           },
         )
@@ -2238,17 +2251,24 @@ export function registerNoteCommand(yargs: Argv): Argv {
           "Delete a note",
           (y2) =>
             addFormatOption(
-              y2.positional("id", {
-                type: "string",
-                demandOption: true,
-                describe: "Note ID (e.g. N-001)",
-              }),
+              y2
+                .positional("id", {
+                  type: "string",
+                  demandOption: true,
+                  describe: "Note ID (e.g. N-001)",
+                })
+                .option("hard", {
+                  type: "boolean",
+                  default: false,
+                  describe: "Force physical removal (skip soft delete in team mode)",
+                }),
             ),
           async (argv) => {
             const format = parseOutputFormat(argv.format);
             const id = parseNoteId(argv.id as string);
+            const hard = argv.hard as boolean;
             await runDeleteCommand(format, false, async (ctx) =>
-              handleNoteDelete(id, format, ctx.root),
+              handleNoteDelete(id, format, ctx.root, hard),
             );
           },
         )
@@ -2687,11 +2707,17 @@ export function registerLessonCommand(yargs: Argv): Argv {
                   type: "string",
                   demandOption: true,
                   describe: "Lesson ID (e.g. L-001)",
+                })
+                .option("hard", {
+                  type: "boolean",
+                  default: false,
+                  describe: "Force physical removal (skip soft delete in team mode)",
                 }),
             ),
           async (argv) => {
             const format = parseOutputFormat(argv.format);
             const id = parseLessonId(argv.id as string);
+            const hard = argv.hard as boolean;
             const root = (
               await import("../core/project-root-discovery.js")
             ).discoverProjectRoot();
@@ -2703,7 +2729,7 @@ export function registerLessonCommand(yargs: Argv): Argv {
               return;
             }
             try {
-              const result = await handleLessonDelete(id, format, root);
+              const result = await handleLessonDelete(id, format, root, hard);
               writeOutput(result.output);
               process.exitCode = result.exitCode ?? ExitCode.OK;
             } catch (err: unknown) {

@@ -23,6 +23,12 @@ export class ProjectState {
   readonly config: Readonly<Config>;
   readonly handoverFilenames: readonly string[];
 
+  // --- Active (lifecycle-filtered) ---
+  readonly activeTickets: readonly Ticket[];
+  readonly activeIssues: readonly Issue[];
+  readonly activeNotes: readonly Note[];
+  readonly activeLessons: readonly Lesson[];
+
   // --- Derived (public readonly) ---
   readonly umbrellaIDs: ReadonlySet<string>;
   readonly leafTickets: readonly Ticket[];
@@ -71,17 +77,23 @@ export class ProjectState {
     this.config = input.config;
     this.handoverFilenames = input.handoverFilenames;
 
-    // Step 1: Umbrella IDs — any ticket ID referenced as parentTicket by another ticket
+    // Step 0: Lifecycle filtering (deleted and archived items excluded from active views)
+    this.activeTickets = input.tickets.filter((t) => isActiveLifecycle(t));
+    this.activeIssues = input.issues.filter((i) => isActiveLifecycle(i));
+    this.activeNotes = input.notes.filter((n) => isActiveLifecycle(n));
+    this.activeLessons = this.lessons.filter((l) => isActiveLifecycle(l));
+
+    // Step 1: Umbrella IDs -- only active tickets count as parents
     const parentIDs = new Set<string>();
-    for (const t of input.tickets) {
+    for (const t of this.activeTickets) {
       if (t.parentTicket != null) {
         parentIDs.add(t.parentTicket);
       }
     }
     this.umbrellaIDs = parentIDs;
 
-    // Step 2: Leaf tickets — not umbrellas
-    this.leafTickets = input.tickets.filter((t) => !parentIDs.has(t.id));
+    // Step 2: Leaf tickets -- active tickets that are not umbrellas
+    this.leafTickets = this.activeTickets.filter((t) => !parentIDs.has(t.id));
     this.leafTicketCount = this.leafTickets.length;
     this.completeLeafTicketCount = this.leafTickets.filter(
       (t) => t.status === "complete",
@@ -176,33 +188,33 @@ export class ProjectState {
     this.completeTicketCount = this.leafTickets.filter(
       (t) => t.status === "complete",
     ).length;
-    this.activeIssueCount = input.issues.filter(
+    this.activeIssueCount = this.activeIssues.filter(
       (i) => i.status !== "resolved",
     ).length;
 
     const bySev = new Map<IssueSeverity, number>();
-    for (const i of input.issues) {
+    for (const i of this.activeIssues) {
       if (i.status !== "resolved") {
         bySev.set(i.severity, (bySev.get(i.severity) ?? 0) + 1);
       }
     }
     this.issuesBySeverity = bySev;
 
-    this.activeNoteCount = input.notes.filter(
+    this.activeNoteCount = this.activeNotes.filter(
       (n) => n.status === "active",
     ).length;
-    this.archivedNoteCount = input.notes.filter(
+    this.archivedNoteCount = this.activeNotes.filter(
       (n) => n.status === "archived",
     ).length;
 
-    this.activeLessonCount = this.lessons.filter(
+    this.activeLessonCount = this.activeLessons.filter(
       (l) => l.status === "active",
     ).length;
-    this.deprecatedLessonCount = this.lessons.filter(
+    this.deprecatedLessonCount = this.activeLessons.filter(
       (l) => l.status === "deprecated" || l.status === "superseded",
     ).length;
 
-    this.lessonTags = [...new Set(this.lessons.flatMap((l) => l.tags ?? []))].sort();
+    this.lessonTags = [...new Set(this.activeLessons.flatMap((l) => l.tags ?? []))].sort();
   }
 
   // --- Query Methods ---
@@ -237,14 +249,15 @@ export class ProjectState {
   }
 
   /**
-   * A ticket is blocked if any blockedBy reference points to a non-complete ticket.
-   * Unknown blocker IDs treated as blocked (conservative — unknown dependency = assume not cleared).
+   * A ticket is blocked if any blockedBy reference points to a non-complete, non-deleted ticket.
+   * Unknown blocker IDs treated as blocked (conservative). Deleted blockers treated as resolved.
    */
   isBlocked(ticket: Ticket): boolean {
     if (ticket.blockedBy.length === 0) return false;
     return ticket.blockedBy.some((blockerID) => {
       const blocker = this.ticketsByID.get(blockerID);
       if (!blocker) return true; // unknown = blocked
+      if (isDeleted(blocker)) return false; // deleted = resolved
       return blocker.status !== "complete";
     });
   }
@@ -320,7 +333,7 @@ export class ProjectState {
     for (const ref of ticket.blockedBy) {
       const resolved = this.resolveTicketRef(ref);
       if (resolved.kind === "missing" || resolved.kind === "ambiguous") return true;
-      if (resolved.kind === "found" && resolved.item.status !== "complete") return true;
+      if (resolved.kind === "found" && !isDeleted(resolved.item) && resolved.item.status !== "complete") return true;
     }
     return false;
   }
@@ -397,6 +410,14 @@ export class ProjectState {
     if (anyProgress || anyComplete) return "inprogress";
     return "notstarted";
   }
+}
+
+function isActiveLifecycle(item: { lifecycle?: unknown }): boolean {
+  return item.lifecycle == null || item.lifecycle === "active";
+}
+
+function isDeleted(item: { lifecycle?: unknown }): boolean {
+  return item.lifecycle === "deleted";
 }
 
 function buildDisplayIndex<T extends { id: string }>(items: readonly T[]): Map<string, T[]> {

@@ -63,7 +63,7 @@ export function handleLessonList(
   filters: { status?: string; tag?: string; source?: string },
   ctx: CommandContext,
 ): CommandResult {
-  let lessons = [...ctx.state.lessons];
+  let lessons = [...ctx.state.activeLessons];
 
   if (filters.status) {
     if (!LESSON_STATUSES.includes(filters.status as LessonStatus)) {
@@ -122,7 +122,7 @@ export function handleLessonGet(
 export function handleLessonDigest(
   ctx: CommandContext,
 ): CommandResult {
-  const digest = buildLessonDigest(ctx.state.lessons);
+  const digest = buildLessonDigest(ctx.state.activeLessons);
   return { output: formatLessonDigest(digest, ctx.format) };
 }
 
@@ -300,22 +300,24 @@ export async function handleLessonDelete(
   id: string,
   format: OutputFormat,
   root: string,
+  hard?: boolean,
 ): Promise<CommandResult> {
-  // Check for supersedes references and delete atomically under the same lock
   await withProjectLock(root, { strict: true }, async ({ state }) => {
     const existing = state.lessonByID(id);
     if (!existing) {
       throw new CliValidationError("not_found", `Lesson ${id} not found`);
     }
-    const referencing = state.lessons.filter((l) => l.supersedes === id);
-    if (referencing.length > 0) {
-      throw new CliValidationError(
-        "conflict",
-        `Cannot delete ${id}: referenced by ${referencing.map((l) => l.id).join(", ")} via supersedes`,
-      );
+    const willHardDelete = hard || (state.config.schemaVersion == null || state.config.schemaVersion < 2);
+    if (willHardDelete) {
+      const referencing = state.lessons.filter((l) => l.supersedes === id);
+      if (referencing.length > 0) {
+        throw new CliValidationError(
+          "conflict",
+          `Cannot delete ${id}: referenced by ${referencing.map((l) => l.id).join(", ")} via supersedes`,
+        );
+      }
     }
-    // Delete under the same lock
-    await deleteLessonUnlocked(id, root);
+    await deleteLessonUnlocked(id, root, { hard });
   });
 
   return { output: formatLessonDeleteResult(id, format) };
