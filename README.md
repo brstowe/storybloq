@@ -380,6 +380,10 @@ git commit -m "T-001: scaffold Next.js"
 # Session ends. Next session starts with /story and picks up with full context.
 ```
 
+## Team CI
+
+For team-mode projects, add CI validation to catch duplicate displayIds and stale references before merge. See [TEAM_CI.md](TEAM_CI.md) for a ready-to-use GitHub Actions workflow.
+
 ## Related projects
 
 - **[@storybloq/lenses](https://github.com/Storybloq/lenses)** - multi-lens code review MCP server. 8 specialized reviewers run in parallel and return structured verdicts.
