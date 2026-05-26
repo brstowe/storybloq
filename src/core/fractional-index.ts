@@ -71,9 +71,16 @@ export function validateRank(rank: string): boolean {
   return true;
 }
 
+export const REBALANCE_THRESHOLD = 10;
+
+function extractNumericSuffix(s: string): number | null {
+  const m = /(\d+)$/.exec(s);
+  return m ? parseInt(m[1]!, 10) : null;
+}
+
 export function compareByRank(
-  a: { rank?: string; order?: number; id: string },
-  b: { rank?: string; order?: number; id: string },
+  a: { rank?: string; order?: number; id: string; displayId?: string | null },
+  b: { rank?: string; order?: number; id: string; displayId?: string | null },
 ): number {
   const aHasRank = a.rank != null;
   const bHasRank = b.rank != null;
@@ -90,5 +97,22 @@ export function compareByRank(
   const aOrder = a.order ?? 0;
   const bOrder = b.order ?? 0;
   if (aOrder !== bOrder) return aOrder - bOrder;
+
+  const aNum = extractNumericSuffix(a.displayId ?? a.id);
+  const bNum = extractNumericSuffix(b.displayId ?? b.id);
+  if (aNum !== null && bNum !== null && aNum !== bNum) return aNum - bNum;
+
   return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+}
+
+export function rebalanceRanks(count: number): string[] {
+  if (count === 0) return [];
+  const ranks: string[] = [];
+  let prev: string | null = null;
+  for (let i = 0; i < count; i++) {
+    const key = generateKeyBetween(prev, null);
+    ranks.push(key);
+    prev = key;
+  }
+  return ranks;
 }

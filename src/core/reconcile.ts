@@ -5,6 +5,7 @@ import type { Lesson } from "../models/lesson.js";
 import type { ProjectState } from "./project-state.js";
 import { TICKET_ID_REGEX, ISSUE_ID_REGEX, NOTE_ID_REGEX, LESSON_ID_REGEX } from "../models/types.js";
 import { maxSequentialNumber } from "./id-allocation.js";
+import { compareByRank, rebalanceRanks, REBALANCE_THRESHOLD } from "./fractional-index.js";
 
 const TICKET_NUMERIC_REGEX = /^T-(\d+)[a-z]?$/;
 const ISSUE_NUMERIC_REGEX = /^ISS-(\d+)$/;
@@ -207,4 +208,59 @@ export function computeReconcilePlan(state: ProjectState): ReconcileResult {
   }
 
   return { ok: true, plan: { renames, warnings } };
+}
+
+export interface RebalanceChange {
+  entityType: "ticket" | "issue";
+  id: string;
+  phase: string | null;
+  oldRank: string;
+  newRank: string;
+}
+
+export interface RebalanceResult {
+  changes: RebalanceChange[];
+  phasesRebalanced: number;
+}
+
+export function computeRebalancePlan(state: ProjectState): RebalanceResult {
+  const changes: RebalanceChange[] = [];
+  let phasesRebalanced = 0;
+
+  const phases = state.roadmap?.phases ?? [];
+  for (const phase of phases) {
+    const tickets = state.phaseTickets(phase.id);
+    const ranked = tickets.filter((t) => {
+      if (t.rank == null) return false;
+      if ((t as Record<string, unknown>)._conflicts) return false;
+      return true;
+    });
+
+    if (ranked.length === 0) continue;
+
+    const needsRebalance = ranked.some((t) => t.rank!.length > REBALANCE_THRESHOLD);
+    if (!needsRebalance) continue;
+
+    const sorted = [...ranked].sort(compareByRank);
+    const freshRanks = rebalanceRanks(sorted.length);
+
+    let phaseChanged = false;
+    for (let i = 0; i < sorted.length; i++) {
+      const oldRank = sorted[i]!.rank!;
+      const newRank = freshRanks[i]!;
+      if (oldRank !== newRank) {
+        changes.push({
+          entityType: "ticket",
+          id: sorted[i]!.id,
+          phase: phase.id,
+          oldRank,
+          newRank,
+        });
+        phaseChanged = true;
+      }
+    }
+    if (phaseChanged) phasesRebalanced++;
+  }
+
+  return { changes, phasesRebalanced };
 }

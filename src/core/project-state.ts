@@ -6,6 +6,7 @@ import type { Roadmap } from "../models/roadmap.js";
 import type { Config } from "../models/config.js";
 import type { IssueSeverity } from "../models/types.js";
 import { resolveRef, type ResolveResult } from "./resolver.js";
+import { compareByRank } from "./fractional-index.js";
 
 export type PhaseStatus = "notstarted" | "inprogress" | "complete";
 
@@ -111,7 +112,7 @@ export class ProjectState {
       }
     }
     for (const [, arr] of byPhase) {
-      arr.sort((a, b) => a.order - b.order);
+      arr.sort(compareByRank);
     }
     this.leafTicketsByPhase = byPhase;
 
