@@ -5,6 +5,7 @@ import type { Lesson } from "../models/lesson.js";
 import type { Roadmap } from "../models/roadmap.js";
 import type { Config } from "../models/config.js";
 import type { IssueSeverity } from "../models/types.js";
+import { resolveRef, type ResolveResult } from "./resolver.js";
 
 export type PhaseStatus = "notstarted" | "inprogress" | "complete";
 
@@ -36,6 +37,10 @@ export class ProjectState {
   private readonly issuesByID: Map<string, Issue>;
   private readonly notesByID: Map<string, Note>;
   private readonly lessonsByID: Map<string, Lesson>;
+  private readonly ticketsByDisplayID: Map<string, Ticket[]>;
+  private readonly issuesByDisplayID: Map<string, Issue[]>;
+  private readonly notesByDisplayID: Map<string, Note[]>;
+  private readonly lessonsByDisplayID: Map<string, Lesson[]>;
 
   // --- Counts ---
   readonly totalTicketCount: number;
@@ -157,6 +162,12 @@ export class ProjectState {
     }
     this.lessonsByID = lByID;
 
+    // Step 6b: Secondary indexes by displayId (for resolver)
+    this.ticketsByDisplayID = buildDisplayIndex(input.tickets);
+    this.issuesByDisplayID = buildDisplayIndex(input.issues);
+    this.notesByDisplayID = buildDisplayIndex(input.notes);
+    this.lessonsByDisplayID = buildDisplayIndex(this.lessons);
+
     // Step 7: Counts
     this.totalTicketCount = this.leafTickets.length;
     this.openTicketCount = this.leafTickets.filter(
@@ -274,6 +285,57 @@ export class ProjectState {
     return this.lessonsByID.get(id);
   }
 
+  // --- Resolver ---
+
+  resolveTicketRef(ref: string): ResolveResult<Ticket> {
+    return resolveRef(ref, this.ticketsByID, this.ticketsByDisplayID, this.tickets);
+  }
+
+  resolveIssueRef(ref: string): ResolveResult<Issue> {
+    return resolveRef(ref, this.issuesByID, this.issuesByDisplayID, this.issues);
+  }
+
+  resolveNoteRef(ref: string): ResolveResult<Note> {
+    return resolveRef(ref, this.notesByID, this.notesByDisplayID, this.notes);
+  }
+
+  resolveLessonRef(ref: string): ResolveResult<Lesson> {
+    return resolveRef(ref, this.lessonsByID, this.lessonsByDisplayID, this.lessons);
+  }
+
+  resolvedBlockerRefs(ticket: Ticket): ResolveResult<Ticket>[] {
+    return ticket.blockedBy.map((ref) => this.resolveTicketRef(ref));
+  }
+
+  resolvedBlockers(ticket: Ticket): Ticket[] {
+    const result: Ticket[] = [];
+    for (const ref of ticket.blockedBy) {
+      const resolved = this.resolveTicketRef(ref);
+      if (resolved.kind === "found") result.push(resolved.item);
+    }
+    return result;
+  }
+
+  isBlockedByResolver(ticket: Ticket): boolean {
+    for (const ref of ticket.blockedBy) {
+      const resolved = this.resolveTicketRef(ref);
+      if (resolved.kind === "missing" || resolved.kind === "ambiguous") return true;
+      if (resolved.kind === "found" && resolved.item.status !== "complete") return true;
+    }
+    return false;
+  }
+
+  resolvedParentRef(ticket: Ticket): ResolveResult<Ticket> | null {
+    const pt = ticket.parentTicket;
+    if (!pt) return null;
+    return this.resolveTicketRef(pt);
+  }
+
+  resolvedParent(ticket: Ticket): Ticket | null {
+    const result = this.resolvedParentRef(ticket);
+    return result?.kind === "found" ? result.item : null;
+  }
+
   // --- Deletion Safety ---
 
   /** IDs of tickets that list `ticketId` in their blockedBy. */
@@ -335,4 +397,19 @@ export class ProjectState {
     if (anyProgress || anyComplete) return "inprogress";
     return "notstarted";
   }
+}
+
+function buildDisplayIndex<T extends { id: string }>(items: T[]): Map<string, T[]> {
+  const index = new Map<string, T[]>();
+  for (const item of items) {
+    const displayId = (item as Record<string, unknown>).displayId as string | undefined;
+    const key = displayId ?? item.id;
+    const arr = index.get(key);
+    if (arr) {
+      arr.push(item);
+    } else {
+      index.set(key, [item]);
+    }
+  }
+  return index;
 }
