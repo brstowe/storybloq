@@ -60,6 +60,8 @@ import { writeResumeMarker, removeResumeMarker } from "./resume-marker.js";
 import { refreshStatusForSession, isSessionActiveForStatus } from "./status-writer.js";
 import { formatCompactReport } from "../core/session-report-formatter.js";
 import { isTargetedMode, getRemainingTargets, buildTargetedCandidatesText, buildTargetedPickInstruction, buildTargetedStuckHandover } from "./target-work.js";
+import { buildAutoStartEventData, buildTieredStartEventData } from "./event-data.js";
+import { resolveWorkId } from "./id-resolution.js";
 import { detectBranchAffinity, buildAffinityAnnotation } from "./branch-affinity.js";
 import {
   handleHandoverLatest,
@@ -698,6 +700,7 @@ async function handleStart(root: string, args: GuideInput): Promise<McpToolResul
   // T-188: Targeted mode validation (before session creation)
   const rawTargetWork = args.targetWork ?? [];
   let validatedTargetWork: string[] = [];
+  let validatedTargetWorkDisplayIds: Record<string, string> = {};
   let skippedTargets: string[] = [];
   let targetProjectState: Awaited<ReturnType<typeof loadProject>>["state"] | undefined;
   if (rawTargetWork.length > 0) {
@@ -712,28 +715,41 @@ async function handleStart(root: string, args: GuideInput): Promise<McpToolResul
     } catch (err) {
       return guideError(new Error(`Cannot validate targetWork: ${err instanceof Error ? err.message : "project load failed"}`));
     }
-    const { TICKET_ID_REGEX, ISSUE_ID_REGEX } = await import("../models/types.js");
     const invalidIds: string[] = [];
     const alreadyDone: string[] = [];
+    const resolvedCanonical: string[] = [];
+    const displayIdMap: Record<string, string> = {};
     for (const id of rawTargetWork) {
-      if (ISSUE_ID_REGEX.test(id)) {
-        const issue = targetProjectState.issues.find(i => i.id === id);
-        if (!issue) { invalidIds.push(id); continue; }
-        if (issue.status === "resolved") { alreadyDone.push(id); continue; }
-      } else if (TICKET_ID_REGEX.test(id)) {
-        const ticket = targetProjectState.ticketByID(id);
-        if (!ticket) { invalidIds.push(id); continue; }
-        if (ticket.status === "complete") { alreadyDone.push(id); continue; }
-      } else {
-        invalidIds.push(id);
+      const resolution = resolveWorkId(id, targetProjectState);
+      const canonicalId = resolution.canonicalId;
+
+      const issueResult = targetProjectState.resolveIssueRef(canonicalId);
+      if (issueResult.kind === "found") {
+        if (issueResult.item.status === "resolved") { alreadyDone.push(canonicalId); continue; }
+        resolvedCanonical.push(canonicalId);
+        if (resolution.displayId !== canonicalId) displayIdMap[canonicalId] = resolution.displayId;
+        continue;
       }
+
+      const ticketResult = targetProjectState.resolveTicketRef(canonicalId);
+      if (ticketResult.kind === "found") {
+        if (ticketResult.item.status === "complete") { alreadyDone.push(canonicalId); continue; }
+        resolvedCanonical.push(canonicalId);
+        if (resolution.displayId !== canonicalId) displayIdMap[canonicalId] = resolution.displayId;
+        continue;
+      }
+
+      invalidIds.push(id);
     }
     if (invalidIds.length > 0) {
       return guideError(new Error(
         `Invalid target IDs: ${invalidIds.join(", ")}. Use T-XXX for tickets or ISS-XXX for issues.`,
       ));
     }
-    validatedTargetWork = [...new Set(rawTargetWork.filter(id => !alreadyDone.includes(id)))];
+    validatedTargetWork = [...new Set(resolvedCanonical.filter(id => !alreadyDone.includes(id)))];
+    validatedTargetWorkDisplayIds = Object.fromEntries(
+      Object.entries(displayIdMap).filter(([k]) => validatedTargetWork.includes(k)),
+    );
     skippedTargets = alreadyDone;
     if (validatedTargetWork.length === 0) {
       const doneMsg = alreadyDone.length > 0
@@ -892,6 +908,7 @@ async function handleStart(root: string, args: GuideInput): Promise<McpToolResul
       },
       // T-188: Targeted auto mode
       targetWork: validatedTargetWork,
+      targetWorkDisplayIds: validatedTargetWorkDisplayIds,
       // T-128: Freeze resolved recipe for session lifetime (survives compact/resume)
       resolvedPipeline: resolvedRecipe.pipeline,
       resolvedPostComplete: resolvedRecipe.postComplete,
@@ -1058,7 +1075,8 @@ async function handleStart(root: string, args: GuideInput): Promise<McpToolResul
 
     // --- Tiered mode: non-auto modes skip PICK_TICKET and enter at specific stage ---
     if (mode !== "auto" && args.ticketId) {
-      const ticket = projectState.ticketByID(args.ticketId);
+      const ticketResolution = resolveWorkId(args.ticketId!, projectState);
+      const ticket = projectState.ticketByID(ticketResolution.canonicalId);
       if (!ticket) {
         abortSession();
         return guideError(new Error(`Ticket ${args.ticketId} not found.`));
@@ -1066,29 +1084,25 @@ async function handleStart(root: string, args: GuideInput): Promise<McpToolResul
 
       // Validate ticket is workable (same checks as PICK_TICKET)
       if (mode !== "review") {
-        // review mode allows any ticket status — user already has code
         if (ticket.status === "complete") {
           abortSession();
-          return guideError(new Error(`Ticket ${args.ticketId} is already complete.`));
+          return guideError(new Error(`Ticket ${ticketResolution.displayId} is already complete.`));
         }
         if (projectState.isBlocked(ticket)) {
           abortSession();
-          return guideError(new Error(`Ticket ${args.ticketId} is blocked by: ${ticket.blockedBy.join(", ")}.`));
+          return guideError(new Error(`Ticket ${ticketResolution.displayId} is blocked by: ${ticket.blockedBy.join(", ")}.`));
         }
       }
 
       // ISS-043: Check if ticket is claimed by another active session
-      // Skip for review mode — user already has code, claim is irrelevant
       if (mode !== "review") {
         const claimId = (ticket as Record<string, unknown>).claimedBySession;
         if (claimId && typeof claimId === "string" && claimId !== session.sessionId) {
           const claimingSession = findSessionById(root, claimId);
-          // Block only if claiming session exists, is active, and lease is not expired
-          // TOCTOU: cooperative check — filesystem-based concurrency, sufficient for this use case
           if (claimingSession && claimingSession.state.status === "active" && !isLeaseExpired(claimingSession.state)) {
             abortSession();
             return guideError(new Error(
-              `Ticket ${args.ticketId} is claimed by active session ${claimId}. ` +
+              `Ticket ${ticketResolution.displayId} is claimed by active session ${claimId}. ` +
               `Wait for it to finish or stop it with "storybloq session stop ${claimId}".`,
             ));
           }
@@ -1128,9 +1142,16 @@ async function handleStart(root: string, args: GuideInput): Promise<McpToolResul
         rev: written.revision,
         type: "start",
         timestamp: new Date().toISOString(),
-        data: { recipe, branch: written.git.branch, head: written.git.initHead, mode, ticketId: args.ticketId },
+        data: buildTieredStartEventData({
+          recipe,
+          branch: written.git.branch,
+          head: written.git.initHead,
+          mode: mode!,
+          canonicalTicketId: ticketResolution.canonicalId,
+          displayId: ticketResolution.displayId,
+        }),
       });
-      emitTelemetry(dir, "session_start", "guide", { recipe, branch: written.git.branch, mode, ticketId: args.ticketId });
+      emitTelemetry(dir, "session_start", "guide", { recipe, branch: written.git.branch, mode, ticketId: ticketResolution.canonicalId });
 
       const modeLabels: Record<string, string> = {
         review: "Review Mode",
@@ -1204,7 +1225,13 @@ async function handleStart(root: string, args: GuideInput): Promise<McpToolResul
       rev: written.revision,
       type: "start",
       timestamp: new Date().toISOString(),
-      data: { recipe, branch: written.git.branch, head: written.git.initHead, mode: "auto", ...(validatedTargetWork.length > 0 ? { targetWork: validatedTargetWork } : {}) },
+      data: buildAutoStartEventData({
+        recipe,
+        branch: written.git.branch,
+        head: written.git.initHead,
+        targetWork: [...(written.targetWork ?? [])],
+        targetWorkDisplayIds: written.targetWorkDisplayIds as Record<string, string> | undefined,
+      }),
     });
     emitTelemetry(dir, "session_start", "guide", { recipe, branch: written.git.branch, mode: "auto" });
 
