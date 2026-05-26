@@ -55,9 +55,11 @@ import { ProjectLoaderError, INTEGRITY_WARNING_TYPES } from "../core/errors.js";
 import { CliValidationError } from "../cli/helpers.js";
 import {
   TICKET_ID_REGEX,
-  ISSUE_ID_REGEX,
+  TICKET_CANONICAL_ID_REGEX,
   NOTE_ID_REGEX,
   LESSON_ID_REGEX,
+  TicketRefSchema,
+  IssueRefSchema,
   TICKET_STATUSES,
   TICKET_TYPES,
   ISSUE_STATUSES,
@@ -399,7 +401,7 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
   server.registerTool("storybloq_ticket_get", {
     description: "Get a ticket by ID (includes umbrella tickets)",
     inputSchema: {
-      id: z.string().regex(TICKET_ID_REGEX).describe("Ticket ID (e.g. T-001, T-079b)"),
+      id: z.string().refine((v) => TICKET_ID_REGEX.test(v) || TICKET_CANONICAL_ID_REGEX.test(v), "Ticket ID").describe("Ticket ID (e.g. T-001, T-079b, t-[canonical])"),
       node: nodeParam,
     },
   }, (args) => {
@@ -411,7 +413,7 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
   server.registerTool("storybloq_ticket_meta_get", {
     description: "Get custom passthrough metadata for a ticket. Omitting path returns all custom metadata.",
     inputSchema: {
-      id: z.string().regex(TICKET_ID_REGEX).describe("Ticket ID (e.g. T-001, T-079b)"),
+      id: z.string().refine((v) => TICKET_ID_REGEX.test(v) || TICKET_CANONICAL_ID_REGEX.test(v), "Ticket ID").describe("Ticket ID (e.g. T-001, T-079b, t-[canonical])"),
       path: z.string().optional().describe("Custom metadata path, using dot notation for nested values"),
     },
   }, (args) => runMcpReadTool(pinnedRoot, (ctx) => handleTicketMetaGet(args.id, args.path, ctx)));
@@ -435,7 +437,7 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
   server.registerTool("storybloq_issue_get", {
     description: "Get an issue by ID",
     inputSchema: {
-      id: z.string().regex(ISSUE_ID_REGEX).describe("Issue ID (e.g. ISS-001)"),
+      id: IssueRefSchema.describe("Issue ID (e.g. ISS-001, i-[canonical])"),
       node: nodeParam,
     },
   }, (args) => {
@@ -447,7 +449,7 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
   server.registerTool("storybloq_issue_meta_get", {
     description: "Get custom passthrough metadata for an issue. Omitting path returns all custom metadata.",
     inputSchema: {
-      id: z.string().regex(ISSUE_ID_REGEX).describe("Issue ID (e.g. ISS-001)"),
+      id: IssueRefSchema.describe("Issue ID (e.g. ISS-001, i-[canonical])"),
       path: z.string().optional().describe("Custom metadata path, using dot notation for nested values"),
     },
   }, (args) => runMcpReadTool(pinnedRoot, (ctx) => handleIssueMetaGet(args.id, args.path, ctx)));
@@ -530,8 +532,8 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
       type: z.enum(TICKET_TYPES).describe("Ticket type: task, feature, chore"),
       phase: z.string().optional().describe("Phase ID"),
       description: z.string().optional().describe("Ticket description"),
-      blockedBy: z.array(z.string().regex(TICKET_ID_REGEX)).optional().describe("IDs of blocking tickets"),
-      parentTicket: z.string().regex(TICKET_ID_REGEX).optional().describe("Parent ticket ID (makes this a sub-ticket)"),
+      blockedBy: z.array(TicketRefSchema).optional().describe("IDs of blocking tickets"),
+      parentTicket: TicketRefSchema.optional().describe("Parent ticket ID (makes this a sub-ticket)"),
       node: nodeParam,
     },
   }, (args) => {
@@ -555,15 +557,15 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
   server.registerTool("storybloq_ticket_update", {
     description: "Update an existing ticket",
     inputSchema: {
-      id: z.string().regex(TICKET_ID_REGEX).describe("Ticket ID (e.g. T-001)"),
+      id: z.string().refine((v) => TICKET_ID_REGEX.test(v) || TICKET_CANONICAL_ID_REGEX.test(v), "Ticket ID").describe("Ticket ID (e.g. T-001, t-[canonical])"),
       status: z.enum(TICKET_STATUSES).optional().describe("New status: open, inprogress, complete"),
       title: z.string().optional().describe("New title"),
       type: z.enum(TICKET_TYPES).optional().describe("New type: task, feature, chore"),
       order: z.number().int().optional().describe("New sort order"),
       description: z.string().optional().describe("New description"),
       phase: z.string().nullable().optional().describe("New phase ID (null to clear)"),
-      parentTicket: z.string().regex(TICKET_ID_REGEX).nullable().optional().describe("Parent ticket ID (null to clear)"),
-      blockedBy: z.array(z.string().regex(TICKET_ID_REGEX)).optional().describe("IDs of blocking tickets"),
+      parentTicket: TicketRefSchema.nullable().optional().describe("Parent ticket ID (null to clear)"),
+      blockedBy: z.array(TicketRefSchema).optional().describe("IDs of blocking tickets"),
       crossNodeBlockedBy: z.array(z.string().regex(CROSS_NODE_REF_REGEX)).nullable().optional().describe("Cross-node blocking refs (e.g. engine:T-061). Null to clear."),
       node: nodeParam,
     },
@@ -593,7 +595,7 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
   server.registerTool("storybloq_ticket_meta_set", {
     description: "Set custom passthrough metadata on a ticket. Core ticket fields are protected.",
     inputSchema: {
-      id: z.string().regex(TICKET_ID_REGEX).describe("Ticket ID (e.g. T-001)"),
+      id: z.string().refine((v) => TICKET_ID_REGEX.test(v) || TICKET_CANONICAL_ID_REGEX.test(v), "Ticket ID").describe("Ticket ID (e.g. T-001, t-[canonical])"),
       path: z.string().describe("Custom metadata path, using dot notation for nested values"),
       value: z.unknown().describe("JSON-compatible metadata value"),
     },
@@ -604,7 +606,7 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
   server.registerTool("storybloq_ticket_meta_unset", {
     description: "Unset custom passthrough metadata on a ticket. Core ticket fields are protected.",
     inputSchema: {
-      id: z.string().regex(TICKET_ID_REGEX).describe("Ticket ID (e.g. T-001)"),
+      id: z.string().refine((v) => TICKET_ID_REGEX.test(v) || TICKET_CANONICAL_ID_REGEX.test(v), "Ticket ID").describe("Ticket ID (e.g. T-001, t-[canonical])"),
       path: z.string().describe("Custom metadata path, using dot notation for nested values"),
     },
   }, (args) => runMcpWriteTool(pinnedRoot, (root, format) =>
@@ -620,7 +622,7 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
       severity: z.enum(ISSUE_SEVERITIES).describe("Issue severity: critical, high, medium, low"),
       impact: z.string().describe("Impact description"),
       components: z.array(z.string()).optional().describe("Affected components"),
-      relatedTickets: z.array(z.string().regex(TICKET_ID_REGEX)).optional().describe("Related ticket IDs"),
+      relatedTickets: z.array(TicketRefSchema).optional().describe("Related ticket IDs"),
       location: z.array(z.string()).optional().describe("File locations"),
       phase: z.string().optional().describe("Phase ID"),
       node: nodeParam,
@@ -648,14 +650,14 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
   server.registerTool("storybloq_issue_update", {
     description: "Update an existing issue",
     inputSchema: {
-      id: z.string().regex(ISSUE_ID_REGEX).describe("Issue ID (e.g. ISS-001)"),
+      id: IssueRefSchema.describe("Issue ID (e.g. ISS-001, i-[canonical])"),
       status: z.enum(ISSUE_STATUSES).optional().describe("New status: open, inprogress, resolved"),
       title: z.string().optional().describe("New title"),
       severity: z.enum(ISSUE_SEVERITIES).optional().describe("New severity"),
       impact: z.string().optional().describe("New impact description"),
       resolution: z.string().nullable().optional().describe("Resolution description (null to clear)"),
       components: z.array(z.string()).optional().describe("Affected components"),
-      relatedTickets: z.array(z.string().regex(TICKET_ID_REGEX)).optional().describe("Related ticket IDs"),
+      relatedTickets: z.array(TicketRefSchema).optional().describe("Related ticket IDs"),
       location: z.array(z.string()).optional().describe("File locations"),
       order: z.number().int().optional().describe("New sort order"),
       phase: z.string().nullable().optional().describe("New phase ID (null to clear)"),
@@ -688,7 +690,7 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
   server.registerTool("storybloq_issue_meta_set", {
     description: "Set custom passthrough metadata on an issue. Core issue fields are protected.",
     inputSchema: {
-      id: z.string().regex(ISSUE_ID_REGEX).describe("Issue ID (e.g. ISS-001)"),
+      id: IssueRefSchema.describe("Issue ID (e.g. ISS-001, i-[canonical])"),
       path: z.string().describe("Custom metadata path, using dot notation for nested values"),
       value: z.unknown().describe("JSON-compatible metadata value"),
     },
@@ -699,7 +701,7 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
   server.registerTool("storybloq_issue_meta_unset", {
     description: "Unset custom passthrough metadata on an issue. Core issue fields are protected.",
     inputSchema: {
-      id: z.string().regex(ISSUE_ID_REGEX).describe("Issue ID (e.g. ISS-001)"),
+      id: IssueRefSchema.describe("Issue ID (e.g. ISS-001, i-[canonical])"),
       path: z.string().describe("Custom metadata path, using dot notation for nested values"),
     },
   }, (args) => runMcpWriteTool(pinnedRoot, (root, format) =>

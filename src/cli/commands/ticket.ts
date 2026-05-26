@@ -1,5 +1,6 @@
 import { nextTicket, nextTickets, blockedTickets } from "../../core/queries.js";
 import { nextTicketID, nextOrder } from "../../core/id-allocation.js";
+import { resolveAndNormalizeTicketRef, RefResolutionError } from "../../core/ref-normalization.js";
 import { validateProject } from "../../core/validation.js";
 import { ProjectState } from "../../core/project-state.js";
 import {
@@ -105,15 +106,23 @@ export function handleTicketGet(
   id: string,
   ctx: CommandContext,
 ): CommandResult {
-  const ticket = ctx.state.ticketByID(id);
-  if (!ticket) {
+  const result = ctx.state.resolveTicketRef(id);
+  if (result.kind === "ambiguous") {
+    const ids = result.matches.map((m) => m.id).join(", ");
+    return {
+      output: formatError("invalid_input", `Ref "${id}" is ambiguous (matches: ${ids})`, ctx.format),
+      exitCode: ExitCode.USER_ERROR,
+      errorCode: "invalid_input",
+    };
+  }
+  if (result.kind === "missing") {
     return {
       output: formatError("not_found", `Ticket ${id} not found`, ctx.format),
       exitCode: ExitCode.USER_ERROR,
       errorCode: "not_found",
     };
   }
-  return { output: formatTicket(ticket, ctx.state, ctx.format) };
+  return { output: formatTicket(result.item, ctx.state, ctx.format) };
 }
 
 export function handleTicketMetaGet(
@@ -121,14 +130,23 @@ export function handleTicketMetaGet(
   path: string | undefined,
   ctx: CommandContext,
 ): CommandResult {
-  const ticket = ctx.state.ticketByID(id);
-  if (!ticket) {
+  const resolved = ctx.state.resolveTicketRef(id);
+  if (resolved.kind === "ambiguous") {
+    const ids = resolved.matches.map((m) => m.id).join(", ");
+    return {
+      output: formatError("invalid_input", `Ref "${id}" is ambiguous (matches: ${ids})`, ctx.format),
+      exitCode: ExitCode.USER_ERROR,
+      errorCode: "invalid_input",
+    };
+  }
+  if (resolved.kind !== "found") {
     return {
       output: formatError("not_found", `Ticket ${id} not found`, ctx.format),
       exitCode: ExitCode.USER_ERROR,
       errorCode: "not_found",
     };
   }
+  const ticket = resolved.item;
   const result = getMetadata(ticket as Record<string, unknown>, path, TICKET_CORE_METADATA_KEYS);
   if (!result.found) {
     return {
@@ -166,28 +184,45 @@ function validatePhase(phase: string | null, ctx: { state: ProjectState }): void
   }
 }
 
-function validateBlockedBy(ids: string[], ticketId: string, state: ProjectState): void {
-  for (const bid of ids) {
-    if (bid === ticketId) {
-      throw new CliValidationError("invalid_input", `Ticket cannot block itself: ${bid}`);
-    }
-    const blocker = state.ticketByID(bid);
-    if (!blocker) {
-      throw new CliValidationError("invalid_input", `Blocked-by ticket ${bid} not found`);
-    }
-    if (state.umbrellaIDs.has(bid)) {
-      throw new CliValidationError("invalid_input", `Cannot block on umbrella ticket ${bid}. Use leaf tickets instead.`);
-    }
+function rethrowResolutionError(err: unknown, fallbackMsg: string): never {
+  if (err instanceof RefResolutionError) {
+    const code = err.reason === "ambiguous" ? "invalid_input" : "not_found";
+    throw new CliValidationError(code, err.message);
   }
+  throw new CliValidationError("not_found", err instanceof Error ? err.message : fallbackMsg);
 }
 
-function validateParentTicket(parentId: string, ticketId: string, state: ProjectState): void {
-  if (parentId === ticketId) {
+function validateAndResolveBlockedBy(ids: string[], ticketId: string, state: ProjectState): string[] {
+  const resolved: string[] = [];
+  for (const bid of ids) {
+    let resolvedId: string;
+    try {
+      resolvedId = resolveAndNormalizeTicketRef(state, bid);
+    } catch (err) {
+      rethrowResolutionError(err, `Blocked-by ticket ${bid} not found`);
+    }
+    if (resolvedId === ticketId) {
+      throw new CliValidationError("invalid_input", `Ticket cannot block itself: ${bid}`);
+    }
+    if (state.umbrellaIDs.has(resolvedId)) {
+      throw new CliValidationError("invalid_input", `Cannot block on umbrella ticket ${bid}. Use leaf tickets instead.`);
+    }
+    resolved.push(resolvedId);
+  }
+  return resolved;
+}
+
+function validateAndResolveParentTicket(parentId: string, ticketId: string, state: ProjectState): string {
+  let resolvedId: string;
+  try {
+    resolvedId = resolveAndNormalizeTicketRef(state, parentId);
+  } catch (err) {
+    rethrowResolutionError(err, `Parent ticket ${parentId} not found`);
+  }
+  if (resolvedId === ticketId) {
     throw new CliValidationError("invalid_input", `Ticket cannot be its own parent`);
   }
-  if (!state.ticketByID(parentId)) {
-    throw new CliValidationError("invalid_input", `Parent ticket ${parentId} not found`);
-  }
+  return resolvedId;
 }
 
 /** Build a multiset of error findings keyed by code|entity|message, with message lookup. */
@@ -269,12 +304,12 @@ export async function handleTicketCreate(
 
   await withProjectLock(root, { strict: true }, async ({ state }) => {
     validatePhase(args.phase, { state });
-    if (args.blockedBy.length > 0) {
-      validateBlockedBy(args.blockedBy, "", state);
-    }
-    if (args.parentTicket) {
-      validateParentTicket(args.parentTicket, "", state);
-    }
+    const resolvedBlockedBy = args.blockedBy.length > 0
+      ? validateAndResolveBlockedBy(args.blockedBy, "", state)
+      : [];
+    const resolvedParent = args.parentTicket
+      ? validateAndResolveParentTicket(args.parentTicket, "", state)
+      : undefined;
 
     const id = nextTicketID(state.tickets);
     const order = nextOrder(args.phase, state);
@@ -288,8 +323,8 @@ export async function handleTicketCreate(
       order,
       createdDate: todayISO(),
       completedDate: null,
-      blockedBy: args.blockedBy,
-      parentTicket: args.parentTicket ?? undefined,
+      blockedBy: resolvedBlockedBy,
+      parentTicket: resolvedParent,
     };
 
     validatePostWriteState(ticket, state, true);
@@ -336,7 +371,13 @@ export async function handleTicketUpdate(
   let updatedTicket: Ticket | undefined;
 
   await withProjectLock(root, { strict: true }, async ({ state }) => {
-    const existing = state.ticketByID(id);
+    let resolvedId: string;
+    try {
+      resolvedId = resolveAndNormalizeTicketRef(state, id);
+    } catch (err) {
+      rethrowResolutionError(err, `Ticket ${id} not found`);
+    }
+    const existing = state.ticketByID(resolvedId);
     if (!existing) {
       throw new CliValidationError("not_found", `Ticket ${id} not found`);
     }
@@ -344,12 +385,12 @@ export async function handleTicketUpdate(
     if (updates.phase !== undefined) {
       validatePhase(updates.phase, { state });
     }
-    if (updates.blockedBy) {
-      validateBlockedBy(updates.blockedBy, id, state);
-    }
-    if (updates.parentTicket) {
-      validateParentTicket(updates.parentTicket, id, state);
-    }
+    const resolvedBlockedBy = updates.blockedBy
+      ? validateAndResolveBlockedBy(updates.blockedBy, resolvedId, state)
+      : undefined;
+    const resolvedParent = updates.parentTicket
+      ? validateAndResolveParentTicket(updates.parentTicket, resolvedId, state)
+      : updates.parentTicket;
 
     // Status transition with date management
     const statusChanges: Partial<Ticket> = {};
@@ -369,9 +410,9 @@ export async function handleTicketUpdate(
       ...(updates.description !== undefined && { description: updates.description }),
       ...(updates.phase !== undefined && { phase: updates.phase }),
       ...(updates.order !== undefined && { order: updates.order }),
-      ...(updates.blockedBy !== undefined && { blockedBy: updates.blockedBy }),
+      ...(resolvedBlockedBy !== undefined && { blockedBy: resolvedBlockedBy }),
       ...(updates.crossNodeBlockedBy !== undefined && { crossNodeBlockedBy: updates.crossNodeBlockedBy ?? undefined }),
-      ...(updates.parentTicket !== undefined && { parentTicket: updates.parentTicket }),
+      ...(updates.parentTicket !== undefined && { parentTicket: resolvedParent }),
       ...statusChanges,
     };
 
@@ -397,7 +438,13 @@ export async function handleTicketMetaSet(
   let updatedTicket: Ticket | undefined;
 
   await withProjectLock(root, { strict: true }, async ({ state }) => {
-    const existing = state.ticketByID(id);
+    let resolvedId: string;
+    try {
+      resolvedId = resolveAndNormalizeTicketRef(state, id);
+    } catch (err) {
+      rethrowResolutionError(err, `Ticket ${id} not found`);
+    }
+    const existing = state.ticketByID(resolvedId);
     if (!existing) {
       throw new CliValidationError("not_found", `Ticket ${id} not found`);
     }
@@ -428,7 +475,13 @@ export async function handleTicketMetaUnset(
   let updatedTicket: Ticket | undefined;
 
   await withProjectLock(root, { strict: true }, async ({ state }) => {
-    const existing = state.ticketByID(id);
+    let resolvedId: string;
+    try {
+      resolvedId = resolveAndNormalizeTicketRef(state, id);
+    } catch (err) {
+      rethrowResolutionError(err, `Ticket ${id} not found`);
+    }
+    const existing = state.ticketByID(resolvedId);
     if (!existing) {
       throw new CliValidationError("not_found", `Ticket ${id} not found`);
     }

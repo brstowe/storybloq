@@ -1,4 +1,5 @@
 import { validateProject } from "../../core/validation.js";
+import { resolveAndNormalizeTicketRefs, resolveAndNormalizeIssueRef, RefResolutionError } from "../../core/ref-normalization.js";
 import { ProjectState } from "../../core/project-state.js";
 import {
   withProjectLock,
@@ -63,6 +64,14 @@ const ISSUE_CORE_METADATA_KEYS = new Set([
   "deletedBy",
 ]);
 
+function rethrowIssueResolutionError(err: unknown, fallbackMsg: string): never {
+  if (err instanceof RefResolutionError) {
+    const code = err.reason === "ambiguous" ? "invalid_input" : "not_found";
+    throw new CliValidationError(code, err.message);
+  }
+  throw new CliValidationError("not_found", err instanceof Error ? err.message : fallbackMsg);
+}
+
 // --- Read Handlers ---
 
 export function handleIssueList(
@@ -100,15 +109,23 @@ export function handleIssueGet(
   id: string,
   ctx: CommandContext,
 ): CommandResult {
-  const issue = ctx.state.issueByID(id);
-  if (!issue) {
+  const result = ctx.state.resolveIssueRef(id);
+  if (result.kind === "ambiguous") {
+    const ids = result.matches.map((m) => m.id).join(", ");
+    return {
+      output: formatError("invalid_input", `Ref "${id}" is ambiguous (matches: ${ids})`, ctx.format),
+      exitCode: ExitCode.USER_ERROR,
+      errorCode: "invalid_input",
+    };
+  }
+  if (result.kind === "missing") {
     return {
       output: formatError("not_found", `Issue ${id} not found`, ctx.format),
       exitCode: ExitCode.USER_ERROR,
       errorCode: "not_found",
     };
   }
-  return { output: formatIssue(issue, ctx.format) };
+  return { output: formatIssue(result.item, ctx.format, ctx.state) };
 }
 
 export function handleIssueMetaGet(
@@ -116,33 +133,51 @@ export function handleIssueMetaGet(
   path: string | undefined,
   ctx: CommandContext,
 ): CommandResult {
-  const issue = ctx.state.issueByID(id);
-  if (!issue) {
+  const result = ctx.state.resolveIssueRef(id);
+  if (result.kind === "ambiguous") {
+    const ids = result.matches.map((m) => m.id).join(", ");
+    return {
+      output: formatError("invalid_input", `Ref "${id}" is ambiguous (matches: ${ids})`, ctx.format),
+      exitCode: ExitCode.USER_ERROR,
+      errorCode: "invalid_input",
+    };
+  }
+  if (result.kind === "missing") {
     return {
       output: formatError("not_found", `Issue ${id} not found`, ctx.format),
       exitCode: ExitCode.USER_ERROR,
       errorCode: "not_found",
     };
   }
-  const result = getMetadata(issue as Record<string, unknown>, path, ISSUE_CORE_METADATA_KEYS);
-  if (!result.found) {
+  const issue = result.item;
+  const metaResult = getMetadata(issue as Record<string, unknown>, path, ISSUE_CORE_METADATA_KEYS);
+  if (!metaResult.found) {
+    const displayLabel = issue.displayId ?? issue.id;
     return {
-      output: formatError("not_found", `Metadata path "${path}" not found on issue ${id}`, ctx.format),
+      output: formatError("not_found", `Metadata path "${path}" not found on issue ${displayLabel}`, ctx.format),
       exitCode: ExitCode.USER_ERROR,
       errorCode: "not_found",
     };
   }
-  return { output: formatMetadataValue(result.value, ctx.format) };
+  return { output: formatMetadataValue(metaResult.value, ctx.format) };
 }
 
 // --- Write Handlers ---
 
-function validateRelatedTickets(ids: string[], state: ProjectState): void {
+function validateAndResolveRelatedTickets(ids: string[], state: ProjectState): string[] {
+  const resolved: string[] = [];
   for (const tid of ids) {
-    if (!state.ticketByID(tid)) {
-      throw new CliValidationError("invalid_input", `Related ticket ${tid} not found`);
+    try {
+      resolved.push(resolveAndNormalizeTicketRefs(state, [tid])[0]!);
+    } catch (err) {
+      if (err instanceof RefResolutionError) {
+        const code = err.reason === "ambiguous" ? "invalid_input" : "not_found";
+        throw new CliValidationError(code, err.message);
+      }
+      throw new CliValidationError("not_found", err instanceof Error ? err.message : `Related ticket ${tid} not found`);
     }
   }
+  return resolved;
 }
 
 /** Build a multiset of error findings keyed by code|entity|message, with message lookup. */
@@ -227,9 +262,9 @@ export async function handleIssueCreate(
     if (args.phase && !state.roadmap.phases.some((p) => p.id === args.phase)) {
       throw new CliValidationError("invalid_input", `Phase "${args.phase}" not found in roadmap`);
     }
-    if (args.relatedTickets.length > 0) {
-      validateRelatedTickets(args.relatedTickets, state);
-    }
+    const resolvedRelated = args.relatedTickets.length > 0
+      ? validateAndResolveRelatedTickets(args.relatedTickets, state)
+      : [];
 
     const id = nextIssueID(state.issues);
     const issue: Issue = {
@@ -243,7 +278,7 @@ export async function handleIssueCreate(
       location: args.location,
       discoveredDate: todayISO(),
       resolvedDate: null,
-      relatedTickets: args.relatedTickets,
+      relatedTickets: resolvedRelated,
       phase: args.phase ?? null,
     };
 
@@ -292,7 +327,13 @@ export async function handleIssueUpdate(
   let updatedIssue: Issue | undefined;
 
   await withProjectLock(root, { strict: true }, async ({ state }) => {
-    const existing = state.issueByID(id);
+    let resolvedId: string;
+    try {
+      resolvedId = resolveAndNormalizeIssueRef(state, id);
+    } catch (err) {
+      rethrowIssueResolutionError(err, `Issue ${id} not found`);
+    }
+    const existing = state.issueByID(resolvedId);
     if (!existing) {
       throw new CliValidationError("not_found", `Issue ${id} not found`);
     }
@@ -302,9 +343,9 @@ export async function handleIssueUpdate(
         throw new CliValidationError("invalid_input", `Phase "${updates.phase}" not found in roadmap`);
       }
     }
-    if (updates.relatedTickets) {
-      validateRelatedTickets(updates.relatedTickets, state);
-    }
+    const resolvedRelated = updates.relatedTickets
+      ? validateAndResolveRelatedTickets(updates.relatedTickets, state)
+      : undefined;
 
     // Status transition with date management
     const statusChanges: Partial<Issue> = {};
@@ -324,7 +365,7 @@ export async function handleIssueUpdate(
       ...(updates.impact !== undefined && { impact: updates.impact }),
       ...(updates.resolution !== undefined && { resolution: updates.resolution }),
       ...(updates.components !== undefined && { components: updates.components }),
-      ...(updates.relatedTickets !== undefined && { relatedTickets: updates.relatedTickets }),
+      ...(resolvedRelated !== undefined && { relatedTickets: resolvedRelated }),
       ...(updates.location !== undefined && { location: updates.location }),
       ...(updates.order !== undefined && { order: updates.order }),
       ...(updates.phase !== undefined && { phase: updates.phase }),
@@ -353,7 +394,13 @@ export async function handleIssueMetaSet(
   let updatedIssue: Issue | undefined;
 
   await withProjectLock(root, { strict: true }, async ({ state }) => {
-    const existing = state.issueByID(id);
+    let resolvedId: string;
+    try {
+      resolvedId = resolveAndNormalizeIssueRef(state, id);
+    } catch (err) {
+      rethrowIssueResolutionError(err, `Issue ${id} not found`);
+    }
+    const existing = state.issueByID(resolvedId);
     if (!existing) {
       throw new CliValidationError("not_found", `Issue ${id} not found`);
     }
@@ -384,7 +431,13 @@ export async function handleIssueMetaUnset(
   let updatedIssue: Issue | undefined;
 
   await withProjectLock(root, { strict: true }, async ({ state }) => {
-    const existing = state.issueByID(id);
+    let resolvedId: string;
+    try {
+      resolvedId = resolveAndNormalizeIssueRef(state, id);
+    } catch (err) {
+      rethrowIssueResolutionError(err, `Issue ${id} not found`);
+    }
+    const existing = state.issueByID(resolvedId);
     if (!existing) {
       throw new CliValidationError("not_found", `Issue ${id} not found`);
     }
