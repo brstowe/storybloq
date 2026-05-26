@@ -132,6 +132,12 @@ describe("team-mode schema additions", () => {
       const result = TicketSchema.safeParse({ ...baseTicket, lifecycle: "bogus" });
       expect(result.success).toBe(false);
     });
+
+    it("rejects _conflicts with invalid kind", () => {
+      const conflicts = [{ fieldPath: "/status", kind: "bogus", base: "open", ours: "a", theirs: "b" }];
+      const result = TicketSchema.safeParse({ ...baseTicket, _conflicts: conflicts });
+      expect(result.success).toBe(false);
+    });
   });
 
   describe("IssueSchema", () => {
@@ -147,6 +153,15 @@ describe("team-mode schema additions", () => {
       if (result.success) {
         expect(result.data.displayId).toBe("ISS-042");
         expect(result.data.lifecycle).toBe("archived");
+      }
+    });
+
+    it("parses issue with tombstone fields", () => {
+      const result = IssueSchema.safeParse({ ...baseIssue, deletedAt: "2026-05-25T20:00:00Z", deletedBy: "dev@example.com" });
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.deletedAt).toBe("2026-05-25T20:00:00Z");
+        expect(result.data.deletedBy).toBe("dev@example.com");
       }
     });
 
@@ -168,6 +183,15 @@ describe("team-mode schema additions", () => {
         expect(result.data.displayId).toBe("N-042");
       }
     });
+
+    it("parses note with tombstone fields", () => {
+      const result = NoteSchema.safeParse({ ...baseNote, deletedAt: "2026-05-25T20:00:00Z", deletedBy: "dev@example.com" });
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.deletedAt).toBe("2026-05-25T20:00:00Z");
+        expect(result.data.deletedBy).toBe("dev@example.com");
+      }
+    });
   });
 
   describe("LessonSchema", () => {
@@ -180,6 +204,15 @@ describe("team-mode schema additions", () => {
       expect(result.success).toBe(true);
       if (result.success) {
         expect(result.data.displayId).toBe("L-042");
+      }
+    });
+
+    it("parses lesson with tombstone fields", () => {
+      const result = LessonSchema.safeParse({ ...baseLesson, deletedAt: "2026-05-25T20:00:00Z", deletedBy: "dev@example.com" });
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.deletedAt).toBe("2026-05-25T20:00:00Z");
+        expect(result.data.deletedBy).toBe("dev@example.com");
       }
     });
   });

@@ -399,7 +399,7 @@ export class ProjectState {
   }
 }
 
-function buildDisplayIndex<T extends { id: string }>(items: T[]): Map<string, T[]> {
+function buildDisplayIndex<T extends { id: string }>(items: readonly T[]): Map<string, T[]> {
   const index = new Map<string, T[]>();
   for (const item of items) {
     const displayId = (item as Record<string, unknown>).displayId as string | undefined;

@@ -27,7 +27,6 @@ export const INTEGRITY_WARNING_TYPES: readonly LoadWarningType[] = [
   "parse_error",
   "schema_error",
   "duplicate_id",
-  "filename_id_mismatch",
 ];
 
 export interface LoadWarning {

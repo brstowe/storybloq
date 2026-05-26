@@ -293,7 +293,7 @@ export async function handleTicketCreate(
     };
 
     validatePostWriteState(ticket, state, true);
-    await writeTicketUnlocked(ticket, root);
+    await writeTicketUnlocked(ticket, root, { createOnly: true });
     createdTicket = ticket;
   });
 

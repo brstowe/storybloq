@@ -23,6 +23,13 @@ import {
   type LessonSource,
   type OutputFormat,
 } from "../../models/types.js";
+import type { Lesson } from "../../models/lesson.js";
+import {
+  todayISO,
+  normalizeTags,
+  CliValidationError,
+} from "../helpers.js";
+import type { CommandContext, CommandResult } from "../types.js";
 
 export const LESSON_CORE_METADATA_KEYS = new Set([
   "id",
@@ -46,13 +53,6 @@ export const LESSON_CORE_METADATA_KEYS = new Set([
   "deletedAt",
   "deletedBy",
 ]);
-import type { Lesson } from "../../models/lesson.js";
-import {
-  todayISO,
-  normalizeTags,
-  CliValidationError,
-} from "../helpers.js";
-import type { CommandContext, CommandResult } from "../types.js";
 
 // Re-export for register.ts
 export { LESSON_STATUSES, LESSON_SOURCES };
@@ -186,7 +186,7 @@ export async function handleLessonCreate(
       status: "active",
     };
 
-    await writeLessonUnlocked(lesson, root);
+    await writeLessonUnlocked(lesson, root, { createOnly: true });
 
     // Auto-supersede target if specified
     if (args.supersedes) {

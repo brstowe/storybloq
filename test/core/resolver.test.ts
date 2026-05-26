@@ -92,6 +92,25 @@ describe("resolveTicketRef", () => {
     }
   });
 
+  it("returns ambiguous when two items share a previousDisplayId", () => {
+    const t1 = makeTicket({
+      id: "t-aaa",
+      displayId: "T-060",
+      previousDisplayIds: ["T-030"],
+    } as any);
+    const t2 = makeTicket({
+      id: "t-bbb",
+      displayId: "T-070",
+      previousDisplayIds: ["T-030"],
+    } as any);
+    const state = makeState({ tickets: [t1, t2] });
+    const result = state.resolveTicketRef("T-030");
+    expect(result.kind).toBe("ambiguous");
+    if (result.kind === "ambiguous") {
+      expect(result.matches).toHaveLength(2);
+    }
+  });
+
   it("returns missing when no match", () => {
     const state = makeState({ tickets: [makeTicket({ id: "T-001" })] });
     const result = state.resolveTicketRef("T-999");

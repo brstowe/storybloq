@@ -313,7 +313,11 @@ export function mergeValidation(
 
   const extra: ValidationFinding[] = loaderWarnings.map((w) => ({
     level:
-      w.type === "naming_convention" ? ("info" as const) : ("error" as const),
+      w.type === "naming_convention"
+        ? ("info" as const)
+        : w.type === "filename_id_mismatch"
+          ? ("warning" as const)
+          : ("error" as const),
     code: `loader_${w.type}`,
     message: `${w.file}: ${w.message}`,
     entity: null,

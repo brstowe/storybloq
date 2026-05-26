@@ -18,6 +18,13 @@ import {
   type NoteStatus,
   type OutputFormat,
 } from "../../models/types.js";
+import type { Note } from "../../models/note.js";
+import {
+  todayISO,
+  normalizeTags,
+  CliValidationError,
+} from "../helpers.js";
+import type { CommandContext, CommandResult } from "../types.js";
 
 export const NOTE_CORE_METADATA_KEYS = new Set([
   "id",
@@ -36,13 +43,6 @@ export const NOTE_CORE_METADATA_KEYS = new Set([
   "deletedAt",
   "deletedBy",
 ]);
-import type { Note } from "../../models/note.js";
-import {
-  todayISO,
-  normalizeTags,
-  CliValidationError,
-} from "../helpers.js";
-import type { CommandContext, CommandResult } from "../types.js";
 
 // Re-export for register.ts
 export { NOTE_STATUSES };
@@ -131,7 +131,7 @@ export async function handleNoteCreate(
       updatedDate: today,
     };
 
-    await writeNoteUnlocked(note, root);
+    await writeNoteUnlocked(note, root, { createOnly: true });
     createdNote = note;
   });
 

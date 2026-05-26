@@ -76,7 +76,7 @@ export async function handleSelftest(
           blockedBy: [],
           parentTicket: null,
         };
-        await writeTicketUnlocked(ticket, root);
+        await writeTicketUnlocked(ticket, root, { createOnly: true });
       });
       createdIds.push({ type: "ticket", id: ticketId! });
       record("ticket", "create", true, `Created ${ticketId}`);
@@ -154,7 +154,7 @@ export async function handleSelftest(
           order: 0,
           phase: null,
         };
-        await writeIssueUnlocked(issue, root);
+        await writeIssueUnlocked(issue, root, { createOnly: true });
       });
       createdIds.push({ type: "issue", id: issueId! });
       record("issue", "create", true, `Created ${issueId}`);
@@ -226,7 +226,7 @@ export async function handleSelftest(
           createdDate: today,
           updatedDate: today,
         };
-        await writeNoteUnlocked(note, root);
+        await writeNoteUnlocked(note, root, { createOnly: true });
       });
       createdIds.push({ type: "note", id: noteId! });
       record("note", "create", true, `Created ${noteId}`);

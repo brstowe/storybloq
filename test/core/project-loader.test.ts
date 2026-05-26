@@ -24,6 +24,7 @@ import {
   serializeJSON,
   atomicWrite,
   atomicCreate,
+  withProjectLock,
 } from "../../src/core/project-loader.js";
 import { ProjectLoaderError } from "../../src/core/errors.js";
 import { fixturesDir } from "../helpers.js";
@@ -352,6 +353,21 @@ describe("loadProject", () => {
       });
       const result = await loadProject(testRoot);
       expect(result.state.config.schemaVersion).toBe(1);
+    });
+
+    it("withProjectLock rejects writes when schemaVersion too high", async () => {
+      testRoot = await createTestProject({
+        config: { ...minimalConfig, schemaVersion: 99 },
+      });
+      try {
+        await withProjectLock(testRoot, {}, async () => {
+          expect.unreachable("handler should not execute");
+        });
+        expect.unreachable("should have thrown");
+      } catch (err) {
+        expect(err).toBeInstanceOf(ProjectLoaderError);
+        expect((err as ProjectLoaderError).code).toBe("version_mismatch");
+      }
     });
   });
 
@@ -929,6 +945,21 @@ describe("atomicCreate", () => {
     ]);
     expect(await readFile(target1, "utf-8")).toBe('{"id":"a"}\n');
     expect(await readFile(target2, "utf-8")).toBe('{"id":"b"}\n');
+  });
+
+  it("exactly one wins when two race for the same target", async () => {
+    const target = join(tmpDir, "race.json");
+    const results = await Promise.allSettled([
+      atomicCreate(target, '{"winner":"a"}\n'),
+      atomicCreate(target, '{"winner":"b"}\n'),
+    ]);
+    const fulfilled = results.filter((r) => r.status === "fulfilled");
+    const rejected = results.filter((r) => r.status === "rejected");
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    const content = await readFile(target, "utf-8");
+    const parsed = JSON.parse(content);
+    expect(["a", "b"]).toContain(parsed.winner);
   });
 });
 

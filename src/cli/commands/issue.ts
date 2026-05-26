@@ -248,7 +248,7 @@ export async function handleIssueCreate(
     };
 
     validatePostWriteIssueState(issue, state, true);
-    await writeIssueUnlocked(issue, root);
+    await writeIssueUnlocked(issue, root, { createOnly: true });
     createdIssue = issue;
   });
 

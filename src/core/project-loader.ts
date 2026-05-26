@@ -206,6 +206,7 @@ export async function loadProject(
 export async function writeTicketUnlocked(
   ticket: Ticket,
   root: string,
+  options?: { createOnly?: boolean },
 ): Promise<void> {
   const parsed = TicketSchema.parse(ticket);
   if (!TICKET_ID_REGEX.test(parsed.id)) {
@@ -218,7 +219,11 @@ export async function writeTicketUnlocked(
   const targetPath = join(wrapDir, "tickets", `${parsed.id}.json`);
   await guardPath(targetPath, wrapDir);
   const json = serializeJSON(parsed);
-  await atomicWrite(targetPath, json);
+  if (options?.createOnly) {
+    await atomicCreate(targetPath, json);
+  } else {
+    await atomicWrite(targetPath, json);
+  }
 }
 
 export async function writeTicket(
@@ -238,6 +243,7 @@ export async function writeTicket(
 export async function writeIssueUnlocked(
   issue: Issue,
   root: string,
+  options?: { createOnly?: boolean },
 ): Promise<void> {
   const parsed = IssueSchema.parse(issue);
   if (!ISSUE_ID_REGEX.test(parsed.id)) {
@@ -250,7 +256,11 @@ export async function writeIssueUnlocked(
   const targetPath = join(wrapDir, "issues", `${parsed.id}.json`);
   await guardPath(targetPath, wrapDir);
   const json = serializeJSON(parsed);
-  await atomicWrite(targetPath, json);
+  if (options?.createOnly) {
+    await atomicCreate(targetPath, json);
+  } else {
+    await atomicWrite(targetPath, json);
+  }
 }
 
 export async function writeIssue(
@@ -407,6 +417,7 @@ export async function deleteIssue(
 export async function writeNoteUnlocked(
   note: Note,
   root: string,
+  options?: { createOnly?: boolean },
 ): Promise<void> {
   const parsed = NoteSchema.parse(note);
   if (!NOTE_ID_REGEX.test(parsed.id)) {
@@ -420,7 +431,11 @@ export async function writeNoteUnlocked(
   await mkdir(dirname(targetPath), { recursive: true });
   await guardPath(targetPath, wrapDir);
   const json = serializeJSON(parsed);
-  await atomicWrite(targetPath, json);
+  if (options?.createOnly) {
+    await atomicCreate(targetPath, json);
+  } else {
+    await atomicWrite(targetPath, json);
+  }
 }
 
 export async function writeNote(
@@ -467,6 +482,7 @@ export async function deleteNote(
 export async function writeLessonUnlocked(
   lesson: Lesson,
   root: string,
+  options?: { createOnly?: boolean },
 ): Promise<void> {
   const parsed = LessonSchema.parse(lesson);
   if (!LESSON_ID_REGEX.test(parsed.id)) {
@@ -480,7 +496,11 @@ export async function writeLessonUnlocked(
   await mkdir(dirname(targetPath), { recursive: true });
   await guardPath(targetPath, wrapDir);
   const json = serializeJSON(parsed);
-  await atomicWrite(targetPath, json);
+  if (options?.createOnly) {
+    await atomicCreate(targetPath, json);
+  } else {
+    await atomicWrite(targetPath, json);
+  }
 }
 
 export async function writeLesson(
@@ -970,6 +990,8 @@ export async function atomicCreate(
     await fd.close();
     fd = undefined;
     await link(tempPath, targetPath);
+    const parentFd = await open(dirname(targetPath), "r");
+    try { await parentFd.sync(); } finally { await parentFd.close(); }
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code === "EEXIST") {
