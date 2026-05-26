@@ -15,6 +15,18 @@ import type { ActiveSessionSummary } from "./session-scan.js";
 import type { SelftestResult } from "../cli/commands/selftest.js";
 import { phasesWithStatus, isBlockerCleared } from "./queries.js";
 
+function resolveTicketRefDisplay(ref: string, state: ProjectState): string {
+  const result = state.resolveTicketRef(ref);
+  if (result.kind === "found") {
+    return entityDisplayId(result.item);
+  }
+  return ref;
+}
+
+function entityDisplayId(item: { id: string; displayId?: string | null }): string {
+  return item.displayId ?? item.id;
+}
+
 /** SKILL PROTOCOL: SKILL.md Step 2b matches this literal string. Do not change without updating SKILL.md. */
 export const EMPTY_SCAFFOLD_HEADING = "## Getting Started";
 
@@ -324,13 +336,13 @@ export function formatTicket(
     `Created: ${ticket.createdDate}${ticket.completedDate ? ` | Completed: ${ticket.completedDate}` : ""}`,
   ];
   if (ticket.blockedBy.length > 0) {
-    lines.push(`Blocked by: ${ticket.blockedBy.join(", ")}`);
+    lines.push(`Blocked by: ${ticket.blockedBy.map((ref) => resolveTicketRefDisplay(ref, state)).join(", ")}`);
   }
   if (ticket.crossNodeBlockedBy && ticket.crossNodeBlockedBy.length > 0) {
     lines.push(`Cross-node blocked by: ${ticket.crossNodeBlockedBy.join(", ")}`);
   }
   if (ticket.parentTicket) {
-    lines.push(`Parent: ${ticket.parentTicket}`);
+    lines.push(`Parent: ${resolveTicketRefDisplay(ticket.parentTicket, state)}`);
   }
   if (ticket.description) {
     lines.push("", "## Description", "", fencedBlock(ticket.description));
@@ -361,13 +373,13 @@ export function formatNextTicketOutcome(
     case "found": {
       const t = outcome.ticket;
       const lines: string[] = [
-        `# Next: ${escapeMarkdownInline(t.id)} — ${escapeMarkdownInline(t.title)}`,
+        `# Next: ${escapeMarkdownInline(entityDisplayId(t))} — ${escapeMarkdownInline(t.title)}`,
         "",
         `Phase: ${t.phase ?? "none"} | Order: ${t.order} | Type: ${t.type}`,
       ];
 
       if (outcome.unblockImpact.wouldUnblock.length > 0) {
-        const ids = outcome.unblockImpact.wouldUnblock.map((u) => u.id).join(", ");
+        const ids = outcome.unblockImpact.wouldUnblock.map((u) => entityDisplayId(u)).join(", ");
         lines.push(`Completing this unblocks: ${ids}`);
       }
 
@@ -419,15 +431,16 @@ export function formatNextTicketsOutcome(
         if (i > 0) lines.push("", "---", "");
 
         // Single candidate: use # Next: format; multiple: use numbered format
+        const tLabel = entityDisplayId(t);
         if (candidates.length === 1) {
-          lines.push(`# Next: ${escapeMarkdownInline(t.id)} — ${escapeMarkdownInline(t.title)}`);
+          lines.push(`# Next: ${escapeMarkdownInline(tLabel)} — ${escapeMarkdownInline(t.title)}`);
         } else {
-          lines.push(`# ${i + 1}. ${escapeMarkdownInline(t.id)} — ${escapeMarkdownInline(t.title)}`);
+          lines.push(`# ${i + 1}. ${escapeMarkdownInline(tLabel)} — ${escapeMarkdownInline(t.title)}`);
         }
         lines.push("", `Phase: ${t.phase ?? "none"} | Order: ${t.order} | Type: ${t.type}`);
 
         if (c.unblockImpact.wouldUnblock.length > 0) {
-          const ids = c.unblockImpact.wouldUnblock.map((u) => u.id).join(", ");
+          const ids = c.unblockImpact.wouldUnblock.map((u) => entityDisplayId(u)).join(", ");
           lines.push(`Completing this unblocks: ${ids}`);
         }
 
@@ -464,7 +477,7 @@ export function formatTicketList(
   const lines: string[] = [];
   for (const t of tickets) {
     const status = t.status === "complete" ? "[x]" : t.status === "inprogress" ? "[~]" : "[ ]";
-    lines.push(`${status} ${t.id}: ${escapeMarkdownInline(t.title)} (${t.phase ?? "none"})`);
+    lines.push(`${status} ${entityDisplayId(t)}: ${escapeMarkdownInline(t.title)} (${t.phase ?? "none"})`);
   }
   return lines.join("\n");
 }
@@ -472,6 +485,7 @@ export function formatTicketList(
 export function formatIssue(
   issue: Issue,
   format: OutputFormat,
+  state?: ProjectState,
 ): string {
   if (format === "json") {
     return JSON.stringify(successEnvelope(issue), null, 2);
@@ -485,7 +499,10 @@ export function formatIssue(
     `Discovered: ${issue.discoveredDate}${issue.resolvedDate ? ` | Resolved: ${issue.resolvedDate}` : ""}`,
   ];
   if (issue.relatedTickets.length > 0) {
-    lines.push(`Related: ${issue.relatedTickets.join(", ")}`);
+    const display = state
+      ? issue.relatedTickets.map((ref) => resolveTicketRefDisplay(ref, state)).join(", ")
+      : issue.relatedTickets.join(", ");
+    lines.push(`Related: ${display}`);
   }
   lines.push("", "## Impact", "", fencedBlock(issue.impact));
   if (issue.resolution) {
@@ -505,7 +522,7 @@ export function formatIssueList(
   const lines: string[] = [];
   for (const i of issues) {
     const status = i.status === "resolved" ? "[x]" : "[ ]";
-    lines.push(`${status} ${i.id} [${i.severity}]: ${escapeMarkdownInline(i.title)}`);
+    lines.push(`${status} ${entityDisplayId(i)} [${i.severity}]: ${escapeMarkdownInline(i.title)}`);
   }
   return lines.join("\n");
 }
@@ -535,11 +552,14 @@ export function formatBlockedTickets(
   for (const t of tickets) {
     const blockerInfo = t.blockedBy
       .map((bid) => {
-        const b = state.ticketByID(bid);
-        return b ? `${bid} (${b.status})` : `${bid} (unknown)`;
+        const resolved = state.resolveTicketRef(bid);
+        if (resolved.kind === "found") {
+          return `${entityDisplayId(resolved.item)} (${resolved.item.status})`;
+        }
+        return `${bid} (unknown)`;
       })
       .join(", ");
-    lines.push(`${t.id}: ${escapeMarkdownInline(t.title)} — blocked by: ${blockerInfo}`);
+    lines.push(`${entityDisplayId(t)}: ${escapeMarkdownInline(t.title)} — blocked by: ${blockerInfo}`);
   }
   return lines.join("\n");
 }
@@ -905,16 +925,16 @@ export function formatRecap(
         lines.push("");
         lines.push("## Tickets");
         for (const t of ticketChanges.statusChanged) {
-          lines.push(`- ${t.id}: ${escapeMarkdownInline(t.title)} — ${t.from} → ${t.to}`);
+          lines.push(`- ${t.displayId ?? t.id}: ${escapeMarkdownInline(t.title)} — ${t.from} → ${t.to}`);
         }
         for (const t of ticketChanges.added) {
-          lines.push(`- ${t.id}: ${escapeMarkdownInline(t.title)} — **new**`);
+          lines.push(`- ${t.displayId ?? t.id}: ${escapeMarkdownInline(t.title)} — **new**`);
         }
         for (const t of ticketChanges.removed) {
-          lines.push(`- ${t.id}: ${escapeMarkdownInline(t.title)} — **removed**`);
+          lines.push(`- ${t.displayId ?? t.id}: ${escapeMarkdownInline(t.title)} — **removed**`);
         }
         for (const t of ticketChanges.descriptionChanged) {
-          lines.push(`- ${t.id}: description updated`);
+          lines.push(`- ${t.displayId ?? t.id}: description updated`);
         }
       }
 
@@ -924,16 +944,16 @@ export function formatRecap(
         lines.push("");
         lines.push("## Issues");
         for (const i of issueChanges.resolved) {
-          lines.push(`- ${i.id}: ${escapeMarkdownInline(i.title)} — **resolved**`);
+          lines.push(`- ${i.displayId ?? i.id}: ${escapeMarkdownInline(i.title)} — **resolved**`);
         }
         for (const i of issueChanges.statusChanged) {
-          lines.push(`- ${i.id}: ${escapeMarkdownInline(i.title)} — ${i.from} → ${i.to}`);
+          lines.push(`- ${i.displayId ?? i.id}: ${escapeMarkdownInline(i.title)} — ${i.from} → ${i.to}`);
         }
         for (const i of issueChanges.added) {
-          lines.push(`- ${i.id}: ${escapeMarkdownInline(i.title)} — **new**`);
+          lines.push(`- ${i.displayId ?? i.id}: ${escapeMarkdownInline(i.title)} — **new**`);
         }
         for (const i of issueChanges.impactChanged) {
-          lines.push(`- ${i.id}: impact updated`);
+          lines.push(`- ${i.displayId ?? i.id}: impact updated`);
         }
       }
 
@@ -966,13 +986,13 @@ export function formatRecap(
         lines.push("");
         lines.push("## Notes");
         for (const n of changes.notes.added) {
-          lines.push(`- ${n.id}: added`);
+          lines.push(`- ${n.displayId ?? n.id}: added`);
         }
         for (const n of changes.notes.removed) {
-          lines.push(`- ${n.id}: removed`);
+          lines.push(`- ${n.displayId ?? n.id}: removed`);
         }
         for (const n of changes.notes.updated) {
-          lines.push(`- ${n.id}: updated (${n.changedFields.join(", ")})`);
+          lines.push(`- ${n.displayId ?? n.id}: updated (${n.changedFields.join(", ")})`);
         }
       }
 
@@ -981,16 +1001,16 @@ export function formatRecap(
         lines.push("");
         lines.push("## Lessons");
         for (const l of changes.lessons.added) {
-          lines.push(`- ${l.id}: ${escapeMarkdownInline(l.title)} — **new**`);
+          lines.push(`- ${l.displayId ?? l.id}: ${escapeMarkdownInline(l.title)} — **new**`);
         }
         for (const l of changes.lessons.removed) {
-          lines.push(`- ${l.id}: ${escapeMarkdownInline(l.title)} — removed`);
+          lines.push(`- ${l.displayId ?? l.id}: ${escapeMarkdownInline(l.title)} — removed`);
         }
         for (const l of changes.lessons.updated) {
-          lines.push(`- ${l.id}: updated (${l.changedFields.join(", ")})`);
+          lines.push(`- ${l.displayId ?? l.id}: updated (${l.changedFields.join(", ")})`);
         }
         for (const l of changes.lessons.reinforced) {
-          lines.push(`- ${l.id}: ${escapeMarkdownInline(l.title)} — reinforced (${l.from} → ${l.to})`);
+          lines.push(`- ${l.displayId ?? l.id}: ${escapeMarkdownInline(l.title)} — reinforced (${l.from} → ${l.to})`);
         }
       }
     }
@@ -1002,12 +1022,12 @@ export function formatRecap(
   lines.push("## Suggested Actions");
 
   if (actions.nextTicket) {
-    lines.push(`- **Next:** ${actions.nextTicket.id} — ${escapeMarkdownInline(actions.nextTicket.title)}${actions.nextTicket.phase ? ` (${actions.nextTicket.phase})` : ""}`);
+    lines.push(`- **Next:** ${actions.nextTicket.displayId ?? actions.nextTicket.id} — ${escapeMarkdownInline(actions.nextTicket.title)}${actions.nextTicket.phase ? ` (${actions.nextTicket.phase})` : ""}`);
   }
 
   if (actions.highSeverityIssues.length > 0) {
     for (const i of actions.highSeverityIssues) {
-      lines.push(`- **${i.severity} issue:** ${i.id} — ${escapeMarkdownInline(i.title)}`);
+      lines.push(`- **${i.severity} issue:** ${i.displayId ?? i.id} — ${escapeMarkdownInline(i.title)}`);
     }
   }
 
@@ -1114,8 +1134,8 @@ function formatPhaseExport(
     lines.push("## Tickets");
     for (const t of leaves) {
       const indicator = t.status === "complete" ? "[x]" : t.status === "inprogress" ? "[~]" : "[ ]";
-      const parentNote = t.parentTicket && umbrellaAncestors.has(t.parentTicket) ? ` (under ${t.parentTicket})` : "";
-      lines.push(`${indicator} ${t.id}: ${escapeMarkdownInline(t.title)}${parentNote}`);
+      const parentLabel = t.parentTicket && umbrellaAncestors.has(t.parentTicket) ? ` (under ${resolveTicketRefDisplay(t.parentTicket, state)})` : "";
+      lines.push(`${indicator} ${entityDisplayId(t)}: ${escapeMarkdownInline(t.title)}${parentLabel}`);
     }
   }
 
@@ -1123,7 +1143,7 @@ function formatPhaseExport(
     lines.push("");
     lines.push("## Cross-Phase Dependencies");
     for (const [, dep] of crossPhaseDeps) {
-      lines.push(`- ${dep.id}: ${escapeMarkdownInline(dep.title)} [${dep.status}] (${dep.phase ?? "unphased"})`);
+      lines.push(`- ${entityDisplayId(dep)}: ${escapeMarkdownInline(dep.title)} [${dep.status}] (${dep.phase ?? "unphased"})`);
     }
   }
 
@@ -1131,7 +1151,7 @@ function formatPhaseExport(
     lines.push("");
     lines.push("## Open Issues");
     for (const i of relatedIssues) {
-      lines.push(`- ${i.id} [${i.severity}]: ${escapeMarkdownInline(i.title)}`);
+      lines.push(`- ${entityDisplayId(i)} [${i.severity}]: ${escapeMarkdownInline(i.title)}`);
     }
   }
 
@@ -1220,7 +1240,7 @@ function formatFullExport(
       lines.push("");
       for (const t of tickets) {
         const ti = t.status === "complete" ? "[x]" : t.status === "inprogress" ? "[~]" : "[ ]";
-        lines.push(`${ti} ${t.id}: ${escapeMarkdownInline(t.title)}`);
+        lines.push(`${ti} ${entityDisplayId(t)}: ${escapeMarkdownInline(t.title)}`);
       }
     }
   }
@@ -1230,7 +1250,7 @@ function formatFullExport(
     lines.push("## Issues");
     for (const i of state.issues) {
       const resolved = i.status === "resolved" ? " ✓" : "";
-      lines.push(`- ${i.id} [${i.severity}]: ${escapeMarkdownInline(i.title)}${resolved}`);
+      lines.push(`- ${entityDisplayId(i)} [${i.severity}]: ${escapeMarkdownInline(i.title)}${resolved}`);
     }
   }
 
@@ -1239,9 +1259,9 @@ function formatFullExport(
     lines.push("");
     lines.push("## Notes");
     for (const n of activeNotes) {
-      const title = n.title ?? n.id;
+      const title = n.title ?? entityDisplayId(n);
       const tagInfo = n.tags.length > 0 ? ` (${n.tags.join(", ")})` : "";
-      lines.push(`- ${n.id}: ${escapeMarkdownInline(title)}${tagInfo}`);
+      lines.push(`- ${entityDisplayId(n)}: ${escapeMarkdownInline(title)}${tagInfo}`);
     }
   }
 
@@ -1252,7 +1272,7 @@ function formatFullExport(
     for (const l of activeLessons) {
       const reinforced = l.reinforcements > 0 ? ` (×${l.reinforcements})` : "";
       const tagInfo = l.tags.length > 0 ? ` [${l.tags.join(", ")}]` : "";
-      lines.push(`- ${l.id}: ${escapeMarkdownInline(l.title)}${reinforced}${tagInfo}`);
+      lines.push(`- ${entityDisplayId(l)}: ${escapeMarkdownInline(l.title)}${reinforced}${tagInfo}`);
     }
   }
 
@@ -1345,7 +1365,7 @@ function truncate(text: string, maxLen: number): string {
 function formatTicketOneLiner(t: Ticket, state: ProjectState): string {
   const status = t.status === "complete" ? "[x]" : t.status === "inprogress" ? "[~]" : "[ ]";
   const blocked = state.isBlocked(t) ? " [BLOCKED]" : "";
-  return `${status} ${t.id}: ${escapeMarkdownInline(t.title)}${blocked}`;
+  return `${status} ${entityDisplayId(t)}: ${escapeMarkdownInline(t.title)}${blocked}`;
 }
 
 // --- Reference ---
@@ -1460,7 +1480,7 @@ export function formatRecommendations(
   for (let i = 0; i < result.recommendations.length; i++) {
     const rec = result.recommendations[i]!;
     lines.push(
-      `${i + 1}. **${escapeMarkdownInline(rec.id)}** (${rec.kind}) — ${escapeMarkdownInline(rec.title)}`,
+      `${i + 1}. **${escapeMarkdownInline(rec.displayId ?? rec.id)}** (${rec.kind}) — ${escapeMarkdownInline(rec.title)}`,
     );
     lines.push(`   _${escapeMarkdownInline(rec.reason)}_`);
     lines.push("");

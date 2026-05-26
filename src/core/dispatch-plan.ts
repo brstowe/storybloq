@@ -6,6 +6,7 @@ import type { Recommendation } from "./recommend.js";
 
 export interface DispatchTarget {
   readonly id: string;
+  readonly displayId?: string;
   readonly kind: "ticket" | "issue";
   readonly title: string;
   readonly reason: string;
@@ -83,6 +84,7 @@ export function buildDispatchPlan(
       .slice(0, maxAgents)
       .map((r) => ({
         id: r.id,
+        displayId: r.displayId,
         kind: r.kind as "ticket" | "issue",
         title: r.title,
         reason: r.reason,
@@ -110,6 +112,7 @@ export function buildDispatchPlan(
         } else {
           targets.push({
             id: rec.id,
+            displayId: rec.displayId,
             kind: rec.kind,
             title: rec.title,
             reason: rec.reason,
@@ -180,6 +183,7 @@ export function buildFederationDispatchPlan(
       candidates.push({
         target: {
           id: rec.id,
+          displayId: rec.displayId,
           kind: rec.kind,
           title: rec.title,
           reason: `${nodeName}: ${rec.reason}`,

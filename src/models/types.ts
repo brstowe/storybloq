@@ -128,3 +128,33 @@ export const IssueIdSchema = z
     (v) => ISSUE_ID_REGEX.test(v) || ISSUE_CANONICAL_ID_REGEX.test(v),
     "Issue ID must match ISS-NNN or i-[canonical]",
   );
+
+// --- Ref schemas (user-provided references, resolved before persisting) ---
+
+export const TicketRefSchema = z
+  .string()
+  .refine(
+    (v) => TICKET_ID_REGEX.test(v) || TICKET_CANONICAL_ID_REGEX.test(v),
+    "Ticket ref must match T-NNN, T-NNNx, or t-[canonical]",
+  );
+
+export const IssueRefSchema = z
+  .string()
+  .refine(
+    (v) => ISSUE_ID_REGEX.test(v) || ISSUE_CANONICAL_ID_REGEX.test(v),
+    "Issue ref must match ISS-NNN or i-[canonical]",
+  );
+
+export const NoteRefSchema = z
+  .string()
+  .refine(
+    (v) => NOTE_ID_REGEX.test(v) || NOTE_CANONICAL_ID_REGEX.test(v),
+    "Note ref must match N-NNN or n-[canonical]",
+  );
+
+export const LessonRefSchema = z
+  .string()
+  .refine(
+    (v) => LESSON_ID_REGEX.test(v) || LESSON_CANONICAL_ID_REGEX.test(v),
+    "Lesson ref must match L-NNN or l-[canonical]",
+  );

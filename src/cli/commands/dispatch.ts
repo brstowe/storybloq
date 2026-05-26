@@ -40,7 +40,7 @@ function formatPlan(plan: DispatchPlan): string {
     lines.push("|---|------|------|-------|");
     plan.entries.forEach((entry, i) => {
       const title = entry.target.title || "(explicit)";
-      lines.push(`| ${i + 1} | ${entry.target.id} | ${entry.target.kind} | ${title} |`);
+      lines.push(`| ${i + 1} | ${entry.target.displayId ?? entry.target.id} | ${entry.target.kind} | ${title} |`);
     });
   }
 

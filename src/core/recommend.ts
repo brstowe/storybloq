@@ -49,6 +49,7 @@ export type RecommendItemKind = "ticket" | "issue" | "action";
 
 export interface Recommendation {
   readonly id: string;
+  readonly displayId?: string;
   readonly kind: RecommendItemKind;
   readonly title: string;
   readonly category: RecommendCategory;
@@ -213,6 +214,7 @@ function generateCriticalIssues(state: ProjectState): Recommendation[] {
 
   return issues.map((issue, index) => ({
     id: issue.id,
+    displayId: issue.displayId ?? undefined,
     kind: "issue" as const,
     title: issue.title,
     category: "critical_issue" as const,
@@ -235,6 +237,7 @@ function generateInProgressTickets(
 
   return sorted.map((ticket, index) => ({
     id: ticket.id,
+    displayId: ticket.displayId ?? undefined,
     kind: "ticket" as const,
     title: ticket.title,
     category: "inprogress_ticket" as const,
@@ -261,6 +264,7 @@ function generateHighImpactUnblocks(state: ProjectState, crossNodeStatuses?: Rec
 
   return candidates.map(({ ticket, unblockCount }, index) => ({
     id: ticket.id,
+    displayId: ticket.displayId ?? undefined,
     kind: "ticket" as const,
     title: ticket.title,
     category: "high_impact_unblock" as const,
@@ -314,6 +318,7 @@ function generateNearCompleteUmbrellas(
 
   return candidates.map((c, index) => ({
     id: c.firstIncompleteLeaf.id,
+    displayId: c.firstIncompleteLeaf.displayId ?? undefined,
     kind: "ticket" as const,
     title: c.firstIncompleteLeaf.title,
     category: "near_complete_umbrella" as const,
@@ -333,6 +338,7 @@ function generatePhaseMomentum(state: ProjectState, crossNodeStatuses?: Record<s
     return [
       {
         id: candidate.id,
+        displayId: candidate.displayId ?? undefined,
         kind: "ticket" as const,
         title: candidate.title,
         category: "phase_momentum" as const,
@@ -353,6 +359,7 @@ function generateQuickWins(state: ProjectState, phaseIndex: Map<string, number>,
 
   return sorted.map((ticket, index) => ({
     id: ticket.id,
+    displayId: ticket.displayId ?? undefined,
     kind: "ticket" as const,
     title: ticket.title,
     category: "quick_win" as const,
@@ -376,6 +383,7 @@ function generateOpenIssues(state: ProjectState): Recommendation[] {
 
   return issues.map((issue, index) => ({
     id: issue.id,
+    displayId: issue.displayId ?? undefined,
     kind: "issue" as const,
     title: issue.title,
     category: "open_issue" as const,

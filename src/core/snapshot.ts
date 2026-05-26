@@ -147,6 +147,7 @@ export async function loadLatestSnapshot(
 
 export interface TicketChange {
   id: string;
+  displayId?: string;
   title: string;
   from: string;
   to: string;
@@ -154,6 +155,7 @@ export interface TicketChange {
 
 export interface IssueChange {
   id: string;
+  displayId?: string;
   title: string;
   from: string;
   to: string;
@@ -168,31 +170,34 @@ export interface PhaseChange {
 
 export interface ContentChange {
   id: string;
+  displayId?: string;
   title: string;
 }
 
 export interface NoteChange {
   id: string;
+  displayId?: string;
   title: string | null;
   changedFields: string[];
 }
 
 export interface LessonChange {
   id: string;
+  displayId?: string;
   title: string;
   changedFields: string[];
 }
 
 export interface SnapshotDiff {
   tickets: {
-    added: Array<{ id: string; title: string }>;
-    removed: Array<{ id: string; title: string }>;
+    added: Array<{ id: string; displayId?: string; title: string }>;
+    removed: Array<{ id: string; displayId?: string; title: string }>;
     statusChanged: TicketChange[];
     descriptionChanged: ContentChange[];
   };
   issues: {
-    added: Array<{ id: string; title: string }>;
-    resolved: Array<{ id: string; title: string }>;
+    added: Array<{ id: string; displayId?: string; title: string }>;
+    resolved: Array<{ id: string; displayId?: string; title: string }>;
     statusChanged: IssueChange[];
     impactChanged: ContentChange[];
   };
@@ -206,15 +211,15 @@ export interface SnapshotDiff {
     statusChanged: PhaseChange[];
   };
   notes: {
-    added: Array<{ id: string; title: string | null }>;
-    removed: Array<{ id: string; title: string | null }>;
+    added: Array<{ id: string; displayId?: string; title: string | null }>;
+    removed: Array<{ id: string; displayId?: string; title: string | null }>;
     updated: NoteChange[];
   };
   lessons: {
-    added: Array<{ id: string; title: string }>;
-    removed: Array<{ id: string; title: string }>;
+    added: Array<{ id: string; displayId?: string; title: string }>;
+    removed: Array<{ id: string; displayId?: string; title: string }>;
     updated: LessonChange[];
-    reinforced: Array<{ id: string; title: string; from: number; to: number }>;
+    reinforced: Array<{ id: string; displayId?: string; title: string; from: number; to: number }>;
   };
   handovers: {
     added: string[];
@@ -233,8 +238,8 @@ export interface RecapResult {
   snapshot: { filename: string; createdAt: string } | null;
   changes: SnapshotDiff | null;
   suggestedActions: {
-    nextTicket: { id: string; title: string; phase: string | null } | null;
-    highSeverityIssues: Array<{ id: string; title: string; severity: string }>;
+    nextTicket: { id: string; displayId?: string; title: string; phase: string | null } | null;
+    highSeverityIssues: Array<{ id: string; displayId?: string; title: string; severity: string }>;
     recentlyClearedBlockers: string[];
   };
   partial: boolean;
@@ -252,27 +257,27 @@ export function diffStates(
   const snapTickets = new Map(snapshotState.tickets.map((t) => [t.id, t]));
   const curTickets = new Map(currentState.tickets.map((t) => [t.id, t]));
 
-  const ticketsAdded: Array<{ id: string; title: string }> = [];
-  const ticketsRemoved: Array<{ id: string; title: string }> = [];
+  const ticketsAdded: Array<{ id: string; displayId?: string; title: string }> = [];
+  const ticketsRemoved: Array<{ id: string; displayId?: string; title: string }> = [];
   const ticketsStatusChanged: TicketChange[] = [];
   const ticketsDescriptionChanged: ContentChange[] = [];
 
   for (const [id, cur] of curTickets) {
     const snap = snapTickets.get(id);
     if (!snap) {
-      ticketsAdded.push({ id, title: cur.title });
+      ticketsAdded.push({ id, displayId: cur.displayId ?? undefined, title: cur.title });
     } else {
       if (snap.status !== cur.status) {
-        ticketsStatusChanged.push({ id, title: cur.title, from: snap.status, to: cur.status });
+        ticketsStatusChanged.push({ id, displayId: cur.displayId ?? undefined, title: cur.title, from: snap.status, to: cur.status });
       }
       if (snap.description !== cur.description) {
-        ticketsDescriptionChanged.push({ id, title: cur.title });
+        ticketsDescriptionChanged.push({ id, displayId: cur.displayId ?? undefined, title: cur.title });
       }
     }
   }
   for (const [id, snap] of snapTickets) {
     if (!curTickets.has(id)) {
-      ticketsRemoved.push({ id, title: snap.title });
+      ticketsRemoved.push({ id, displayId: snap.displayId ?? undefined, title: snap.title });
     }
   }
 
@@ -280,25 +285,25 @@ export function diffStates(
   const snapIssues = new Map(snapshotState.issues.map((i) => [i.id, i]));
   const curIssues = new Map(currentState.issues.map((i) => [i.id, i]));
 
-  const issuesAdded: Array<{ id: string; title: string }> = [];
-  const issuesResolved: Array<{ id: string; title: string }> = [];
+  const issuesAdded: Array<{ id: string; displayId?: string; title: string }> = [];
+  const issuesResolved: Array<{ id: string; displayId?: string; title: string }> = [];
   const issuesStatusChanged: IssueChange[] = [];
   const issuesImpactChanged: ContentChange[] = [];
 
   for (const [id, cur] of curIssues) {
     const snap = snapIssues.get(id);
     if (!snap) {
-      issuesAdded.push({ id, title: cur.title });
+      issuesAdded.push({ id, displayId: cur.displayId ?? undefined, title: cur.title });
     } else {
       if (snap.status !== cur.status) {
         if (cur.status === "resolved") {
-          issuesResolved.push({ id, title: cur.title });
+          issuesResolved.push({ id, displayId: cur.displayId ?? undefined, title: cur.title });
         } else {
-          issuesStatusChanged.push({ id, title: cur.title, from: snap.status, to: cur.status });
+          issuesStatusChanged.push({ id, displayId: cur.displayId ?? undefined, title: cur.title, from: snap.status, to: cur.status });
         }
       }
       if (snap.impact !== cur.impact) {
-        issuesImpactChanged.push({ id, title: cur.title });
+        issuesImpactChanged.push({ id, displayId: cur.displayId ?? undefined, title: cur.title });
       }
     }
   }
@@ -360,14 +365,14 @@ export function diffStates(
   const snapNotes = new Map(snapshotState.notes.map((n) => [n.id, n]));
   const curNotes = new Map(currentState.notes.map((n) => [n.id, n]));
 
-  const notesAdded: Array<{ id: string; title: string | null }> = [];
-  const notesRemoved: Array<{ id: string; title: string | null }> = [];
+  const notesAdded: Array<{ id: string; displayId?: string; title: string | null }> = [];
+  const notesRemoved: Array<{ id: string; displayId?: string; title: string | null }> = [];
   const notesUpdated: NoteChange[] = [];
 
   for (const [id, cur] of curNotes) {
     const snap = snapNotes.get(id);
     if (!snap) {
-      notesAdded.push({ id, title: cur.title });
+      notesAdded.push({ id, displayId: cur.displayId ?? undefined, title: cur.title });
     } else {
       const changedFields: string[] = [];
       if (snap.title !== cur.title) changedFields.push("title");
@@ -375,13 +380,13 @@ export function diffStates(
       if (JSON.stringify([...snap.tags].sort()) !== JSON.stringify([...cur.tags].sort())) changedFields.push("tags");
       if (snap.status !== cur.status) changedFields.push("status");
       if (changedFields.length > 0) {
-        notesUpdated.push({ id, title: cur.title, changedFields });
+        notesUpdated.push({ id, displayId: cur.displayId ?? undefined, title: cur.title, changedFields });
       }
     }
   }
   for (const [id, snap] of snapNotes) {
     if (!curNotes.has(id)) {
-      notesRemoved.push({ id, title: snap.title });
+      notesRemoved.push({ id, displayId: snap.displayId ?? undefined, title: snap.title });
     }
   }
 
@@ -389,15 +394,15 @@ export function diffStates(
   const snapLessons = new Map(snapshotState.lessons.map((l) => [l.id, l]));
   const curLessons = new Map(currentState.lessons.map((l) => [l.id, l]));
 
-  const lessonsAdded: Array<{ id: string; title: string }> = [];
-  const lessonsRemoved: Array<{ id: string; title: string }> = [];
+  const lessonsAdded: Array<{ id: string; displayId?: string; title: string }> = [];
+  const lessonsRemoved: Array<{ id: string; displayId?: string; title: string }> = [];
   const lessonsUpdated: LessonChange[] = [];
-  const lessonsReinforced: Array<{ id: string; title: string; from: number; to: number }> = [];
+  const lessonsReinforced: Array<{ id: string; displayId?: string; title: string; from: number; to: number }> = [];
 
   for (const [id, cur] of curLessons) {
     const snap = snapLessons.get(id);
     if (!snap) {
-      lessonsAdded.push({ id, title: cur.title });
+      lessonsAdded.push({ id, displayId: cur.displayId ?? undefined, title: cur.title });
     } else {
       const changedFields: string[] = [];
       if (snap.title !== cur.title) changedFields.push("title");
@@ -407,16 +412,16 @@ export function diffStates(
       if (JSON.stringify([...snap.tags].sort()) !== JSON.stringify([...cur.tags].sort())) changedFields.push("tags");
       if (snap.supersedes !== cur.supersedes) changedFields.push("supersedes");
       if (changedFields.length > 0) {
-        lessonsUpdated.push({ id, title: cur.title, changedFields });
+        lessonsUpdated.push({ id, displayId: cur.displayId ?? undefined, title: cur.title, changedFields });
       }
       if (snap.reinforcements !== cur.reinforcements) {
-        lessonsReinforced.push({ id, title: cur.title, from: snap.reinforcements, to: cur.reinforcements });
+        lessonsReinforced.push({ id, displayId: cur.displayId ?? undefined, title: cur.title, from: snap.reinforcements, to: cur.reinforcements });
       }
     }
   }
   for (const [id, snap] of snapLessons) {
     if (!curLessons.has(id)) {
-      lessonsRemoved.push({ id, title: snap.title });
+      lessonsRemoved.push({ id, displayId: snap.displayId ?? undefined, title: snap.title });
     }
   }
 
@@ -457,7 +462,7 @@ export async function buildRecap(
   const next = nextTicket(currentState);
   const nextTicketAction =
     next.kind === "found"
-      ? { id: next.ticket.id, title: next.ticket.title, phase: next.ticket.phase }
+      ? { id: next.ticket.id, displayId: next.ticket.displayId ?? undefined, title: next.ticket.title, phase: next.ticket.phase }
       : null;
 
   const highSeverityIssues = currentState.issues
@@ -466,7 +471,7 @@ export async function buildRecap(
         i.status !== "resolved" &&
         (i.severity === "critical" || i.severity === "high"),
     )
-    .map((i) => ({ id: i.id, title: i.title, severity: i.severity }));
+    .map((i) => ({ id: i.id, displayId: i.displayId ?? undefined, title: i.title, severity: i.severity }));
 
   if (!snapshotInfo) {
     return {

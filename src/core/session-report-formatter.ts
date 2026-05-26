@@ -104,7 +104,7 @@ function buildTicketSection(state: FullSessionState): string {
       return [
         "## Ticket Progression",
         "",
-        `In progress: **${current.id}** — ${current.title} (risk: ${current.risk ?? "unknown"})`,
+        `In progress: **${current.displayId ?? current.id}** — ${current.title} (risk: ${current.risk ?? "unknown"})`,
       ].join("\n");
     }
     return "## Ticket Progression\n\nNo tickets completed.";
@@ -119,7 +119,7 @@ function buildTicketSection(state: FullSessionState): string {
       ? formatDuration(t.startedAt, t.completedAt)
       : null;
     const durationPart = duration ? ` | duration: ${duration}` : "";
-    lines.push(`- **${t.id}:** ${t.title} | risk: ${risk}${durationPart} | commit: \`${t.commitHash ?? "?"}\``);
+    lines.push(`- **${t.displayId ?? t.id}:** ${t.title} | risk: ${risk}${durationPart} | commit: \`${t.commitHash ?? "?"}\``);
   }
   return lines.join("\n");
 }
@@ -256,8 +256,8 @@ export interface CompactReportData {
   readonly state: FullSessionState;
   readonly endedAt?: string;
   readonly remainingWork?: {
-    tickets: { id: string; title: string }[];
-    issues: { id: string; title: string; severity: string }[];
+    tickets: { id: string; title: string; displayId?: string }[];
+    issues: { id: string; title: string; severity: string; displayId?: string }[];
   };
 }
 
@@ -284,7 +284,7 @@ export function formatCompactReport(data: CompactReportData): string {
         ? formatDuration(t.startedAt, t.completedAt)
         : "--";
       const safeTitle = (t.title ?? "").replace(/\|/g, "\\|");
-      lines.push(`| ${t.id} | ${safeTitle} | ${ticketDuration} |`);
+      lines.push(`| ${t.displayId ?? t.id} | ${safeTitle} | ${ticketDuration} |`);
     }
 
     // Avg time per ticket
@@ -301,10 +301,10 @@ export function formatCompactReport(data: CompactReportData): string {
   if (remainingWork && (remainingWork.tickets.length > 0 || remainingWork.issues.length > 0)) {
     lines.push("", "### What's Left");
     for (const t of remainingWork.tickets) {
-      lines.push(`- ${t.id}: ${t.title} (unblocked)`);
+      lines.push(`- ${t.displayId ?? t.id}: ${t.title} (unblocked)`);
     }
     for (const i of remainingWork.issues) {
-      lines.push(`- ${i.id}: ${i.title} (${i.severity})`);
+      lines.push(`- ${i.displayId ?? i.id}: ${i.title} (${i.severity})`);
     }
   }
 

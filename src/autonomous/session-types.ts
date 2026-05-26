@@ -121,11 +121,12 @@ export interface SessionState {
   readonly lastGuideCall?: string;
   readonly ticket?: {
     readonly id: string;
+    readonly displayId?: string;
     readonly title: string;
     readonly risk?: string;
   };
   readonly currentIssue?: CurrentIssueRef | null;
-  readonly completedTickets?: ReadonlyArray<{ readonly id: string }>;
+  readonly completedTickets?: ReadonlyArray<{ readonly id: string; readonly displayId?: string }>;
   readonly resolvedIssues?: ReadonlyArray<string>;
   readonly contextPressure?: {
     readonly level: string;
@@ -359,6 +360,7 @@ export const SessionStateSchema = z.object({
   // Ticket in progress
   ticket: z.object({
     id: z.string(),
+    displayId: z.string().optional(),
     title: z.string(),
     risk: z.string().optional(),
     realizedRisk: z.string().optional(),
@@ -405,6 +407,7 @@ export const SessionStateSchema = z.object({
   // Completed tickets this session
   completedTickets: z.array(z.object({
     id: z.string(),
+    displayId: z.string().optional(),
     title: z.string().optional(),
     commitHash: z.string().optional(),
     risk: z.string().optional(),
