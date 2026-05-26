@@ -62,6 +62,7 @@ import { formatCompactReport } from "../core/session-report-formatter.js";
 import { isTargetedMode, getRemainingTargets, buildTargetedCandidatesText, buildTargetedPickInstruction, buildTargetedStuckHandover } from "./target-work.js";
 import { buildAutoStartEventData, buildTieredStartEventData } from "./event-data.js";
 import { resolveWorkId } from "./id-resolution.js";
+import { checkAutonomousConflicts } from "./conflicts-guard.js";
 import { detectBranchAffinity, buildAffinityAnnotation } from "./branch-affinity.js";
 import {
   handleHandoverLatest,
@@ -1035,6 +1036,13 @@ async function handleStart(root: string, args: GuideInput): Promise<McpToolResul
 
     // Load context
     const { state: projectState, warnings } = await loadProject(root);
+
+    const conflictsError = checkAutonomousConflicts(projectState);
+    if (conflictsError) {
+      abortSession();
+      return guideError(new Error(conflictsError));
+    }
+
     const handoversDir = join(root, ".story", "handovers");
     const ctx: CommandContext = { state: projectState, warnings, root, handoversDir, format: "md" };
 
@@ -1594,6 +1602,18 @@ async function handleReport(root: string, args: GuideInput): Promise<McpToolResu
       `Session ${args.sessionId} is in COMPACT state. ` +
       `Call action: "resume" before reporting completion, or run ` +
       `"storybloq session stop ${args.sessionId}" if the session is stuck.`,
+    ));
+  }
+
+  try {
+    const { state: reportProjectState } = await loadProject(root);
+    const conflictsError = checkAutonomousConflicts(reportProjectState);
+    if (conflictsError) {
+      return guideError(new Error(conflictsError));
+    }
+  } catch {
+    return guideError(new Error(
+      "Cannot verify conflict-free project state. Ensure .story/ is intact and retry.",
     ));
   }
 
