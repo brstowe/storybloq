@@ -31,6 +31,7 @@ import { handleStatus } from "./commands/status.js";
 import { handleValidate } from "./commands/validate.js";
 import { handleRepair, computeRepairs } from "./commands/repair.js";
 import { handleReconcile } from "./commands/reconcile.js";
+import { handleTeamDoctor } from "./commands/team-doctor.js";
 import {
   handleHandoverList,
   handleHandoverLatest,
@@ -231,6 +232,39 @@ export function registerReconcileCommand(yargs: Argv): Argv {
         process.exitCode = result.exitCode;
       }
     },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// team
+// ---------------------------------------------------------------------------
+
+export function registerTeamCommand(yargs: Argv): Argv {
+  return yargs.command(
+    "team",
+    "Team-mode commands",
+    (y) =>
+      y.command(
+        "doctor",
+        "Run team health checks on the project",
+        (y2) =>
+          y2
+            .option("ci", { type: "boolean", default: false, describe: "Exit non-zero on error-level findings" })
+            .option("format", { type: "string", choices: ["md", "json"], default: "md", describe: "Output format" }),
+        async (argv) => {
+          const root = (await import("../core/project-root-discovery.js")).discoverProjectRoot();
+          const result = await handleTeamDoctor(root, {
+            ci: argv.ci as boolean,
+            format: (argv.format as "md" | "json") ?? "md",
+          });
+          writeOutput(result.output);
+          if (result.exitCode !== undefined && result.exitCode !== 0) {
+            process.exitCode = result.exitCode;
+          }
+        },
+      )
+      .demandCommand(1, ""),
+    () => {},
   );
 }
 

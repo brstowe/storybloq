@@ -12,6 +12,7 @@ import type { ValidationResult } from "./validation.js";
 import type { NextTicketOutcome, NextTicketsOutcome } from "./queries.js";
 import type { RecommendResult } from "./recommend.js";
 import type { ReconcileResult } from "./reconcile.js";
+import type { DoctorResult } from "./team-doctor.js";
 import type { ActiveSessionSummary } from "./session-scan.js";
 import type { SelftestResult } from "../cli/commands/selftest.js";
 import { phasesWithStatus, isBlockerCleared } from "./queries.js";
@@ -1527,4 +1528,51 @@ export function formatReconcileResult(
     }
   }
   return lines.join("\n");
+}
+
+export function formatDoctorResult(
+  result: DoctorResult,
+  format: OutputFormat,
+): string {
+  if (format === "json") {
+    return JSON.stringify(successEnvelope(result), null, 2);
+  }
+  if (result.findings.length === 0) {
+    return "Team doctor: all checks passed.";
+  }
+  const lines = ["# Team Doctor", ""];
+  lines.push(`${result.errorCount} error(s), ${result.warningCount} warning(s), ${result.infoCount} info`);
+  lines.push("");
+
+  const grouped: Record<string, typeof result.findings> = { error: [], warning: [], info: [] };
+  for (const f of result.findings) {
+    grouped[f.severity]!.push(f);
+  }
+
+  for (const severity of ["error", "warning", "info"] as const) {
+    const group = grouped[severity]!;
+    if (group.length === 0) continue;
+    lines.push(`## ${severity.charAt(0).toUpperCase() + severity.slice(1)}s`, "");
+    for (const f of group) {
+      const entityPart = f.entity ? ` (${escapeMarkdownInline(f.entity)})` : "";
+      lines.push(`- **${f.code}**${entityPart}: ${escapeMarkdownInline(f.message)}`);
+      if (f.repair) {
+        if ("command" in f.repair) {
+          lines.push(`  Fix: \`${f.repair.command.map(shellQuote).join(" ")}\``);
+        } else {
+          for (const step of f.repair.manualSteps) {
+            lines.push(`  Fix: ${escapeMarkdownInline(step)}`);
+          }
+        }
+      }
+    }
+    lines.push("");
+  }
+
+  return lines.join("\n").trimEnd();
+}
+
+function shellQuote(arg: string): string {
+  if (/^[a-zA-Z0-9_./@:-]+$/.test(arg)) return arg;
+  return `'${arg.replace(/'/g, "'\\''")}'`;
 }
