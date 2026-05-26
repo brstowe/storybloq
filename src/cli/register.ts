@@ -1168,6 +1168,47 @@ export function registerTicketCommand(yargs: Argv): Argv {
           },
         )
         .command(
+          "move <id>",
+          "Move a ticket relative to another (fractional rank)",
+          (y2) =>
+            addFormatOption(
+              y2
+                .positional("id", { type: "string", demandOption: true, describe: "Ticket ID to move" })
+                .option("after", { type: "string", describe: "Place after this ticket" })
+                .option("before", { type: "string", describe: "Place before this ticket" }),
+            ),
+          async (argv) => {
+            const format = parseOutputFormat(argv.format);
+            const id = parseTicketId(argv.id as string);
+            const root = (await import("../core/project-root-discovery.js")).discoverProjectRoot();
+            if (!root) {
+              writeOutput(formatError("not_found", "No .story/ project found.", format));
+              process.exitCode = ExitCode.USER_ERROR;
+              return;
+            }
+            try {
+              const { handleTicketMove } = await import("./commands/move.js");
+              const result = await handleTicketMove(id, root, {
+                after: argv.after as string | undefined,
+                before: argv.before as string | undefined,
+                format: format as "md" | "json",
+              });
+              writeOutput(result.output);
+              if (result.exitCode) process.exitCode = result.exitCode;
+            } catch (err: unknown) {
+              const { ProjectLoaderError } = await import("../core/errors.js");
+              if (err instanceof ProjectLoaderError) {
+                writeOutput(formatError(err.code, err.message, format));
+                process.exitCode = ExitCode.USER_ERROR;
+                return;
+              }
+              const message = err instanceof Error ? err.message : String(err);
+              writeOutput(formatError("io_error", message, format));
+              process.exitCode = ExitCode.USER_ERROR;
+            }
+          },
+        )
+        .command(
           "delete <id>",
           "Delete a ticket",
           (y2) =>
