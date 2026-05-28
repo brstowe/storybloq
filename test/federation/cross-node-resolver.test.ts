@@ -295,6 +295,94 @@ describe("CrossNodeBlockingResolver", () => {
     });
   });
 
+  // ISS-687: canonical-ID and reconciled-child cross-node refs
+  describe("canonical-ID and displayId-fallback cross-node refs (ISS-687)", () => {
+    const CANON_TICKET = "t-k7m2p9x3w4a5b6e8";
+    const CANON_ISSUE = "i-k7m2p9x3w4a5b6e8";
+
+    async function createNodeWithRawFiles(
+      name: string,
+      tickets: Array<{ file: string; content: Record<string, unknown> }>,
+      issues: Array<{ file: string; content: Record<string, unknown> }> = [],
+    ): Promise<string> {
+      const dir = await mkdtemp(join(tmpdir(), `fed-xnode-${name}-`));
+      tmpDirs.push(dir);
+      const storyDir = join(dir, ".story");
+      await mkdir(join(storyDir, "tickets"), { recursive: true });
+      await mkdir(join(storyDir, "issues"), { recursive: true });
+      for (const t of tickets) await writeFile(join(storyDir, "tickets", t.file), JSON.stringify(t.content));
+      for (const i of issues) await writeFile(join(storyDir, "issues", i.file), JSON.stringify(i.content));
+      return dir;
+    }
+
+    function nodeMap(name: string, dir: string): Map<string, ResolvedNode> {
+      return new Map<string, ResolvedNode>([
+        [name, { resolved: true, absolutePath: dir, storyDir: join(dir, ".story"), rawPath: dir }],
+      ]);
+    }
+
+    it("resolves a canonical-ID ticket ref from tickets/ (not issues/)", async () => {
+      const dir = await createNodeWithRawFiles("engine", [
+        { file: `${CANON_TICKET}.json`, content: { id: CANON_TICKET, displayId: "T-061", status: "complete" } },
+      ]);
+      const ticket = makeTicketWithCrossRef("T-001", [`engine:${CANON_TICKET}`]);
+      const resolver = await CrossNodeBlockingResolver.build([ticket], nodeMap("engine", dir));
+      expect(resolver.getCrossNodeStatus(`engine:${CANON_TICKET}`)).toEqual({ resolved: true, status: "complete" });
+      expect(resolver.isCrossNodeBlocked(ticket)).toBe(false);
+    });
+
+    it("blocks on an open canonical-ID ticket ref (proves tickets/ routing)", async () => {
+      const dir = await createNodeWithRawFiles("engine", [
+        { file: `${CANON_TICKET}.json`, content: { id: CANON_TICKET, displayId: "T-061", status: "open" } },
+      ]);
+      const ticket = makeTicketWithCrossRef("T-001", [`engine:${CANON_TICKET}`]);
+      const resolver = await CrossNodeBlockingResolver.build([ticket], nodeMap("engine", dir));
+      expect(resolver.isCrossNodeBlocked(ticket)).toBe(true);
+    });
+
+    it("resolves a canonical-ID issue ref from issues/", async () => {
+      const dir = await createNodeWithRawFiles("engine", [], [
+        { file: `${CANON_ISSUE}.json`, content: { id: CANON_ISSUE, displayId: "ISS-009", status: "open" } },
+      ]);
+      const ticket = makeTicketWithCrossRef("T-001", [`engine:${CANON_ISSUE}`]);
+      const resolver = await CrossNodeBlockingResolver.build([ticket], nodeMap("engine", dir));
+      expect(resolver.isCrossNodeBlocked(ticket)).toBe(true);
+    });
+
+    it("resolves a display-form ref against a reconciled child via displayId fallback", async () => {
+      // File is named by canonical id; the display ref T-061 must resolve by scanning content.
+      const dir = await createNodeWithRawFiles("engine", [
+        { file: `${CANON_TICKET}.json`, content: { id: CANON_TICKET, displayId: "T-061", status: "complete" } },
+      ]);
+      const ticket = makeTicketWithCrossRef("T-001", ["engine:T-061"]);
+      const resolver = await CrossNodeBlockingResolver.build([ticket], nodeMap("engine", dir));
+      expect(resolver.getCrossNodeStatus("engine:T-061")).toEqual({ resolved: true, status: "complete" });
+      expect(resolver.isCrossNodeBlocked(ticket)).toBe(false);
+    });
+
+    it("resolves a display ref via previousDisplayIds when the child was renumbered", async () => {
+      const dir = await createNodeWithRawFiles("engine", [
+        { file: `${CANON_TICKET}.json`, content: { id: CANON_TICKET, displayId: "T-067", previousDisplayIds: ["T-061"], status: "open" } },
+      ]);
+      const ticket = makeTicketWithCrossRef("T-001", ["engine:T-061"]);
+      const resolver = await CrossNodeBlockingResolver.build([ticket], nodeMap("engine", dir));
+      expect(resolver.isCrossNodeBlocked(ticket)).toBe(true);
+    });
+
+    it("current displayId match wins over a previousDisplayIds match on another item", async () => {
+      const other = "t-r4n6w8y2a3b5c7d9";
+      const dir = await createNodeWithRawFiles("engine", [
+        { file: `${CANON_TICKET}.json`, content: { id: CANON_TICKET, displayId: "T-061", status: "complete" } },
+        { file: `${other}.json`, content: { id: other, displayId: "T-070", previousDisplayIds: ["T-061"], status: "open" } },
+      ]);
+      const ticket = makeTicketWithCrossRef("T-001", ["engine:T-061"]);
+      const resolver = await CrossNodeBlockingResolver.build([ticket], nodeMap("engine", dir));
+      // The current displayId owner (complete) wins over the previousDisplayIds owner (open).
+      expect(resolver.getCrossNodeStatus("engine:T-061")).toEqual({ resolved: true, status: "complete" });
+      expect(resolver.isCrossNodeBlocked(ticket)).toBe(false);
+    });
+  });
+
   describe("multi-node fan-out", () => {
     it("resolves refs across two different nodes", async () => {
       const engineDir = await createNodeWithTickets("engine", [{ id: "T-010", status: "complete" }]);
