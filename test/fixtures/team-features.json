@@ -1,0 +1,12 @@
+[
+  "canonical-ids",
+  "claims",
+  "fractional-rank",
+  "global-conflict-blocking",
+  "merge-driver",
+  "reconcile",
+  "remote-ref-reservations",
+  "resolver",
+  "team-config",
+  "tombstones"
+]

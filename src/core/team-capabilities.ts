@@ -2,7 +2,11 @@ import { createRequire } from "node:module";
 import type { Config } from "../models/config.js";
 import { ProjectLoaderError } from "./errors.js";
 
-const SUPPORTED_TEAM_FEATURES = new Set([
+// Canonical team-feature vocabulary the CLI implements. ISS-684: this MUST stay
+// byte-for-byte identical to the Swift Config.TeamCapabilities.supportedFeatures
+// (ClaudeStoryModels/Config.swift) -- both write paths gate on the same set so a
+// partially-implemented client fails closed.
+export const SUPPORTED_TEAM_FEATURES = new Set([
   "canonical-ids",
   "claims",
   "fractional-rank",
