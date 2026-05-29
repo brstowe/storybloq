@@ -18,6 +18,7 @@ import {
   writeFileSync,
   readFileSync,
   existsSync,
+  chmodSync,
 } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -26,6 +27,8 @@ import {
   type SynthesizeInput,
   type SynthesizeOutput,
 } from "../../../src/autonomous/review-lenses/mcp-handlers.js";
+import { writeReviewSnapshot } from "../../../src/autonomous/review-lenses/index.js";
+import { SnapshotIntegrityError } from "../../../src/autonomous/review-lenses/verification.js";
 
 // ── Fixtures ──────────────────────────────────────────────────────
 
@@ -115,8 +118,10 @@ describe("handleSynthesize verification gate", () => {
     expect(typeof vc.proposed).toBe("number");
     expect(typeof vc.verified).toBe("number");
     expect(typeof vc.rejected).toBe("number");
-    // Without a real snapshot, integrity failure always occurs
-    expect(output.snapshotIntegrityFailure).toBe(true);
+    // ISS-715: with no real snapshot the gate skips verification rather than
+    // reporting a false integrity failure.
+    expect(output.snapshotIntegrityFailure).toBe(false);
+    expect(output.verificationSkipped).toBe(true);
     expect(vc.verified).toBe(0);
     expect(vc.rejected).toBe(0);
     expect(vc.proposed).toBeGreaterThan(0);
@@ -152,7 +157,7 @@ describe("handleSynthesize verification gate", () => {
     expect(output.verificationSkipped).toBe(true);
   });
 
-  it("sets snapshotIntegrityFailure with no duplicates and preExisting=[]", () => {
+  it("skips verification with no duplicates and preExisting=[] when no snapshot exists (ISS-715)", () => {
     const projectRoot = setupProjectRoot(tmpDir);
     const sessionDir = join(tmpDir, "session");
     mkdirSync(sessionDir, { recursive: true });
@@ -165,18 +170,19 @@ describe("handleSynthesize verification gate", () => {
 
     const output = handleSynthesize(input);
 
-    // Without a real snapshot, integrity failure always fires
-    expect(output.snapshotIntegrityFailure).toBe(true);
+    // ISS-715: no snapshot exists, so verification is skipped (not a failure)
+    expect(output.snapshotIntegrityFailure).toBe(false);
+    expect(output.verificationSkipped).toBe(true);
     // No duplicate findings in output
     const ids = output.validatedFindings.map(f => f.issueKey);
     expect(ids.length).toBe(new Set(ids).size);
-    // preExisting should be empty on integrity failure
+    // preExisting should be empty on the skip path
     expect(output.preExistingFindings).toEqual([]);
     // verified counter should be 0
     expect(output.verificationCounters.verified).toBe(0);
   });
 
-  it("SnapshotIntegrityError skips rejection logging entirely", () => {
+  it("skip path writes no rejection log (ISS-715)", () => {
     const projectRoot = setupProjectRoot(tmpDir);
     const sessionDir = join(tmpDir, "session");
     mkdirSync(sessionDir, { recursive: true });
@@ -189,7 +195,7 @@ describe("handleSynthesize verification gate", () => {
 
     handleSynthesize(input);
 
-    // T-257: on integrity failure, verification.log should NOT be written
+    // On the skip path (no snapshot), verification.log should NOT be written
     expect(existsSync(join(sessionDir, "verification.log"))).toBe(false);
   });
 
@@ -225,8 +231,9 @@ describe("handleSynthesize verification gate", () => {
 
     // T-257: logWriteFailures should not change the finding partition
     expect(typeof output.logWriteFailures).toBe("number");
-    // On integrity failure (no real snapshot): verified=0, rejected=0
-    expect(output.snapshotIntegrityFailure).toBe(true);
+    // ISS-715: skip path (no real snapshot): verified=0, rejected=0
+    expect(output.snapshotIntegrityFailure).toBe(false);
+    expect(output.verificationSkipped).toBe(true);
     expect(output.verificationCounters.verified).toBe(0);
     expect(output.verificationCounters.rejected).toBe(0);
   });
@@ -296,5 +303,37 @@ describe("handleSynthesize verification gate", () => {
     expect(entry).toHaveProperty("verified");
     expect(entry).toHaveProperty("rejected");
     expect(entry).toHaveProperty("timestamp");
+  });
+
+  it("throws (does not silently degrade) when a snapshot exists but is corrupt (ISS-715)", () => {
+    // A present-but-corrupt snapshot is a genuine integrity violation: the gate
+    // must surface it (throw -> MCP isError) rather than skip or pass findings
+    // through as if verified.
+    const projectRoot = join(tmpDir, "corrupt-project");
+    const sessionId = "a0a0a0a0-b1b1-c2c2-d3d3-e4e4e4e4e4e4";
+    const reviewId = "code-review-r1";
+    mkdirSync(join(projectRoot, ".story"), { recursive: true });
+    writeFileSync(join(projectRoot, ".story", "config.json"), JSON.stringify({ version: 2, recipeOverrides: {} }));
+    const sessionDir = join(projectRoot, ".story", "sessions", sessionId);
+    mkdirSync(sessionDir, { recursive: true });
+    mkdirSync(join(projectRoot, "src"), { recursive: true });
+    writeFileSync(join(projectRoot, "src", "a.ts"), "line1\nline2\nline3\n");
+
+    writeReviewSnapshot({ projectRoot, sessionId, reviewId, stage: "code-review", round: 1, files: ["src/a.ts"] });
+
+    // Corrupt the snapshot manifest (it is written read-only) so the reader
+    // throws a non-ENOENT error: a present-but-broken snapshot, not an absent one.
+    const manifestPath = join(sessionDir, "review-snapshot", reviewId, "manifest.json");
+    chmodSync(manifestPath, 0o644);
+    writeFileSync(manifestPath, "{ not valid json");
+
+    const input = makeSynthesizeInput({
+      projectRoot,
+      sessionDir,
+      sessionId,
+      metadata: { activeLenses: ["security", "clean-code"], skippedLenses: [], reviewRound: 1, reviewId },
+    });
+
+    expect(() => handleSynthesize(input)).toThrow(SnapshotIntegrityError);
   });
 });

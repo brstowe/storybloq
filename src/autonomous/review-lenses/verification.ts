@@ -113,6 +113,10 @@ export interface SnapshotContext {
 }
 
 export type SnapshotIntegrityCode =
+  // ISS-715: distinguishes "no snapshot exists for this review" (benign: the
+  // verification gate skips) from a snapshot that exists but fails its
+  // integrity contract (must escalate). snapshot_absent is NOT a tamper signal.
+  | "snapshot_absent"
   | "manifest_load_failed"
   | "snapshot_tampered"
   | "payload_symlink"
@@ -165,9 +169,17 @@ export function loadSnapshot(ctx: SnapshotContext): PreloadedSnapshot {
     manifest = loaded.manifest;
     manifestBytes = loaded.manifestBytes;
   } catch (err) {
+    // ISS-715: classify "no snapshot to load" (ENOENT, or an unaddressable
+    // sessionId/reviewId) as snapshot_absent so the gate can skip rather than
+    // report a false integrity failure. Anything else (digest/manifest
+    // mismatch, parse error) is a genuine integrity violation to escalate.
+    const code = (err as NodeJS.ErrnoException)?.code;
+    const message = (err as Error)?.message ?? "";
+    const absent =
+      code === "ENOENT" || /invalid reviewId|invalid sessionId/.test(message);
     throw new SnapshotIntegrityError(
-      "manifest_load_failed",
-      `review-snapshot reader refused manifest: ${(err as Error).message}`,
+      absent ? "snapshot_absent" : "manifest_load_failed",
+      `review-snapshot reader refused manifest: ${message}`,
     );
   }
 

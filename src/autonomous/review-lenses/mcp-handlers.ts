@@ -222,7 +222,6 @@ function runVerificationGate(
   const verified: LensFinding[] = [];
   const strictlyVerified: LensFinding[] = [];
   const rejected: Array<{ finding: LensFinding; result: VerifyFail }> = [];
-  let snapshotIntegrityFailure = false;
   let verificationRuntimeErrors = 0;
   let logWriteFailures = 0;
 
@@ -230,44 +229,46 @@ function runVerificationGate(
   try {
     snapshot = loadSnapshot(ctx);
   } catch (err) {
-    if (err instanceof SnapshotIntegrityError) {
-      snapshotIntegrityFailure = true;
-    } else {
-      throw err;
+    if (err instanceof SnapshotIntegrityError && err.code === "snapshot_absent") {
+      // ISS-715: no snapshot exists for this review (no session, a stage that
+      // does not snapshot, or a write that was skipped). There is nothing to
+      // verify against, so skip rather than reporting a false integrity
+      // failure. Findings still pass through to the merger unverified.
+      return {
+        verifiedFindings: allFindings,
+        verifiedForFiling: [],
+        rejectedCount: 0,
+        snapshotIntegrityFailure: false,
+        verificationSkipped: true,
+        logWriteFailures: 0,
+        verificationRuntimeErrors: 0,
+      };
     }
+    // ISS-715: a genuine integrity violation (snapshot present but corrupt or
+    // tampered) must not degrade silently. Rethrow so the synthesize MCP tool
+    // returns isError and the agent escalates the round instead of treating
+    // unverified findings as verified.
+    throw err;
   }
 
-  if (!snapshotIntegrityFailure) {
-    for (const finding of allFindings) {
-      try {
-        const result = verifyLensFindingPreloaded(finding, snapshot!);
-        if (result.pass) {
-          verified.push(finding);
-          strictlyVerified.push(finding);
-        } else {
-          rejected.push({ finding, result });
-        }
-      } catch (err) {
-        if (err instanceof SnapshotIntegrityError) {
-          snapshotIntegrityFailure = true;
-          break;
-        }
+  for (const finding of allFindings) {
+    try {
+      const result = verifyLensFindingPreloaded(finding, snapshot!);
+      if (result.pass) {
         verified.push(finding);
-        verificationRuntimeErrors++;
+        strictlyVerified.push(finding);
+      } else {
+        rejected.push({ finding, result });
       }
+    } catch (err) {
+      if (err instanceof SnapshotIntegrityError) {
+        // ISS-715: a payload that was present at load but fails its integrity
+        // check mid-verification is a genuine tamper signal. Surface it.
+        throw err;
+      }
+      verified.push(finding);
+      verificationRuntimeErrors++;
     }
-  }
-
-  if (snapshotIntegrityFailure) {
-    return {
-      verifiedFindings: allFindings,
-      verifiedForFiling: [],
-      rejectedCount: 0,
-      snapshotIntegrityFailure: true,
-      verificationSkipped: false,
-      logWriteFailures: 0,
-      verificationRuntimeErrors,
-    };
   }
 
   if (rejected.length > 0 && opts.sessionDir) {
