@@ -181,6 +181,64 @@ describe("prepare -> synthesize snapshot wiring (ISS-714)", () => {
     expect(output.verificationCounters.rejected).toBe(0);
   });
 
+  it("verifies a lens finding on a newly-added file that is in the diff but omitted from changedFiles (ISS-722)", () => {
+    // Real CODE_REVIEW flow: the agent builds changedFiles via `git diff --name-only`
+    // (which omits an untracked/new file), while the diff handed to the lenses DOES
+    // include it. The new file must still be snapshotted so a finding quoting it
+    // verifies instead of being silently dropped as file_not_snapshotted.
+    const NEW_FILE = "src/added.ts";
+    writeFileSync(join(projectRoot, NEW_FILE), "const a = 1;\nconst b = 2;\n");
+    const newFileDiff = `--- /dev/null\n+++ b/${NEW_FILE}\n@@ -0,0 +1,2 @@\n+const a = 1;\n+const b = 2;\n`;
+    const combinedDiff = DIFF + newFileDiff;
+
+    const prep = handlePrepare({
+      stage: "CODE_REVIEW",
+      diff: combinedDiff,
+      changedFiles: [FILE], // NEW_FILE intentionally omitted -- name-only misses untracked files
+      ticketDescription: "Add a file",
+      reviewRound: 1,
+      projectRoot,
+      sessionId,
+    });
+    expect(prep.metadata.reviewId).toBe("code-review-r1");
+
+    const sessionDir = join(projectRoot, ".story", "sessions", sessionId);
+    const newFileFinding = {
+      lens: "security",
+      lensVersion: "security-v2",
+      severity: "major",
+      recommendedImpact: "needs-revision",
+      category: "test",
+      description: "Finding on the newly-added file",
+      file: NEW_FILE,
+      line: 1,
+      evidence: [{ file: NEW_FILE, startLine: 1, endLine: 1, code: "const a = 1;" }],
+      suggestedFix: null,
+      confidence: 0.9,
+      assumptions: null,
+      requiresMoreContext: false,
+    };
+
+    const output = handleSynthesize({
+      stage: "CODE_REVIEW",
+      lensResults: [{ lens: "security", status: "complete", findings: [newFileFinding] }],
+      metadata: { activeLenses: ["security"], skippedLenses: [], reviewRound: 1, reviewId: prep.metadata.reviewId },
+      projectRoot,
+      sessionId,
+      sessionDir,
+      diff: combinedDiff,
+      changedFiles: [FILE],
+    });
+
+    // After ISS-722 the new file is snapshotted (its path comes from the diff), so the
+    // finding verifies. Before the fix it hit file_not_snapshotted -> rejected -> dropped.
+    expect(output.snapshotIntegrityFailure).toBe(false);
+    expect(output.verificationSkipped).toBe(false);
+    expect(output.verificationCounters.proposed).toBe(1);
+    expect(output.verificationCounters.verified).toBe(1);
+    expect(output.verificationCounters.rejected).toBe(0);
+  });
+
   it("falls back to a non-addressable reviewId when the fresh-slot write produces nothing, so the gate skips rather than loading a stale snapshot (ISS-714)", () => {
     const sessionDir = join(projectRoot, ".story", "sessions", sessionId);
 
@@ -191,10 +249,13 @@ describe("prepare -> synthesize snapshot wiring (ISS-714)", () => {
     });
     expect(prep1.metadata.reviewId).toBe("code-review-r1");
 
-    // Re-prepare for the same round, but with no snapshottable file (it does not
-    // exist), so the fresh-slot write produces nothing.
+    // Re-prepare for the same round with NO snapshottable file. Both changedFiles
+    // AND the diff reference a non-existent file, so the ISS-722 union of
+    // (changedFiles + diff paths) still has nothing on disk to snapshot and the
+    // fresh-slot write produces nothing.
+    const ghostDiff = `--- a/src/does-not-exist.ts\n+++ b/src/does-not-exist.ts\n@@ -1 +1 @@\n-const x = 1;\n+const x = 2;\n`;
     const prep2 = handlePrepare({
-      stage: "CODE_REVIEW", diff: DIFF, changedFiles: ["src/does-not-exist.ts"],
+      stage: "CODE_REVIEW", diff: ghostDiff, changedFiles: ["src/does-not-exist.ts"],
       ticketDescription: "Add y", reviewRound: 1, projectRoot, sessionId,
     });
     // The reviewId must NOT be the round-based id (which would resolve to the
@@ -205,7 +266,7 @@ describe("prepare -> synthesize snapshot wiring (ISS-714)", () => {
       stage: "CODE_REVIEW",
       lensResults: [{ lens: "security", status: "complete", findings: [makeFinding("const y = 2;")] }],
       metadata: { activeLenses: ["security"], skippedLenses: [], reviewRound: 1, reviewId: prep2.metadata.reviewId },
-      projectRoot, sessionId, sessionDir, diff: DIFF, changedFiles: ["src/does-not-exist.ts"],
+      projectRoot, sessionId, sessionDir, diff: ghostDiff, changedFiles: ["src/does-not-exist.ts"],
     });
 
     // Gate skips (no addressable snapshot) rather than verifying against stale r1.

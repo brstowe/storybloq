@@ -192,12 +192,22 @@ export function handlePrepare(input: PrepareInput): PrepareOutput {
   if (input.sessionId && input.stage === "CODE_REVIEW") {
     const snapshotSessionDir = sessionDir
       ?? join(input.projectRoot, ".story", "sessions", input.sessionId);
+    // ISS-722: the agent builds changedFiles with `git diff --name-only`, which omits
+    // newly-added/untracked files that the reviewed diff DOES include. Snapshotting only
+    // changedFiles left those files unsnapshotted, so a lens finding quoting a new file hit
+    // file_not_snapshotted -> rejected -> silently dropped from the merged verdict. Union in
+    // the paths the diff itself touches (parseDiffScope reads the +++ b/<path> headers) so the
+    // snapshot file set matches what the lenses actually reviewed. writeFreshReviewSnapshot
+    // still existsSync-filters, so paths with no on-disk file (e.g. pure deletions) are ignored.
+    const snapshotFiles = [
+      ...new Set([...input.changedFiles, ...parseDiffScope(input.diff).changedFiles]),
+    ];
     const snapReviewId = writeFreshReviewSnapshot({
       projectRoot: input.projectRoot,
       sessionId: input.sessionId,
       sessionDir: snapshotSessionDir,
       stage: stagePrefix,
-      changedFiles: input.changedFiles,
+      changedFiles: snapshotFiles,
     });
     if (snapReviewId) reviewId = snapReviewId;
   }
