@@ -1,3 +1,4 @@
+import { displayIdOf } from "../core/resolver.js";
 /**
  * T-188: Targeted auto mode helpers.
  *
@@ -72,7 +73,7 @@ export function buildTargetedCandidatesText(
     const issueResult = projectState.resolveIssueRef(id);
     if (issueResult.kind === "found") {
       const issue = issueResult.item;
-      const displayId = (issue as Record<string, unknown>).displayId as string | undefined ?? issue.id;
+      const displayId = displayIdOf(issue);
       lines.push(`${i + 1}. **${displayId}: ${issue.title}** (issue, ${issue.severity}) -- ${issueStatusLabel(issue.status)}`);
       if (!firstReady && (issue.status === "open" || issue.status === "inprogress")) {
         firstReady = { id: issue.id, displayId, kind: "issue" };
@@ -83,12 +84,12 @@ export function buildTargetedCandidatesText(
     const ticketResult = projectState.resolveTicketRef(id);
     if (ticketResult.kind === "found") {
       const ticket = ticketResult.item;
-      const displayId = (ticket as Record<string, unknown>).displayId as string | undefined ?? ticket.id;
+      const displayId = displayIdOf(ticket);
       const blocked = projectState.isBlocked(ticket);
       const complete = ticket.status === "complete";
       const blockerIds = ticket.blockedBy.map((bId) => {
         const bResult = projectState.resolveTicketRef(bId);
-        if (bResult.kind === "found") return (bResult.item as Record<string, unknown>).displayId as string | undefined ?? bResult.item.id;
+        if (bResult.kind === "found") return displayIdOf(bResult.item);
         return bId;
       });
       const status = complete ? "already complete" : blocked ? `blocked by ${blockerIds.join(", ")}` : "ready";

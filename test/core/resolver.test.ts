@@ -1,5 +1,21 @@
 import { describe, it, expect } from "vitest";
 import { makeTicket, makeIssue, makeState } from "./test-factories.js";
+import { displayIdOf } from "../../src/core/resolver.js";
+
+describe("displayIdOf (ISS-700/ISS-702)", () => {
+  it("returns the displayId when set", () => {
+    expect(displayIdOf({ id: "t-k7m2p9x3w4a5b6e8", displayId: "T-051" })).toBe("T-051");
+  });
+  it("falls back to the canonical id when displayId is absent", () => {
+    expect(displayIdOf({ id: "t-k7m2p9x3w4a5b6e8" })).toBe("t-k7m2p9x3w4a5b6e8");
+  });
+  it("falls back to the canonical id when displayId is null", () => {
+    expect(displayIdOf({ id: "T-001", displayId: null })).toBe("T-001");
+  });
+  it("treats a legacy item (displayId === id) as its own display id", () => {
+    expect(displayIdOf({ id: "T-030", displayId: "T-030" })).toBe("T-030");
+  });
+});
 
 describe("resolveTicketRef", () => {
   it("resolves legacy ID via primary index", () => {
