@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import type { ProjectState } from "./project-state.js";
 import type { LoadWarning } from "./errors.js";
 import { isClaimStale } from "./claims.js";
@@ -252,13 +253,103 @@ function checkLoadWarnings(_state: ProjectState, ctx: DoctorContext): DoctorFind
   }));
 }
 
-function checkStaleClaims(state: ProjectState): DoctorFinding[] {
+/** Lists remote branch names so the stale-claim check can detect deleted branches. */
+export type RemoteBranchLister = (root: string) => Set<string>;
+
+/**
+ * Parses `git branch -r` output into the set of branch names a claim may match.
+ * Every remote-tracking name is kept verbatim (e.g. `origin/feat/x`) so a claim
+ * recorded with its remote prefix matches exactly. Additionally, the names of
+ * the DEFAULT remote (`origin` if present, otherwise the sole remote) are added
+ * with the prefix stripped (`feat/x`), because claims record the local branch
+ * name and local work pushes to the default remote. Names are NOT stripped for
+ * non-default remotes: with multiple remotes a bare `feat/x` would be ambiguous,
+ * so only an exact `<remote>/feat/x` match counts for those. The symbolic HEAD
+ * line (`origin/HEAD -> origin/main`) is skipped.
+ */
+export function parseRemoteBranches(stdout: string): Set<string> {
+  const fullNames = new Set<string>();
+  const remotes = new Set<string>();
+  for (const raw of stdout.split("\n")) {
+    const line = raw.trim();
+    if (!line || line.includes("->")) continue;
+    fullNames.add(line);
+    const slash = line.indexOf("/");
+    if (slash !== -1) remotes.add(line.slice(0, slash));
+  }
+
+  const defaultRemote = remotes.has("origin")
+    ? "origin"
+    : remotes.size === 1
+      ? [...remotes][0]!
+      : null;
+
+  const names = new Set(fullNames);
+  if (defaultRemote !== null) {
+    const prefix = defaultRemote + "/";
+    for (const full of fullNames) {
+      if (full.startsWith(prefix)) names.add(full.slice(prefix.length));
+    }
+  }
+  return names;
+}
+
+/**
+ * Returns the set of remote branch names known to git, per N-059's stale-claim
+ * rule that checks branch existence via `git branch -r`. See parseRemoteBranches
+ * for the matching semantics. Returns an empty set when git is unavailable, the
+ * directory is not a repo, or no remote branches exist; callers skip the
+ * branch-gone check in that case because a deleted branch cannot be told apart
+ * from one that was never pushed.
+ */
+export function listRemoteBranchNames(root: string): Set<string> {
+  try {
+    const stdout = execFileSync("git", ["branch", "-r"], {
+      cwd: root,
+      encoding: "utf-8",
+      timeout: 5000,
+    });
+    return parseRemoteBranches(stdout);
+  } catch {
+    return new Set();
+  }
+}
+
+/**
+ * A claim's branch is "gone" when it is not among the known remote branches.
+ * An empty/whitespace branch yields false: with no branch recorded we cannot
+ * judge its existence and must not flag a false positive.
+ */
+export function isClaimBranchGone(
+  branch: string | undefined,
+  remoteBranches: ReadonlySet<string>,
+): boolean {
+  const trimmed = (branch ?? "").trim();
+  if (trimmed === "") return false;
+  return !remoteBranches.has(trimmed);
+}
+
+export function checkStaleClaims(
+  state: ProjectState,
+  ctx: DoctorContext,
+  listBranches: RemoteBranchLister = listRemoteBranchNames,
+): DoctorFinding[] {
   const findings: DoctorFinding[] = [];
   const threshold = state.config.team?.claimStalenessHours ?? 48;
   const now = Date.now();
 
+  // N-059 stale-claim condition 3: the claimed branch no longer exists, checked
+  // via `git branch -r`. Gather the remote branch set once. When git is
+  // unavailable or no remote branches exist the set is empty and the branch-gone
+  // check is skipped -- a deleted branch cannot be distinguished from one never
+  // pushed, so claims are not flagged on that basis.
+  const remoteBranches = listBranches(ctx.root);
+
   for (const t of state.tickets) {
     if (!t.claim) continue;
+    // Tombstoned tickets are hidden from every suggestion surface; a residual
+    // claim on a deleted ticket is handled by reconcile/gc, not flagged here.
+    if ((t as Record<string, unknown>).lifecycle === "deleted") continue;
 
     if (t.status === "complete") {
       findings.push({
@@ -273,6 +364,14 @@ function checkStaleClaims(state: ProjectState): DoctorFinding[] {
         severity: "warning",
         code: "stale_claim",
         message: `Ticket ${effectiveDisplayId(t)} has stale claim by ${t.claim.user} (since ${t.claim.since})`,
+        entity: t.id,
+        repair: { command: ["storybloq", "ticket", "unclaim", t.id] },
+      });
+    } else if (remoteBranches.size > 0 && isClaimBranchGone(t.claim.branch, remoteBranches)) {
+      findings.push({
+        severity: "warning",
+        code: "stale_claim",
+        message: `Ticket ${effectiveDisplayId(t)} has claim by ${t.claim.user} on branch '${t.claim.branch}' which no longer exists`,
         entity: t.id,
         repair: { command: ["storybloq", "ticket", "unclaim", t.id] },
       });
