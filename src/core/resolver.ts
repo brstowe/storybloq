@@ -49,9 +49,15 @@ export function buildPrevDisplayIndex<T>(
     if (Array.isArray(prev)) {
       for (const p of prev) {
         if (typeof p === "string") {
-          const existing = index.get(p);
+          // ISS-699/ISS-708: mirror Swift buildPreviousDisplayIdIndex -- trim each
+          // previous displayId and skip blank entries, indexing under the trimmed
+          // form. Previously TS keyed verbatim, so a hand-edited "  T-051 " resolved
+          // on Mac (trimmed key) but not via the CLI, and "" became a stray key.
+          const trimmed = p.trim();
+          if (trimmed === "") continue;
+          const existing = index.get(trimmed);
           if (existing) { existing.push(item); }
-          else { index.set(p, [item]); }
+          else { index.set(trimmed, [item]); }
         }
       }
     }

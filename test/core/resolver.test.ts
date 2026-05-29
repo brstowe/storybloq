@@ -134,6 +134,25 @@ describe("resolveTicketRef", () => {
     expect(result.kind).toBe("missing");
   });
 
+  it("trims previousDisplayIds and skips blank entries, mirroring Swift (ISS-699/708)", () => {
+    // A hand-edited file with a whitespace-padded previous id and a blank one. The
+    // prev index must key under the trimmed value and skip the blank, so a clean
+    // ref resolves via previousDisplayId and the blank does not become a key.
+    const t = makeTicket({
+      id: "t-k7m2p9x3w4a5b6e8",
+      displayId: "T-067",
+      previousDisplayIds: ["  T-051  ", "   "],
+    } as any);
+    const state = makeState({ tickets: [t] });
+
+    const trimmedHit = state.resolveTicketRef("T-051");
+    expect(trimmedHit.kind).toBe("found");
+    if (trimmedHit.kind === "found") expect(trimmedHit.matchedBy).toBe("previousDisplayId");
+
+    expect(state.resolveTicketRef("").kind).toBe("missing");
+    expect(state.resolveTicketRef("   ").kind).toBe("missing");
+  });
+
   it("treats an empty/whitespace displayId as absent, mirroring Swift (ISS-696)", () => {
     // Malformed/hand-edited item with a blank displayId. The display index must
     // fall back to the canonical id (not key on ""), so an empty ref does not
