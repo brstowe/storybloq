@@ -65,15 +65,54 @@ export async function handleTicketMove(
       return;
     }
 
-    let newRank: string;
+    // Lower/upper rank bounds for the new position. For --after we slot between the
+    // target and its next sibling; for --before, between the previous sibling and
+    // the target.
+    let lo: string | null;
+    let hi: string | null;
     if (options.after) {
-      const after = siblings[targetIdx]!;
-      const next = targetIdx + 1 < siblings.length ? siblings[targetIdx + 1]! : null;
-      newRank = generateKeyBetween(after.rank ?? null, next?.rank ?? null);
+      lo = siblings[targetIdx]!.rank ?? null;
+      hi = targetIdx + 1 < siblings.length ? (siblings[targetIdx + 1]!.rank ?? null) : null;
     } else {
-      const before = siblings[targetIdx]!;
-      const prev = targetIdx > 0 ? siblings[targetIdx - 1]! : null;
-      newRank = generateKeyBetween(prev?.rank ?? null, before.rank ?? null);
+      lo = targetIdx > 0 ? (siblings[targetIdx - 1]!.rank ?? null) : null;
+      hi = siblings[targetIdx]!.rank ?? null;
+    }
+
+    let newRank: string;
+    try {
+      // ISS-688: the spec allows duplicate ranks, so the immediate bounds can be
+      // equal (or non-increasing) and there is no value strictly between them. Rather
+      // than let generateKeyBetween's midpoint() throw (which surfaced as an opaque
+      // io_error), widen the bound past the duplicate-rank group to the nearest
+      // DISTINCT sibling, so the ticket lands just after/before the group and still
+      // before/after the next distinct sibling (siblings are sorted ascending by rank).
+      if (lo !== null && hi !== null && lo >= hi) {
+        if (options.after) {
+          let upper: string | null = null;
+          for (let j = targetIdx + 1; j < siblings.length; j++) {
+            const r = siblings[j]!.rank;
+            if (r != null && r > lo) { upper = r; break; }
+          }
+          newRank = generateKeyBetween(lo, upper);
+        } else {
+          let lower: string | null = null;
+          for (let j = targetIdx - 1; j >= 0; j--) {
+            const r = siblings[j]!.rank;
+            if (r != null && r < hi) { lower = r; break; }
+          }
+          newRank = generateKeyBetween(lower, hi);
+        }
+      } else {
+        newRank = generateKeyBetween(lo, hi);
+      }
+    } catch {
+      // Genuine exhaustion (e.g. moving before the minimum rank): actionable guidance
+      // instead of a crash. reconcile --rebalance-ranks restores spread-out ranks.
+      const msg = `Cannot compute a rank for this move: sibling ranks are duplicated or exhausted. Run \`storybloq reconcile --rebalance-ranks\` and retry.`;
+      output = format === "json"
+        ? JSON.stringify({ ok: false, error: msg }, null, 2)
+        : `Error: ${msg}`;
+      return;
     }
 
     const updated = { ...ticket, rank: newRank } as Record<string, unknown>;
