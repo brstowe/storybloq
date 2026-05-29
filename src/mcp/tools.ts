@@ -1136,18 +1136,29 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
         handoverContent: z.string().optional().describe("Handover markdown content"),
         verdict: z.string().optional().describe("Review verdict: approve|revise|request_changes|reject"),
         findings: z.array(z.object({
-          id: z.string(),
+          // ISS-717: id is optional and disposition defaults to "open" so a
+          // synthesized lens-shaped finding (which carries severity, category,
+          // and description but no id/disposition) validates here instead of
+          // being rejected with -32602 before the contradiction guard in the
+          // review stage can run. Unknown lens-only fields (lens, evidence,
+          // confidence, issueKey, recommendedImpact) are stripped by zod.
+          id: z.string().optional(),
           severity: z.string(),
           category: z.string(),
           description: z.string(),
-          // ISS-556: must match the enum persisted by SessionStateSchema.
-          // Without this, a single invalid value wedges readSession for the
-          // entire session.
-          disposition: z.enum(LENS_FINDING_DISPOSITIONS).describe(
-            "Finding disposition. 'open' = unresolved this round; 'addressed' = fixed in this round; " +
-            "'contested' = false positive (feeds the false-positive learning loop, files no issue; do NOT use it " +
-            "to park a valid finding, that pollutes the signal); 'deferred' = valid but out of scope, which " +
-            "AUTO-FILES a storybloq issue (severity 'suggestion' is exempt and is not filed).",
+          // ISS-556: stays constrained to the enum persisted by
+          // SessionStateSchema (a default of "open" can never violate it).
+          disposition: z.enum(LENS_FINDING_DISPOSITIONS).default("open").describe(
+            "Finding disposition (defaults to 'open' if omitted). 'open' = unresolved this round; " +
+            "'addressed' = fixed in this round; 'contested' = false positive (feeds the false-positive " +
+            "learning loop, files no issue; do NOT use it to park a valid finding, that pollutes the signal); " +
+            "'deferred' = valid but out of scope, which AUTO-FILES a storybloq issue (severity 'suggestion' is exempt).",
+          ),
+          // ISS-717: previously omitted from this schema, so the SDK stripped it
+          // and the PLAN-redirect guard in the review stages was unreachable.
+          recommendedNextState: z.enum(["PLAN", "IMPLEMENT"]).optional().describe(
+            "Set to 'PLAN' when the review concludes the implementation approach must be replanned; on a " +
+            "non-approve verdict this routes the session back to PLAN. Leave unset for ordinary findings.",
           ),
         })).optional().describe("Review findings"),
         reviewerSessionId: z.string().optional().describe("Codex session ID"),

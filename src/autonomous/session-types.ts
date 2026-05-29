@@ -317,7 +317,10 @@ export interface ReviewRecord {
 // ---------------------------------------------------------------------------
 
 export interface Finding {
-  readonly id: string;
+  // ISS-717: optional -- a synthesized lens-shaped finding has no id, and the
+  // MCP report schema no longer requires one (no consumer keys off it; review
+  // verdict content hashing stays stable whether id is present or absent).
+  readonly id?: string;
   readonly severity: "critical" | "major" | "minor" | "suggestion";
   readonly category: string;
   readonly description: string;
