@@ -1,3 +1,4 @@
+import { displayIdOf } from "../../core/resolver.js";
 import { accessSync, realpathSync, constants } from "node:fs";
 import { join, resolve } from "node:path";
 import { homedir } from "node:os";
@@ -270,7 +271,7 @@ export async function handleNodeRemove(
       const refs = Array.isArray(ticket.crossNodeBlockedBy) ? ticket.crossNodeBlockedBy as string[] : [];
       for (const ref of refs) {
         if (ref.startsWith(prefix)) {
-          crossNodeRefs.push(`${ticket.displayId ?? ticket.id} -> ${ref}`);
+          crossNodeRefs.push(`${displayIdOf(ticket)} -> ${ref}`);
         }
       }
     }

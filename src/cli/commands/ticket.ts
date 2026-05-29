@@ -1,3 +1,4 @@
+import { displayIdOf } from "../../core/resolver.js";
 import { nextTicket, nextTickets, blockedTickets } from "../../core/queries.js";
 import { nextTicketID, nextOrder, allocateTeamTicketId } from "../../core/id-allocation.js";
 import { reserveDisplayId } from "../../core/remote-refs.js";
@@ -353,7 +354,7 @@ export async function handleTicketCreate(
   if (format === "json") {
     return { output: JSON.stringify(successEnvelope(createdTicket), null, 2) };
   }
-  return { output: `Created ticket ${createdTicket.displayId ?? createdTicket.id}: ${createdTicket.title}` };
+  return { output: `Created ticket ${displayIdOf(createdTicket)}: ${createdTicket.title}` };
 }
 
 export async function handleTicketUpdate(
@@ -443,7 +444,7 @@ export async function handleTicketUpdate(
   if (format === "json") {
     return { output: JSON.stringify(successEnvelope(updatedTicket), null, 2) };
   }
-  return { output: `Updated ticket ${updatedTicket.displayId ?? updatedTicket.id}: ${updatedTicket.title}` };
+  return { output: `Updated ticket ${displayIdOf(updatedTicket)}: ${updatedTicket.title}` };
 }
 
 export async function handleTicketMetaSet(
@@ -481,7 +482,7 @@ export async function handleTicketMetaSet(
   if (format === "json") {
     return { output: JSON.stringify(successEnvelope(updatedTicket), null, 2) };
   }
-  return { output: `Updated metadata ${path} on ticket ${updatedTicket.displayId ?? updatedTicket.id}` };
+  return { output: `Updated metadata ${path} on ticket ${displayIdOf(updatedTicket)}` };
 }
 
 export async function handleTicketMetaUnset(
@@ -517,7 +518,7 @@ export async function handleTicketMetaUnset(
   if (format === "json") {
     return { output: JSON.stringify(successEnvelope(updatedTicket), null, 2) };
   }
-  return { output: `Unset metadata ${path} on ticket ${updatedTicket.displayId ?? updatedTicket.id}` };
+  return { output: `Unset metadata ${path} on ticket ${displayIdOf(updatedTicket)}` };
 }
 
 export async function handleTicketDelete(

@@ -1,3 +1,4 @@
+import { displayIdOf } from "../../core/resolver.js";
 import type { WorkflowStage, StageResult, StageAdvance, StageContext } from "./types.js";
 import type { GuideReportInput } from "../session-types.js";
 
@@ -19,7 +20,7 @@ export class IssueFixStage implements WorkflowStage {
     if (!issue) {
       return { action: "goto", target: "PICK_TICKET" };
     }
-    const issueLabel = issue.displayId ?? issue.id;
+    const issueLabel = displayIdOf(issue);
 
     // Load full issue details from project state
     let projectState;
@@ -88,7 +89,7 @@ export class IssueFixStage implements WorkflowStage {
     if (!issue) {
       return { action: "goto", target: "PICK_TICKET" };
     }
-    const issueLabel = issue.displayId ?? issue.id;
+    const issueLabel = displayIdOf(issue);
 
     // Verify the issue was actually resolved in project state
     let projectState;

@@ -1,3 +1,4 @@
+import { displayIdOf } from "./resolver.js";
 import type { Ticket } from "../models/ticket.js";
 import type { Issue } from "../models/issue.js";
 import type { Note } from "../models/note.js";
@@ -51,10 +52,6 @@ interface EntityWithTimestamp extends Resolvable {
   _conflicts?: unknown[] | null;
 }
 
-function effectiveDisplayId(item: Resolvable): string {
-  return item.displayId ?? item.id;
-}
-
 function getEntityTimestamp(entityType: EntityType, entity: Record<string, unknown>): string | null {
   // Prefer sub-day ISO 8601 createdAt when available
   const createdAt = entity.createdAt;
@@ -78,7 +75,7 @@ function isLegacyId(entityType: EntityType, id: string): boolean {
 }
 
 function hasLegacyPriority(entityType: EntityType, item: Resolvable): boolean {
-  return isLegacyId(entityType, item.id) && effectiveDisplayId(item) === item.id;
+  return isLegacyId(entityType, item.id) && displayIdOf(item) === item.id;
 }
 
 function compareEntities(
@@ -158,7 +155,7 @@ function reconcileEntityType<T extends EntityWithTimestamp & Record<string, unkn
   const activeItems = items.filter((item) => (item as Record<string, unknown>).lifecycle !== "deleted");
   const groups = new Map<string, T[]>();
   for (const item of activeItems) {
-    const did = effectiveDisplayId(item);
+    const did = displayIdOf(item);
     let group = groups.get(did);
     if (!group) {
       group = [];
@@ -193,7 +190,7 @@ function reconcileEntityType<T extends EntityWithTimestamp & Record<string, unkn
         id: loser.id,
         oldDisplayId: displayId,
         newDisplayId,
-        reason: `${effectiveDisplayId(winner)} wins (${winnerLabel})`,
+        reason: `${displayIdOf(winner)} wins (${winnerLabel})`,
       });
     }
   }

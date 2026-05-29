@@ -1,3 +1,4 @@
+import { displayIdOf } from "../../core/resolver.js";
 import {
   withProjectLock,
   writeLessonUnlocked,
@@ -350,7 +351,7 @@ export async function handleLessonDelete(
       if (referencing.length > 0) {
         throw new CliValidationError(
           "conflict",
-          `Cannot delete ${id}: referenced by ${referencing.map((l) => l.displayId ?? l.id).join(", ")} via supersedes`,
+          `Cannot delete ${id}: referenced by ${referencing.map((l) => displayIdOf(l)).join(", ")} via supersedes`,
         );
       }
     }

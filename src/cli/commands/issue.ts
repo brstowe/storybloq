@@ -1,3 +1,4 @@
+import { displayIdOf } from "../../core/resolver.js";
 import { validateProject } from "../../core/validation.js";
 import { resolveAndNormalizeTicketRef, resolveAndNormalizeIssueRef, RefResolutionError } from "../../core/ref-normalization.js";
 import { ProjectState } from "../../core/project-state.js";
@@ -153,7 +154,7 @@ export function handleIssueMetaGet(
   const issue = result.item;
   const metaResult = getMetadata(issue as Record<string, unknown>, path, ISSUE_CORE_METADATA_KEYS);
   if (!metaResult.found) {
-    const displayLabel = issue.displayId ?? issue.id;
+    const displayLabel = displayIdOf(issue);
     return {
       output: formatError("not_found", `Metadata path "${path}" not found on issue ${displayLabel}`, ctx.format),
       exitCode: ExitCode.USER_ERROR,
@@ -307,7 +308,7 @@ export async function handleIssueCreate(
   if (format === "json") {
     return { output: JSON.stringify(successEnvelope(createdIssue), null, 2) };
   }
-  return { output: `Created issue ${createdIssue.displayId ?? createdIssue.id}: ${createdIssue.title}` };
+  return { output: `Created issue ${displayIdOf(createdIssue)}: ${createdIssue.title}` };
 }
 
 export async function handleIssueUpdate(
@@ -397,7 +398,7 @@ export async function handleIssueUpdate(
   if (format === "json") {
     return { output: JSON.stringify(successEnvelope(updatedIssue), null, 2) };
   }
-  return { output: `Updated issue ${updatedIssue.displayId ?? updatedIssue.id}: ${updatedIssue.title}` };
+  return { output: `Updated issue ${displayIdOf(updatedIssue)}: ${updatedIssue.title}` };
 }
 
 export async function handleIssueMetaSet(
@@ -435,7 +436,7 @@ export async function handleIssueMetaSet(
   if (format === "json") {
     return { output: JSON.stringify(successEnvelope(updatedIssue), null, 2) };
   }
-  return { output: `Updated metadata ${path} on issue ${updatedIssue.displayId ?? updatedIssue.id}` };
+  return { output: `Updated metadata ${path} on issue ${displayIdOf(updatedIssue)}` };
 }
 
 export async function handleIssueMetaUnset(
@@ -471,7 +472,7 @@ export async function handleIssueMetaUnset(
   if (format === "json") {
     return { output: JSON.stringify(successEnvelope(updatedIssue), null, 2) };
   }
-  return { output: `Unset metadata ${path} on issue ${updatedIssue.displayId ?? updatedIssue.id}` };
+  return { output: `Unset metadata ${path} on issue ${displayIdOf(updatedIssue)}` };
 }
 
 export async function handleIssueDelete(

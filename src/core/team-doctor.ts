@@ -1,3 +1,4 @@
+import { displayIdOf } from "./resolver.js";
 import { execFileSync } from "node:child_process";
 import type { ProjectState } from "./project-state.js";
 import type { LoadWarning } from "./errors.js";
@@ -79,10 +80,6 @@ function buildResult(findings: DoctorFinding[]): DoctorResult {
   return { findings, errorCount, warningCount, infoCount };
 }
 
-function effectiveDisplayId(item: { id: string; displayId?: string | null }): string {
-  return item.displayId ?? item.id;
-}
-
 function checkDuplicateDisplayIds(state: ProjectState): DoctorFinding[] {
   const findings: DoctorFinding[] = [];
 
@@ -96,7 +93,7 @@ function checkDuplicateDisplayIds(state: ProjectState): DoctorFinding[] {
   for (const { type, items } of entityGroups) {
     const seen = new Map<string, string[]>();
     for (const item of items) {
-      const did = effectiveDisplayId(item);
+      const did = displayIdOf(item);
       let ids = seen.get(did);
       if (!ids) {
         ids = [];
@@ -158,7 +155,7 @@ function checkUnresolvableRefs(state: ProjectState): DoctorFinding[] {
         findings.push({
           severity: "warning",
           code: "unresolvable_ref",
-          message: `Ticket ${effectiveDisplayId(t)} has unresolvable blockedBy ref '${ref}'`,
+          message: `Ticket ${displayIdOf(t)} has unresolvable blockedBy ref '${ref}'`,
           entity: t.id,
           repair: { command: ["storybloq", "repair"] },
         });
@@ -170,7 +167,7 @@ function checkUnresolvableRefs(state: ProjectState): DoctorFinding[] {
         findings.push({
           severity: "warning",
           code: "unresolvable_ref",
-          message: `Ticket ${effectiveDisplayId(t)} has unresolvable parentTicket ref '${t.parentTicket}'`,
+          message: `Ticket ${displayIdOf(t)} has unresolvable parentTicket ref '${t.parentTicket}'`,
           entity: t.id,
           repair: { command: ["storybloq", "repair"] },
         });
@@ -185,7 +182,7 @@ function checkUnresolvableRefs(state: ProjectState): DoctorFinding[] {
         findings.push({
           severity: "warning",
           code: "unresolvable_ref",
-          message: `Issue ${effectiveDisplayId(i)} has unresolvable relatedTickets ref '${ref}'`,
+          message: `Issue ${displayIdOf(i)} has unresolvable relatedTickets ref '${ref}'`,
           entity: i.id,
           repair: { command: ["storybloq", "repair"] },
         });
@@ -355,7 +352,7 @@ export function checkStaleClaims(
       findings.push({
         severity: "warning",
         code: "claim_on_complete",
-        message: `Ticket ${effectiveDisplayId(t)} is complete but still has claim by ${t.claim.user}`,
+        message: `Ticket ${displayIdOf(t)} is complete but still has claim by ${t.claim.user}`,
         entity: t.id,
         repair: { command: ["storybloq", "ticket", "unclaim", t.id] },
       });
@@ -363,7 +360,7 @@ export function checkStaleClaims(
       findings.push({
         severity: "warning",
         code: "stale_claim",
-        message: `Ticket ${effectiveDisplayId(t)} has stale claim by ${t.claim.user} (since ${t.claim.since})`,
+        message: `Ticket ${displayIdOf(t)} has stale claim by ${t.claim.user} (since ${t.claim.since})`,
         entity: t.id,
         repair: { command: ["storybloq", "ticket", "unclaim", t.id] },
       });
@@ -371,7 +368,7 @@ export function checkStaleClaims(
       findings.push({
         severity: "warning",
         code: "stale_claim",
-        message: `Ticket ${effectiveDisplayId(t)} has claim by ${t.claim.user} on branch '${t.claim.branch}' which no longer exists`,
+        message: `Ticket ${displayIdOf(t)} has claim by ${t.claim.user} on branch '${t.claim.branch}' which no longer exists`,
         entity: t.id,
         repair: { command: ["storybloq", "ticket", "unclaim", t.id] },
       });

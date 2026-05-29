@@ -1,3 +1,4 @@
+import { displayIdOf } from "../../core/resolver.js";
 /**
  * T-251: `storybloq session` CLI — list, show, repair, delete.
  *
@@ -175,13 +176,13 @@ export async function handleSessionShow(
   lines.push(`Lease:   ${formatLease(state.lease?.expiresAt)} (${state.lease?.expiresAt ?? "n/a"})`);
   const ticket = (state as FullSessionState & { ticket?: { id?: string; displayId?: string; title?: string } }).ticket;
   if (ticket?.id) {
-    lines.push(`Ticket:  ${ticket.displayId ?? ticket.id} — ${ticket.title ?? ""}`);
+    lines.push(`Ticket:  ${displayIdOf(ticket)} — ${ticket.title ?? ""}`);
   }
   if (state.completedTickets.length) {
     lines.push("");
     lines.push("Completed tickets:");
     for (const t of state.completedTickets) {
-      lines.push(`  ${t.displayId ?? t.id} (${t.commitHash?.slice(0, 8) ?? "no-hash"})`);
+      lines.push(`  ${displayIdOf(t)} (${t.commitHash?.slice(0, 8) ?? "no-hash"})`);
     }
   }
   if ((state.resolvedIssues ?? []).length) {

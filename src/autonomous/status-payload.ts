@@ -1,3 +1,4 @@
+import { displayIdOf } from "../core/resolver.js";
 import {
   deriveClaudeStatus,
   CURRENT_STATUS_SCHEMA_VERSION,
@@ -36,7 +37,7 @@ export function buildActivePayload(
     startedAt: session.startedAt ?? null,
     lastGuideCall: session.lastGuideCall ?? null,
     completedThisSession: [
-      ...(session.completedTickets?.map((t) => t.displayId ?? t.id) ?? []),
+      ...(session.completedTickets?.map((t) => displayIdOf(t)) ?? []),
       ...(session.resolvedIssues?.map((id) => issueDisplayIds[id] ?? id) ?? []),
     ],
     contextPressure: session.contextPressure?.level ?? "unknown",

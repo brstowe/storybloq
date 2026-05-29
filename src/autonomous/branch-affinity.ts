@@ -1,3 +1,4 @@
+import { displayIdOf } from "../core/resolver.js";
 /**
  * Branch affinity detection for PICK_TICKET stage.
  * Pure functions (detection/annotation), plus async branch creation helpers for Part 2.
@@ -141,7 +142,7 @@ export async function createTicketBranch(
   ticket: { id: string; displayId?: string; title: string },
   prefix: "story" | "fix" = "story",
 ): Promise<GitResult<BranchCreationResult>> {
-  const branchName = buildTicketBranchName(ticket.displayId ?? ticket.id, ticket.title, prefix);
+  const branchName = buildTicketBranchName(displayIdOf(ticket), ticket.title, prefix);
 
   // 1. Idempotency: already on correct branch?
   if (gitState.branch === branchName) {

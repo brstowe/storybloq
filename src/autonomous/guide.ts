@@ -1,3 +1,4 @@
+import { displayIdOf } from "../core/resolver.js";
 import { readFileSync, writeFileSync, existsSync, unlinkSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import {
@@ -2387,16 +2388,19 @@ function guideResult(
   return { content: [{ type: "text", text: parts.join("\n") }] };
 }
 
+// Thin adapters over the shared displayIdOf projection (ISS-700). The autonomous
+// session works with loosely-typed Records, so these coerce an untyped displayId
+// to string|null before delegating, keeping the displayId-else-id rule in one place.
 function displayTicket(ticket: { id: string } & Record<string, unknown>): string {
-  return typeof ticket.displayId === "string" ? ticket.displayId : ticket.id;
+  return displayIdOf({ id: ticket.id, displayId: typeof ticket.displayId === "string" ? ticket.displayId : null });
 }
 
 function displayIssue(issue: { id: string } & Record<string, unknown>): string {
-  return typeof issue.displayId === "string" ? issue.displayId : issue.id;
+  return displayIdOf({ id: issue.id, displayId: typeof issue.displayId === "string" ? issue.displayId : null });
 }
 
 function displaySessionTicket(ticket: { id: string; displayId?: string }): string {
-  return ticket.displayId ?? ticket.id;
+  return displayIdOf(ticket);
 }
 
 function guideError(err: unknown): McpToolResult {

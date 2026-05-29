@@ -1,3 +1,4 @@
+import { displayIdOf } from "./resolver.js";
 /**
  * Session report formatter — renders 7-section structured analysis.
  * All sections always present; missing data uses "Not available" placeholders.
@@ -104,7 +105,7 @@ function buildTicketSection(state: FullSessionState): string {
       return [
         "## Ticket Progression",
         "",
-        `In progress: **${current.displayId ?? current.id}** — ${current.title} (risk: ${current.risk ?? "unknown"})`,
+        `In progress: **${displayIdOf(current)}** — ${current.title} (risk: ${current.risk ?? "unknown"})`,
       ].join("\n");
     }
     return "## Ticket Progression\n\nNo tickets completed.";
@@ -119,7 +120,7 @@ function buildTicketSection(state: FullSessionState): string {
       ? formatDuration(t.startedAt, t.completedAt)
       : null;
     const durationPart = duration ? ` | duration: ${duration}` : "";
-    lines.push(`- **${t.displayId ?? t.id}:** ${t.title} | risk: ${risk}${durationPart} | commit: \`${t.commitHash ?? "?"}\``);
+    lines.push(`- **${displayIdOf(t)}:** ${t.title} | risk: ${risk}${durationPart} | commit: \`${t.commitHash ?? "?"}\``);
   }
   return lines.join("\n");
 }
@@ -284,7 +285,7 @@ export function formatCompactReport(data: CompactReportData): string {
         ? formatDuration(t.startedAt, t.completedAt)
         : "--";
       const safeTitle = (t.title ?? "").replace(/\|/g, "\\|");
-      lines.push(`| ${t.displayId ?? t.id} | ${safeTitle} | ${ticketDuration} |`);
+      lines.push(`| ${displayIdOf(t)} | ${safeTitle} | ${ticketDuration} |`);
     }
 
     // Avg time per ticket
@@ -301,10 +302,10 @@ export function formatCompactReport(data: CompactReportData): string {
   if (remainingWork && (remainingWork.tickets.length > 0 || remainingWork.issues.length > 0)) {
     lines.push("", "### What's Left");
     for (const t of remainingWork.tickets) {
-      lines.push(`- ${t.displayId ?? t.id}: ${t.title} (unblocked)`);
+      lines.push(`- ${displayIdOf(t)}: ${t.title} (unblocked)`);
     }
     for (const i of remainingWork.issues) {
-      lines.push(`- ${i.displayId ?? i.id}: ${i.title} (${i.severity})`);
+      lines.push(`- ${displayIdOf(i)}: ${i.title} (${i.severity})`);
     }
   }
 

@@ -1,3 +1,4 @@
+import { displayIdOf } from "./resolver.js";
 import { execFileSync } from "node:child_process";
 import type { ProjectState } from "./project-state.js";
 
@@ -93,7 +94,7 @@ function readOwner(root: string, objectId?: string): string | null {
 function itemsByDisplayId(items: readonly { id: string; displayId?: string | null }[]): Map<string, string[]> {
   const map = new Map<string, string[]>();
   for (const item of items) {
-    const displayId = item.displayId ?? item.id;
+    const displayId = displayIdOf(item);
     const ids = map.get(displayId);
     if (ids) ids.push(item.id);
     else map.set(displayId, [item.id]);

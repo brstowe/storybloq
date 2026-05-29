@@ -1,3 +1,4 @@
+import { displayIdOf } from "../../core/resolver.js";
 import type { WorkflowStage, StageResult, StageAdvance, StageContext } from "./types.js";
 import { buildLensHistoryUpdate } from "./types.js";
 import type { GuideReportInput } from "../session-types.js";
@@ -35,7 +36,7 @@ export class CodeReviewStage implements WorkflowStage {
     const mergeBase = ctx.state.git.mergeBase;
     const isIssueFix = !!ctx.state.currentIssue;
     const issueHeader = isIssueFix
-      ? `Issue Fix Code Review (${ctx.state.currentIssue!.displayId ?? ctx.state.currentIssue!.id})`
+      ? `Issue Fix Code Review (${displayIdOf(ctx.state.currentIssue!)})`
       : "Code Review";
 
     const diffCommand = mergeBase

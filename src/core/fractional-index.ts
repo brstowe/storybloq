@@ -1,3 +1,4 @@
+import { displayIdOf } from "./resolver.js";
 const DIGITS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 const BASE = DIGITS.length; // 62
 const MID = DIGITS[Math.floor(BASE / 2)]!; // "V"
@@ -105,8 +106,8 @@ export function compareByRank(
   const bOrder = b.order ?? 0;
   if (aOrder !== bOrder) return aOrder - bOrder;
 
-  const aNum = extractNumericSuffix(a.displayId ?? a.id);
-  const bNum = extractNumericSuffix(b.displayId ?? b.id);
+  const aNum = extractNumericSuffix(displayIdOf(a));
+  const bNum = extractNumericSuffix(displayIdOf(b));
   if (aNum !== null && bNum !== null && aNum !== bNum) return aNum - bNum;
 
   return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;

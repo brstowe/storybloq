@@ -3,6 +3,17 @@ export type ResolveResult<T> =
   | { kind: "ambiguous"; matches: T[] }
   | { kind: "missing" };
 
+/**
+ * The display boundary projection: render the human-facing display ID for an
+ * item, falling back to the canonical id when no display ID is set. This is the
+ * single source of truth for the inverse of resolveRef -- every rendering site
+ * (CLI output, formatters, autonomous guide, team doctor, reconcile) routes
+ * through it so the projection rule lives in exactly one place (ISS-700).
+ */
+export function displayIdOf(item: { id: string; displayId?: string | null }): string {
+  return item.displayId ?? item.id;
+}
+
 export function resolveRef<T extends { id: string }>(
   ref: string,
   primaryIndex: Map<string, T>,

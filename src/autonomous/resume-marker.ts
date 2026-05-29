@@ -1,3 +1,4 @@
+import { displayIdOf } from "../core/resolver.js";
 /**
  * T-183: Resume marker file for 100% compaction survival.
  *
@@ -30,7 +31,7 @@ export function writeResumeMarker(root: string, sessionId: string, state: {
     mkdirSync(rulesDir, { recursive: true });
 
     const ticketInfo = state.ticket
-      ? `Working on: ${sanitize(state.ticket.displayId ?? state.ticket.id, 20)} (${sanitize(state.ticket.title)})`
+      ? `Working on: ${sanitize(displayIdOf(state.ticket), 20)} (${sanitize(state.ticket.title)})`
       : "Between tickets";
     const progress = `Progress: ${state.completedTickets.length} tickets completed, ${(state.resolvedIssues ?? []).length} issues resolved`;
 
