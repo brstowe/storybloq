@@ -1171,6 +1171,7 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
       ticketDescription: z.string().optional().describe("Current ticket description for context"),
       reviewRound: z.number().int().min(1).optional().describe("Review round (1 = first, 2+ = subsequent)"),
       priorDeferrals: z.array(z.string()).optional().describe("issueKeys of findings the agent intentionally deferred from prior rounds"),
+      sessionId: z.string().uuid().optional().describe("Active session ID. Pass it so prepare can snapshot the reviewed files, enabling the synthesize verification gate to check lens evidence quotes. Use the same reviewRound and the returned reviewId when you call synthesize."),
     },
   }, (args) => {
     try {

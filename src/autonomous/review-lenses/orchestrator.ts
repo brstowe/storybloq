@@ -49,6 +49,10 @@ export interface LensReviewOptions {
   readonly ticketDescription: string;
   readonly projectRoot: string;
   readonly sessionDir?: string;
+  // ISS-714: when provided, use this contract-valid reviewId (<stage>-r<n>) so
+  // the snapshot the verification gate later loads is addressable. Defaults to
+  // the legacy lens-<ts> id when omitted (manual/non-session use).
+  readonly reviewId?: string;
   readonly config?: Partial<LensConfig>;
   readonly repoPolicy?: Partial<BlockingPolicy>;
   readonly knownFalsePositives?: string;
@@ -90,7 +94,7 @@ export interface JudgeInput {
 export function prepareLensReview(opts: LensReviewOptions): PreparedLensReview {
   const config: LensConfig = { ...DEFAULT_LENS_CONFIG, ...opts.config };
   const policy: BlockingPolicy = { ...DEFAULT_BLOCKING_POLICY, ...opts.repoPolicy };
-  const reviewId = `lens-${Date.now().toString(36)}`;
+  const reviewId = opts.reviewId ?? `lens-${Date.now().toString(36)}`;
   const knownFP = opts.knownFalsePositives ?? "";
 
   const emit = (lens: string, status: LensStatus, extra?: Partial<LensProgressEvent>) => {

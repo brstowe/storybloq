@@ -12,9 +12,10 @@
  * T-189
  */
 
-import { readFileSync, appendFileSync } from "node:fs";
+import { readFileSync, appendFileSync, existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { prepareLensReview } from "./orchestrator.js";
+import { writeReviewSnapshot } from "./review-snapshot.js";
 import { validateFindings } from "./schema-validator.js";
 import { generateIssueKey } from "./issue-key.js";
 import { computeBlocking } from "./blocking-policy.js";
@@ -63,6 +64,77 @@ export interface PrepareInput {
   readonly priorDeferrals?: readonly string[];
   readonly projectRoot: string;
   readonly sessionDir?: string;
+  // ISS-714: when present, prepare writes a byte-exact review snapshot of the
+  // changed files keyed by the <stage>-r<round> reviewId, so the synthesize
+  // verification gate has something to verify findings against.
+  readonly sessionId?: string;
+}
+
+// ISS-714: map the workflow stage to the snapshot stage vocabulary.
+function snapshotStage(stage: ReviewStage): "code-review" | "plan-review" {
+  return stage === "PLAN_REVIEW" ? "plan-review" : "code-review";
+}
+
+// ISS-714: capture a byte-exact snapshot of the reviewed files so the
+// verification gate can check lens evidence quotes against it, and return the
+// reviewId that addresses it. A FRESH snapshot slot is allocated on every call
+// (next free <stage>-r<n> under the session) so re-running prepare after the
+// reviewed content changed never reuses a stale immutable snapshot -- synthesize
+// always verifies against the bytes this call captured. Fail soft: if no file
+// can be snapshotted (bad path, unreadable/deleted file, write error) it returns
+// null and the caller falls back to a non-snapshot reviewId, so the gate skips
+// verification (ISS-715) rather than crashing prepare.
+function writeFreshReviewSnapshot(opts: {
+  projectRoot: string;
+  sessionId: string;
+  sessionDir: string;
+  stage: "code-review" | "plan-review";
+  changedFiles: readonly string[];
+}): string | null {
+  const files: string[] = [];
+  for (const f of opts.changedFiles) {
+    if (typeof f !== "string" || f.length === 0) continue;
+    // The snapshot writer requires root-relative posix paths and rejects
+    // absolute/backslash/dot segments; pre-filter so one bad path does not
+    // abort the whole snapshot.
+    if (f.startsWith("/") || f.includes("\\")) continue;
+    if (f.split("/").some((seg) => seg === "" || seg === "." || seg === "..")) continue;
+    if (existsSync(join(opts.projectRoot, f))) files.push(f);
+  }
+  if (files.length === 0) return null;
+
+  // Allocate the next free snapshot slot for this stage so the write never
+  // collides with an existing (possibly stale) immutable snapshot.
+  const snapshotParent = join(opts.sessionDir, "review-snapshot");
+  let maxIndex = 0;
+  if (existsSync(snapshotParent)) {
+    const slot = new RegExp(`^${opts.stage}-r(\\d+)$`);
+    try {
+      for (const name of readdirSync(snapshotParent)) {
+        const m = name.match(slot);
+        if (m?.[1]) maxIndex = Math.max(maxIndex, parseInt(m[1], 10));
+      }
+    } catch {
+      // unreadable parent: fall through with maxIndex 0
+    }
+  }
+  const reviewId = `${opts.stage}-r${maxIndex + 1}`;
+
+  try {
+    writeReviewSnapshot({
+      projectRoot: opts.projectRoot,
+      sessionId: opts.sessionId,
+      reviewId,
+      stage: opts.stage,
+      round: maxIndex + 1,
+      files,
+    });
+    return reviewId;
+  } catch {
+    // Best effort: a write failure leaves no snapshot at this slot, so the gate
+    // skips. Never propagate out of prepare.
+    return null;
+  }
 }
 
 export interface PrepareOutput {
@@ -104,6 +176,32 @@ export function handlePrepare(input: PrepareInput): PrepareOutput {
   const sessionDir = input.sessionDir;
   const knownFP = (input.priorDeferrals ?? []).join("\n");
 
+  // ISS-714: snapshot the reviewed files at prepare time (CODE_REVIEW only,
+  // where changedFiles are real source files the lens evidence quotes against)
+  // and use the fresh snapshot's slot as the reviewId, so the synthesize
+  // verification gate -- which loads by the reviewId echoed back through
+  // metadata.reviewId -- verifies against exactly these bytes. The reviewId is
+  // addressable (resolves to a snapshot) ONLY when a snapshot was actually
+  // written by this call. In every other case (no session, PLAN_REVIEW, no
+  // snapshottable file, or a write error) it stays a non-addressable lens-<ts>
+  // id that the snapshot reader rejects as snapshot_absent, so synthesize skips
+  // verification rather than ever loading a stale or coincidentally-matching
+  // pre-existing snapshot (ISS-715).
+  const stagePrefix = snapshotStage(input.stage);
+  let reviewId = `lens-${Date.now().toString(36)}`;
+  if (input.sessionId && input.stage === "CODE_REVIEW") {
+    const snapshotSessionDir = sessionDir
+      ?? join(input.projectRoot, ".story", "sessions", input.sessionId);
+    const snapReviewId = writeFreshReviewSnapshot({
+      projectRoot: input.projectRoot,
+      sessionId: input.sessionId,
+      sessionDir: snapshotSessionDir,
+      stage: stagePrefix,
+      changedFiles: input.changedFiles,
+    });
+    if (snapReviewId) reviewId = snapReviewId;
+  }
+
   const prepared = prepareLensReview({
     stage: input.stage,
     diff: input.diff,
@@ -112,6 +210,7 @@ export function handlePrepare(input: PrepareInput): PrepareOutput {
     projectRoot: input.projectRoot,
     sessionDir,
     knownFalsePositives: knownFP || undefined,
+    reviewId,
   });
 
   const lensPrompts = [];
