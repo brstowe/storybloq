@@ -220,6 +220,34 @@ describe("computeReconcilePlan", () => {
     expect(new Set(newIds).size).toBe(2);
   });
 
+  it("is deterministic across input array order: same losers -> same newDisplayIds (ISS-694)", () => {
+    // N-059's "concurrent reconcile (self-correcting)" invariant: two clones with
+    // equivalent state must produce the SAME renumbering, so the deterministic
+    // tie-breaks (loser sort + sequential nextSeq) must not depend on array order.
+    const items = [
+      { id: "t-aaa0000000000001", displayId: "T-042", createdDate: "2026-01-01" }, // winner
+      { id: "t-bbb0000000000002", displayId: "T-042", createdDate: "2026-01-15" },
+      { id: "t-ccc0000000000003", displayId: "T-042", createdDate: "2026-01-20" },
+    ];
+    const planFor = (order: typeof items) => {
+      const s = state({ tickets: order.map((t) => makeTicket(t)) });
+      const result = computeReconcilePlan(s);
+      expect(result.ok).toBe(true);
+      if (!result.ok) throw new Error("unexpected");
+      return new Map(result.plan.renames.map((r) => [r.id, r.newDisplayId]));
+    };
+
+    const forward = planFor(items);
+    const reversed = planFor([...items].reverse());
+
+    // The winner (earliest createdDate) is never renamed; both losers map identically.
+    expect(forward).toEqual(reversed);
+    expect(forward.has("t-aaa0000000000001")).toBe(false);
+    // Pinned numbers: nextSeq = max(42)+1 = 43; losers in compareEntities order.
+    expect(forward.get("t-bbb0000000000002")).toBe("T-043");
+    expect(forward.get("t-ccc0000000000003")).toBe("T-044");
+  });
+
   it("produces empty plan when run on already-reconciled state (idempotent)", () => {
     const s = state({
       tickets: [
