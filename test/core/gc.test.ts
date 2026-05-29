@@ -46,6 +46,31 @@ describe("computeGcPlan", () => {
     expect(plan.eligible).toHaveLength(0);
   });
 
+  it("blocks a candidate referenced by its displayId or previousDisplayIds (ISS-711)", () => {
+    // The tombstone has a canonical id plus a displayId and a previous displayId;
+    // active tickets reference it by those rather than the canonical id. The
+    // candidateByRef map (built during collection) must resolve all three.
+    const state = makeState({
+      tickets: [
+        makeTicket({
+          id: "t-k7m2p9x3w4a5b6e8",
+          displayId: "T-051",
+          previousDisplayIds: ["T-030"],
+          lifecycle: "deleted",
+          deletedAt: thirtyOneDaysAgo,
+          deletedBy: "alice",
+        } as any),
+        makeTicket({ id: "T-100", blockedBy: ["T-051"] }),
+        makeTicket({ id: "T-101", parentTicket: "T-030" }),
+      ],
+    });
+    const plan = computeGcPlan(state, { retentionDays: 30 });
+    expect(plan.blocked).toHaveLength(1);
+    expect(plan.blocked[0]!.id).toBe("t-k7m2p9x3w4a5b6e8");
+    expect(plan.blocked[0]!.activeReferences.sort()).toEqual(["T-100", "T-101"]);
+    expect(plan.eligible).toHaveLength(0);
+  });
+
   it("handles empty state", () => {
     const state = makeState({});
     const plan = computeGcPlan(state, { retentionDays: 30 });

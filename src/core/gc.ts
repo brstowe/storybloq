@@ -32,6 +32,12 @@ export function computeGcPlan(state: ProjectState, options?: GcOptions): GcPlan 
   const candidates: GcCandidate[] = [];
   const warnings: string[] = [];
 
+  // ISS-711: capture the candidate's id + displayId + previousDisplayIds into
+  // candidateByRef during collection (the source record is in scope here),
+  // instead of re-scanning every state collection per candidate afterward.
+  const candidateIds = new Set<string>();
+  const candidateByRef = new Map<string, GcCandidate>();
+
   function collectDeleted(
     items: readonly { id: string }[],
     type: GcCandidate["type"],
@@ -60,14 +66,24 @@ export function computeGcPlan(state: ProjectState, options?: GcOptions): GcPlan 
       const age = Math.floor((now - ts) / MS_PER_DAY);
       if (age < retentionDays) continue;
 
-      candidates.push({
+      const candidate: GcCandidate = {
         type,
         id: item.id,
         deletedAt,
         deletedBy: (rec.deletedBy as string) ?? "unknown",
         age,
         activeReferences: [],
-      });
+      };
+      candidates.push(candidate);
+
+      candidateIds.add(item.id);
+      candidateByRef.set(item.id, candidate);
+      if (typeof rec.displayId === "string") candidateByRef.set(rec.displayId, candidate);
+      if (Array.isArray(rec.previousDisplayIds)) {
+        for (const prev of rec.previousDisplayIds) {
+          if (typeof prev === "string") candidateByRef.set(prev, candidate);
+        }
+      }
     }
   }
 
@@ -75,24 +91,6 @@ export function computeGcPlan(state: ProjectState, options?: GcOptions): GcPlan 
   collectDeleted(state.issues, "issue");
   collectDeleted(state.notes, "note");
   collectDeleted(state.lessons, "lesson");
-
-  const candidateIds = new Set(candidates.map((c) => c.id));
-  const candidateByRef = new Map<string, GcCandidate>();
-  for (const c of candidates) {
-    candidateByRef.set(c.id, c);
-    const rec = (state.tickets as readonly Record<string, unknown>[]).find((t) => t.id === c.id)
-      ?? (state.issues as readonly Record<string, unknown>[]).find((i) => i.id === c.id)
-      ?? (state.notes as readonly Record<string, unknown>[]).find((n) => n.id === c.id)
-      ?? (state.lessons as readonly Record<string, unknown>[]).find((l) => l.id === c.id);
-    if (rec) {
-      if (typeof rec.displayId === "string") candidateByRef.set(rec.displayId, c);
-      if (Array.isArray(rec.previousDisplayIds)) {
-        for (const prev of rec.previousDisplayIds) {
-          if (typeof prev === "string") candidateByRef.set(prev, c);
-        }
-      }
-    }
-  }
 
   function findCandidate(ref: string): GcCandidate | undefined {
     return candidateByRef.get(ref);
