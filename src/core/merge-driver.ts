@@ -89,6 +89,25 @@ function recencyValue(obj: Record<string, unknown>, spec: string): string {
   return String(primary ?? obj.updatedAt ?? obj.updatedDate ?? "");
 }
 
+// ISS-728: ACCEPTED DESIGN LIMITATION -- recency is a pure wall-clock tie-break.
+// compareRecency orders ISO timestamps produced by unsynchronized
+// `new Date().toISOString()` calls (e.g. claim.since). There is no logical clock
+// (no HLC/Lamport/version-vector) anywhere in TS or Swift, so the merge cannot
+// detect true concurrency and cannot tell "edited later" from "this machine's
+// clock runs fast". This is deliberate (N-059/N-061), and it is LOW risk because
+// wall-clock latest-wins decides ONLY two coupled groups: attribution metadata
+// (whose onAmbiguous="conflict" already surfaces ties rather than guessing) and
+// advisory claims (which by design must never block a merge -- best-effort, flap
+// is human-recoverable). Every substantive user-content/state field is
+// hard-conflict or coupled-WITHOUT a latestWinsField (see field-classification.ts),
+// so concurrent edits there surface as _conflicts and are write-blocked, never
+// silently latest-wins-dropped. FUTURE HARDENING (not scheduled): adopt a Hybrid
+// Logical Clock (keeps human-readable timestamps) or version vectors only if real
+// concurrent claim/attribution collisions are observed, or if a base-less
+// real-time transport is added (the CRDT non-goal in N-059). Do NOT reopen
+// ISS-673 (its scope was the null-claim-loses-lexically bug; it intentionally
+// retained wall-clock comparison).
+//
 // Compares two recency strings. Returns 1 (a newer), -1 (b newer), or 0 (indistinguishable).
 // 0 is returned when the values are equal, both unparseable, or one is date-only and the other
 // is a full timestamp on the same calendar day (the time-of-day is genuinely unknown). A
