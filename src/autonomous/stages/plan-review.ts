@@ -1,7 +1,7 @@
 import type { WorkflowStage, StageResult, StageAdvance, StageContext } from "./types.js";
 import { buildLensHistoryUpdate } from "./types.js";
 import type { GuideReportInput } from "../session-types.js";
-import { REVIEW_VERDICTS } from "../session-types.js";
+import { REVIEW_VERDICTS, REVIEW_VERDICTS_PROSE } from "../session-types.js";
 import { requiredRounds, nextReviewer } from "../review-depth.js";
 import { accumulateVerificationCounters } from "../review-lenses/verification-log.js";
 import { writeReviewVerdict, readReviewVerdict, buildTier1Verdict, classifyLensReviewPath, type ReviewVerdictArtifact } from "../review-verdict.js";
@@ -150,7 +150,7 @@ export class PlanReviewStage implements WorkflowStage {
 
     const verdict = report.verdict;
     if (!verdict || !(REVIEW_VERDICTS as readonly string[]).includes(verdict)) {
-      return { action: "retry", instruction: 'Invalid verdict. Re-submit with verdict: "approve", "revise", "request_changes", or "reject".' };
+      return { action: "retry", instruction: `Invalid verdict. Re-submit with verdict: ${REVIEW_VERDICTS_PROSE}.` };
     }
 
     // Record review round

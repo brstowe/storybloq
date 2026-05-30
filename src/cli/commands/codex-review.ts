@@ -4,7 +4,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { discoverProjectRoot } from "../../core/project-root-discovery.js";
 import { readSession, sessionDir } from "../../autonomous/session.js";
-import type { Finding, GuideReportInput } from "../../autonomous/session-types.js";
+import type { Finding, GuideReportInput, ReviewVerdict } from "../../autonomous/session-types.js";
 
 export type CodexReviewKind = "plan" | "code";
 export type CodexReviewFormat = "guide-report";
@@ -21,7 +21,10 @@ interface CodexFinding {
 }
 
 interface CodexReviewOutput {
-  readonly verdict: "approve" | "revise" | "request_changes" | "reject";
+  // ISS-725: derive from the canonical ReviewVerdict so this never drifts from
+  // REVIEW_VERDICTS. The per-kind PLAN_REVIEW_VERDICTS/CODE_REVIEW_VERDICTS sets
+  // below are intentionally narrower (3 values each) and stay independent.
+  readonly verdict: ReviewVerdict;
   readonly summary?: string;
   readonly findings?: readonly CodexFinding[];
 }

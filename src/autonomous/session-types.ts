@@ -29,6 +29,19 @@ export type LensFindingDisposition = typeof LENS_FINDING_DISPOSITIONS[number];
 export const REVIEW_VERDICTS = ["approve", "revise", "request_changes", "reject"] as const;
 export type ReviewVerdict = typeof REVIEW_VERDICTS[number];
 
+/**
+ * ISS-725: single source of truth for the human-readable verdict enumeration
+ * used in retry-instruction prose ('"approve", "revise", "request_changes", or
+ * "reject"'). Derived from REVIEW_VERDICTS so the two stage guards never drift
+ * from the canonical list.
+ */
+export const REVIEW_VERDICTS_PROSE: string = (() => {
+  const quoted = REVIEW_VERDICTS.map((v) => `"${v}"`);
+  return quoted.length <= 1
+    ? quoted.join("")
+    : `${quoted.slice(0, -1).join(", ")}, or ${quoted[quoted.length - 1]}`;
+})();
+
 // ---------------------------------------------------------------------------
 // Workflow states from N-005 v5.1 state machine
 // ---------------------------------------------------------------------------

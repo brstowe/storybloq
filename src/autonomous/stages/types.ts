@@ -232,7 +232,7 @@ export class StageContext {
   }
 }
 
-/** DJB2 hash — must match guide.ts simpleHash exactly for fingerprint compatibility. */
+/** DJB2 hash (seed 5381, base-36): the canonical deferral-fingerprint algorithm; keep it byte-for-byte in sync with the plan-fingerprint hash in stages/plan.ts. */
 function djb2Hash(content: string): string {
   let hash = 5381;
   for (let i = 0; i < content.length; i++) {

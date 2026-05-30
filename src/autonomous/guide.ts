@@ -361,33 +361,11 @@ const SEVERITY_MAP: Record<string, string> = {
   minor: "medium",
 };
 
-/**
- * File issues for deferred findings. Called after review round is validated and written.
- * Adds to pendingDeferrals first (durable), then attempts to file, moves to filedDeferrals on success.
- */
-async function fileDeferredFindings(
-  root: string,
-  dir: string,
-  state: FullSessionState,
-  findings: readonly { severity: string; category: string; description: string; disposition: string }[],
-  reviewKind: "plan" | "code",
-): Promise<FullSessionState> {
-  const deferred = findings.filter(f => f.disposition === "deferred" && f.severity !== "suggestion");
-  if (deferred.length === 0) return state;
-
-  const pending = [...(state.pendingDeferrals ?? [])];
-  for (const f of deferred) {
-    const fp = simpleHash(`${state.ticket?.id ?? ""}:${reviewKind}:${f.severity}:${f.category}:${f.description}`);
-    if ((state.filedDeferrals ?? []).some(d => d.fingerprint === fp)) continue;
-    if (pending.some(d => d.fingerprint === fp)) continue;
-    pending.push({ fingerprint: fp, severity: f.severity, category: f.category, description: f.description, reviewKind });
-  }
-
-  // Persist pending entries first (crash-safe: survives before drain attempt)
-  const persisted = writeSessionAndRefresh(root, dir, { ...state, pendingDeferrals: pending } as FullSessionState, "if-active");
-  let updated = await drainPendingDeferrals(root, dir, persisted);
-  return updated;
-}
+// ISS-725: the deferred-finding filing logic that used to live here as a
+// module-level fileDeferredFindings() was dead code (zero callers). The live
+// path is StageContext.fileDeferredFindings (stages/types.ts), invoked from the
+// code-review and plan-review stages, which then calls drainPendingDeferrals
+// below. Only the still-live drain half remains.
 
 /**
  * Attempt to file all pending deferrals. Called on handleReport, handleResume, handleReportHandover, session stop.
@@ -2431,11 +2409,3 @@ function readFileSafe(path: string): string {
   }
 }
 
-/** DJB2 hash — sufficient for plan change detection (ISS-035). */
-function simpleHash(content: string): string {
-  let hash = 5381;
-  for (let i = 0; i < content.length; i++) {
-    hash = ((hash << 5) + hash + content.charCodeAt(i)) & 0xffffffff;
-  }
-  return hash.toString(36);
-}
