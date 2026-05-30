@@ -1,9 +1,11 @@
-import { mkdir, writeFile, readFile, readdir, copyFile, rm, rename, unlink } from "node:fs/promises";
+import { mkdir, writeFile, readFile, readdir, copyFile, rm, rename, lstat } from "node:fs/promises";
 import { existsSync, accessSync, readdirSync, constants as fsConstants } from "node:fs";
 import { join, dirname, delimiter as pathDelimiter } from "node:path";
 import { homedir } from "node:os";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+
+import { atomicWriteFollowingSymlink, resolveSymlinkTarget } from "../../core/symlink-write.js";
 
 import {
   PRECOMPACT_SUBCOMMAND,
@@ -59,16 +61,74 @@ export function resolveSkillSourceDir(): string {
 }
 
 /**
+ * Test-only injection seam for the copyDirRecursive swap rollback. Production
+ * callers never pass this; it exists so the rename-failure rollback path can be
+ * exercised deterministically (a flaky read-only-dir test would not reliably
+ * hit the inner swap).
+ */
+export interface CopyDirTestHooks {
+  /** Invoked inside the try, immediately before the tmpDir -> targetDir swap rename. */
+  beforeSwapRename?: () => void | Promise<void>;
+}
+
+/**
  * Recursively copies a directory tree from src to dest.
  * Copies to a temp dir first, then atomically swaps to avoid partial installs.
  * Uses withFileTypes to skip directories (cross-platform) and copyFile (binary-safe).
+ *
+ * Issue #12: if destDir is a symlinked directory (e.g. a stow/chezmoi-managed
+ * ~/.claude/skills/story), the swap operates on the link's REAL target so the
+ * symlink is preserved rather than replaced by a standalone directory. existsSync
+ * follows symlinks and cannot detect one, so we lstat first.
  */
 export async function copyDirRecursive(srcDir: string, destDir: string): Promise<string[]> {
-  const tmpDir = destDir + ".tmp";
-  const bakDir = destDir + ".bak";
-  // Recover from a previous crash: if destDir is gone but bakDir exists, restore it
-  if (!existsSync(destDir) && existsSync(bakDir)) {
-    await rename(bakDir, destDir);
+  return runCopyDir(srcDir, destDir);
+}
+
+/** Test-only entry point that threads rollback hooks into the private swap. */
+export async function __copyDirRecursiveForTest(
+  srcDir: string,
+  destDir: string,
+  testHooks?: CopyDirTestHooks,
+): Promise<string[]> {
+  return runCopyDir(srcDir, destDir, testHooks);
+}
+
+async function runCopyDir(srcDir: string, destDir: string, testHooks?: CopyDirTestHooks): Promise<string[]> {
+  let st = null;
+  try {
+    st = await lstat(destDir);
+  } catch (e) {
+    // ENOENT: destDir does not exist yet -> swap the literal path. Any other
+    // error leaves symlink-ness unknown, so rethrow rather than risk clobbering.
+    if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+  }
+
+  let targetDir = destDir;
+  if (st?.isSymbolicLink()) {
+    targetDir = await resolveSymlinkTarget(destDir);
+    // Refuse to convert a symlink-to-an-existing-non-directory into a real dir.
+    // A missing target (dangling dir symlink) is allowed -- the swap creates it.
+    let resolvedStat = null;
+    try {
+      resolvedStat = await lstat(targetDir);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+    }
+    if (resolvedStat && !resolvedStat.isDirectory()) {
+      throw new Error(`refusing to replace non-directory symlink target: ${targetDir}`);
+    }
+  }
+
+  return copyDirSwap(srcDir, targetDir, testHooks);
+}
+
+async function copyDirSwap(srcDir: string, targetDir: string, testHooks?: CopyDirTestHooks): Promise<string[]> {
+  const tmpDir = targetDir + ".tmp";
+  const bakDir = targetDir + ".bak";
+  // Recover from a previous crash: if targetDir is gone but bakDir exists, restore it
+  if (!existsSync(targetDir) && existsSync(bakDir)) {
+    await rename(bakDir, targetDir);
   }
   // Clean up any leftover temp/backup dirs
   if (existsSync(tmpDir)) await rm(tmpDir, { recursive: true, force: true });
@@ -89,14 +149,15 @@ export async function copyDirRecursive(srcDir: string, destDir: string): Promise
     written.push(relativePath);
   }
   // Safe swap: back up old, rename new in, clean up backup
-  if (existsSync(destDir)) {
-    await rename(destDir, bakDir);
+  if (existsSync(targetDir)) {
+    await rename(targetDir, bakDir);
   }
   try {
-    await rename(tmpDir, destDir);
+    if (testHooks?.beforeSwapRename) await testHooks.beforeSwapRename();
+    await rename(tmpDir, targetDir);
   } catch (err) {
     // Restore backup if rename fails
-    if (existsSync(bakDir)) await rename(bakDir, destDir).catch(() => {});
+    if (existsSync(bakDir)) await rename(bakDir, targetDir).catch(() => {});
     await rm(tmpDir, { recursive: true, force: true }).catch(() => {});
     throw err;
   }
@@ -321,16 +382,10 @@ async function registerHook(
     hookArray.push({ matcher: targetMatcher, hooks: [hookEntry] });
   }
 
-  // Atomic write: temp file + rename
-  const tmpPath = `${path}.${process.pid}.tmp`;
+  // Atomic write that follows a symlinked settings.json (issue #12)
   try {
-    const dir = dirname(path);
-    await mkdir(dir, { recursive: true });
-    await writeFile(tmpPath, JSON.stringify(settings, null, 2) + "\n", "utf-8");
-    await rename(tmpPath, path);
+    await atomicWriteFollowingSymlink(path, JSON.stringify(settings, null, 2) + "\n");
   } catch (err: unknown) {
-    // Clean up temp file on failure
-    try { await unlink(tmpPath); } catch { /* ignore */ }
     const message = err instanceof Error ? err.message : String(err);
     process.stderr.write(`Failed to write settings.json: ${message}\n`);
     return "skipped";
@@ -423,15 +478,10 @@ export async function removeHook(
 
   if (!removed) return "not_found";
 
-  // Atomic write
-  const tmpPath = `${path}.${process.pid}.tmp`;
+  // Atomic write that follows a symlinked settings.json (issue #12)
   try {
-    const dir = dirname(path);
-    await mkdir(dir, { recursive: true });
-    await writeFile(tmpPath, JSON.stringify(settings, null, 2) + "\n", "utf-8");
-    await rename(tmpPath, path);
+    await atomicWriteFollowingSymlink(path, JSON.stringify(settings, null, 2) + "\n");
   } catch {
-    try { await unlink(tmpPath); } catch { /* ignore */ }
     return "skipped";
   }
 
@@ -778,13 +828,10 @@ export async function ensureCodexToolApprovals(
     next += additions.join("\n");
   }
 
-  const tmpPath = `${configPath}.${process.pid}.tmp`;
+  // Atomic write that follows a symlinked config.toml (issue #12)
   try {
-    await mkdir(dirname(configPath), { recursive: true });
-    await writeFile(tmpPath, next, "utf-8");
-    await rename(tmpPath, configPath);
+    await atomicWriteFollowingSymlink(configPath, next);
   } catch (err: unknown) {
-    try { await unlink(tmpPath); } catch { /* ignore */ }
     const message = err instanceof Error ? err.message : String(err);
     process.stderr.write(`Failed to write Codex config.toml: ${message}\n`);
     return "skipped";
@@ -873,13 +920,10 @@ export async function ensureCodexClientEnv(
     next += `${header}\nSTORYBLOQ_CLIENT = "codex"\n`;
   }
 
-  const tmpPath = `${configPath}.${process.pid}.tmp`;
+  // Atomic write that follows a symlinked config.toml (issue #12)
   try {
-    await mkdir(dirname(configPath), { recursive: true });
-    await writeFile(tmpPath, next, "utf-8");
-    await rename(tmpPath, configPath);
+    await atomicWriteFollowingSymlink(configPath, next);
   } catch (err: unknown) {
-    try { await unlink(tmpPath); } catch { /* ignore */ }
     const message = err instanceof Error ? err.message : String(err);
     process.stderr.write(`Failed to write Codex config.toml: ${message}\n`);
     return "skipped";
@@ -938,13 +982,10 @@ export async function migrateCodexHookVariants(
 
   if (removedCount === 0) return 0;
 
-  const tmpPath = `${hooksPath}.${process.pid}.tmp`;
+  // Atomic write that follows a symlinked hooks.json (issue #12)
   try {
-    await mkdir(dirname(hooksPath), { recursive: true });
-    await writeFile(tmpPath, JSON.stringify(settings, null, 2) + "\n", "utf-8");
-    await rename(tmpPath, hooksPath);
+    await atomicWriteFollowingSymlink(hooksPath, JSON.stringify(settings, null, 2) + "\n");
   } catch {
-    try { await unlink(tmpPath); } catch { /* ignore */ }
     return 0;
   }
 
@@ -1028,13 +1069,10 @@ export async function registerCodexHook(
     hookArray.push(group);
   }
 
-  const tmpPath = `${hooksPath}.${process.pid}.tmp`;
+  // Atomic write that follows a symlinked hooks.json (issue #12)
   try {
-    await mkdir(dirname(hooksPath), { recursive: true });
-    await writeFile(tmpPath, JSON.stringify(settings, null, 2) + "\n", "utf-8");
-    await rename(tmpPath, hooksPath);
+    await atomicWriteFollowingSymlink(hooksPath, JSON.stringify(settings, null, 2) + "\n");
   } catch (err: unknown) {
-    try { await unlink(tmpPath); } catch { /* ignore */ }
     const message = err instanceof Error ? err.message : String(err);
     process.stderr.write(`Failed to write Codex hooks.json: ${message}\n`);
     return "skipped";
@@ -1059,14 +1097,24 @@ async function handleSetupCodex(options: SetupSkillOptions = {}): Promise<void> 
 
   const skillDir = join(homedir(), ".agents", "skills", "story");
   const existed = existsSync(join(skillDir, "SKILL.md"));
-  const writtenFiles = await copyDirRecursive(srcSkillDir, skillDir);
-  log(`${existed ? "Updated" : "Installed"} $story skill at ${skillDir}/`);
-  log(`  ${writtenFiles.join(" + ")} written`);
+  try {
+    const writtenFiles = await copyDirRecursive(srcSkillDir, skillDir);
+    log(`${existed ? "Updated" : "Installed"} $story skill at ${skillDir}/`);
+    log(`  ${writtenFiles.join(" + ")} written`);
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    process.stderr.write(`Warning: $story skill copy failed: ${msg}\n`);
+  }
 
   const compatSkillDir = join(codexHome(), "skills", "story");
   if (existsSync(join(compatSkillDir, "SKILL.md"))) {
-    const compatFiles = await copyDirRecursive(srcSkillDir, compatSkillDir);
-    log(`  Refreshed existing Codex skill copy at ${compatSkillDir}/ (${compatFiles.length} files)`);
+    try {
+      const compatFiles = await copyDirRecursive(srcSkillDir, compatSkillDir);
+      log(`  Refreshed existing Codex skill copy at ${compatSkillDir}/ (${compatFiles.length} files)`);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(`Warning: Codex skill copy refresh failed: ${msg}\n`);
+    }
   }
 
   let cliInPath = false;

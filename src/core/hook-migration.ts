@@ -19,10 +19,12 @@
  * command string already equals the freshly-formatted canonical.
  */
 
-import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, join } from "node:path";
+
+import { atomicWriteFollowingSymlink } from "./symlink-write.js";
 
 function defaultSettingsPath(): string {
   return join(homedir(), ".claude", "settings.json");
@@ -251,14 +253,10 @@ export async function migrateLegacyHookVariants(
 
   if (removedCount === 0) return 0;
 
-  const tmpPath = `${path}.${process.pid}.tmp`;
   try {
-    const dir = dirname(path);
-    await mkdir(dir, { recursive: true });
-    await writeFile(tmpPath, JSON.stringify(settings, null, 2) + "\n", "utf-8");
-    await rename(tmpPath, path);
+    // Issue #12: follow a symlinked settings.json instead of replacing it.
+    await atomicWriteFollowingSymlink(path, JSON.stringify(settings, null, 2) + "\n");
   } catch {
-    try { await unlink(tmpPath); } catch { /* ignore */ }
     return 0;
   }
 
