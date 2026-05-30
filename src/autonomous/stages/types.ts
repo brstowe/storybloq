@@ -1,5 +1,6 @@
 import {
   LENS_FINDING_DISPOSITIONS,
+  normalizeSeverity,
   type FullSessionState,
   type GuideReportInput,
   type LensFindingDisposition,
@@ -216,7 +217,10 @@ export class StageContext {
     findings: readonly { severity: string; category: string; description: string; disposition: string }[],
     reviewKind: "plan" | "code",
   ): Promise<void> {
-    const deferred = findings.filter(f => f.disposition === "deferred" && f.severity !== "suggestion");
+    // ISS-726: normalize severity here too so the suggestion-exemption holds
+    // even if a caller passes findings that did not pass through a stage's
+    // entry normalization.
+    const deferred = findings.filter(f => f.disposition === "deferred" && normalizeSeverity(f.severity) !== "suggestion");
     if (deferred.length === 0) return;
 
     const pending = [...(this._state.pendingDeferrals ?? [])];

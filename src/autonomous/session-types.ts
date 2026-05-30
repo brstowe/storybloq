@@ -42,6 +42,22 @@ export const REVIEW_VERDICTS_PROSE: string = (() => {
     : `${quoted.slice(0, -1).join(", ")}, or ${quoted[quoted.length - 1]}`;
 })();
 
+/**
+ * ISS-726: canonicalize a finding's severity for the case-sensitive downstream
+ * comparisons. The report.findings[] schema keeps severity as a lenient
+ * z.string (so non-canonical values are accepted rather than rejected), but two
+ * safety checks match it exactly: the suggestion-exemption in the deferral
+ * filter (severity !== "suggestion") and the critical/major contradiction guard
+ * in the review stages. Without normalization a miscased "Suggestion" would
+ * bypass the exemption (auto-filing an issue) and a miscased "Critical"/"Major"
+ * would silently skip the guard (letting an approve verdict through with an
+ * effectively-critical finding). Normalize at the consumption point so the fix
+ * holds regardless of how the report was constructed.
+ */
+export function normalizeSeverity(severity: string): string {
+  return severity.trim().toLowerCase();
+}
+
 // ---------------------------------------------------------------------------
 // Workflow states from N-005 v5.1 state machine
 // ---------------------------------------------------------------------------

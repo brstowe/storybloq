@@ -3,7 +3,7 @@
  * ISS-075: PICK_TICKET should exit when all work is done.
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { StageContext, type ResolvedRecipe } from "../../../src/autonomous/stages/types.js";
@@ -166,6 +166,77 @@ describe("ISS-073: code-review contradiction guard respects disposition", () => 
     });
     expect(advance.action).toBe("retry");
     expect(advance.instruction).toContain("Contradictory");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ISS-726: severity comparisons are case-insensitive (normalizeSeverity)
+// ---------------------------------------------------------------------------
+
+// Build a finding with an arbitrary (possibly miscased) severity string.
+function miscasedFinding(severity: string, disposition: Finding["disposition"]): Finding {
+  return { id: "F-1", severity: severity as Finding["severity"], category: "test", description: "Test finding", disposition };
+}
+
+describe("ISS-726: contradiction guard treats severity case-insensitively", () => {
+  it("code-review: approve + miscased 'Critical' open -> blocked (retry)", async () => {
+    const { CodeReviewStage } = await import("../../../src/autonomous/stages/code-review.js");
+    const stage = new CodeReviewStage();
+    const state = makeState({ state: "CODE_REVIEW", reviews: { plan: [{ round: 1, reviewer: "agent", verdict: "approve", findingCount: 0, criticalCount: 0, majorCount: 0, suggestionCount: 0, timestamp: new Date().toISOString() }], code: [] } });
+    const ctx = new StageContext(testRoot, sessionDir, state, makeRecipe());
+
+    const advance = await stage.report(ctx, {
+      completedAction: "code_review_round",
+      verdict: "approve",
+      findings: [miscasedFinding("Critical", "open")],
+    });
+    expect(advance.action).toBe("retry");
+    expect(advance.instruction).toContain("Contradictory");
+  });
+
+  it("plan-review: approve + miscased 'MAJOR' open -> blocked (retry)", async () => {
+    const { PlanReviewStage } = await import("../../../src/autonomous/stages/plan-review.js");
+    const stage = new PlanReviewStage();
+    const state = makeState({ state: "PLAN_REVIEW", reviews: { plan: [], code: [] } });
+    const ctx = new StageContext(testRoot, sessionDir, state, makeRecipe());
+
+    const advance = await stage.report(ctx, {
+      completedAction: "plan_review_round",
+      verdict: "approve",
+      findings: [miscasedFinding("MAJOR", "open")],
+    });
+    expect(advance.action).toBe("retry");
+    expect(advance.instruction).toContain("Contradictory");
+  });
+});
+
+describe("ISS-726: suggestion-exemption treats severity case-insensitively", () => {
+  function issueCount(): number {
+    return readdirSync(join(testRoot, ".story", "issues")).filter((f) => /^ISS-\d+\.json$/.test(f)).length;
+  }
+
+  it("a deferred miscased 'Suggestion' is exempt and files no issue", async () => {
+    const state = makeState();
+    const ctx = new StageContext(testRoot, sessionDir, state, makeRecipe());
+    expect(issueCount()).toBe(0);
+
+    await ctx.fileDeferredFindings(
+      [{ severity: "Suggestion", category: "style", description: "nit", disposition: "deferred" }],
+      "code",
+    );
+    expect(issueCount()).toBe(0);
+  });
+
+  it("control: a deferred 'major' is NOT exempt and files an issue", async () => {
+    const state = makeState();
+    const ctx = new StageContext(testRoot, sessionDir, state, makeRecipe());
+    expect(issueCount()).toBe(0);
+
+    await ctx.fileDeferredFindings(
+      [{ severity: "major", category: "logic", description: "real bug", disposition: "deferred" }],
+      "code",
+    );
+    expect(issueCount()).toBe(1);
   });
 });
 

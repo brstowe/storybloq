@@ -2,7 +2,7 @@ import { displayIdOf } from "../../core/resolver.js";
 import type { WorkflowStage, StageResult, StageAdvance, StageContext } from "./types.js";
 import { buildLensHistoryUpdate } from "./types.js";
 import type { GuideReportInput } from "../session-types.js";
-import { REVIEW_VERDICTS, REVIEW_VERDICTS_PROSE } from "../session-types.js";
+import { REVIEW_VERDICTS, REVIEW_VERDICTS_PROSE, normalizeSeverity } from "../session-types.js";
 import { requiredRounds, nextReviewer } from "../review-depth.js";
 import { clearCache } from "../review-lenses/cache.js";
 import { accumulateVerificationCounters } from "../review-lenses/verification-log.js";
@@ -177,7 +177,10 @@ export class CodeReviewStage implements WorkflowStage {
 
     const codeReviews = [...ctx.state.reviews.code];
     const roundNum = codeReviews.length + 1;
-    const findings = report.findings ?? [];
+    // ISS-726: canonicalize severity up front so the suggestion-exemption and
+    // critical/major contradiction guard below (and the per-severity counts and
+    // lens history) cannot be bypassed by a miscased value.
+    const findings = (report.findings ?? []).map((f) => ({ ...f, severity: normalizeSeverity(f.severity) }));
     const backends = reviewBackendsForClient(ctx.state.config);
     const computedReviewer = nextReviewer(codeReviews, backends, ctx.state.codexUnavailable, ctx.state.codexUnavailableSince);
     // ISS-102: Use actual reviewer from report, infer from notes, or fall back to computed

@@ -124,8 +124,10 @@ side effect worth knowing before you choose it:
   learning loop and files no issue. Do NOT use it to park a valid finding you simply
   will not fix now; that pollutes the learning signal.
 - `deferred` -- the finding is valid but out of scope for this ticket. This AUTO-FILES
-  a storybloq issue so the work is tracked. Severity `suggestion` is exempt and is not
-  filed. Use `deferred` only when you genuinely want a new issue created.
+  a storybloq issue so the work is tracked. A `deferred` finding whose severity is the
+  canonical lowercase `suggestion` is exempt and is not filed (severity is normalized to
+  lowercase before this check, so `Suggestion`/`SUGGESTION` are treated the same). Use
+  `deferred` only when you genuinely want a new issue created.
 
 So the rule of thumb: park valid-but-out-of-scope work as `deferred` (it becomes an
 issue), and reserve `contested` for genuine false positives.
