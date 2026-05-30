@@ -524,7 +524,7 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
   // --- Ticket write tools ---
 
   server.registerTool("storybloq_ticket_create", {
-    description: "Create a new ticket",
+    description: "Create a new ticket. ID assignment is serialized under the project lock, so concurrent creates that acquire the lock receive distinct sequential IDs.",
     inputSchema: {
       title: z.string().describe("Ticket title"),
       type: z.enum(TICKET_TYPES).describe("Ticket type: task, feature, chore"),
@@ -614,7 +614,7 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
   // --- Issue write tools ---
 
   server.registerTool("storybloq_issue_create", {
-    description: "Create a new issue",
+    description: "Create a new issue. ID assignment is serialized under the project lock, so concurrent creates that acquire the lock receive distinct sequential IDs.",
     inputSchema: {
       title: z.string().describe("Issue title"),
       severity: z.enum(ISSUE_SEVERITIES).describe("Issue severity: critical, high, medium, low"),
@@ -726,7 +726,7 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
   }, (args) => runMcpReadTool(pinnedRoot, (ctx) => handleNoteGet(args.id, ctx)));
 
   server.registerTool("storybloq_note_create", {
-    description: "Create a new note",
+    description: "Create a new note. ID assignment is serialized under the project lock, so concurrent creates that acquire the lock receive distinct sequential IDs.",
     inputSchema: {
       content: z.string().describe("Note content"),
       title: z.string().optional().describe("Note title"),
@@ -794,7 +794,7 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
   }, () => runMcpReadTool(pinnedRoot, (ctx) => handleLessonDigest(ctx)));
 
   server.registerTool("storybloq_lesson_create", {
-    description: "Create a new lesson",
+    description: "Create a new lesson. ID assignment is serialized under the project lock, so concurrent creates that acquire the lock receive distinct sequential IDs.",
     inputSchema: {
       title: z.string().describe("Lesson title — concise lesson name"),
       content: z.string().describe("The actionable rule (1-3 sentences)"),

@@ -13,7 +13,7 @@ Invocation differs by client: use `/story` in Claude Code, `$story` in Codex, or
 
 This guard runs on EVERY `/story` invocation regardless of subcommand (`/story`, `/story auto`, `/story review`, `/story plan`, `/story guided`, `/story handover`, `/story snapshot`, `/story export`, `/story design`, `/story review-lenses`, `/story settings`, `/story help`, `/story status`, etc.). It MUST complete before ANY other action in this invocation.
 
-**Guard prelude: force-surface deferred MCP tools.** Before running step 1 of this guard, make a single `ToolSearch` call with `query: "storybloq"` (max_results: 20). On Claude Code desktop/web, `storybloq_*` tool schemas are deferred — without this prelude the subsequent `storybloq_status` call in step 1 is not dispatchable. The prelude is explicitly part of the guard, not a separate pre-guard step; it satisfies the whitelist below.
+**Guard prelude: force-surface deferred MCP tools.** Before running step 1 of this guard, make a `ToolSearch` call with `query: "storybloq"` and `max_results: 80` (high enough to surface the full `storybloq_*` tool set, currently ~53 tools, in one call; a smaller cap truncates alphabetically and can drop `storybloq_status`). On Claude Code desktop/web, `storybloq_*` tool schemas are deferred, so without this prelude the subsequent `storybloq_status` call in step 1 is not dispatchable. If `storybloq_status` is still not available after that call (some clients clamp or ignore `max_results`), make a second targeted `ToolSearch` with `query: "storybloq_status"` and `max_results: 5`, which ranks that exact tool to the top, before concluding anything about MCP availability. The prelude is explicitly part of the guard, not a separate pre-guard step; it satisfies the whitelist below.
 
 - If `ToolSearch` itself is not available or returns an error on this harness, SKIP the prelude and continue to step 1. Do NOT treat a missing `ToolSearch` tool as evidence that MCP is unavailable — step 1's `storybloq_status` call will either succeed (MCP already surfaced) or its failure will route the skill to the Step 0 setup/CLI-fallback path below.
 - The prelude is idempotent: on terminal CLI sessions where `storybloq_*` tools are already in the base list, it simply returns the same tool set.
@@ -62,7 +62,7 @@ Check if the storybloq MCP tools are available.
 **Deferred tools note (Claude Code app).** Claude Code desktop/web may register MCP tools at session start but defer exposing their full schemas to your tool list until you explicitly request them. A naive "look for `storybloq_status` in available tools" check fails on a cold session even when the MCP server is healthy and connected, routing the skill to the CLI fallback unnecessarily. The Step 0.5 guard prelude above (the `ToolSearch` call) has already force-surfaced any deferred tools by this point, so this step only needs to check the current tool list:
 
 1. **Check for storybloq MCP tools in your tool list.** If any `storybloq_*` tools (for example `storybloq_status`) are present, MCP is available -- proceed to Step 1.
-2. **If no `storybloq_*` tools are present**, try a second `ToolSearch` call with `query: "storybloq"` (max_results: 20) as a safety net in case the guard prelude was skipped or failed silently. If the response lists any `storybloq_*` tools, proceed to Step 1.
+2. **If no `storybloq_*` tools are present**, try a `ToolSearch` call with `query: "storybloq"` and `max_results: 80` (and, if `storybloq_status` is still not listed, a targeted `query: "storybloq_status"`, `max_results: 5`) as a safety net in case the guard prelude was skipped or failed silently. If the response lists any `storybloq_*` tools, proceed to Step 1.
 3. **If `ToolSearch` is unavailable on this harness OR returned no matches**, MCP is genuinely unavailable -- continue with the setup/fallback path below. Missing `ToolSearch` is never by itself evidence that MCP is broken; it just means the harness exposes tools differently.
 
 **If MCP tools are NOT available:**
@@ -138,18 +138,17 @@ Open with the project name and progress. Mention what the last session accomplis
 
 You MUST show the following tables after the prose intro. Do not summarize them in paragraph form.
 
-**Ready to Work table** -- call `storybloq_recommend` for context-aware suggestions. Always render as a markdown table:
+**Ready to Work table** -- call `storybloq_recommend` for context-aware suggestions. `storybloq_recommend` MIXES tickets and issues, so render as a neutral markdown table:
 
 ```
 ## Ready to Work
-| Ticket | Title                              | Phase      |
-|--------|-----------------------------------|------------|
-| T-001  | Project setup                     | foundation |
-| T-011  | Rate agreement conditions schema  | foundation |
-| T-012  | Audit trail infrastructure        | foundation |
+| Item    | Type   | Title                            | Context        |
+|---------|--------|----------------------------------|----------------|
+| T-011   | ticket | Rate agreement conditions schema | foundation     |
+| ISS-042 | issue  | Auth token expiry bug            | severity: high |
 ```
 
-Show up to 5 unblocked tickets. If more exist, note "(+N more unblocked)".
+Ticket rows show their phase in Context; issue rows show severity. Show up to 5 recommendations. If more exist, note "(+N more)". Note: tickets are filtered to unblocked ones, but issues are ranked by severity and have no blocker model, so a listed issue may be externally blocked -- verify it is actionable before starting.
 
 **Decisions Pending** (show only if there are TBD items in CLAUDE.md or undecided tech choices):
 

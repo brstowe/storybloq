@@ -4,6 +4,7 @@ import {
   errorEnvelope,
   partialEnvelope,
   escapeMarkdownInline,
+  escapeMarkdownDocument,
   fencedBlock,
   formatStatus,
   formatPhaseList,
@@ -59,52 +60,112 @@ describe("escapeMarkdownInline", () => {
     expect(escapeMarkdownInline("+ list")).toContain("\\+");
   });
 
-  it("escapes blockquote at line start (via HTML entity)", () => {
-    const result = escapeMarkdownInline("> quote");
-    // > is escaped as &gt; which prevents blockquote rendering
-    expect(result).toContain("&gt;");
-    expect(result).not.toMatch(/^>/);
+  it("escapes ordered lists at line start", () => {
+    expect(escapeMarkdownInline("1. item")).toContain("1\\.");
   });
 
-  it("escapes ordered lists", () => {
-    const result = escapeMarkdownInline("1. item");
-    expect(result).toContain("1\\.");
+  it("escapes line-start markers after a newline", () => {
+    expect(escapeMarkdownInline("first\n# second")).toContain("\\#");
   });
 
-  it("escapes inline structural chars", () => {
-    const result = escapeMarkdownInline("use `code` and *bold*");
-    expect(result).toContain("\\`");
-    expect(result).toContain("\\*");
+  // Plain-text sinks (CLI stdout, MCP text): inline/HTML/backslash escaping was
+  // removed, so these must pass through verbatim rather than leak escape noise.
+  it("passes blockquote markers through unescaped", () => {
+    expect(escapeMarkdownInline("> quote")).toBe("> quote");
   });
 
-  it("escapes brackets and parens (link injection)", () => {
-    const result = escapeMarkdownInline("[click](http://evil.com)");
-    expect(result).toContain("\\[");
-    expect(result).toContain("\\(");
+  it("passes inline structural chars through unescaped", () => {
+    expect(escapeMarkdownInline("use `code` and *bold*")).toBe("use `code` and *bold*");
+  });
+
+  it("passes brackets and parens through unescaped", () => {
+    expect(escapeMarkdownInline("[click](http://example.com)")).toBe("[click](http://example.com)");
+  });
+
+  it("passes angle brackets through unescaped (no HTML entities)", () => {
+    expect(escapeMarkdownInline("<script>alert('x')</script>")).toBe("<script>alert('x')</script>");
+  });
+
+  it("passes ampersands through unescaped", () => {
+    expect(escapeMarkdownInline("A & B")).toBe("A & B");
+  });
+
+  it("passes backslashes through unescaped", () => {
+    expect(escapeMarkdownInline("C:\\tmp\\file")).toBe("C:\\tmp\\file");
   });
 
   it("does not escape normal text", () => {
     expect(escapeMarkdownInline("Hello world")).toBe("Hello world");
   });
 
-  it("handles multi-line text", () => {
-    const result = escapeMarkdownInline("first\n# second");
-    expect(result).toContain("\\#");
+  it("handles empty string", () => {
+    expect(escapeMarkdownInline("")).toBe("");
+  });
+});
+
+describe("escapeMarkdownDocument", () => {
+  // The export document is opened in a real Markdown viewer, so unlike the
+  // plain-text inline escaper, this one must neutralize inline structure, HTML,
+  // and link injection.
+  it("escapes heading and list markers at line start", () => {
+    expect(escapeMarkdownDocument("# Title")).toContain("\\#");
+    expect(escapeMarkdownDocument("- item")).toContain("\\-");
+    expect(escapeMarkdownDocument("1. item")).toContain("1\\.");
   });
 
-  it("escapes HTML characters", () => {
-    const result = escapeMarkdownInline("<script>alert('xss')</script>");
-    expect(result).toContain("&lt;");
-    expect(result).toContain("&gt;");
-    expect(result).not.toContain("<script>");
+  it("escapes inline structural chars", () => {
+    expect(escapeMarkdownDocument("use `code` and *bold*")).toBe(
+      "use \\`code\\` and \\*bold\\*",
+    );
+    expect(escapeMarkdownDocument("a_b~c")).toBe("a\\_b\\~c");
   });
 
-  it("escapes ampersands", () => {
-    expect(escapeMarkdownInline("A & B")).toContain("&amp;");
+  it("escapes link and table syntax", () => {
+    expect(escapeMarkdownDocument("[click](http://x)")).toBe(
+      "\\[click\\]\\(http://x\\)",
+    );
+    expect(escapeMarkdownDocument("a|b")).toBe("a\\|b");
+  });
+
+  it("escapes HTML to entities", () => {
+    expect(escapeMarkdownDocument("<b>hi</b>")).toBe("&lt;b&gt;hi&lt;/b&gt;");
+  });
+
+  it("escapes ampersands to entities", () => {
+    expect(escapeMarkdownDocument("A & B")).toBe("A &amp; B");
+  });
+
+  it("escapes backslashes first so later escapes are not doubled", () => {
+    expect(escapeMarkdownDocument("C:\\tmp")).toBe("C:\\\\tmp");
+  });
+
+  it("does not escape normal text", () => {
+    expect(escapeMarkdownDocument("Hello world")).toBe("Hello world");
   });
 
   it("handles empty string", () => {
-    expect(escapeMarkdownInline("")).toBe("");
+    expect(escapeMarkdownDocument("")).toBe("");
+  });
+});
+
+describe("escapeMarkdownInline at formatter boundaries", () => {
+  it("escapes a phase name starting with a heading marker in formatStatus md", () => {
+    const state = makeState({
+      tickets: [makeTicket({ id: "T-001", phase: "p1" })],
+      roadmap: makeRoadmap([makePhase({ id: "p1", name: "# Heading Phase" })]),
+    });
+    const md = formatStatus(state, "md");
+    expect(md).toContain("\\# Heading Phase");
+    expect(md).not.toContain("**# Heading Phase**");
+  });
+
+  it("escapes a phase name starting with a list marker in formatStatus md", () => {
+    const state = makeState({
+      tickets: [makeTicket({ id: "T-001", phase: "p1" })],
+      roadmap: makeRoadmap([makePhase({ id: "p1", name: "- Dash Phase" })]),
+    });
+    const md = formatStatus(state, "md");
+    expect(md).toContain("\\- Dash Phase");
   });
 });
 

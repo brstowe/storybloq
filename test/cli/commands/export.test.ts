@@ -5,6 +5,8 @@ import { CliValidationError } from "../../../src/cli/helpers.js";
 import {
   makeTicket,
   makeIssue,
+  makeNote,
+  makeLesson,
   makePhase,
   makeRoadmap,
   makeState,
@@ -217,6 +219,21 @@ describe("formatExport", () => {
       // Should not produce raw heading or HTML
       expect(md).not.toMatch(/^# Heading/m);
       expect(md).not.toContain("<script>");
+    });
+
+    it("escapes note and lesson tags in full export", () => {
+      const state = makeState({
+        notes: [makeNote({ id: "N-001", title: "Note", tags: ["a|b", "<x>"] })],
+        lessons: [makeLesson({ id: "L-001", title: "Lesson", tags: ["c|d"] })],
+        roadmap: makeRoadmap([makePhase({ id: "p1" })]),
+      });
+      const md = formatExport(state, "all", null, "md");
+      // Free-text tags must be neutralized, not interpolated raw.
+      expect(md).toContain("a\\|b");
+      expect(md).toContain("&lt;x&gt;");
+      expect(md).toContain("c\\|d");
+      expect(md).not.toContain("a|b");
+      expect(md).not.toContain("<x>");
     });
   });
 });
