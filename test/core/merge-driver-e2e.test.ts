@@ -160,4 +160,69 @@ describe("G-2: end-to-end git merge driver", () => {
     expect(merged.language).toBe("python");
     expect(merged.project).toBe("renamed");
   });
+
+  it("add/add: independently created entity with no common ancestor auto-resolves via driver", () => {
+    // Regression for the empty-%O bug: an add/add has no merge base, so git
+    // passes an empty ancestor file. The driver must treat that as base {} and
+    // still merge (here a commutative blockedBy union) rather than bailing to a
+    // raw `CONFLICT (add/add)`.
+    const dir = createTeamRepo();
+    tmpDirs.push(dir);
+    writeTicket(dir, "T-001");
+    git(dir, "add", "-A");
+    git(dir, "commit", "-m", "base (no T-002)");
+
+    git(dir, "checkout", "-b", "branch-a");
+    writeTicket(dir, "T-002", { blockedBy: ["T-010", "T-020"] });
+    git(dir, "add", "-A");
+    git(dir, "commit", "-m", "create T-002 on A");
+
+    git(dir, "checkout", "main");
+    git(dir, "checkout", "-b", "branch-b");
+    writeTicket(dir, "T-002", { blockedBy: ["T-010", "T-030"] });
+    git(dir, "add", "-A");
+    git(dir, "commit", "-m", "create T-002 on B");
+
+    const { exitCode } = gitMerge(dir, "branch-a");
+
+    const raw = readFileSync(join(dir, ".story", "tickets", "T-002.json"), "utf-8");
+    expect(raw).not.toContain("<<<<<<<");
+    const merged = JSON.parse(raw);
+    expect(merged._conflicts).toBeUndefined();
+    expect([...merged.blockedBy].sort()).toEqual(["T-010", "T-020", "T-030"]);
+    expect(exitCode).toBe(0);
+  });
+
+  it("add/add: divergent entity sharing an id surfaces structured _conflicts, not raw markers", () => {
+    // Two branches independently create T-002 with different content (the
+    // displayId-collision shape). Before the empty-%O fix this surfaced as a
+    // raw git add/add conflict; now the driver writes a structured _conflicts
+    // block the user can resolve.
+    const dir = createTeamRepo();
+    tmpDirs.push(dir);
+    writeTicket(dir, "T-001");
+    git(dir, "add", "-A");
+    git(dir, "commit", "-m", "base (no T-002)");
+
+    git(dir, "checkout", "-b", "branch-a");
+    writeTicket(dir, "T-002", { title: "From A" });
+    git(dir, "add", "-A");
+    git(dir, "commit", "-m", "create T-002 on A");
+
+    git(dir, "checkout", "main");
+    git(dir, "checkout", "-b", "branch-b");
+    writeTicket(dir, "T-002", { title: "From B" });
+    git(dir, "add", "-A");
+    git(dir, "commit", "-m", "create T-002 on B");
+
+    const { exitCode } = gitMerge(dir, "branch-a");
+
+    const raw = readFileSync(join(dir, ".story", "tickets", "T-002.json"), "utf-8");
+    expect(raw).not.toContain("<<<<<<<");
+    const merged = JSON.parse(raw);
+    expect(Array.isArray(merged._conflicts)).toBe(true);
+    expect(merged._conflicts.some((c: { field: string }) => c.field === "title")).toBe(true);
+    // Structured conflict must still leave the merge unresolved (git exit 1).
+    expect(exitCode).toBe(1);
+  });
 });

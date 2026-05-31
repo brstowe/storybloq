@@ -42,7 +42,13 @@ export function handleMergeDriver(
   let theirs: Record<string, unknown>;
 
   try {
-    base = JSON.parse(readFileSync(ancestorPath, "utf-8"));
+    // An add/add conflict has no common ancestor, so git supplies an empty file
+    // as %O. Treat an empty/whitespace ancestor as an empty base object so the
+    // merge can still run: identical content on both sides merges clean, while
+    // genuine field divergence (including displayId) still surfaces as a
+    // structured _conflicts block rather than raw git conflict markers.
+    const rawBase = readFileSync(ancestorPath, "utf-8");
+    base = rawBase.trim() === "" ? {} : JSON.parse(rawBase);
     ours = JSON.parse(readFileSync(oursPath, "utf-8"));
     theirs = JSON.parse(readFileSync(theirsPath, "utf-8"));
   } catch {
