@@ -359,4 +359,124 @@ describe("T-387: mergeRoadmap", () => {
       expect(result.merged._conflicts).toBeUndefined();
     });
   });
+
+  describe("ISS-657 placement + ISS-658 reorder/delete-edit", () => {
+    const ph = (id: string, name = id.toUpperCase()) => ({
+      id,
+      label: id.toUpperCase(),
+      name,
+      description: `${id} desc`,
+    });
+    const rm = (phases: Array<Record<string, unknown>>) => roadmap({ phases });
+    const ids = (r: { merged: Record<string, unknown> }) =>
+      (r.merged.phases as Array<Record<string, unknown>>).map((p) => p.id as string);
+
+    it("ISS-658: reordering side deletes an element the other side edits -> delete-edit conflict, not silent loss", () => {
+      const base = rm([ph("a"), ph("b"), ph("c")]);
+      const ours = rm([ph("c"), ph("b")]); // deletes a, reorders survivors
+      const theirs = rm([ph("a", "A-EDIT"), ph("b"), ph("c")]); // edits a
+      const result = mergeRoadmap(base, ours, theirs);
+      expect(result.clean).toBe(false);
+      expect(result.conflicts.some((c) => c.kind === "delete-edit")).toBe(true);
+      const a = (result.merged.phases as Array<Record<string, unknown>>).find((p) => p.id === "a");
+      expect(a).toBeDefined();
+      expect(a!.name).toBe("A"); // base retained under conflict; theirs edit surfaced, not dropped
+    });
+
+    it("ISS-658 symmetric: theirs reorders+deletes, ours edits", () => {
+      const base = rm([ph("a"), ph("b"), ph("c")]);
+      const ours = rm([ph("a", "A-EDIT"), ph("b"), ph("c")]);
+      const theirs = rm([ph("c"), ph("b")]);
+      const result = mergeRoadmap(base, ours, theirs);
+      expect(result.clean).toBe(false);
+      expect(result.conflicts.some((c) => c.kind === "delete-edit")).toBe(true);
+      expect((result.merged.phases as Array<Record<string, unknown>>).find((p) => p.id === "a")).toBeDefined();
+    });
+
+    it("ISS-658: clean delete under reorder (other side unchanged) -> no false conflict", () => {
+      const base = rm([ph("a"), ph("b"), ph("c")]);
+      const ours = rm([ph("c"), ph("b")]); // delete a + reorder
+      const theirs = rm([ph("a"), ph("b"), ph("c")]); // unchanged
+      const result = mergeRoadmap(base, ours, theirs);
+      expect(result.clean).toBe(true);
+      expect(ids(result)).not.toContain("a");
+      expect(result.conflicts.some((c) => c.fieldPath === "/phases")).toBe(false);
+    });
+
+    it("insert after a base id the reordering side deletes unchanged -> addition not dumped at tail", () => {
+      const base = rm([ph("a"), ph("b"), ph("c")]);
+      const ours = rm([ph("c"), ph("b")]); // delete a + reorder
+      const theirs = rm([ph("a"), ph("x"), ph("b"), ph("c")]); // a unchanged, add x after a
+      const result = mergeRoadmap(base, ours, theirs);
+      expect(result.clean).toBe(true);
+      expect(ids(result)).toEqual(["x", "c", "b"]);
+    });
+
+    it("insert after a base id deleted by reorderer AND edited by other -> conflict, base kept, addition present", () => {
+      const base = rm([ph("a"), ph("b"), ph("c")]);
+      const ours = rm([ph("c"), ph("b")]); // delete a + reorder
+      const theirs = rm([ph("a", "A-EDIT"), ph("x"), ph("b"), ph("c")]); // edit a + add x
+      const result = mergeRoadmap(base, ours, theirs);
+      expect(result.clean).toBe(false);
+      expect(result.conflicts.some((c) => c.kind === "delete-edit")).toBe(true);
+      const merged = ids(result);
+      expect(merged).toContain("x");
+      expect(merged).toContain("a"); // conflict-kept base
+    });
+
+    it("regression lock: non-reorder delete-edit keeps base element in place [a,b,c]", () => {
+      const base = rm([ph("a"), ph("b"), ph("c")]);
+      const ours = rm([ph("a"), ph("c")]); // delete b, no reorder
+      const theirs = rm([ph("a"), ph("b", "B-EDIT"), ph("c")]); // edit b
+      const result = mergeRoadmap(base, ours, theirs);
+      expect(result.clean).toBe(false);
+      expect(result.conflicts.some((c) => c.kind === "delete-edit")).toBe(true);
+      expect(ids(result)).toEqual(["a", "b", "c"]);
+    });
+
+    it("ISS-657: both sides add, placement preserved [X,A,Y,B]", () => {
+      const base = rm([ph("A"), ph("B")]);
+      const ours = rm([ph("X"), ph("A"), ph("B")]); // add X at start
+      const theirs = rm([ph("A"), ph("Y"), ph("B")]); // add Y after A
+      const result = mergeRoadmap(base, ours, theirs);
+      expect(result.clean).toBe(true);
+      expect(ids(result)).toEqual(["X", "A", "Y", "B"]);
+    });
+
+    it("ISS-657: one side reorders, other inserts mid-list", () => {
+      const base = rm([ph("A"), ph("B")]);
+      const ours = rm([ph("B"), ph("A")]); // reorder
+      const theirs = rm([ph("A"), ph("Z"), ph("B")]); // insert Z after A
+      const result = mergeRoadmap(base, ours, theirs);
+      expect(result.clean).toBe(true);
+      expect(ids(result)).toEqual(["B", "A", "Z"]);
+    });
+
+    it("consecutive at-start additions keep source order [X,Y,A,B]", () => {
+      const base = rm([ph("A"), ph("B")]);
+      const ours = rm([ph("X"), ph("Y"), ph("A"), ph("B")]);
+      const theirs = rm([ph("A"), ph("B")]);
+      const result = mergeRoadmap(base, ours, theirs);
+      expect(result.clean).toBe(true);
+      expect(ids(result)).toEqual(["X", "Y", "A", "B"]);
+    });
+
+    it("same-anchor additions on both sides -> ours before theirs [A,X,Y,B]", () => {
+      const base = rm([ph("A"), ph("B")]);
+      const ours = rm([ph("A"), ph("X"), ph("B")]);
+      const theirs = rm([ph("A"), ph("Y"), ph("B")]);
+      const result = mergeRoadmap(base, ours, theirs);
+      expect(result.clean).toBe(true);
+      expect(ids(result)).toEqual(["A", "X", "Y", "B"]);
+    });
+
+    it("chained additions preserve order [A,X,Y,B]", () => {
+      const base = rm([ph("A"), ph("B")]);
+      const ours = rm([ph("A"), ph("X"), ph("Y"), ph("B")]);
+      const theirs = rm([ph("A"), ph("B")]);
+      const result = mergeRoadmap(base, ours, theirs);
+      expect(result.clean).toBe(true);
+      expect(ids(result)).toEqual(["A", "X", "Y", "B"]);
+    });
+  });
 });

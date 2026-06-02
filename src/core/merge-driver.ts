@@ -454,6 +454,56 @@ interface KeyedArrayOpts {
   blockerMode?: boolean;
 }
 
+interface Addition {
+  id: string;
+  side: 0 | 1; // 0 = ours, 1 = theirs
+  source: string[];
+}
+
+// Insert added ids into a keyed-array order (ISS-657). Each addition lands
+// immediately after its nearest preceding neighbor (from its own side's order)
+// that is a STABLE survivor (present in base and on both sides); additions never
+// anchor to a one-sided-deleted id, whose survival is not known until the
+// emission loop runs. Additions with no stable predecessor go to the front.
+// Same-anchor ties resolve ours-before-theirs, then by source order, so chains
+// and leading runs keep their authored order. The spine is walked verbatim, so
+// one-sided-deleted ids stay exactly where the caller placed them.
+function buildMergedOrder(spine: string[], stableSet: Set<string>, additions: Addition[]): string[] {
+  const front: Addition[] = [];
+  const groups = new Map<string, Addition[]>(); // stable anchor id -> additions placed after it
+  for (const add of additions) {
+    const srcIdx = add.source.indexOf(add.id);
+    let anchorId: string | null = null;
+    for (let i = srcIdx - 1; i >= 0; i--) {
+      const prev = add.source[i];
+      if (prev !== undefined && stableSet.has(prev)) {
+        anchorId = prev;
+        break;
+      }
+    }
+    if (anchorId === null) {
+      front.push(add);
+    } else {
+      const g = groups.get(anchorId);
+      if (g) g.push(add);
+      else groups.set(anchorId, [add]);
+    }
+  }
+  const cmp = (a: Addition, b: Addition): number =>
+    a.side - b.side || a.source.indexOf(a.id) - b.source.indexOf(b.id);
+  front.sort(cmp);
+  for (const g of groups.values()) g.sort(cmp);
+
+  const result: string[] = [];
+  for (const add of front) result.push(add.id);
+  for (const id of spine) {
+    result.push(id);
+    const g = groups.get(id);
+    if (g) for (const add of g) result.push(add.id);
+  }
+  return result;
+}
+
 function keyedArrayMerge(
   base: unknown[],
   ours: unknown[],
@@ -487,8 +537,26 @@ function keyedArrayMerge(
   const oursReordered = !deepEqual(oursSharedOrder, baseOursOrder);
   const theirsReordered = !deepEqual(theirsSharedOrder, baseTheirsOrder);
 
-  let mergedOrder: string[];
+  // Stable survivors: base ids kept by BOTH sides. These always appear in the
+  // output, so they are the only valid anchors for addition placement (ISS-657).
+  const stableSet = new Set(baseOrder.filter((id) => oursIds.has(id) && theirsIds.has(id)));
 
+  // Additions, de-duped: an id added by both sides appears once (in ours) and is
+  // reconciled by the emission loop, matching the prior behavior.
+  const addedByOurs = oursOrder.filter((id) => !baseIds.has(id));
+  const addedByTheirs = theirsOrder.filter((id) => !baseIds.has(id) && !oursIds.has(id));
+  const additions: Addition[] = [
+    ...addedByOurs.map((id) => ({ id, side: 0 as const, source: oursOrder })),
+    ...addedByTheirs.map((id) => ({ id, side: 1 as const, source: theirsOrder })),
+  ];
+
+  // Visit spine: the base ids to walk, in order. The non-reorder and both-reorder
+  // branches keep their exact prior spine (so delete-edit-kept elements stay in
+  // base position). The two single-side reorder branches additionally visit base
+  // ids the reordering side deleted but the other side still has, so the emission
+  // loop applies clean-delete / delete-edit instead of silently dropping them
+  // (ISS-658).
+  let spine: string[];
   if (oursReordered && theirsReordered && !deepEqual(oursSharedOrder, theirsSharedOrder)) {
     conflicts.push({
       fieldPath: parentPointer,
@@ -498,26 +566,18 @@ function keyedArrayMerge(
       ours: oursOrder,
       theirs: theirsOrder,
     });
-    mergedOrder = [...baseOrder];
-    const addedByOurs = oursOrder.filter((id) => !baseIds.has(id));
-    const addedByTheirs = theirsOrder.filter((id) => !baseIds.has(id) && !oursIds.has(id));
-    mergedOrder.push(...addedByOurs, ...addedByTheirs);
+    spine = [...baseOrder];
   } else if (oursReordered) {
-    mergedOrder = [...oursSharedOrder];
-    const addedByOurs = oursOrder.filter((id) => !baseIds.has(id));
-    const addedByTheirs = theirsOrder.filter((id) => !baseIds.has(id) && !oursIds.has(id));
-    mergedOrder.push(...addedByOurs, ...addedByTheirs);
+    spine = [...oursSharedOrder];
+    for (const id of baseOrder) if (theirsIds.has(id) && !oursIds.has(id)) spine.push(id);
   } else if (theirsReordered) {
-    mergedOrder = [...theirsSharedOrder];
-    const addedByOurs = oursOrder.filter((id) => !baseIds.has(id) && !theirsIds.has(id));
-    const addedByTheirs = theirsOrder.filter((id) => !baseIds.has(id));
-    mergedOrder.push(...addedByOurs, ...addedByTheirs);
+    spine = [...theirsSharedOrder];
+    for (const id of baseOrder) if (oursIds.has(id) && !theirsIds.has(id)) spine.push(id);
   } else {
-    mergedOrder = [...baseOrder.filter((id) => oursIds.has(id) || theirsIds.has(id))];
-    const addedByOurs = oursOrder.filter((id) => !baseIds.has(id));
-    const addedByTheirs = theirsOrder.filter((id) => !baseIds.has(id) && !oursIds.has(id));
-    mergedOrder.push(...addedByOurs, ...addedByTheirs);
+    spine = baseOrder.filter((id) => oursIds.has(id) || theirsIds.has(id));
   }
+
+  const mergedOrder = buildMergedOrder(spine, stableSet, additions);
 
   const removedByOurs = new Set(baseOrder.filter((id) => !oursIds.has(id)));
   const removedByTheirs = new Set(baseOrder.filter((id) => !theirsIds.has(id)));
