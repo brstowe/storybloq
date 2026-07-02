@@ -85,22 +85,22 @@ describe("detectBranchAffinity", () => {
 describe("checkAffinityMismatch", () => {
   it("never blocks for none status", () => {
     const affinity = { status: "none" as const, matchedIds: [], branch: "main" };
-    expect(checkAffinityMismatch(affinity, "T-100").blocked).toBe(false);
+    expect(checkAffinityMismatch(affinity, ["T-100"], "T-100").blocked).toBe(false);
   });
 
   it("never blocks for ambiguous status", () => {
     const affinity = { status: "ambiguous" as const, matchedIds: ["T-012", "T-013"], branch: "feature/T-012-and-T-013" };
-    expect(checkAffinityMismatch(affinity, "T-999").blocked).toBe(false);
+    expect(checkAffinityMismatch(affinity, ["T-999"], "T-999").blocked).toBe(false);
   });
 
   it("does not block when pick matches branch entity", () => {
     const affinity = { status: "matched" as const, matchedIds: ["T-123"], branch: "story/T-123-foo" };
-    expect(checkAffinityMismatch(affinity, "T-123").blocked).toBe(false);
+    expect(checkAffinityMismatch(affinity, ["T-123"], "T-123").blocked).toBe(false);
   });
 
   it("blocks when pick does not match branch entity", () => {
     const affinity = { status: "matched" as const, matchedIds: ["T-123"], branch: "story/T-123-foo" };
-    const result = checkAffinityMismatch(affinity, "T-456");
+    const result = checkAffinityMismatch(affinity, ["T-456"], "T-456");
     expect(result.blocked).toBe(true);
     expect(result.reason).toContain("T-123");
     expect(result.reason).toContain("T-456");
@@ -108,13 +108,57 @@ describe("checkAffinityMismatch", () => {
 
   it("normalizes case for comparison", () => {
     const affinity = { status: "matched" as const, matchedIds: ["ISS-077"], branch: "fix/ISS-077-crash" };
-    expect(checkAffinityMismatch(affinity, "iss-077").blocked).toBe(false);
+    expect(checkAffinityMismatch(affinity, ["iss-077"], "iss-077").blocked).toBe(false);
   });
 
   it("blocks issue pick on ticket branch", () => {
     const affinity = { status: "matched" as const, matchedIds: ["T-123"], branch: "story/T-123-foo" };
-    const result = checkAffinityMismatch(affinity, "ISS-050");
+    const result = checkAffinityMismatch(affinity, ["ISS-050"], "ISS-050");
     expect(result.blocked).toBe(true);
+  });
+
+  // ISS-752: id-set semantics for team-mode picks (canonical id + displayId + previousDisplayIds)
+  it("blocks when NO id in the picked set overlaps the branch ids", () => {
+    const affinity = { status: "matched" as const, matchedIds: ["T-401"], branch: "story/T-401-tidy-slug" };
+    const result = checkAffinityMismatch(affinity, ["t-8kmn4qrs2tvw5xyz", "T-500"], "T-500");
+    expect(result.blocked).toBe(true);
+  });
+
+  it("passes when ANY id in the picked set overlaps the branch ids", () => {
+    const affinity = { status: "matched" as const, matchedIds: ["T-401"], branch: "story/T-401-tidy-slug" };
+    const result = checkAffinityMismatch(affinity, ["t-3fg59pn3sfeja1v1", "T-401"], "T-401");
+    expect(result.blocked).toBe(false);
+  });
+
+  it("matches picked-set ids case-insensitively", () => {
+    const affinity = { status: "matched" as const, matchedIds: ["T-401"], branch: "story/T-401-tidy-slug" };
+    const result = checkAffinityMismatch(affinity, ["t-3fg59pn3sfeja1v1", "T-402", "t-401"], "T-402");
+    expect(result.blocked).toBe(false);
+  });
+
+  it("blocks on an empty picked id set", () => {
+    const affinity = { status: "matched" as const, matchedIds: ["T-401"], branch: "story/T-401-tidy-slug" };
+    const result = checkAffinityMismatch(affinity, [], "T-500");
+    expect(result.blocked).toBe(true);
+  });
+
+  it("accepts caller-built id sets with undefined display ids filtered out", () => {
+    // Mirrors the pick-ticket caller pattern for a team item lacking displayId
+    const ticket: { id: string; displayId?: string; previousDisplayIds?: string[] } = { id: "t-3fg59pn3sfeja1v1" };
+    const pickedIds = [ticket.id, ticket.displayId, ...(ticket.previousDisplayIds ?? [])].filter((v): v is string => Boolean(v));
+    const affinity = { status: "matched" as const, matchedIds: ["T-401"], branch: "story/T-401-tidy-slug" };
+    const result = checkAffinityMismatch(affinity, pickedIds, ticket.id);
+    expect(pickedIds.every((v) => typeof v === "string")).toBe(true);
+    expect(result.blocked).toBe(true);
+  });
+
+  it("uses the picked label in the reason, not the raw id set", () => {
+    const affinity = { status: "matched" as const, matchedIds: ["T-401"], branch: "story/T-401-tidy-slug" };
+    const result = checkAffinityMismatch(affinity, ["t-8kmn4qrs2tvw5xyz"], "T-500");
+    expect(result.blocked).toBe(true);
+    expect(result.reason).toContain("T-500");
+    expect(result.reason).toContain("T-401");
+    expect(result.reason).not.toContain("t-8kmn4qrs2tvw5xyz");
   });
 });
 

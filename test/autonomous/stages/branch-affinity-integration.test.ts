@@ -4,7 +4,7 @@
  * annotation injection in enter(), and config propagation.
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { StageContext, type ResolvedRecipe } from "../../../src/autonomous/stages/types.js";
@@ -50,8 +50,8 @@ function makeRecipe(overrides?: Partial<ResolvedRecipe>): ResolvedRecipe {
 }
 
 function setupProject(root: string, options?: {
-  tickets?: Array<{ id: string; title: string; status: string; phase: string; blockedBy?: string[] }>;
-  issues?: Array<{ id: string; title: string; status: string; severity: string }>;
+  tickets?: Array<{ id: string; title: string; status: string; phase: string; blockedBy?: string[]; displayId?: string; previousDisplayIds?: string[] }>;
+  issues?: Array<{ id: string; title: string; status: string; severity: string; displayId?: string; previousDisplayIds?: string[] }>;
 }): void {
   const storyDir = join(root, ".story");
   mkdirSync(join(storyDir, "tickets"), { recursive: true });
@@ -74,6 +74,8 @@ function setupProject(root: string, options?: {
       id: t.id, title: t.title, type: "task", status: t.status, phase: t.phase,
       order: 10, description: "", createdDate: "2026-04-03", completedDate: null,
       blockedBy: t.blockedBy ?? [], parentTicket: null,
+      ...(t.displayId ? { displayId: t.displayId } : {}),
+      ...(t.previousDisplayIds ? { previousDisplayIds: t.previousDisplayIds } : {}),
     }));
   }
   for (const i of options?.issues ?? []) {
@@ -81,6 +83,8 @@ function setupProject(root: string, options?: {
       id: i.id, title: i.title, status: i.status, severity: i.severity,
       components: [], impact: "test", resolution: null, location: [],
       discoveredDate: "2026-04-03", resolvedDate: null, relatedTickets: [], order: 10,
+      ...(i.displayId ? { displayId: i.displayId } : {}),
+      ...(i.previousDisplayIds ? { previousDisplayIds: i.previousDisplayIds } : {}),
     }));
   }
 }
@@ -199,6 +203,143 @@ describe("mismatch blocking in PickTicketStage.report()", () => {
 
     expect(result).toHaveProperty("action", "goto");
     expect(result).toHaveProperty("target", "HANDOVER");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ISS-752 + ISS-759: team-shaped picks (canonical id + displayId) in report()
+// ---------------------------------------------------------------------------
+
+describe("team-shaped picks in PickTicketStage.report()", () => {
+  const CANONICAL_A = "t-3fg59pn3sfeja1v1"; // displayId T-401
+  const CANONICAL_B = "t-8kmn4qrs2tvw5xyz"; // displayId T-500
+
+  function setupTeamTickets(): void {
+    setupProject(testRoot, {
+      tickets: [
+        { id: CANONICAL_A, title: "Tidy slug", status: "open", phase: "p1", displayId: "T-401" },
+        { id: CANONICAL_B, title: "Other work", status: "open", phase: "p1", displayId: "T-500" },
+      ],
+    });
+  }
+
+  function makeAffinityState(): FullSessionState {
+    return makeSessionState({
+      git: { branch: "story/T-401-tidy-slug", mergeBase: "abc123", expectedHead: "abc123" },
+    });
+  }
+
+  it("(a) advances when the canonical id of the branch's ticket is reported", async () => {
+    setupTeamTickets();
+    const ctx = new StageContext(testRoot, sessionDir, makeAffinityState(), makeRecipe());
+    const stage = new PickTicketStage();
+
+    const result = await stage.report(ctx, { completedAction: "ticket_picked", ticketId: CANONICAL_A } as any);
+
+    expect(result).toHaveProperty("action", "advance");
+    expect(ctx.state.ticket?.id).toBe(CANONICAL_A);
+  });
+
+  it("(b) resolves a displayId report to the canonical ticket and advances", async () => {
+    setupTeamTickets();
+    const ctx = new StageContext(testRoot, sessionDir, makeAffinityState(), makeRecipe());
+    const stage = new PickTicketStage();
+
+    const result = await stage.report(ctx, { completedAction: "ticket_picked", ticketId: "T-401" } as any);
+
+    expect(result).toHaveProperty("action", "advance");
+    expect(ctx.state.ticket?.id).toBe(CANONICAL_A);
+    expect(ctx.state.ticket?.displayId).toBe("T-401");
+  });
+
+  it("(c) still blocks a DIFFERENT ticket's canonical id, reason uses its display label", async () => {
+    setupTeamTickets();
+    const ctx = new StageContext(testRoot, sessionDir, makeAffinityState(), makeRecipe());
+    const stage = new PickTicketStage();
+
+    const result = await stage.report(ctx, { completedAction: "ticket_picked", ticketId: CANONICAL_B } as any);
+
+    expect(result).toHaveProperty("action", "goto");
+    expect(result).toHaveProperty("target", "HANDOVER");
+    expect((result as any).result.instruction).toContain("T-500");
+    expect((result as any).result.instruction).toContain("T-401");
+  });
+
+  it("advances when a previousDisplayId matches the branch entity", async () => {
+    setupProject(testRoot, {
+      tickets: [
+        { id: CANONICAL_A, title: "Tidy slug", status: "open", phase: "p1", displayId: "T-402", previousDisplayIds: ["T-401"] },
+      ],
+    });
+    const ctx = new StageContext(testRoot, sessionDir, makeAffinityState(), makeRecipe());
+    const stage = new PickTicketStage();
+
+    const result = await stage.report(ctx, { completedAction: "ticket_picked", ticketId: CANONICAL_A } as any);
+
+    expect(result).toHaveProperty("action", "advance");
+  });
+
+  it("(d) retries with canonical candidates when a displayId is ambiguous (reconcile-pending)", async () => {
+    setupProject(testRoot, {
+      tickets: [
+        { id: CANONICAL_A, title: "Tidy slug", status: "open", phase: "p1", displayId: "T-401" },
+        { id: CANONICAL_B, title: "Duplicate display", status: "open", phase: "p1", displayId: "T-401" },
+      ],
+    });
+    const ctx = new StageContext(testRoot, sessionDir, makeAffinityState(), makeRecipe());
+    const stage = new PickTicketStage();
+
+    const result = await stage.report(ctx, { completedAction: "ticket_picked", ticketId: "T-401" } as any);
+
+    expect(result).toHaveProperty("action", "retry");
+    expect((result as any).instruction).toContain(CANONICAL_A);
+    expect((result as any).instruction).toContain(CANONICAL_B);
+  });
+
+  const ISSUE_CANONICAL_A = "i-2abcdefg34hjkmnp"; // displayId ISS-050
+  const ISSUE_CANONICAL_B = "i-9qrstvwx56yz7abc"; // displayId ISS-060
+
+  function setupTeamIssues(): void {
+    setupProject(testRoot, {
+      issues: [
+        { id: ISSUE_CANONICAL_A, title: "Crash on load", status: "open", severity: "high", displayId: "ISS-050" },
+        { id: ISSUE_CANONICAL_B, title: "Other issue", status: "open", severity: "low", displayId: "ISS-060" },
+      ],
+    });
+  }
+
+  it("(e-a) routes to ISSUE_FIX when the canonical id of the branch's issue is reported", async () => {
+    setupTeamIssues();
+    const state = makeSessionState({
+      git: { branch: "fix/ISS-050-crash", mergeBase: "abc123", expectedHead: "abc123" },
+    });
+    const ctx = new StageContext(testRoot, sessionDir, state, makeRecipe());
+    const stage = new PickTicketStage();
+
+    const result = await stage.report(ctx, { completedAction: "issue_picked", issueId: ISSUE_CANONICAL_A } as any);
+
+    expect(result).toHaveProperty("action", "goto");
+    expect(result).toHaveProperty("target", "ISSUE_FIX");
+    expect(ctx.state.currentIssue?.id).toBe(ISSUE_CANONICAL_A);
+    // ISS-759: the mutation must target the resolved canonical id
+    const written = JSON.parse(readFileSync(join(testRoot, ".story", "issues", `${ISSUE_CANONICAL_A}.json`), "utf-8"));
+    expect(written.status).toBe("inprogress");
+  });
+
+  it("(e-c) still blocks a DIFFERENT issue's canonical id, reason uses its display label", async () => {
+    setupTeamIssues();
+    const state = makeSessionState({
+      git: { branch: "fix/ISS-050-crash", mergeBase: "abc123", expectedHead: "abc123" },
+    });
+    const ctx = new StageContext(testRoot, sessionDir, state, makeRecipe());
+    const stage = new PickTicketStage();
+
+    const result = await stage.report(ctx, { completedAction: "issue_picked", issueId: ISSUE_CANONICAL_B } as any);
+
+    expect(result).toHaveProperty("action", "goto");
+    expect(result).toHaveProperty("target", "HANDOVER");
+    expect((result as any).result.instruction).toContain("ISS-060");
+    expect((result as any).result.instruction).toContain("ISS-050");
   });
 });
 

@@ -25,6 +25,12 @@ const PROTECTED_BRANCHES = new Set([
   "main", "master", "develop", "dev", "staging", "production",
 ]);
 
+// ISS-752 accepted limitation: a team item lacking a displayId produces a
+// canonical-id branch name (e.g. story/t-3fg59pn3sfeja1v1-slug) that this
+// regex does not match, so branch affinity is inert for that branch. The
+// loss is annotation-only (no false blocking, no false ending). The regex is
+// deliberately NOT extended to 16-char crockford canonical ids because such
+// runs collide with ordinary slug words.
 const ENTITY_ID_REGEX = /(?:^|[/_-])(T-\d+[a-z]?|ISS-\d+)(?=$|[/_-])/gi;
 
 // --- Functions ---
@@ -60,20 +66,28 @@ export function detectBranchAffinity(branch: string | null): BranchAffinity {
   return { status: "ambiguous", matchedIds: matches, branch };
 }
 
+/**
+ * ISS-752: The pick is blocked only when NO id in pickedIds matches the
+ * branch's matched ids (case-insensitive). Callers pass the full id set of
+ * the resolved item (canonical id + displayId + previousDisplayIds) so a
+ * canonical-id pick on a display-id branch is not falsely blocked.
+ * pickedLabel is the single human-facing name used in the reason string.
+ */
 export function checkAffinityMismatch(
   affinity: BranchAffinity,
-  pickedId: string,
+  pickedIds: readonly string[],
+  pickedLabel: string,
 ): { blocked: boolean; reason: string } {
   if (affinity.status !== "matched") {
     return { blocked: false, reason: "" };
   }
-  const normalized = pickedId.toUpperCase();
-  if (affinity.matchedIds.some(id => id.toUpperCase() === normalized)) {
+  const matched = affinity.matchedIds.map(id => id.toUpperCase());
+  if (pickedIds.some(id => matched.includes(id.toUpperCase()))) {
     return { blocked: false, reason: "" };
   }
   return {
     blocked: true,
-    reason: `Branch "${affinity.branch}" is scoped to ${affinity.matchedIds.join(", ")}. Picking ${pickedId} would contaminate this branch.`,
+    reason: `Branch "${affinity.branch}" is scoped to ${affinity.matchedIds.join(", ")}. Picking ${pickedLabel} would contaminate this branch.`,
   };
 }
 

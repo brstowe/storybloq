@@ -6,6 +6,7 @@ import { isTargetedMode, getRemainingTargets, buildTargetedCandidatesText, build
 import { detectBranchAffinity, checkAffinityMismatch, buildAffinityAnnotation, buildMismatchHandoverInstruction, createTicketBranch, refreshGitWorkingState } from "../branch-affinity.js";
 import { canClaim, buildClaim } from "../../core/claims.js";
 import { gitUserEmail } from "../git-inspector.js";
+import { displayIdOf } from "../../core/resolver.js";
 
 /**
  * PICK_TICKET stage -- Claude selects the next ticket to work on.
@@ -157,27 +158,9 @@ export class PickTicketStage implements WorkflowStage {
       return { action: "retry", instruction: "report.ticketId or report.issueId is required." };
     }
 
-    // T-188: Enforce target list in targeted mode
-    const targetReject = this.enforceTargetList(ctx, ticketId);
-    if (targetReject) return targetReject;
-
-    // T-328: Branch affinity mismatch blocking
-    // Skip when: targeted mode (already handled above), or per-ticket branching (Part 2)
-    if (!isTargetedMode(ctx.state) && ctx.state.resolvedBranchStrategy !== "per-ticket") {
-      const affinity = detectBranchAffinity(ctx.state.git?.branch ?? null);
-      const mismatch = checkAffinityMismatch(affinity, ticketId);
-      if (mismatch.blocked) {
-        return {
-          action: "goto",
-          target: "HANDOVER",
-          result: {
-            instruction: buildMismatchHandoverInstruction(affinity, ticketId, ctx.state.sessionId),
-            reminders: [],
-            transitionedFrom: "PICK_TICKET",
-          },
-        };
-      }
-    }
+    // T-188: Targeted mode -- if no targets remain, complete BEFORE any resolution
+    const exhausted = this.targetsExhausted(ctx);
+    if (exhausted) return exhausted;
 
     // Validate ticket
     let projectState;
@@ -186,18 +169,49 @@ export class PickTicketStage implements WorkflowStage {
     } catch (err) {
       return { action: "retry", instruction: `Failed to load project state: ${err instanceof Error ? err.message : String(err)}. Check .story/ files for corruption.` };
     }
-    const ticket = projectState.ticketByID(ticketId);
-    if (!ticket) {
+
+    // ISS-759: Resolve the reported id (canonical id, displayId, or previousDisplayId)
+    const resolvedRef = projectState.resolveTicketRef(ticketId);
+    if (resolvedRef.kind === "ambiguous") {
+      return { action: "retry", instruction: `Ticket ref ${ticketId} is ambiguous -- it matches ${resolvedRef.matches.map(m => m.id).join(", ")}. Pick one by its canonical id.` };
+    }
+    if (resolvedRef.kind === "missing") {
       return { action: "retry", instruction: `Ticket ${ticketId} not found. Pick a valid ticket.` };
     }
+    const ticket = resolvedRef.item;
+    const ticketLabel = displayIdOf(ticket);
+
+    // T-188: Enforce target membership with the resolved canonical id (targetWork is canonical per ISS-654)
+    const targetReject = this.enforceTargetMembership(ctx, ticket.id, ticketLabel);
+    if (targetReject) return targetReject;
+
+    // T-328 + ISS-752: Branch affinity mismatch blocking against the resolved item's full id set
+    // Skip when: targeted mode (already handled above), or per-ticket branching (Part 2)
+    if (!isTargetedMode(ctx.state) && ctx.state.resolvedBranchStrategy !== "per-ticket") {
+      const affinity = detectBranchAffinity(ctx.state.git?.branch ?? null);
+      const pickedIds = [ticket.id, ticket.displayId, ...(ticket.previousDisplayIds ?? [])].filter((v): v is string => Boolean(v));
+      const mismatch = checkAffinityMismatch(affinity, pickedIds, ticketLabel);
+      if (mismatch.blocked) {
+        return {
+          action: "goto",
+          target: "HANDOVER",
+          result: {
+            instruction: buildMismatchHandoverInstruction(affinity, ticketLabel, ctx.state.sessionId),
+            reminders: [],
+            transitionedFrom: "PICK_TICKET",
+          },
+        };
+      }
+    }
+
     if (projectState.isBlocked(ticket)) {
-      return { action: "retry", instruction: `Ticket ${ticketId} is blocked. Pick an unblocked ticket.` };
+      return { action: "retry", instruction: `Ticket ${ticketLabel} is blocked. Pick an unblocked ticket.` };
     }
     // ISS-027: Reject non-open tickets unless claimed by this session
     if (ticket.status !== "open") {
       const ticketClaim = (ticket as Record<string, unknown>).claimedBySession;
       if (!(ticket.status === "inprogress" && ticketClaim === ctx.state.sessionId)) {
-        return { action: "retry", instruction: `Ticket ${ticketId} is ${ticket.status} — pick an open ticket.` };
+        return { action: "retry", instruction: `Ticket ${ticketLabel} is ${ticket.status} -- pick an open ticket.` };
       }
     }
 
@@ -205,11 +219,11 @@ export class PickTicketStage implements WorkflowStage {
     const email = await gitUserEmail(ctx.root);
     if (ticket.claim) {
       if (!email) {
-        return { action: "retry", instruction: `Ticket ${ticketId} is claimed by ${ticket.claim.user}. Configure git user.email to verify identity, or pick a different ticket.` };
+        return { action: "retry", instruction: `Ticket ${ticketLabel} is claimed by ${ticket.claim.user}. Configure git user.email to verify identity, or pick a different ticket.` };
       }
       const claimResult = canClaim(ticket, email, ctx.state.git?.branch ?? "unknown");
       if (!claimResult.allowed) {
-        return { action: "retry", instruction: `Ticket ${ticketId} is claimed by ${claimResult.claimedBy} on branch ${ticket.claim.branch}. Pick a different ticket.` };
+        return { action: "retry", instruction: `Ticket ${ticketLabel} is claimed by ${claimResult.claimedBy} on branch ${ticket.claim.branch}. Pick a different ticket.` };
       }
     }
 
@@ -222,7 +236,7 @@ export class PickTicketStage implements WorkflowStage {
       const result = await createTicketBranch(
         ctx.root,
         ctx.state.git ?? { branch: null, mergeBase: null },
-        { id: ticket.id, displayId: (ticket as Record<string, unknown>).displayId as string | undefined, title: ticket.title },
+        { id: ticket.id, displayId: ticket.displayId, title: ticket.title },
         "story",
       );
       if (!result.ok) {
@@ -251,12 +265,10 @@ export class PickTicketStage implements WorkflowStage {
     // T-375: Build claim using final branch (after per-ticket branch creation)
     const finalBranch = ctx.state.git?.branch ?? "unknown";
     const claimObj = email ? buildClaim(email, finalBranch, new Date().toISOString()) : undefined;
-    const ticketDisplayId = (ticket as Record<string, unknown>).displayId as string | undefined;
-    const ticketLabel = ticketDisplayId ?? ticket.id;
 
     // Stage field updates (persisted atomically with state transition by processAdvance)
     ctx.updateDraft({
-      ticket: { id: ticket.id, displayId: ticketDisplayId, title: ticket.title, claimed: true },
+      ticket: { id: ticket.id, displayId: ticket.displayId, title: ticket.title, claimed: true },
       reviews: { plan: [], code: [] },
       finalizeCheckpoint: null,
       ticketStartedAt: new Date().toISOString(),
@@ -290,26 +302,9 @@ export class PickTicketStage implements WorkflowStage {
 
   // T-153: Handle issue pick -- validate and route to ISSUE_FIX
   private async handleIssuePick(ctx: StageContext, issueId: string): Promise<StageAdvance> {
-    // T-188: Enforce target list in targeted mode
-    const targetReject = this.enforceTargetList(ctx, issueId);
-    if (targetReject) return targetReject;
-
-    // T-328: Branch affinity mismatch blocking
-    if (!isTargetedMode(ctx.state) && ctx.state.resolvedBranchStrategy !== "per-ticket") {
-      const affinity = detectBranchAffinity(ctx.state.git?.branch ?? null);
-      const mismatch = checkAffinityMismatch(affinity, issueId);
-      if (mismatch.blocked) {
-        return {
-          action: "goto",
-          target: "HANDOVER",
-          result: {
-            instruction: buildMismatchHandoverInstruction(affinity, issueId, ctx.state.sessionId),
-            reminders: [],
-            transitionedFrom: "PICK_TICKET",
-          },
-        };
-      }
-    }
+    // T-188: Targeted mode -- if no targets remain, complete BEFORE any resolution
+    const exhausted = this.targetsExhausted(ctx);
+    if (exhausted) return exhausted;
 
     let projectState;
     try {
@@ -317,15 +312,44 @@ export class PickTicketStage implements WorkflowStage {
     } catch (err) {
       return { action: "retry", instruction: `Failed to load project state: ${err instanceof Error ? err.message : String(err)}. Check .story/ files for corruption.` };
     }
-    const issue = projectState.issues.find(i => i.id === issueId);
 
-    if (!issue) {
+    // ISS-759: Resolve the reported id (canonical id, displayId, or previousDisplayId)
+    const resolvedRef = projectState.resolveIssueRef(issueId);
+    if (resolvedRef.kind === "ambiguous") {
+      return { action: "retry", instruction: `Issue ref ${issueId} is ambiguous -- it matches ${resolvedRef.matches.map(m => m.id).join(", ")}. Pick one by its canonical id.` };
+    }
+    if (resolvedRef.kind === "missing") {
       return { action: "retry", instruction: `Issue ${issueId} not found. Pick a valid issue or ticket.` };
     }
+    const issue = resolvedRef.item;
+    const issueLabel = displayIdOf(issue);
+
+    // T-188: Enforce target membership with the resolved canonical id (targetWork is canonical per ISS-654)
+    const targetReject = this.enforceTargetMembership(ctx, issue.id, issueLabel);
+    if (targetReject) return targetReject;
+
+    // T-328 + ISS-752: Branch affinity mismatch blocking against the resolved item's full id set
+    if (!isTargetedMode(ctx.state) && ctx.state.resolvedBranchStrategy !== "per-ticket") {
+      const affinity = detectBranchAffinity(ctx.state.git?.branch ?? null);
+      const pickedIds = [issue.id, issue.displayId, ...(issue.previousDisplayIds ?? [])].filter((v): v is string => Boolean(v));
+      const mismatch = checkAffinityMismatch(affinity, pickedIds, issueLabel);
+      if (mismatch.blocked) {
+        return {
+          action: "goto",
+          target: "HANDOVER",
+          result: {
+            instruction: buildMismatchHandoverInstruction(affinity, issueLabel, ctx.state.sessionId),
+            reminders: [],
+            transitionedFrom: "PICK_TICKET",
+          },
+        };
+      }
+    }
+
     // T-188: Targeted mode allows inprogress issues (resume from prior session)
     const targeted = isTargetedMode(ctx.state);
     if (issue.status !== "open" && !(targeted && issue.status === "inprogress")) {
-      return { action: "retry", instruction: `Issue ${issueId} is ${issue.status}. Pick an open issue.` };
+      return { action: "retry", instruction: `Issue ${issueLabel} is ${issue.status}. Pick an open issue.` };
     }
 
     // T-328 Part 2: Per-ticket branch creation for issues
@@ -337,7 +361,7 @@ export class PickTicketStage implements WorkflowStage {
       const result = await createTicketBranch(
         ctx.root,
         ctx.state.git ?? { branch: null, mergeBase: null },
-        { id: issue.id, displayId: (issue as Record<string, unknown>).displayId as string | undefined, title: issue.title },
+        { id: issue.id, displayId: issue.displayId, title: issue.title },
         "fix",
       );
       if (!result.ok) {
@@ -361,18 +385,19 @@ export class PickTicketStage implements WorkflowStage {
 
     // ISS-090: Mark issue as inprogress with pendingProjectMutation for crash recovery
     // ISS-112: Include expectedCurrent for 3-way recovery check (matches ticket_update pattern)
-    const transitionId = `issue-pick-${issueId}-${Date.now()}`;
+    // ISS-759: Use the resolved canonical issue.id -- crash-recovery replay matches on target
+    const transitionId = `issue-pick-${issue.id}-${Date.now()}`;
     ctx.writeState({
-      pendingProjectMutation: { type: "issue_update", target: issueId, field: "status", value: "inprogress", expectedCurrent: issue.status, transitionId },
+      pendingProjectMutation: { type: "issue_update", target: issue.id, field: "status", value: "inprogress", expectedCurrent: issue.status, transitionId },
     });
     try {
       const { handleIssueUpdate } = await import("../../cli/commands/issue.js");
-      await handleIssueUpdate(issueId, { status: "inprogress" }, "json", ctx.root);
+      await handleIssueUpdate(issue.id, { status: "inprogress" }, "json", ctx.root);
     } catch { /* best-effort -- don't block on status update */ }
     ctx.writeState({ pendingProjectMutation: null });
 
     ctx.updateDraft({
-      currentIssue: { id: issue.id, displayId: (issue as Record<string, unknown>).displayId as string | undefined, title: issue.title, severity: issue.severity },
+      currentIssue: { id: issue.id, displayId: issue.displayId, title: issue.title, severity: issue.severity },
       ticket: undefined,
       reviews: { plan: [], code: [] },
       finalizeCheckpoint: null,
@@ -381,15 +406,22 @@ export class PickTicketStage implements WorkflowStage {
     return { action: "goto", target: "ISSUE_FIX" };
   }
 
-  // T-188: Shared target list enforcement for report() and handleIssuePick()
-  private enforceTargetList(ctx: StageContext, pickedId: string): StageAdvance | null {
+  // T-188 (split for ISS-759): remaining-empty check runs BEFORE resolution
+  private targetsExhausted(ctx: StageContext): StageAdvance | null {
     if (!isTargetedMode(ctx.state)) return null;
-    const remaining = getRemainingTargets(ctx.state);
-    if (remaining.length === 0) {
+    if (getRemainingTargets(ctx.state).length === 0) {
       return { action: "goto", target: "COMPLETE" };
     }
-    if (!remaining.includes(pickedId)) {
-      return { action: "retry", instruction: `${pickedId} is not a remaining target. Pick from: ${remaining.join(", ")}.` };
+    return null;
+  }
+
+  // T-188 (split for ISS-759): membership check runs AFTER resolution, on the
+  // resolved canonical id (targetWork is canonical per ISS-654)
+  private enforceTargetMembership(ctx: StageContext, canonicalId: string, pickedLabel: string): StageAdvance | null {
+    if (!isTargetedMode(ctx.state)) return null;
+    const remaining = getRemainingTargets(ctx.state);
+    if (!remaining.includes(canonicalId)) {
+      return { action: "retry", instruction: `${pickedLabel} is not a remaining target. Pick from: ${remaining.join(", ")}.` };
     }
     return null;
   }
