@@ -254,7 +254,13 @@ export async function handleSessionStop(root: string, sessionId?: string): Promi
           const ticket = projectState.ticketByID(ticketId);
           if (ticket && ticket.status === "inprogress") {
             const claim = (ticket as Record<string, unknown>).claimedBySession;
-            if (!claim || claim === info!.state.sessionId) {
+            const claimBlock = (ticket as Record<string, unknown>).claim;
+            // ISS-778: strict ownership. Release only when this session owns the
+            // claimedBySession stamp, or when the ticket carries no claim material
+            // at all. The old `!claimedBySession` escape hatch released FOREIGN
+            // CLI claims, which write claim{user,branch,since} but never set
+            // claimedBySession.
+            if (claim === info!.state.sessionId || (!claim && claimBlock == null)) {
               // ISS-759/ISS-652: delete the claim keys rather than writing
               // explicit nulls, so a released ticket carries no residual state.
               const { claimedBySession: _cb, claim: _cl, ...rest } = ticket as Record<string, unknown>;

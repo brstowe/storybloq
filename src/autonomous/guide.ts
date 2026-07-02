@@ -2193,7 +2193,14 @@ async function handleCancel(root: string, args: GuideInput): Promise<McpToolResu
         const ticket = projectState.ticketByID(ticketId);
         if (ticket && ticket.status === "inprogress") {
           const ticketClaim = (ticket as Record<string, unknown>).claimedBySession;
-          if (!ticketClaim || ticketClaim === cancelInfo.state.sessionId) {
+          const ticketClaimBlock = (ticket as Record<string, unknown>).claim;
+          // ISS-778: strict ownership. Release only when this session owns the
+          // claimedBySession stamp, or when the ticket carries no claim material
+          // at all (a bare inprogress ticket this session flipped before any
+          // claim existed, nothing foreign to destroy). The old
+          // `!claimedBySession` escape hatch released FOREIGN CLI claims, which
+          // write claim{user,branch,since} but never set claimedBySession.
+          if (ticketClaim === cancelInfo.state.sessionId || (!ticketClaim && ticketClaimBlock == null)) {
             // ISS-759/ISS-652: delete the claim keys rather than writing
             // explicit nulls, so a released ticket carries no residual state.
             const { claimedBySession: _cb, claim: _cl, ...rest } = ticket as Record<string, unknown>;
