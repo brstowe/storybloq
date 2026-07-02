@@ -719,9 +719,19 @@ export function formatNoteUpdateResult(
 export function formatNoteDeleteResult(
   id: string,
   format: OutputFormat,
+  alreadyDeleted = false,
 ): string {
+  // ISS-757: team-mode re-delete of a tombstoned note is a silent success
+  // (exit 0) that preserves the existing tombstone; surface it distinctly.
   if (format === "json") {
-    return JSON.stringify(successEnvelope({ id, deleted: true }), null, 2);
+    return JSON.stringify(
+      successEnvelope({ id, deleted: true, ...(alreadyDeleted ? { alreadyDeleted: true } : {}) }),
+      null,
+      2,
+    );
+  }
+  if (alreadyDeleted) {
+    return `Note ${id} is already deleted; existing tombstone preserved.`;
   }
   return `Deleted note ${id}.`;
 }
@@ -819,9 +829,19 @@ export function formatLessonReinforceResult(
 export function formatLessonDeleteResult(
   id: string,
   format: OutputFormat,
+  alreadyDeleted = false,
 ): string {
+  // ISS-757: team-mode re-delete of a tombstoned lesson is a silent success
+  // (exit 0) that preserves the existing tombstone; surface it distinctly.
   if (format === "json") {
-    return JSON.stringify(successEnvelope({ id, deleted: true }), null, 2);
+    return JSON.stringify(
+      successEnvelope({ id, deleted: true, ...(alreadyDeleted ? { alreadyDeleted: true } : {}) }),
+      null,
+      2,
+    );
+  }
+  if (alreadyDeleted) {
+    return `Lesson ${id} is already deleted; existing tombstone preserved.`;
   }
   return `Deleted lesson ${id}.`;
 }

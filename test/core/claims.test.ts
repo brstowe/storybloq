@@ -93,6 +93,20 @@ describe("clearClaimOnComplete", () => {
     const result = clearClaimOnComplete(ticket);
     expect(result.claim).toBeDefined();
   });
+
+  // ISS-759(a): the gate must be key PRESENCE, not truthiness. A completed
+  // ticket carrying claimedBySession: null (the pre-ISS-652 release shape)
+  // must still have the KEY stripped, not survive as an explicit null.
+  it("strips a present-but-null claimedBySession key on complete (ISS-759)", () => {
+    const ticket = makeTicket({
+      id: "T-001",
+      status: "complete",
+      claimedBySession: null,
+    }) as Ticket;
+    const result = clearClaimOnComplete(ticket);
+    expect("claimedBySession" in result).toBe(false);
+    expect("claim" in result).toBe(false);
+  });
 });
 
 describe("applyClaimAnnotations", () => {

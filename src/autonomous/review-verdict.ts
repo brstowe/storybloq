@@ -246,9 +246,17 @@ export function classifyLensReviewPath(
   if (!match) return undefined;
   // Number(undefined) is NaN and NaN > 0 is false, so legacy entries without
   // verificationRuntimeErrors are not falsely downgraded.
+  // ISS-760: verificationDegraded means the gate RAN against a partial
+  // snapshot (some reviewed paths could not be captured). It is distinct
+  // from skipped in telemetry, but the round still classifies as
+  // lenses-unverified -- before ISS-760 the same situation aborted the
+  // snapshot entirely and landed here via verificationSkipped, so this
+  // preserves the existing classification rather than flipping degraded
+  // rounds to lenses-verified.
   if (
     match.snapshotIntegrityFailure === true ||
     match.verificationSkipped === true ||
+    match.verificationDegraded === true ||
     Number(match.verificationRuntimeErrors) > 0
   ) {
     return "lenses-unverified";

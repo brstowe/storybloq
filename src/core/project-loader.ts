@@ -57,6 +57,17 @@ export interface DeleteOptions {
   force?: boolean;
 }
 
+/**
+ * ISS-757: result of a delete operation. In team mode a delete of an
+ * already-tombstoned item is a silent success: `alreadyDeleted: true`, no
+ * write occurs, and the original deletedAt/deletedBy are preserved. A fresh
+ * tombstone write (team) or a physical unlink (non-team) returns
+ * `alreadyDeleted: false`.
+ */
+export interface DeleteResult {
+  alreadyDeleted: boolean;
+}
+
 export interface LoadResult {
   readonly state: ProjectState;
   readonly warnings: readonly LoadWarning[];
@@ -428,7 +439,7 @@ export async function deleteTicket(
   id: string,
   root: string,
   options?: DeleteOptions,
-): Promise<void> {
+): Promise<DeleteResult> {
   if (!TICKET_ID_REGEX.test(id) && !TICKET_CANONICAL_ID_REGEX.test(id)) {
     throw new ProjectLoaderError(
       "invalid_input",
@@ -439,7 +450,7 @@ export async function deleteTicket(
   const targetPath = join(wrapDir, "tickets", `${id}.json`);
   await guardPath(targetPath, wrapDir);
 
-  await withLock(wrapDir, async () => {
+  return withLock(wrapDir, async () => {
     await assertNoConflictsFromDisk(root);
 
     const teamModeResult = options?.hard ? false : await isTeamMode(root);
@@ -490,6 +501,14 @@ export async function deleteTicket(
       } catch {
         throw new ProjectLoaderError("io_error", `Failed to parse tickets/${id}.json for tombstone write`);
       }
+      // ISS-757: team-mode second delete is a silent success -- the tombstone
+      // keeps the item addressable, so re-deleting returns alreadyDeleted: true
+      // with NO write (original deletedAt/deletedBy preserved). Non-team second
+      // delete throws not_found instead (the file is physically gone after
+      // unlink). This asymmetry is deliberate.
+      if (raw.lifecycle === "deleted") {
+        return { alreadyDeleted: true };
+      }
       raw.lifecycle = "deleted";
       raw.deletedAt = new Date().toISOString();
       raw.deletedBy = await resolveActor(root, options?.actor);
@@ -497,6 +516,7 @@ export async function deleteTicket(
     } else {
       await unlink(targetPath);
     }
+    return { alreadyDeleted: false };
   });
 }
 
@@ -504,7 +524,7 @@ export async function deleteIssue(
   id: string,
   root: string,
   options?: DeleteOptions,
-): Promise<void> {
+): Promise<DeleteResult> {
   if (!ISSUE_ID_REGEX.test(id) && !ISSUE_CANONICAL_ID_REGEX.test(id)) {
     throw new ProjectLoaderError(
       "invalid_input",
@@ -515,7 +535,7 @@ export async function deleteIssue(
   const targetPath = join(wrapDir, "issues", `${id}.json`);
   await guardPath(targetPath, wrapDir);
 
-  await withLock(wrapDir, async () => {
+  return withLock(wrapDir, async () => {
     await assertNoConflictsFromDisk(root);
 
     const teamModeResult = options?.hard ? false : await isTeamMode(root);
@@ -539,6 +559,14 @@ export async function deleteIssue(
       } catch {
         throw new ProjectLoaderError("io_error", `Failed to parse issues/${id}.json for tombstone write`);
       }
+      // ISS-757: team-mode second delete is a silent success -- the tombstone
+      // keeps the item addressable, so re-deleting returns alreadyDeleted: true
+      // with NO write (original deletedAt/deletedBy preserved). Non-team second
+      // delete throws not_found instead (the file is physically gone after
+      // unlink). This asymmetry is deliberate.
+      if (raw.lifecycle === "deleted") {
+        return { alreadyDeleted: true };
+      }
       raw.lifecycle = "deleted";
       raw.deletedAt = new Date().toISOString();
       raw.deletedBy = await resolveActor(root, options?.actor);
@@ -546,6 +574,7 @@ export async function deleteIssue(
     } else {
       await unlink(targetPath);
     }
+    return { alreadyDeleted: false };
   });
 }
 
@@ -592,7 +621,7 @@ export async function deleteNote(
   id: string,
   root: string,
   options?: DeleteOptions,
-): Promise<void> {
+): Promise<DeleteResult> {
   if (!NOTE_ID_REGEX.test(id) && !NOTE_CANONICAL_ID_REGEX.test(id)) {
     throw new ProjectLoaderError(
       "invalid_input",
@@ -603,7 +632,7 @@ export async function deleteNote(
   const targetPath = join(wrapDir, "notes", `${id}.json`);
   await guardPath(targetPath, wrapDir);
 
-  await withLock(wrapDir, async () => {
+  return withLock(wrapDir, async () => {
     await assertNoConflictsFromDisk(root);
 
     const teamModeResult = options?.hard ? false : await isTeamMode(root);
@@ -627,6 +656,14 @@ export async function deleteNote(
       } catch {
         throw new ProjectLoaderError("io_error", `Failed to parse notes/${id}.json for tombstone write`);
       }
+      // ISS-757: team-mode second delete is a silent success -- the tombstone
+      // keeps the item addressable, so re-deleting returns alreadyDeleted: true
+      // with NO write (original deletedAt/deletedBy preserved). Non-team second
+      // delete throws not_found instead (the file is physically gone after
+      // unlink). This asymmetry is deliberate.
+      if (raw.lifecycle === "deleted") {
+        return { alreadyDeleted: true };
+      }
       raw.lifecycle = "deleted";
       raw.deletedAt = new Date().toISOString();
       raw.deletedBy = await resolveActor(root, options?.actor);
@@ -634,6 +671,7 @@ export async function deleteNote(
     } else {
       await unlink(targetPath);
     }
+    return { alreadyDeleted: false };
   });
 }
 
@@ -684,7 +722,7 @@ export async function deleteLessonUnlocked(
   id: string,
   root: string,
   options?: DeleteOptions,
-): Promise<void> {
+): Promise<DeleteResult> {
   if (!LESSON_ID_REGEX.test(id) && !LESSON_CANONICAL_ID_REGEX.test(id)) {
     throw new ProjectLoaderError(
       "invalid_input",
@@ -716,6 +754,14 @@ export async function deleteLessonUnlocked(
     } catch {
       throw new ProjectLoaderError("io_error", `Failed to parse lessons/${id}.json for tombstone write`);
     }
+    // ISS-757: team-mode second delete is a silent success -- the tombstone
+    // keeps the item addressable, so re-deleting returns alreadyDeleted: true
+    // with NO write (original deletedAt/deletedBy preserved). Non-team second
+    // delete throws not_found instead (the file is physically gone after
+    // unlink). This asymmetry is deliberate.
+    if (raw.lifecycle === "deleted") {
+      return { alreadyDeleted: true };
+    }
     raw.lifecycle = "deleted";
     raw.deletedAt = new Date().toISOString();
     raw.deletedBy = await resolveActor(root, options?.actor);
@@ -723,17 +769,18 @@ export async function deleteLessonUnlocked(
   } else {
     await unlink(targetPath);
   }
+  return { alreadyDeleted: false };
 }
 
 export async function deleteLesson(
   id: string,
   root: string,
   options?: DeleteOptions,
-): Promise<void> {
+): Promise<DeleteResult> {
   const wrapDir = resolve(root, ".story");
-  await withLock(wrapDir, async () => {
+  return withLock(wrapDir, async () => {
     await assertNoConflictsFromDisk(root);
-    await deleteLessonUnlocked(id, root, options);
+    return deleteLessonUnlocked(id, root, options);
   });
 }
 

@@ -482,7 +482,15 @@ export async function handleIssueDelete(
   hard?: boolean,
   displayLabel?: string,
 ): Promise<CommandResult> {
-  await deleteIssue(id, root, { hard });
+  const result = await deleteIssue(id, root, { hard });
+  // ISS-757: team-mode re-delete of a tombstoned issue is a silent success
+  // (exit 0) that preserves the existing tombstone; surface it distinctly.
+  if (result.alreadyDeleted) {
+    if (format === "json") {
+      return { output: JSON.stringify(successEnvelope({ id, deleted: true, alreadyDeleted: true }), null, 2) };
+    }
+    return { output: `Issue ${displayLabel ?? id} is already deleted; existing tombstone preserved.` };
+  }
   if (format === "json") {
     return { output: JSON.stringify(successEnvelope({ id, deleted: true }), null, 2) };
   }

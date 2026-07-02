@@ -73,6 +73,10 @@ export interface PreparedLensReview {
   readonly subagentPrompts: ReadonlyMap<string, { prompt: string; model: string }>;
   readonly cachedFindings: ReadonlyMap<string, readonly LensFinding[]>;
   readonly secretsGateActive: boolean;
+  // ISS-760(b): consumed by mcp-handlers handlePrepare, which surfaces it in
+  // PrepareOutput.metadata and persists it for handleSynthesize to inject
+  // POST-verification-gate (its redacted evidence can never verify against
+  // the pre-redaction snapshot, so pre-gate paths would self-reject it).
   readonly secretsMetaFinding: LensFinding | null;
   processResults(lensResults: ReadonlyMap<string, LensResult | null>): Promise<OrchestratorOutput>;
 }

@@ -56,6 +56,21 @@ export async function teamInit(root: string, opts: TeamInitOptions): Promise<Tea
     if (config.team.requiredFeatures === undefined) {
       config.team.requiredFeatures = ["merge-driver"];
     }
+    // ISS-755: the git-refs allocator is only safe when every writer supports
+    // remote-ref reservations, so the capability must be fenced via
+    // requiredFeatures whenever the effective allocator is git-refs.
+    // DELIBERATELY different from the initialize-only-when-undefined defaults
+    // above: this ensure APPLIES EVEN WHEN requiredFeatures PRE-EXISTED
+    // (append if missing, idempotent). Do not "fix" it to the undefined-only
+    // pattern -- an existing requiredFeatures list without the reservation
+    // fence would let old clients allocate IDs locally against a git-refs
+    // team and collide.
+    if (
+      config.team.idAllocator === "git-refs" &&
+      !config.team.requiredFeatures.includes("remote-ref-reservations")
+    ) {
+      config.team.requiredFeatures = [...config.team.requiredFeatures, "remote-ref-reservations"];
+    }
     if (config.team.minCliVersion === undefined) {
       // Non-critical: version gate is best-effort (ISS-748: shared resolver, not a
       // relative require that reads the wrong manifest from dist builds)

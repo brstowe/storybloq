@@ -55,4 +55,35 @@ describe("team config set", () => {
     });
     await expect(handleTeamConfigSet(root, "claimStalenessHours", "24", "json")).rejects.toThrow("unresolved conflicts");
   });
+
+  // ISS-755: flipping idAllocator to git-refs must couple the
+  // remote-ref-reservations capability into requiredFeatures (mirrors
+  // team-init), preserving and appending to any pre-existing list.
+  it("setting idAllocator to git-refs adds remote-ref-reservations to requiredFeatures (ISS-755)", async () => {
+    const root = createProject({
+      team: { enabled: true, requiredFeatures: ["merge-driver"] },
+    });
+    await handleTeamConfigSet(root, "idAllocator", "\"git-refs\"", "json");
+    const config = JSON.parse(readFileSync(join(root, ".story", "config.json"), "utf-8"));
+    expect(config.team.idAllocator).toBe("git-refs");
+    expect(config.team.requiredFeatures).toEqual(["merge-driver", "remote-ref-reservations"]);
+  });
+
+  it("setting idAllocator to git-refs is idempotent about remote-ref-reservations (ISS-755)", async () => {
+    const root = createProject({
+      team: { enabled: true, requiredFeatures: ["merge-driver", "remote-ref-reservations"] },
+    });
+    await handleTeamConfigSet(root, "idAllocator", "\"git-refs\"", "json");
+    const config = JSON.parse(readFileSync(join(root, ".story", "config.json"), "utf-8"));
+    expect(config.team.requiredFeatures).toEqual(["merge-driver", "remote-ref-reservations"]);
+  });
+
+  it("setting idAllocator to local does not add remote-ref-reservations (ISS-755)", async () => {
+    const root = createProject({
+      team: { enabled: true, requiredFeatures: ["merge-driver"] },
+    });
+    await handleTeamConfigSet(root, "idAllocator", "\"local\"", "json");
+    const config = JSON.parse(readFileSync(join(root, ".story", "config.json"), "utf-8"));
+    expect(config.team.requiredFeatures).toEqual(["merge-driver"]);
+  });
 });

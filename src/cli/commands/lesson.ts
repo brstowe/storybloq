@@ -338,6 +338,7 @@ export async function handleLessonDelete(
 ): Promise<CommandResult> {
   let resolvedId = id;
   let resolvedDisplayLabel = displayLabel;
+  let alreadyDeleted = false;
   await withProjectLock(root, { strict: true }, async ({ state }) => {
     resolvedId = resolveAndNormalizeLessonRef(state, id);
     const existing = state.lessonByID(resolvedId);
@@ -355,8 +356,10 @@ export async function handleLessonDelete(
         );
       }
     }
-    await deleteLessonUnlocked(resolvedId, root, { hard });
+    // ISS-757: team-mode re-delete of a tombstoned lesson is a silent success
+    // (exit 0) that preserves the existing tombstone.
+    ({ alreadyDeleted } = await deleteLessonUnlocked(resolvedId, root, { hard }));
   });
 
-  return { output: formatLessonDeleteResult(format === "json" ? resolvedId : resolvedDisplayLabel ?? id, format) };
+  return { output: formatLessonDeleteResult(format === "json" ? resolvedId : resolvedDisplayLabel ?? id, format, alreadyDeleted) };
 }

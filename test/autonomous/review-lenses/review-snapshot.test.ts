@@ -239,48 +239,46 @@ describe("writeReviewSnapshot — source path safety", () => {
     ).toThrow();
   });
 
-  it("8. rejects a symlink whose target escapes the project root", () => {
+  // ISS-760: an escaping symlink no longer aborts the whole snapshot -- the
+  // entry is recorded in failedPaths and NOTHING of its target is captured
+  // (the containment guarantee is unchanged; only the failure scope shrank
+  // from whole-snapshot to per-entry).
+  it("8. records a symlink whose target escapes the project root in failedPaths without capturing it", () => {
     const external = join(scratchDir, "outside.txt");
     writeFileSync(external, "secret");
     symlinkSync(external, join(projectRoot, "escape-link"));
-    expect(() =>
-      writeReviewSnapshot({
-        projectRoot,
-        sessionId: SESSION_ID,
-        reviewId: "code-review-r1",
-        stage: "code-review",
-        round: 1,
-        files: ["escape-link"],
-      }),
-    ).toThrow();
-  });
-
-  it("9. rejects a missing source file cleanly and allows retry", () => {
     seedFile("src/a.ts", "x");
-    expect(() =>
-      writeReviewSnapshot({
-        projectRoot,
-        sessionId: SESSION_ID,
-        reviewId: "code-review-r1",
-        stage: "code-review",
-        round: 1,
-        files: ["src/a.ts", "src/missing.ts"],
-      }),
-    ).toThrow();
-    // No final dir.
-    expect(existsSync(snapshotDirFor(SESSION_ID, "code-review-r1"))).toBe(
-      false,
-    );
-    // Retry with only the present file.
     const result = writeReviewSnapshot({
       projectRoot,
       sessionId: SESSION_ID,
       reviewId: "code-review-r1",
       stage: "code-review",
       round: 1,
-      files: ["src/a.ts"],
+      files: ["src/a.ts", "escape-link"],
+    });
+    expect(result.manifest.failedPaths).toEqual(["escape-link"]);
+    expect(result.manifest.files.map((f) => f.path)).toEqual(["src/a.ts"]);
+    // The escaping target's bytes are NOT in the snapshot.
+    expect(existsSync(join(result.snapshotDir, "escape-link"))).toBe(false);
+  });
+
+  // ISS-760: a missing source no longer aborts the snapshot (all-or-nothing
+  // silently disabled the verification gate for the whole round). The present
+  // file is captured and the missing one is recorded in failedPaths.
+  it("9. records a missing source file in failedPaths and snapshots the rest", () => {
+    seedFile("src/a.ts", "x");
+    const result = writeReviewSnapshot({
+      projectRoot,
+      sessionId: SESSION_ID,
+      reviewId: "code-review-r1",
+      stage: "code-review",
+      round: 1,
+      files: ["src/a.ts", "src/missing.ts"],
     });
     expect(result.manifest.files).toHaveLength(1);
+    expect(result.manifest.files[0]!.path).toBe("src/a.ts");
+    expect(result.manifest.failedPaths).toEqual(["src/missing.ts"]);
+    expect(existsSync(snapshotDirFor(SESSION_ID, "code-review-r1"))).toBe(true);
   });
 });
 
@@ -403,7 +401,10 @@ describe("writeReviewSnapshot — reviewId separation and immutability", () => {
 
   it("15. retry after a failed write succeeds", () => {
     seedFile("src/a.ts", "x");
-    // First attempt fails on missing file.
+    // First attempt fails on a lexical path-contract violation. (ISS-760: a
+    // missing SOURCE file no longer aborts -- it degrades into failedPaths --
+    // but lexically invalid caller paths still abort the whole write, which
+    // is the failure mode this retry contract needs.)
     expect(() =>
       writeReviewSnapshot({
         projectRoot,
@@ -411,7 +412,7 @@ describe("writeReviewSnapshot — reviewId separation and immutability", () => {
         reviewId: "code-review-r1",
         stage: "code-review",
         round: 1,
-        files: ["src/a.ts", "src/missing.ts"],
+        files: ["src/a.ts", "../escape.txt"],
       }),
     ).toThrow();
     expect(existsSync(snapshotDirFor(SESSION_ID, "code-review-r1"))).toBe(

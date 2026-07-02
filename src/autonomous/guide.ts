@@ -2194,7 +2194,10 @@ async function handleCancel(root: string, args: GuideInput): Promise<McpToolResu
         if (ticket && ticket.status === "inprogress") {
           const ticketClaim = (ticket as Record<string, unknown>).claimedBySession;
           if (!ticketClaim || ticketClaim === cancelInfo.state.sessionId) {
-            await writeTicketUnlocked({ ...ticket, status: "open" as const, claimedBySession: null, claim: undefined }, root);
+            // ISS-759/ISS-652: delete the claim keys rather than writing
+            // explicit nulls, so a released ticket carries no residual state.
+            const { claimedBySession: _cb, claim: _cl, ...rest } = ticket as Record<string, unknown>;
+            await writeTicketUnlocked({ ...rest, status: "open" as const } as typeof ticket, root);
             ticketReleased = true;
           } else {
             ticketConflict = true;

@@ -242,13 +242,23 @@ describe("inbox-watcher", () => {
 
     // Write an event after the second start to verify it's functional
     await writeEvent(inboxPath, "pause_session", {}, "2026-04-05T10:00:00.000Z");
-    // ISS-444: Increase timeout from 300ms to 1000ms to avoid flaky failures
-    // when FSWatcher is slow to process under CI load.
-    await new Promise((resolve) => setTimeout(resolve, 1000));
+
+    // ISS-741 (was ISS-444): a fixed sleep loses the race under parallel
+    // full-suite load (~50% failure rate observed at 1000ms). Poll until the
+    // watcher consumes the file AND the notification lands (a poll landing in
+    // the rename-to-.processing claim window sees zero .json files before the
+    // notification is sent), with a deadline generous enough to cover the
+    // always-on 10s sweep recovering a missed watcher event; the assertions
+    // below remain the real check.
+    const deadline = Date.now() + 15_000;
+    let jsonFiles: string[];
+    do {
+      jsonFiles = (await readdir(inboxPath)).filter((f) => f.endsWith(".json"));
+      if (jsonFiles.length === 0 && mock.notifications.length >= 1) break;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    } while (Date.now() < deadline);
 
     // The event should be processed by the second watcher
-    const remaining = await readdir(inboxPath);
-    const jsonFiles = remaining.filter((f) => f.endsWith(".json"));
     expect(jsonFiles).toHaveLength(0);
     expect(mock.notifications.length).toBeGreaterThanOrEqual(1);
   });

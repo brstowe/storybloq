@@ -231,6 +231,6 @@ export async function handleNoteDelete(
   hard?: boolean,
   displayLabel?: string,
 ): Promise<CommandResult> {
-  await deleteNote(id, root, { hard });
-  return { output: formatNoteDeleteResult(format === "json" ? id : displayLabel ?? id, format) };
+  const result = await deleteNote(id, root, { hard });
+  return { output: formatNoteDeleteResult(format === "json" ? id : displayLabel ?? id, format, result.alreadyDeleted) };
 }

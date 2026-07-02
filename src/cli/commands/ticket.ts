@@ -534,7 +534,15 @@ export async function handleTicketDelete(
       `Warning: force-deleting ${id} may leave dangling references. Run \`storybloq validate\` to check.\n`,
     );
   }
-  await deleteTicket(id, root, { force, hard });
+  const result = await deleteTicket(id, root, { force, hard });
+  // ISS-757: team-mode re-delete of a tombstoned ticket is a silent success
+  // (exit 0) that preserves the existing tombstone; surface it distinctly.
+  if (result.alreadyDeleted) {
+    if (format === "json") {
+      return { output: JSON.stringify(successEnvelope({ id, deleted: true, alreadyDeleted: true }), null, 2) };
+    }
+    return { output: `Ticket ${displayLabel ?? id} is already deleted; existing tombstone preserved.` };
+  }
   if (format === "json") {
     return { output: JSON.stringify(successEnvelope({ id, deleted: true }), null, 2) };
   }

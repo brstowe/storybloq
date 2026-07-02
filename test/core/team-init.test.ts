@@ -211,4 +211,50 @@ describe("T-366: team-init", () => {
     expect(team.claimStalenessHours).toBe(24);
     expect(team.idAllocator).toBe("git-refs");
   });
+
+  // ISS-755: the git-refs allocator is only safe when every writer supports
+  // remote-ref reservations, so choosing it must couple the capability into
+  // requiredFeatures -- including when requiredFeatures pre-existed.
+  describe("git-refs capability coupling (ISS-755)", () => {
+    it("teamInit with idAllocator git-refs requires merge-driver AND remote-ref-reservations", async () => {
+      const root = createTempGitRepo();
+      writeConfig(root, baseConfig());
+      await teamInit(root, { idAllocator: "git-refs" });
+      const team = readConfig(root).team as Record<string, unknown>;
+      expect(team.requiredFeatures).toContain("merge-driver");
+      expect(team.requiredFeatures).toContain("remote-ref-reservations");
+    });
+
+    it("default/local allocator does NOT add remote-ref-reservations", async () => {
+      const root = createTempGitRepo();
+      writeConfig(root, baseConfig());
+      await teamInit(root, {});
+      const team = readConfig(root).team as Record<string, unknown>;
+      expect(team.requiredFeatures).not.toContain("remote-ref-reservations");
+    });
+
+    it("pre-existing requiredFeatures are preserved and appended to (even though they were not undefined)", async () => {
+      const root = createTempGitRepo();
+      writeConfig(root, baseConfig({
+        team: {
+          enabled: true,
+          idAllocator: "git-refs",
+          requiredFeatures: ["merge-driver", "tombstones"],
+        },
+      }));
+      await teamInit(root, {});
+      const team = readConfig(root).team as Record<string, unknown>;
+      expect(team.requiredFeatures).toEqual(["merge-driver", "tombstones", "remote-ref-reservations"]);
+    });
+
+    it("re-run is idempotent (no duplicate remote-ref-reservations)", async () => {
+      const root = createTempGitRepo();
+      writeConfig(root, baseConfig());
+      await teamInit(root, { idAllocator: "git-refs" });
+      await teamInit(root, {});
+      const team = readConfig(root).team as Record<string, unknown>;
+      const occurrences = (team.requiredFeatures as string[]).filter((f) => f === "remote-ref-reservations");
+      expect(occurrences).toHaveLength(1);
+    });
+  });
 });

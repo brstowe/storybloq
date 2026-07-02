@@ -18,11 +18,13 @@ const DEBOUNCE_MS = 100;
 const MAX_PERMISSION_RETRIES = 15;
 const MAX_EVENT_RETRIES = 30;
 const EVENT_EXPIRY_MS = 60_000; // 60s -- drop events older than this
+const SWEEP_INTERVAL_MS = 10_000;
 
 let watcher: FSWatcher | null = null;
 const permissionRetryCount = new Map<string, number>();
 const eventRetryCount = new Map<string, number>();
 let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+let sweepInterval: ReturnType<typeof setInterval> | null = null;
 
 /**
  * Starts watching .story/channel-inbox/ for event files.
@@ -36,6 +38,26 @@ export async function startInboxWatcher(root: string, server: McpServer): Promis
     watcher.close();
     watcher = null;
     permissionRetryCount.clear();
+  }
+  // ISS-741 lifecycle: a re-start must also clear every timer created by the
+  // previous start -- their callbacks capture the OLD root's inboxPath.
+  // Pre-existing leaks fixed here: a second start used to leave the first
+  // root's 2s polling fallback running forever, AND the `if (pollInterval)
+  // return` guard in startPollingFallback then blocked the NEW start's error
+  // fallback from ever engaging. The always-on sweep would leak the same way.
+  // Cleared unconditionally (not inside the `if (watcher)` block) because the
+  // first start may have failed over to polling with no live watcher.
+  if (sweepInterval) {
+    clearInterval(sweepInterval);
+    sweepInterval = null;
+  }
+  if (pollInterval) {
+    clearInterval(pollInterval);
+    pollInterval = null;
+  }
+  if (debounceTimer) {
+    clearTimeout(debounceTimer);
+    debounceTimer = null;
   }
 
   // Ensure inbox directory exists
@@ -68,6 +90,18 @@ export async function startInboxWatcher(root: string, server: McpServer): Promis
     process.stderr.write(`storybloq: failed to start inbox watcher, using polling fallback: ${msg}\n`);
     startPollingFallback(inboxPath, server);
   }
+
+  // ISS-741: fs.watch on macOS can permanently miss the rename event for a
+  // file written right after watcher (re)establishment, and the 2s polling
+  // fallback only engages after a watcher ERROR -- a silently missed event
+  // strands the file until the next unrelated inbox activity. Always-on
+  // low-frequency sweep: it coalesces through the same 100ms debounce, and
+  // the atomic rename-claim in processEventFile keeps concurrent processing
+  // safe. unref() so the sweep never keeps the process alive on shutdown.
+  sweepInterval = setInterval(() => {
+    scheduleDebouncedProcess(inboxPath, server);
+  }, SWEEP_INTERVAL_MS);
+  sweepInterval.unref();
 }
 
 /**
@@ -86,7 +120,37 @@ export function stopInboxWatcher(): void {
     clearInterval(pollInterval);
     pollInterval = null;
   }
+  if (sweepInterval) {
+    clearInterval(sweepInterval);
+    sweepInterval = null;
+  }
   permissionRetryCount.clear();
+}
+
+// MARK: - Test hooks (ISS-741)
+
+/**
+ * Test-only: exposes the live timer handles so lifecycle tests can assert
+ * that start/stop/restart create and clear them. Not part of the public API.
+ */
+export function _inboxWatcherTimersForTest(): {
+  sweep: ReturnType<typeof setInterval> | null;
+  poll: ReturnType<typeof setInterval> | null;
+  debounce: ReturnType<typeof setTimeout> | null;
+} {
+  return { sweep: sweepInterval, poll: pollInterval, debounce: debounceTimer };
+}
+
+/**
+ * Test-only: closes the FSWatcher WITHOUT touching the timers, simulating a
+ * watcher that silently misses events (the ISS-741 failure mode) so tests can
+ * prove the always-on sweep alone recovers a stranded file.
+ */
+export function _closeWatcherForTest(): void {
+  if (watcher) {
+    watcher.close();
+    watcher = null;
+  }
 }
 
 // MARK: - Debounce

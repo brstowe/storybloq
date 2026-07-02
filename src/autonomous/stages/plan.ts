@@ -3,7 +3,6 @@ import { join } from "node:path";
 import type { WorkflowStage, StageResult, StageAdvance, StageContext } from "./types.js";
 import type { GuideReportInput } from "../session-types.js";
 import { assessRisk, requiredRounds, nextReviewer } from "../review-depth.js";
-import { canClaim } from "../../core/claims.js";
 import {
   currentStorybloqClient,
   nativeCodexReportInstruction,
@@ -67,7 +66,10 @@ export class PlanStage implements WorkflowStage {
           await withProjectLock(ctx.root, { strict: false }, async ({ state: ps }) => {
             const ticket = ps.ticketByID(ticketId);
             if (ticket && (ticket as Record<string, unknown>).claimedBySession === ctx.state.sessionId) {
-              await writeTicketUnlocked({ ...ticket, status: "open" as const, claimedBySession: null, claim: undefined }, ctx.root);
+              // ISS-759/ISS-652: delete the claim keys rather than writing
+              // explicit nulls, so a released ticket carries no residual state.
+              const { claimedBySession: _cb, claim: _cl, ...rest } = ticket as Record<string, unknown>;
+              await writeTicketUnlocked({ ...rest, status: "open" as const } as typeof ticket, ctx.root);
             }
           });
         } catch { /* best-effort */ }
@@ -128,8 +130,14 @@ export class PlanStage implements WorkflowStage {
           if (ticketClaim && ticketClaim !== ctx.state.sessionId) { claimFailed = true; return; }
           const draftClaim = (ctx.state as Record<string, unknown>).pendingTicketClaim as { user: string; branch: string; since: string } | undefined;
           if (ticket.claim && draftClaim) {
-            const claimCheck = canClaim(ticket, draftClaim.user, draftClaim.branch);
-            if (!claimCheck.allowed) { claimFailed = true; return; }
+            // ISS-759: same-user claims are re-claimable on ANY branch. A
+            // per-ticket-branch session legitimately holds a claim from a
+            // previous branch of the same user (e.g. a prior story/T-xxx
+            // attempt), and the canClaim same-branch requirement made PLAN
+            // spin on retry. Only a FOREIGN user's claim blocks the recheck;
+            // freshness handling for foreign claims stays where it is today
+            // (PICK_TICKET), unchanged by this gate.
+            if (ticket.claim.user !== draftClaim.user) { claimFailed = true; return; }
           } else if (ticket.claim && !draftClaim) {
             claimFailed = true; return;
           }
@@ -142,7 +150,33 @@ export class PlanStage implements WorkflowStage {
     }
 
     if (claimFailed) {
-      return { action: "retry", instruction: `Cannot claim ticket ${ctx.state.ticket?.id} — it is not open or is already claimed by another session. Pick a different ticket.` };
+      const lostTicketId = ctx.state.ticket?.id ?? "unknown";
+      // ISS-759: a failed claim means another session/user took the ticket
+      // between PICK_TICKET and PLAN. Retrying PLAN can never succeed (the
+      // plan file exists, the claim stays foreign), so it used to spin
+      // forever. Clear the draft lock FIRST so the session no longer holds
+      // the ticket, then send the walker back to PICK_TICKET (goto is
+      // target-agnostic; same pattern as complete.ts).
+      ctx.updateDraft({ ticket: undefined, pendingTicketClaim: undefined } as Partial<typeof ctx.state>);
+      return {
+        action: "goto",
+        target: "PICK_TICKET",
+        result: {
+          instruction: [
+            `# Claim Lost: ${lostTicketId}`,
+            "",
+            `Ticket ${lostTicketId} could not be claimed -- it is no longer open or was claimed by another session/user after it was picked.`,
+            "The session is re-picking: choose a different ticket.",
+            "",
+            "When picked, call `storybloq_autonomous_guide` with:",
+            '```json',
+            `{ "sessionId": "${ctx.state.sessionId}", "action": "report", "report": { "completedAction": "ticket_picked", "ticketId": "T-XXX" } }`,
+            '```',
+          ].join("\n"),
+          reminders: ["Do not re-pick the ticket whose claim was just lost."],
+          transitionedFrom: "PLAN",
+        },
+      };
     }
 
     // Stage field updates (persisted atomically with state transition by processAdvance)

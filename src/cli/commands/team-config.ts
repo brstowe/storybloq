@@ -71,6 +71,20 @@ export async function handleTeamConfigSet(
         [key]: parsed,
       },
     };
+    // ISS-755: setting the git-refs allocator must also fence the
+    // remote-ref-reservations capability into requiredFeatures (mirrors
+    // team-init). Applied on the merged config, before schema validation:
+    // append if missing, idempotent, and it applies even when
+    // requiredFeatures pre-existed.
+    const team = config.team as Record<string, unknown>;
+    if (team.idAllocator === "git-refs") {
+      const features = Array.isArray(team.requiredFeatures)
+        ? (team.requiredFeatures as string[])
+        : [];
+      if (!features.includes("remote-ref-reservations")) {
+        team.requiredFeatures = [...features, "remote-ref-reservations"];
+      }
+    }
     const validated = ConfigSchema.parse(config);
     assertTeamWriteCapabilities(validated);
     await writeConfigUnlocked(validated, root);

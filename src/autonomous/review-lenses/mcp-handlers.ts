@@ -12,7 +12,7 @@
  * T-189
  */
 
-import { readFileSync, appendFileSync, existsSync, readdirSync } from "node:fs";
+import { readFileSync, writeFileSync, appendFileSync, existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { prepareLensReview } from "./orchestrator.js";
 import { writeReviewSnapshot } from "./review-snapshot.js";
@@ -121,7 +121,7 @@ function writeFreshReviewSnapshot(opts: {
   const reviewId = `${opts.stage}-r${maxIndex + 1}`;
 
   try {
-    writeReviewSnapshot({
+    const written = writeReviewSnapshot({
       projectRoot: opts.projectRoot,
       sessionId: opts.sessionId,
       reviewId,
@@ -129,6 +129,12 @@ function writeFreshReviewSnapshot(opts: {
       round: maxIndex + 1,
       files,
     });
+    // ISS-760: per-entry source failures no longer abort the snapshot (they
+    // are recorded in manifest.failedPaths and the gate runs degraded), but
+    // if EVERY entry failed there is nothing to verify against -- preserve
+    // the established ISS-715 skip semantics instead of rejecting the whole
+    // round against an empty snapshot.
+    if (written.manifest.fileCount === 0) return null;
     return reviewId;
   } catch {
     // Best effort: a write failure leaves no snapshot at this slot, so the gate
@@ -154,6 +160,9 @@ export interface PrepareOutput {
     readonly secretsGateActive: boolean;
     readonly reviewRound: number;
     readonly reviewId: string;
+    // ISS-760(b): the orchestrator secrets meta-finding, surfaced so it can
+    // reach the synthesize step (see the post-gate injection there).
+    readonly secretsMetaFinding: LensFinding | null;
   };
 }
 
@@ -169,6 +178,7 @@ export function handlePrepare(input: PrepareInput): PrepareOutput {
         secretsGateActive: false,
         reviewRound: input.reviewRound ?? 1,
         reviewId: `lens-empty-${Date.now().toString(36)}`,
+        secretsMetaFinding: null,
       },
     };
   }
@@ -253,6 +263,23 @@ export function handlePrepare(input: PrepareInput): PrepareOutput {
     }
   }
 
+  // ISS-760(b): when the secrets gate fires, persist the meta-finding keyed
+  // by this reviewId so handleSynthesize (a separate MCP call whose metadata
+  // is echoed field-by-field by the agent) can inject it into the merger
+  // findings without relying on the agent to round-trip it.
+  if (prepared.secretsMetaFinding) {
+    const persistDir = sessionDir
+      ?? (input.sessionId ? join(input.projectRoot, ".story", "sessions", input.sessionId) : undefined);
+    if (persistDir) {
+      try {
+        writeFileSync(
+          join(persistDir, "secrets-meta-finding.json"),
+          JSON.stringify({ reviewId: prepared.reviewId, metaFinding: prepared.secretsMetaFinding }, null, 2),
+        );
+      } catch { /* best-effort: metadata passthrough still carries it */ }
+    }
+  }
+
   return {
     lensPrompts,
     artifact: input.diff,
@@ -262,6 +289,7 @@ export function handlePrepare(input: PrepareInput): PrepareOutput {
       secretsGateActive: prepared.secretsGateActive,
       reviewRound: input.reviewRound ?? 1,
       reviewId: prepared.reviewId,
+      secretsMetaFinding: prepared.secretsMetaFinding,
     },
   };
 }
@@ -302,6 +330,9 @@ interface VerificationGateResult {
   rejectedCount: number;
   snapshotIntegrityFailure: boolean;
   verificationSkipped: boolean;
+  // ISS-760: true when the gate RAN against a partial snapshot (the writer
+  // recorded failedPaths). Distinguishes gate-ran-degraded from skipped.
+  verificationDegraded: boolean;
   logWriteFailures: number;
   verificationRuntimeErrors: number;
 }
@@ -317,6 +348,7 @@ function runVerificationGate(
       rejectedCount: 0,
       snapshotIntegrityFailure: false,
       verificationSkipped: true,
+      verificationDegraded: false,
       logWriteFailures: 0,
       verificationRuntimeErrors: 0,
     };
@@ -349,6 +381,7 @@ function runVerificationGate(
         rejectedCount: 0,
         snapshotIntegrityFailure: false,
         verificationSkipped: true,
+        verificationDegraded: false,
         logWriteFailures: 0,
         verificationRuntimeErrors: 0,
       };
@@ -400,12 +433,35 @@ function runVerificationGate(
     rejectedCount: rejected.length,
     snapshotIntegrityFailure: false,
     verificationSkipped: false,
+    verificationDegraded: snapshot!.failedPaths.size > 0,
     logWriteFailures,
     verificationRuntimeErrors,
   };
 }
 
 // ── Synthesize ────────────────────────────────────────────────
+
+/**
+ * ISS-760(b): read the secrets meta-finding handlePrepare persisted for this
+ * review. Returns null unless the stored reviewId matches (a stale file from
+ * an earlier round must not leak into a later one). Best-effort: any read or
+ * parse failure yields null.
+ */
+function readPersistedSecretsMeta(
+  sessionDir: string | undefined,
+  reviewId: string,
+): LensFinding | null {
+  if (!sessionDir) return null;
+  try {
+    const raw = JSON.parse(
+      readFileSync(join(sessionDir, "secrets-meta-finding.json"), "utf-8"),
+    ) as { reviewId?: unknown; metaFinding?: unknown };
+    if (raw && raw.reviewId === reviewId && raw.metaFinding && typeof raw.metaFinding === "object") {
+      return raw.metaFinding as LensFinding;
+    }
+  } catch { /* absent or unreadable: no meta-finding */ }
+  return null;
+}
 
 export interface SynthesizeInput {
   readonly stage?: ReviewStage;
@@ -419,6 +475,10 @@ export interface SynthesizeInput {
     readonly skippedLenses: readonly string[];
     readonly reviewRound: number;
     readonly reviewId: string;
+    // ISS-760(b): optional direct passthrough of the prepare-step secrets
+    // meta-finding (programmatic callers). The MCP flow falls back to the
+    // file handlePrepare persists in the session dir, keyed by reviewId.
+    readonly secretsMetaFinding?: LensFinding | null;
   };
   readonly sessionDir?: string;
   readonly sessionId?: string;
@@ -447,6 +507,9 @@ export interface SynthesizeOutput {
   };
   readonly snapshotIntegrityFailure: boolean;
   readonly verificationSkipped: boolean;
+  // ISS-760: the gate ran against a partial snapshot (some paths failed to
+  // capture). Rounds with this flag stay lenses-unverified.
+  readonly verificationDegraded: boolean;
   readonly logWriteFailures: number;
   readonly verificationRuntimeErrors: number;
   readonly telemetryWriteFailed: boolean;
@@ -548,6 +611,7 @@ export function handleSynthesize(input: SynthesizeInput): SynthesizeOutput {
     rejectedCount,
     snapshotIntegrityFailure,
     verificationSkipped,
+    verificationDegraded,
     logWriteFailures,
     verificationRuntimeErrors,
   } = gate;
@@ -556,6 +620,25 @@ export function handleSynthesize(input: SynthesizeInput): SynthesizeOutput {
   const preExistingFindings = verifiedForFiling.filter(
     f => f.origin === "pre-existing" && f.severity !== "suggestion",
   );
+
+  // ── ISS-760(b): inject the orchestrator secrets meta-finding ────
+  // POST-verification-gate, into the merger findings only. Constraint: the
+  // meta-finding has no snapshottable file evidence -- its evidence quotes
+  // the "[REDACTED -- potential secret]" placeholder, which can never match
+  // the pre-redaction snapshot bytes, so injecting it BEFORE the gate would
+  // make the gate self-reject it. It is therefore exempt from the
+  // verification counters (proposed/verified/rejected count lens findings
+  // only) and from pre-existing filing (verifiedForFiling excludes it).
+  const secretsMeta = input.metadata.secretsMetaFinding
+    ?? readPersistedSecretsMeta(input.sessionDir, input.metadata.reviewId);
+  if (secretsMeta) {
+    verifiedFindings.unshift({
+      ...secretsMeta,
+      resolvedModel: "orchestrator",
+      issueKey: "orchestrator:hardcoded-secrets:gate",
+      blocking: true,
+    });
+  }
 
   const lensMetadata = buildLensMetadata(lensesCompleted, lensesFailed, lensesInsufficientContext);
 
@@ -581,6 +664,9 @@ export function handleSynthesize(input: SynthesizeInput): SynthesizeOutput {
         rejected: verificationCounters.rejected,
         snapshotIntegrityFailure,
         verificationSkipped,
+        // ISS-760: gate-ran-degraded is distinct from skipped; the round
+        // still classifies as lenses-unverified (see classifyLensReviewPath).
+        verificationDegraded,
         verificationRuntimeErrors,
         logWriteFailures,
         timestamp: new Date().toISOString(),
@@ -607,6 +693,7 @@ export function handleSynthesize(input: SynthesizeInput): SynthesizeOutput {
     verificationCounters,
     snapshotIntegrityFailure,
     verificationSkipped,
+    verificationDegraded,
     logWriteFailures,
     verificationRuntimeErrors,
     telemetryWriteFailed,

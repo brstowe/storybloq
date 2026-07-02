@@ -42,7 +42,10 @@ export function isClaimStale(
 }
 
 export function clearClaimOnComplete(ticket: Ticket): Ticket {
-  if (ticket.status === "complete" && (ticket.claim || ticket.claimedBySession != null)) {
+  // ISS-759: gate on key PRESENCE, not truthiness. A completed ticket carrying
+  // claimedBySession: null (the pre-ISS-652 release shape) must still have the
+  // key deleted rather than surviving as an explicit null on disk.
+  if (ticket.status === "complete" && (("claim" in ticket) || ("claimedBySession" in ticket))) {
     const { claim: _, claimedBySession: _claimedBySession, ...rest } = ticket;
     return rest as Ticket;
   }

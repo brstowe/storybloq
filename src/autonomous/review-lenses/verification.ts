@@ -146,6 +146,14 @@ export interface PreloadedSnapshot {
   readonly snapshotDir: string;
   readonly snapshotDirReal: string;
   readonly byPath: ReadonlyMap<string, ReviewSnapshotManifestFileEntry>;
+  /**
+   * ISS-760: caller paths the snapshot writer could not capture (unreadable
+   * file, directory, escaping symlink). The gate still RUNS against the
+   * partial snapshot; evidence citing one of these paths fails with the
+   * existing file_not_snapshotted reason code, and callers use a non-empty
+   * set to mark the round's telemetry as degraded.
+   */
+  readonly failedPaths: ReadonlySet<string>;
 }
 
 /**
@@ -196,6 +204,7 @@ export function loadSnapshot(ctx: SnapshotContext): PreloadedSnapshot {
   const snapshotDir = manifest.snapshotRoot;
   const byPath = new Map<string, ReviewSnapshotManifestFileEntry>();
   for (const entry of manifest.files) byPath.set(entry.path, entry);
+  const failedPaths = new Set<string>(manifest.failedPaths ?? []);
 
   // Cache realpathSync(snapshotDir) once instead of per evidence item (ISS-394).
   let snapshotDirReal: string;
@@ -208,7 +217,7 @@ export function loadSnapshot(ctx: SnapshotContext): PreloadedSnapshot {
     );
   }
 
-  return { snapshotDir, snapshotDirReal, byPath };
+  return { snapshotDir, snapshotDirReal, byPath, failedPaths };
 }
 
 // ── Public helpers ──────────────────────────────────────────────────
@@ -261,7 +270,7 @@ export function verifyLensFindingPreloaded(
   const verified: VerifiedEvidence[] = [];
   for (let i = 0; i < finding.evidence.length; i++) {
     const item = finding.evidence[i] as EvidenceItem;
-    const outcome = verifyEvidenceItem(item, snapshot.snapshotDir, snapshot.byPath, snapshot.snapshotDirReal);
+    const outcome = verifyEvidenceItem(item, snapshot.snapshotDir, snapshot.byPath, snapshot.snapshotDirReal, snapshot.failedPaths);
     if (outcome.kind === "integrity") {
       throw outcome.error;
     }
@@ -356,6 +365,7 @@ function verifyPathAndLookup(
   evidence: EvidenceItem,
   snapshotDir: string,
   byPath: ReadonlyMap<string, ReviewSnapshotManifestFileEntry>,
+  failedPaths?: ReadonlySet<string>,
 ): EvidenceOutcome | { kind: "resolved"; entry: ReviewSnapshotManifestFileEntry; resolved: string } {
   try {
     _assertValidManifestPath(evidence.file, `evidence path`);
@@ -368,9 +378,14 @@ function verifyPathAndLookup(
 
   const entry = byPath.get(evidence.file);
   if (!entry) {
+    // ISS-760: reuse the existing file_not_snapshotted reason code for paths
+    // the writer recorded as failed (degraded snapshot), with a message that
+    // says WHY the file is absent from the manifest.
     return failOutcome("file_not_snapshotted", {
       file: evidence.file,
-      message: `evidence path not in snapshot manifest: ${evidence.file}`,
+      message: failedPaths?.has(evidence.file)
+        ? `evidence path could not be captured by the snapshot writer (unreadable/directory/symlink at snapshot time): ${evidence.file}`
+        : `evidence path not in snapshot manifest: ${evidence.file}`,
     });
   }
 
@@ -588,9 +603,10 @@ function verifyEvidenceItem(
   snapshotDir: string,
   byPath: ReadonlyMap<string, ReviewSnapshotManifestFileEntry>,
   snapshotDirReal?: string,
+  failedPaths?: ReadonlySet<string>,
 ): EvidenceOutcome {
   // Steps 1-2: path canonicalization + manifest lookup
-  const lookup = verifyPathAndLookup(evidence, snapshotDir, byPath);
+  const lookup = verifyPathAndLookup(evidence, snapshotDir, byPath, failedPaths);
   if (lookup.kind !== "resolved") return lookup;
 
   // Payload integrity: lstat, symlink, realpath, hash

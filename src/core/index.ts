@@ -22,6 +22,7 @@ export {
   guardPath,
   type LoadOptions,
   type LoadResult,
+  type DeleteResult,
   type WithProjectLockOptions,
 } from "./project-loader.js";
 export { discoverProjectRoot } from "./project-root-discovery.js";

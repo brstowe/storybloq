@@ -61,6 +61,15 @@ export interface ReviewSnapshotManifest {
   files: ReviewSnapshotManifestFileEntry[];
   fileCount: number;
   totalBytes: number;
+  /**
+   * ISS-760: caller paths whose SOURCE could not be captured (unreadable
+   * file, directory, missing file, symlink escaping the project root). A
+   * per-entry source failure no longer aborts the whole snapshot; the
+   * readable entries are captured and the failures recorded here so the
+   * verification gate can run degraded instead of skipping entirely.
+   * Absent in pre-ISS-760 manifests; readers default it to [].
+   */
+  failedPaths: string[];
 }
 
 export interface WriteReviewSnapshotResult {
@@ -391,16 +400,32 @@ export function writeReviewSnapshotInto(
     assertValidManifestPath(p, `caller path`);
   }
 
+  // ISS-760: per-entry SOURCE failures (unreadable file, directory, missing
+  // file, symlink escaping the project root) must not abort the whole
+  // snapshot -- all-or-nothing behavior made ONE bad entry silently disable
+  // the verification gate for the entire round (no snapshot -> gate skips ->
+  // fabricated quotes flow to the merger unverified). Failed caller paths are
+  // recorded in the manifest instead. Lexical path-contract violations
+  // (Phase 1) and destination-side failures still abort: they indicate a
+  // caller bug or a compromised snapshot destination, not a degraded source.
+  const failedPathSet = new Set<string>();
+
   // Phase 2: resolve sources, dedup, sort.
   const dedup = new Map<
     string,
     { callerPath: string; resolvedTarget: string }
   >();
   for (const callerPath of input.files) {
-    const { resolvedTarget } = resolveSourcePath(
-      paths.canonicalProjectRoot,
-      callerPath,
-    );
+    let resolvedTarget: string;
+    try {
+      ({ resolvedTarget } = resolveSourcePath(
+        paths.canonicalProjectRoot,
+        callerPath,
+      ));
+    } catch {
+      failedPathSet.add(callerPath);
+      continue;
+    }
     if (!dedup.has(callerPath)) {
       dedup.set(callerPath, { callerPath, resolvedTarget });
     }
@@ -413,7 +438,14 @@ export function writeReviewSnapshotInto(
   const manifestEntries: ReviewSnapshotManifestFileEntry[] = [];
   let totalBytes = 0;
   for (const entry of resolved) {
-    const bytes = readFileSync(entry.resolvedTarget);
+    let bytes: Buffer;
+    try {
+      bytes = readFileSync(entry.resolvedTarget);
+    } catch {
+      // ISS-760: unreadable at capture time (EACCES, EISDIR, vanished file).
+      failedPathSet.add(entry.callerPath);
+      continue;
+    }
     const sha256 = createHash("sha256").update(bytes).digest("hex");
 
     const dest = join(stagingDir, entry.callerPath);
@@ -459,6 +491,7 @@ export function writeReviewSnapshotInto(
     files: manifestEntries,
     fileCount: manifestEntries.length,
     totalBytes,
+    failedPaths: [...failedPathSet].sort(),
   };
   const manifestBytes = Buffer.from(
     JSON.stringify(manifest, null, 2) + "\n",
@@ -731,6 +764,19 @@ function validateManifestShape(value: unknown): ReviewSnapshotManifest {
       `review-snapshot: manifest totalBytes mismatch: stored ${m.totalBytes}, summed ${summedBytes}`,
     );
   }
+  // ISS-760: failedPaths is additive -- pre-ISS-760 manifests lack it, so a
+  // missing field defaults to []. When present it must be an array of strings
+  // (informational only: the reader never derives filesystem paths from it).
+  let failedPaths: string[] = [];
+  if (m.failedPaths !== undefined) {
+    if (
+      !Array.isArray(m.failedPaths) ||
+      (m.failedPaths as unknown[]).some((p) => typeof p !== "string")
+    ) {
+      throw new Error("review-snapshot: manifest.failedPaths invalid");
+    }
+    failedPaths = [...(m.failedPaths as string[])];
+  }
   return {
     reviewId: m.reviewId,
     sessionId: m.sessionId,
@@ -742,6 +788,7 @@ function validateManifestShape(value: unknown): ReviewSnapshotManifest {
     files,
     fileCount: m.fileCount,
     totalBytes: m.totalBytes,
+    failedPaths,
   };
 }
 
