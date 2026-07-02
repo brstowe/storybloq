@@ -243,6 +243,7 @@ See [Team mode](#team-mode) for the merge model these commands operate on.
 | `storybloq reconcile [--dry-run] [--ci]` | Detect and renumber duplicate display ids |
 | `storybloq conflicts list` · `conflicts show <id>` | Inspect unresolved merge conflicts |
 | `storybloq resolve <id> [--field <f>] [--use ours\|theirs] [--value <json>]` | Resolve conflicts (also `resolve config`, `resolve roadmap`) |
+| `storybloq gc [--apply] [--retention-days N]` | Purge deleted-item tombstones past retention; dry-run without `--apply` (default 30-day retention) |
 
 ## MCP server reference
 
@@ -457,11 +458,17 @@ Team repos created before the fence carry `schemaVersion: 2`. To upgrade an exis
 `team init` and `team setup` write `.story/.gitignore` covering the machine-local files (`sessions/`, `snapshots/`, `status.json`, `federation-cache.json`, `channel-inbox/`). A gitignore does not untrack files that are already tracked, so a project that adopted storybloq before the gitignore existed may already have ephemeral files in git history. Check once and untrack them:
 
 ```bash
-git ls-files .story/ | grep -E 'sessions/|snapshots/|status\.json|channel-inbox/'
-git rm -r --cached --ignore-unmatch .story/sessions .story/snapshots .story/status.json .story/channel-inbox
+git ls-files .story/ | grep -E 'sessions/|snapshots/|status\.json|federation-cache\.json|channel-inbox/'
+git rm -r --cached --ignore-unmatch .story/sessions .story/snapshots .story/status.json .story/federation-cache.json .story/channel-inbox
 ```
 
 Commit the removal. Session state records absolute paths (including your username), so this is worth doing before the first shared push.
+
+### Deletes leave tombstones
+
+Deleting a ticket, issue, note, or lesson in team mode does not remove it from the shared repo. The file stays, keeping its full original content, plus a lifecycle marker: `lifecycle: "deleted"`, a `deletedAt` timestamp, and `deletedBy` set to the deleter's git `user.email`. Resolving a delete-versus-edit conflict can likewise stamp the resolver's email as `deletedBy` on a synthesized tombstone. Tombstones stay in the repo until someone runs `storybloq gc --apply` (default 30-day retention).
+
+The takeaway: deleting an item hides it from normal views, but it does not remove the content or your identity stamp from teammates' clones. Run `storybloq gc` to preview eligible tombstones, then `storybloq gc --apply` to purge them once they pass retention.
 
 ### What your team sees
 
@@ -470,8 +477,9 @@ Team mode shares state through the repo, so everything committed under `.story/`
 - Tickets, issues, notes, and lessons, including all free-text fields.
 - Handovers: narrative session documents, often the most detailed record of what happened and why.
 - Claim blocks on in-progress items: the claiming teammate's git identity (`user.email`), branch name, and claim timestamp, plus a `claimedBySession` UUID while an autonomous session works the item.
+- Unresolved merge conflicts: after a divergent merge, the affected record carries the conflicting values from both sides (base, ours, and theirs) inside its `_conflicts` block until someone resolves it. Text a teammate wrote but later lost in arbitration stays visible in the file until resolution.
 
-The machine-local files stay out of the repo once the gitignore is in place: `sessions/` (autonomous session state, including each session's `events.log`), `snapshots/`, `status.json`, and `channel-inbox/`. Treat committed `.story/` content with the same care as commit messages and code comments; it travels with the repo.
+The machine-local files stay out of the repo once the gitignore is in place: `sessions/` (autonomous session state, including each session's `events.log`), `snapshots/`, `status.json`, `federation-cache.json`, and `channel-inbox/`. Treat committed `.story/` content with the same care as commit messages and code comments; it travels with the repo.
 
 ## Team CI
 
