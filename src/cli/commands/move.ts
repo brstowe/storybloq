@@ -1,5 +1,7 @@
 import { resolve } from "node:path";
-import { generateKeyBetween, compareByRank } from "../../core/fractional-index.js";
+import { generateKeyBetween, compareByRank, rebalanceRanks } from "../../core/fractional-index.js";
+import { displayIdOf } from "../../core/resolver.js";
+import type { Ticket } from "../../models/index.js";
 import type { CommandResult } from "../types.js";
 
 export interface MoveOptions {
@@ -22,47 +24,107 @@ export async function handleTicketMove(
     return { output: "Error: specify --after or --before.", exitCode: 1 };
   }
 
-  const targetId = (options.after ?? options.before)!;
-  if (targetId === id) {
+  const targetRef = (options.after ?? options.before)!;
+  if (targetRef === id) {
     return { output: "Error: cannot move a ticket relative to itself.", exitCode: 1 };
   }
 
   const { withProjectLock, writeTicketUnlocked } = await import("../../core/project-loader.js");
 
   let output = "";
+  let exitCode: 0 | 1 = 0;
+  const fail = (message: string): void => {
+    output = format === "json"
+      ? JSON.stringify({ ok: false, error: message }, null, 2)
+      : `Error: ${message}`;
+    exitCode = 1;
+  };
+
   await withProjectLock(root, { strict: false }, async ({ state }) => {
-    const ticket = state.ticketByID(id);
-    if (!ticket) {
-      output = format === "json"
-        ? JSON.stringify({ ok: false, error: `Ticket ${id} not found.` }, null, 2)
-        : `Error: ticket ${id} not found.`;
+    // ISS-753: resolve both refs at the display boundary (canonical id, displayId,
+    // previous displayId) instead of canonical-id-only lookup, so the T-NNN display
+    // IDs the CLI itself prints are movable in team mode.
+    const ticketRes = state.resolveTicketRef(id);
+    if (ticketRes.kind === "ambiguous") {
+      fail(`ticket reference "${id}" is ambiguous; matches: ${ticketRes.matches.map((m) => m.id).join(", ")}. Use a canonical id.`);
       return;
     }
+    if (ticketRes.kind === "missing") {
+      fail(`ticket ${id} not found.`);
+      return;
+    }
+    const ticket = ticketRes.item;
 
-    const target = state.ticketByID(targetId);
-    if (!target) {
-      output = format === "json"
-        ? JSON.stringify({ ok: false, error: `Target ticket ${targetId} not found.` }, null, 2)
-        : `Error: target ticket ${targetId} not found.`;
+    const targetRes = state.resolveTicketRef(targetRef);
+    if (targetRes.kind === "ambiguous") {
+      fail(`target ticket reference "${targetRef}" is ambiguous; matches: ${targetRes.matches.map((m) => m.id).join(", ")}. Use a canonical id.`);
+      return;
+    }
+    if (targetRes.kind === "missing") {
+      fail(`target ticket ${targetRef} not found.`);
+      return;
+    }
+    const target = targetRes.item;
+
+    // Self-move via mixed refs (canonical id on one side, its own displayId on the
+    // other): the raw string check above cannot catch this; only post-resolution
+    // identity can.
+    if (target.id === ticket.id) {
+      fail(`cannot move a ticket relative to itself.`);
       return;
     }
 
     if (ticket.phase !== target.phase) {
-      output = format === "json"
-        ? JSON.stringify({ ok: false, error: `Tickets are in different phases.` }, null, 2)
-        : `Error: ${id} (phase ${ticket.phase}) and ${targetId} (phase ${target.phase}) are in different phases.`;
+      fail(`${displayIdOf(ticket)} (phase ${ticket.phase}) and ${displayIdOf(target)} (phase ${target.phase}) are in different phases.`);
       return;
     }
 
-    const siblings = state.phaseTickets(ticket.phase)
-      .filter((t) => t.id !== id)
-      .map((t) => ({ rank: (t as Record<string, unknown>).rank as string | undefined, order: t.order, id: t.id }))
+    const siblings: Ticket[] = state.phaseTickets(ticket.phase)
+      .filter((t) => t.id !== ticket.id)
       .sort(compareByRank);
 
-    const targetIdx = siblings.findIndex((s) => s.id === targetId);
+    const targetIdx = siblings.findIndex((s) => s.id === target.id);
     if (targetIdx === -1) {
-      output = `Error: target ${targetId} not found in phase siblings.`;
+      fail(`target ${displayIdOf(target)} not found in phase siblings.`);
       return;
+    }
+
+    // ISS-753: rank backfill. Tickets are never assigned a rank at creation, so in
+    // the default state every sibling is unranked; ranking only the moved ticket
+    // yanks it to the top/bottom because compareByRank sorts ranked before unranked.
+    // Materialize a rank onto every unranked sibling first, preserving the currently
+    // displayed (compareByRank) order exactly, then compute the move bounds against
+    // the fully ranked sibling list. All writes happen under this same project lock.
+    //
+    // Decided disclosure: writeTicketUnlocked also persists the loader-derived
+    // displayId (= id) that loadProject injects in-memory onto legacy ticket files
+    // (project-loader.ts legacy classification). Accepted deliberately: semantically
+    // a no-op (displayIdOf falls back to id), loader-idempotent, one-time churn.
+    if (siblings.some((s) => s.rank == null)) {
+      if (siblings.every((s) => s.rank == null)) {
+        // All unranked: assign evenly spread ranks in displayed order.
+        const ranks = rebalanceRanks(siblings.length);
+        for (let i = 0; i < siblings.length; i++) {
+          const updated: Ticket = { ...siblings[i]!, rank: ranks[i]! };
+          await writeTicketUnlocked(updated, resolve(root));
+          siblings[i] = updated;
+        }
+      } else {
+        // Mixed: ranked siblings sort before unranked ones, so the unranked tail
+        // appends after the highest existing rank. Walk the displayed order and give
+        // each unranked sibling generateKeyBetween(prevRank, null) sequentially (the
+        // next-existing bound is always null for the tail).
+        let prev: string | null = null;
+        for (let i = 0; i < siblings.length; i++) {
+          let sibling = siblings[i]!;
+          if (sibling.rank == null) {
+            sibling = { ...sibling, rank: generateKeyBetween(prev, null) };
+            await writeTicketUnlocked(sibling, resolve(root));
+            siblings[i] = sibling;
+          }
+          prev = sibling.rank!;
+        }
+      }
     }
 
     // Lower/upper rank bounds for the new position. For --after we slot between the
@@ -108,22 +170,19 @@ export async function handleTicketMove(
     } catch {
       // Genuine exhaustion (e.g. moving before the minimum rank): actionable guidance
       // instead of a crash. reconcile --rebalance-ranks restores spread-out ranks.
-      const msg = `Cannot compute a rank for this move: sibling ranks are duplicated or exhausted. Run \`storybloq reconcile --rebalance-ranks\` and retry.`;
-      output = format === "json"
-        ? JSON.stringify({ ok: false, error: msg }, null, 2)
-        : `Error: ${msg}`;
+      fail(`Cannot compute a rank for this move: sibling ranks are duplicated or exhausted. Run \`storybloq reconcile --rebalance-ranks\` and retry.`);
       return;
     }
 
-    const updated = { ...ticket, rank: newRank } as Record<string, unknown>;
-    await writeTicketUnlocked(updated as any, resolve(root));
+    const updated: Ticket = { ...ticket, rank: newRank };
+    await writeTicketUnlocked(updated, resolve(root));
 
     if (format === "json") {
-      output = JSON.stringify({ ok: true, data: { id, rank: newRank } }, null, 2);
+      output = JSON.stringify({ ok: true, data: { id: ticket.id, displayId: displayIdOf(ticket), rank: newRank } }, null, 2);
     } else {
-      output = `Moved ${id} ${options.after ? "after" : "before"} ${targetId} (rank: ${newRank}).`;
+      output = `Moved ${displayIdOf(ticket)} ${options.after ? "after" : "before"} ${displayIdOf(target)} (rank: ${newRank}).`;
     }
   });
 
-  return { output };
+  return exitCode ? { output, exitCode } : { output };
 }

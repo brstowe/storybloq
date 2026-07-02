@@ -118,3 +118,19 @@ describe("ISS-748: dist bundle resolves its own version for the team write gate"
     expect(r.out).toContain(`current CLI is ${bakedVersion}`);
   });
 });
+
+describe("ISS-753/ISS-758: CLI error paths propagate a nonzero process exit code", () => {
+  it("ticket move with a nonexistent ticket exits 1", () => {
+    const dir = createTeamProject(bakedVersion);
+    const r = runCli(cliPath, dir, "ticket", "move", "T-999", "--after", "T-001");
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("not found");
+  });
+
+  it("gc with a garbage --retention-days exits 1", () => {
+    const dir = createTeamProject(bakedVersion);
+    const r = runCli(cliPath, dir, "gc", "--retention-days", "garbage");
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("retention-days");
+  });
+});

@@ -372,6 +372,7 @@ export function registerGcCommand(yargs: Argv): Argv {
           format: (argv.format as "md" | "json") ?? "md",
         });
         writeOutput(result.output);
+        if (result.exitCode) process.exitCode = result.exitCode;
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
         writeOutput(message);

@@ -143,4 +143,20 @@ describe("handleGc apply loop", () => {
       expect(existsSync(tombstonePath)).toBe(true);
     });
   });
+
+  describe("invalid --retention-days (ISS-758: handler-level exit code)", () => {
+    it("returns exitCode 1 for a non-numeric value (yargs coerces garbage to NaN)", async () => {
+      const root = createProject({ team: false });
+      const result = await handleGc(root, { retentionDays: Number.NaN });
+      expect(result.exitCode).toBe(1);
+      expect(result.output).toContain("retention-days");
+    });
+
+    it("returns exitCode 1 for a negative value", async () => {
+      const root = createProject({ team: false });
+      const result = await handleGc(root, { retentionDays: -1 });
+      expect(result.exitCode).toBe(1);
+      expect(result.output).toContain("retention-days");
+    });
+  });
 });
