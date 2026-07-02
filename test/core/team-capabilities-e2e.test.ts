@@ -1,8 +1,8 @@
 import { describe, it, expect } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, copyFileSync, symlinkSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, copyFileSync, symlinkSync, chmodSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 // ISS-748 regression suite. Runs against the BUILT bundle: `npm run build` must
@@ -165,5 +165,57 @@ describe("ISS-753/ISS-758: CLI error paths propagate a nonzero process exit code
     const r = runCli(cliPath, dir, "gc", "--retention-days", "garbage");
     expect(r.code).toBe(1);
     expect(r.out).toContain("retention-days");
+  });
+});
+
+describe("ISS-736: update banner stays out of non-interactive stderr", () => {
+  function warmCacheHome(): string {
+    const home = mkdtempSync(join(tmpdir(), "banner-home-"));
+    const cacheDir = join(home, ".claude", "storybloq");
+    mkdirSync(cacheDir, { recursive: true });
+    const cacheFile = join(cacheDir, "update-check.json");
+    // latestVersion far above the baked version; fetchedAt fresh (24h TTL).
+    writeFileSync(cacheFile, JSON.stringify({ latestVersion: "99.0.0", fetchedAt: Date.now() }) + "\n");
+    // Housekeeping's unawaited background registry fetch overwrites this file
+    // within a single run when online (observed live); writeCache is
+    // best-effort, so a read-only file keeps the fixture authoritative.
+    chmodSync(cacheFile, 0o444);
+    return home;
+  }
+
+  // spawnSync (NOT execFileSync): stderr must be observable on exit-0 paths
+  // too; execFileSync exposes it only via the thrown error object, which made
+  // the first version of these assertions vacuously pass on any build.
+  function runWithHome(home: string, cwd: string, ...args: string[]): { status: number | null; stderr: string } {
+    const r = spawnSync("node", [cliPath, ...args], {
+      cwd,
+      encoding: "utf-8",
+      env: { ...process.env, HOME: home },
+    });
+    return { status: r.status, stderr: r.stderr ?? "" };
+  }
+
+  it("piped status emits no banner despite a warmed stale cache", () => {
+    const home = warmCacheHome();
+    const dir = createTeamProject(bakedVersion);
+    const r = runWithHome(home, dir, "status");
+    expect(r.status).toBe(0);
+    expect(r.stderr).not.toMatch(/is available|99\.0\.0/i);
+  });
+
+  it("merge-driver invocation emits no banner despite a warmed stale cache", () => {
+    const home = warmCacheHome();
+    const stage = mkdtempSync(join(tmpdir(), "banner-md-"));
+    const ticket = JSON.stringify({ id: "T-001", title: "t", description: "", type: "task", status: "open", phase: "p0", order: 10, createdDate: "2026-01-01", completedDate: null, blockedBy: [], parentTicket: null }) + "\n";
+    const mk = (name: string, content: string) => {
+      const p = join(stage, name);
+      writeFileSync(p, content);
+      return p;
+    };
+    const base = mk("base.json", ticket);
+    const ours = mk("ours.json", ticket);
+    const theirs = mk("theirs.json", ticket);
+    const r = runWithHome(home, stage, "merge-driver", base, ours, theirs, "tickets/T-001.json");
+    expect(r.stderr).not.toMatch(/is available|99\.0\.0/i);
   });
 });

@@ -166,3 +166,30 @@ export function formatUpdateBanner(info: UpdateInfo | null): string {
     `Update: npm install -g @storybloq/storybloq@latest\n`
   );
 }
+
+/**
+ * Whether the CLI should print the update banner at all (ISS-736).
+ *
+ * The COMMAND guard is the primary fix for the observed defect: git spawns
+ * the merge driver once per merged .story file and the driver inherits git's
+ * stderr, which in an interactive `git merge` IS a TTY -- so the TTY guard
+ * alone would not have stopped the observed per-file banner pollution. Do
+ * not remove the command check as "redundant with TTY".
+ *
+ * The TTY guard covers pipes, plumbing, and CI runners structurally.
+ * NO_UPDATE_NOTIFIER is the conventional opt-out. CI is suppressed whenever
+ * set non-empty, deliberately including CI="false" (some tools set it to
+ * mean not-CI): a real terminal still gets the banner via the TTY path in
+ * practice, and CI-shaped environments never want stderr noise.
+ */
+export function shouldEmitUpdateBanner(opts: {
+  stderrIsTTY: boolean;
+  env: Record<string, string | undefined>;
+  command?: string;
+}): boolean {
+  if (opts.command === "merge-driver") return false;
+  if (!opts.stderrIsTTY) return false;
+  if (opts.env.NO_UPDATE_NOTIFIER !== undefined && opts.env.NO_UPDATE_NOTIFIER !== "") return false;
+  if (opts.env.CI !== undefined && opts.env.CI !== "") return false;
+  return true;
+}

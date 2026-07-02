@@ -75,10 +75,18 @@ async function runCli(): Promise<void> {
   // Version injected at build time by tsup define
   const version = process.env.STORYBLOQ_VERSION ?? "0.0.0-dev";
 
+  // ISS-736: git spawns `storybloq merge-driver ...` once per merged .story
+  // file; both housekeeping (awaited skill refresh + background npm fetch)
+  // and the update banner are per-spawn noise/latency inside git plumbing.
+  const dispatchedCommand = hideBin(process.argv)[0];
+  const isMergeDriver = dispatchedCommand === "merge-driver";
+
   // ISS-570: silent skill-dir refresh if the CLI version changed + schedule
   // a background update check so the next invocation's banner is fresh.
-  const { preCommandHousekeeping } = await import("./housekeeping.js");
-  await preCommandHousekeeping(version);
+  if (!isMergeDriver) {
+    const { preCommandHousekeeping } = await import("./housekeeping.js");
+    await preCommandHousekeeping(version);
+  }
 
   class HandledError extends Error {
     constructor() {
@@ -159,6 +167,9 @@ async function runCli(): Promise<void> {
 
   // ISS-570 G1: banner is the last thing the CLI does, after the command's
   // own output. Prints to stderr so it never interferes with structured
-  // JSON on stdout.
-  await emitUpdateBannerIfStale(version);
+  // JSON on stdout. ISS-736: gated on TTY/env/command via the pure guard.
+  const { shouldEmitUpdateBanner } = await import("../core/update-check.js");
+  if (shouldEmitUpdateBanner({ stderrIsTTY: process.stderr.isTTY === true, env: process.env, command: dispatchedCommand })) {
+    await emitUpdateBannerIfStale(version);
+  }
 }
