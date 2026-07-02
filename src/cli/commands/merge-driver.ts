@@ -64,10 +64,14 @@ function diag(message: string): void {
  *
  * 1. Validate the FULL merged output with the loader's schema (including the
  *    embedded `_conflicts` entries). Pass -> write as-is with the normal exit.
- * 2. Pass-through exemption: if validation fails but the merged CONTENT equals
- *    ours' content, the driver introduced no new invalidity (the input was
- *    already out-of-schema); write anyway. A pre-existing broken file must not
- *    become a new merge failure.
+ * 2. Pass-through exemption: fires only when validation fails AND ours ITSELF
+ *    already failed the schema AND the merged CONTENT equals ours' content. In
+ *    that case the input was already out-of-schema, so the driver introduced no
+ *    new invalidity; write anyway (a pre-existing broken file must not become a
+ *    new merge failure). When ours WAS valid the exemption is skipped, so
+ *    theirs-sourced malformed `_conflicts` entries (invisible to the body-only
+ *    comparison) drop through the fallback ladder instead of being written
+ *    (ISS-770).
  * 3. Fallback ladder: a loadable candidate built from one side's body plus a
  *    whole-entity conflict entry carrying all three snapshots. NOTE the
  *    semantic overload: the fallback entry uses kind "field" (NOT a new enum
@@ -96,7 +100,8 @@ export function finalizeMergeOutput(
     return { merged: result.merged, exit: normalExit };
   }
 
-  if (deepEqual(stripConflicts(result.merged), stripConflicts(ours))) {
+  const oursValid = schema.safeParse(ours).success;
+  if (!oursValid && deepEqual(stripConflicts(result.merged), stripConflicts(ours))) {
     return { merged: result.merged, exit: normalExit };
   }
 

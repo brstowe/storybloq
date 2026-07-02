@@ -634,6 +634,76 @@ describe("R8: self-heal of pre-existing ISS-747 damage", () => {
   });
 });
 
+describe("ISS-770: theirs-sourced malformed carried _conflicts", () => {
+  it("ours valid + theirs carrying a malformed entry: output loads, malformed dropped, valid carried, exit 1", () => {
+    const dir = createTeamRepo();
+    tmpDirs.push(dir);
+    writeTicket(dir, "T-001", { title: "Base Title" });
+    git(dir, "add", "-A");
+    git(dir, "commit", "-m", "base");
+
+    // theirs (branch-a): same body as ours, but carries one well-formed and one
+    // malformed _conflicts entry (the malformed one fails ConflictEntrySchema).
+    git(dir, "checkout", "-b", "branch-a");
+    const wellFormed = { fieldPath: "/order", field: "order", kind: "field", base: 10, ours: 20, theirs: 30 };
+    const malformed = { fieldPath: "/desc", field: "desc", kind: "totally-invalid-kind", base: "a", ours: "b", theirs: "c" };
+    writeTicket(dir, "T-001", { title: "Shared Title", _conflicts: [wellFormed, malformed] });
+    git(dir, "add", "-A");
+    git(dir, "commit", "-m", "carry conflicts on A");
+
+    // ours (branch-b): identical body, NO _conflicts.
+    git(dir, "checkout", "main");
+    git(dir, "checkout", "-b", "branch-b");
+    writeTicket(dir, "T-001", { title: "Shared Title" });
+    git(dir, "add", "-A");
+    git(dir, "commit", "-m", "no conflicts on B");
+
+    const { exitCode } = gitMerge(dir, "branch-a");
+
+    const merged = JSON.parse(readFileSync(join(dir, ".story", "tickets", "T-001.json"), "utf-8"));
+    // The written file must load under the loader's schema.
+    expect(TicketSchema.safeParse(merged).success).toBe(true);
+    const entries = (merged._conflicts ?? []) as Array<Record<string, unknown>>;
+    // The theirs-sourced malformed entry must not survive into the output.
+    expect(entries.some((c) => c.kind === "totally-invalid-kind")).toBe(false);
+    // The well-formed carried entry survives.
+    expect(entries.some((c) => c.field === "order")).toBe(true);
+    // Conflicts present -> merge stays unresolved (git exit 1).
+    expect(exitCode).toBe(1);
+  });
+
+  it("ours ALREADY invalid + merged body ours-equal: pass-through exemption preserved, exit 0", () => {
+    const dir = createTeamRepo();
+    tmpDirs.push(dir);
+    writeTicket(dir, "T-001", { title: "Base Title", description: "orig" });
+    git(dir, "add", "-A");
+    git(dir, "commit", "-m", "base");
+
+    // theirs (branch-a): title made a number (schema-invalid), description unchanged.
+    git(dir, "checkout", "-b", "branch-a");
+    writeTicket(dir, "T-001", { title: 123, description: "orig" });
+    git(dir, "add", "-A");
+    git(dir, "commit", "-m", "invalid title on A");
+
+    // ours (branch-b): same invalid title, description edited so ours body wins.
+    git(dir, "checkout", "main");
+    git(dir, "checkout", "-b", "branch-b");
+    writeTicket(dir, "T-001", { title: 123, description: "ours-desc" });
+    git(dir, "add", "-A");
+    git(dir, "commit", "-m", "invalid title + desc on B");
+
+    const { exitCode } = gitMerge(dir, "branch-a");
+
+    const merged = JSON.parse(readFileSync(join(dir, ".story", "tickets", "T-001.json"), "utf-8"));
+    // Pre-existing-broken ours passes through unchanged (no _entity fallback added).
+    expect(merged.title).toBe(123);
+    expect(merged.description).toBe("ours-desc");
+    expect(merged._conflicts).toBeUndefined();
+    expect(TicketSchema.safeParse(merged).success).toBe(false);
+    expect(exitCode).toBe(0);
+  });
+});
+
 describe("I5: non-team repos never invoke the driver", () => {
   it("a repo without the merge driver gets git's default conflict markers", () => {
     const dir = mkdtempSync(join(tmpdir(), "merge-e2e-plain-"));
