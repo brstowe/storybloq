@@ -22,12 +22,63 @@ function issue(overrides: Record<string, unknown> = {}): Record<string, unknown>
 
 describe("T-385: threeWayMerge", () => {
   describe("identity fields", () => {
+    // ISS-761: the original test used three identical inputs and asserted
+    // nothing (any implementation passes). The sides MUST differ for the
+    // identity rule to be exercised.
     it("preserves id from base even if sides differ", () => {
       const base = ticket({ id: "T-001" });
-      const ours = ticket({ id: "T-001" });
-      const theirs = ticket({ id: "T-001" });
+      const ours = ticket({ id: "T-002" });
+      const theirs = ticket({ id: "T-003" });
       const result = threeWayMerge(base, ours, theirs, "ticket");
       expect(result.merged.id).toBe("T-001");
+    });
+  });
+
+  // ISS-761: the issue and note rule tables were previously dead-untested;
+  // every threeWayMerge test went through "ticket" or "lesson".
+  describe("issue and note entity types", () => {
+    function issue(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+      return {
+        id: "ISS-001", title: "Issue", severity: "medium", status: "open",
+        components: [], impact: "x", resolution: null, location: [],
+        discoveredDate: "2026-01-01", resolvedDate: null, relatedTickets: [], order: 10,
+        ...overrides,
+      };
+    }
+    function note(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+      return {
+        id: "N-001", title: "Note", content: "body", tags: [], status: "active",
+        createdDate: "2026-01-01", updatedDate: "2026-01-01",
+        ...overrides,
+      };
+    }
+
+    it("issue: one-sided severity change merges clean; divergent titles conflict", () => {
+      const base = issue();
+      const ours = issue({ severity: "high" });
+      const theirs = issue({ title: "Renamed by theirs" });
+      const result = threeWayMerge(base, ours, theirs, "issue");
+      expect(result.clean).toBe(true);
+      expect(result.merged.severity).toBe("high");
+      expect(result.merged.title).toBe("Renamed by theirs");
+
+      const divergent = threeWayMerge(issue(), issue({ title: "A" }), issue({ title: "B" }), "issue");
+      expect(divergent.clean).toBe(false);
+      const conflictFields = (divergent.merged._conflicts as Array<{ fieldPath: string }>).map(c => c.fieldPath);
+      expect(conflictFields).toContain("/title");
+    });
+
+    it("note: one-sided content change merges clean; divergent content conflicts", () => {
+      const base = note();
+      const ours = note({ content: "edited by ours" });
+      const theirs = note();
+      const result = threeWayMerge(base, ours, theirs, "note");
+      expect(result.clean).toBe(true);
+      expect(result.merged.content).toBe("edited by ours");
+
+      const divergent = threeWayMerge(note(), note({ content: "A" }), note({ content: "B" }), "note");
+      expect(divergent.clean).toBe(false);
+      expect((divergent.merged._conflicts as Array<{ fieldPath: string }>).map(c => c.fieldPath)).toContain("/content");
     });
   });
 
