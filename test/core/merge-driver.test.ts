@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { threeWayMerge } from "../../src/core/merge-driver.js";
+import { TicketSchema } from "../../src/models/ticket.js";
 
 function ticket(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
@@ -426,8 +427,11 @@ describe("T-385: threeWayMerge", () => {
       });
       const result = threeWayMerge(base, ours, theirs, "ticket");
       expect(result.clean).toBe(true);
-      expect(result.merged.claim).toBeNull(); // cleared side preferred
-      expect(result.merged.claimedBySession).toBeNull();
+      // ISS-786: release is now key deletion, never a schema-breaking null. The
+      // cleared side still wins the tie, but the released members are ABSENT.
+      expect(Object.hasOwn(result.merged, "claim")).toBe(false);
+      expect(Object.hasOwn(result.merged, "claimedBySession")).toBe(false);
+      expect(TicketSchema.safeParse(result.merged).success).toBe(true);
     });
 
     it("cross-day date-only unclaim beats an earlier ISO claim via fallback", () => {
@@ -502,6 +506,101 @@ describe("T-385: threeWayMerge", () => {
       // Both recency values unparseable -> ambiguous -> conflict, not a crash.
       expect(result.clean).toBe(false);
       expect(result.conflicts.some((c) => c.group === "attribution")).toBe(true);
+    });
+  });
+
+  // ISS-786: an ambiguous coupled-group "release" must drop the members by KEY
+  // DELETION, never by writing null. ClaimSchema is optional-not-nullable, so a
+  // claim:null body fails the loader schema and cascades into a blocking _entity
+  // conflict. Key-absent members keep the merged body schema-valid and clean.
+  describe("ISS-786: coupled-group release deletes keys, never writes null", () => {
+    it("identical claim.since on both sides releases by key deletion (clean, schema-valid)", () => {
+      const base = ticket({ claim: null, claimedBySession: null, updatedDate: "2026-05-20" });
+      const ours = ticket({
+        claim: { user: "alice@test.com", branch: "feat/a", since: "2026-05-25T10:00:00Z" },
+        claimedBySession: "sess-a", updatedDate: "2026-05-25",
+      });
+      const theirs = ticket({
+        claim: { user: "bob@test.com", branch: "feat/b", since: "2026-05-25T10:00:00Z" },
+        claimedBySession: "sess-b", updatedDate: "2026-05-25",
+      });
+      const result = threeWayMerge(base, ours, theirs, "ticket");
+      expect(result.clean).toBe(true);
+      expect(Object.hasOwn(result.merged, "claim")).toBe(false);
+      expect(Object.hasOwn(result.merged, "claimedBySession")).toBe(false);
+      expect(TicketSchema.safeParse(result.merged).success).toBe(true);
+    });
+
+    it("one-side-cleared ambiguous release drops the members instead of nulling them", () => {
+      const base = ticket({
+        claim: { user: "alice@test.com", branch: "feat/x", since: "2026-05-24T10:00:00Z" },
+        claimedBySession: "sess-1", updatedDate: "2026-05-24",
+      });
+      const ours = ticket({ claim: null, claimedBySession: null, updatedDate: "2026-05-25" });
+      const theirs = ticket({
+        claim: { user: "bob@test.com", branch: "feat/y", since: "2026-05-25T10:00:00Z" },
+        claimedBySession: "sess-2", updatedDate: "2026-05-25",
+      });
+      const result = threeWayMerge(base, ours, theirs, "ticket");
+      expect(result.clean).toBe(true);
+      expect(Object.hasOwn(result.merged, "claim")).toBe(false);
+      expect(Object.hasOwn(result.merged, "claimedBySession")).toBe(false);
+      expect(TicketSchema.safeParse(result.merged).success).toBe(true);
+    });
+  });
+
+  // ISS-787: when both sides tombstoned, a divergence in the pre-tombstone BODY
+  // (a teammate edited content then deleted, while we only deleted) must surface
+  // rather than being silently discarded. Advisory release-group members (claims)
+  // and the tombstone stamps are excluded from the comparison.
+  describe("ISS-787: both-tombstoned divergence surfaces or stays clean", () => {
+    it("diverging pre-tombstone title surfaces a delete-edit _entity conflict, ours body kept", () => {
+      const base = ticket({ title: "Base Title", lifecycle: "active" });
+      const ours = ticket({
+        title: "Base Title",
+        lifecycle: "deleted", deletedAt: "2026-05-26T00:00:00Z", deletedBy: "alice@test.com",
+      });
+      const theirs = ticket({
+        title: "Edited by theirs",
+        lifecycle: "deleted", deletedAt: "2026-05-26T01:00:00Z", deletedBy: "bob@test.com",
+      });
+      const result = threeWayMerge(base, ours, theirs, "ticket");
+      expect(result.clean).toBe(false);
+      const entry = result.conflicts.find((c) => c.field === "_entity");
+      expect(entry).toBeDefined();
+      expect(entry!.kind).toBe("delete-edit");
+      expect(entry!.fieldPath).toBe("");
+      expect((entry!.theirs as Record<string, unknown>).title).toBe("Edited by theirs");
+      // ours' tombstone body is kept wholesale (advisory/comparison-only fields never rewritten).
+      expect(result.merged.title).toBe("Base Title");
+      expect(result.merged.lifecycle).toBe("deleted");
+    });
+
+    it("different delete stamps but identical content stays clean (boundary lock)", () => {
+      const base = ticket({ lifecycle: "active" });
+      const ours = ticket({ lifecycle: "deleted", deletedAt: "2026-05-26T00:00:00Z", deletedBy: "alice@test.com" });
+      const theirs = ticket({ lifecycle: "deleted", deletedAt: "2026-05-26T05:00:00Z", deletedBy: "bob@test.com" });
+      const result = threeWayMerge(base, ours, theirs, "ticket");
+      expect(result.clean).toBe(true);
+      expect(result.merged._conflicts).toBeUndefined();
+      expect(result.merged.lifecycle).toBe("deleted");
+    });
+
+    it("both tombstoned differing only in claim members stays clean, keeps ours' claim", () => {
+      const base = ticket({ lifecycle: "active" });
+      const ours = ticket({
+        lifecycle: "deleted", deletedAt: "2026-05-26T00:00:00Z", deletedBy: "alice@test.com",
+        claim: { user: "alice@test.com", branch: "feat/x", since: "2026-05-25T10:00:00Z" }, claimedBySession: "sess-1",
+      });
+      const theirs = ticket({
+        lifecycle: "deleted", deletedAt: "2026-05-26T00:00:00Z", deletedBy: "alice@test.com",
+        claim: { user: "bob@test.com", branch: "feat/y", since: "2026-05-24T09:00:00Z" }, claimedBySession: "sess-2",
+      });
+      const result = threeWayMerge(base, ours, theirs, "ticket");
+      expect(result.clean).toBe(true);
+      expect(result.merged._conflicts).toBeUndefined();
+      expect(result.merged.claim).toEqual(ours.claim);
+      expect(result.merged.claimedBySession).toBe("sess-1");
     });
   });
 });

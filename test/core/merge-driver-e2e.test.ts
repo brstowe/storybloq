@@ -704,6 +704,107 @@ describe("ISS-770: theirs-sourced malformed carried _conflicts", () => {
   });
 });
 
+describe("ISS-786: identical concurrent claims release without a schema-breaking null", () => {
+  it("both branches claim T-001 with identical claim.since: clean merge, no claim key, loads", () => {
+    const dir = createTeamRepo();
+    tmpDirs.push(dir);
+    writeTicket(dir, "T-001", { claim: null, claimedBySession: null });
+    git(dir, "add", "-A");
+    git(dir, "commit", "-m", "base");
+
+    git(dir, "checkout", "-b", "branch-a");
+    writeTicket(dir, "T-001", {
+      claim: { user: "alice@test.com", branch: "feat/a", since: "2026-05-25T10:00:00Z" },
+      claimedBySession: "sess-a",
+    });
+    git(dir, "add", "-A");
+    git(dir, "commit", "-m", "claim on A");
+
+    git(dir, "checkout", "main");
+    git(dir, "checkout", "-b", "branch-b");
+    writeTicket(dir, "T-001", {
+      claim: { user: "bob@test.com", branch: "feat/b", since: "2026-05-25T10:00:00Z" },
+      claimedBySession: "sess-b",
+    });
+    git(dir, "add", "-A");
+    git(dir, "commit", "-m", "claim on B");
+
+    const { exitCode } = gitMerge(dir, "branch-a");
+    expect(exitCode).toBe(0);
+
+    const merged = JSON.parse(readFileSync(join(dir, ".story", "tickets", "T-001.json"), "utf-8"));
+    // The released claim is key-ABSENT, so the file loads and there is no blocking conflict.
+    expect(TicketSchema.safeParse(merged).success).toBe(true);
+    expect(merged._conflicts).toBeUndefined();
+    expect(Object.hasOwn(merged, "claim")).toBe(false);
+    expect(Object.hasOwn(merged, "claimedBySession")).toBe(false);
+  });
+});
+
+describe("ISS-787: both-tombstoned merge surfaces divergent pre-delete content", () => {
+  function setupDivergentTombstones(): string {
+    const dir = createTeamRepo();
+    tmpDirs.push(dir);
+    writeTicket(dir, "T-001", { title: "Base Title" });
+    git(dir, "add", "-A");
+    git(dir, "commit", "-m", "base");
+
+    // theirs (edit-delete): edit the title THEN tombstone.
+    git(dir, "checkout", "-b", "edit-delete");
+    writeTicket(dir, "T-001", {
+      title: "Edited Title",
+      lifecycle: "deleted", deletedAt: "2026-05-26T01:00:00Z", deletedBy: "bob@test.com",
+    });
+    git(dir, "add", "-A");
+    git(dir, "commit", "-m", "edit + tombstone on theirs");
+
+    // ours (main): tombstone only, title unchanged.
+    git(dir, "checkout", "main");
+    writeTicket(dir, "T-001", {
+      title: "Base Title",
+      lifecycle: "deleted", deletedAt: "2026-05-26T00:00:00Z", deletedBy: "alice@test.com",
+    });
+    git(dir, "add", "-A");
+    git(dir, "commit", "-m", "tombstone on ours");
+    return dir;
+  }
+
+  it("theirs edited-then-deleted vs ours deleted: git exit 1, ours tombstone kept, edit in the conflict", () => {
+    const dir = setupDivergentTombstones();
+    const { exitCode } = gitMerge(dir, "edit-delete");
+    expect(exitCode).toBe(1);
+
+    const merged = JSON.parse(readFileSync(join(dir, ".story", "tickets", "T-001.json"), "utf-8"));
+    // ours' tombstone kept wholesale as the body.
+    expect(merged.lifecycle).toBe("deleted");
+    expect(merged.title).toBe("Base Title");
+    expect(merged.deletedBy).toBe("alice@test.com");
+    expect(TicketSchema.safeParse(merged).success).toBe(true);
+
+    const entry = (merged._conflicts as Array<Record<string, unknown>>)[0];
+    expect(entry.kind).toBe("delete-edit");
+    expect(entry.field).toBe("_entity");
+    expect((entry.theirs as Record<string, unknown>).title).toBe("Edited Title");
+  });
+
+  it("resolve --use theirs restores theirs' edited tombstone body", () => {
+    const dir = setupDivergentTombstones();
+    const { exitCode } = gitMerge(dir, "edit-delete");
+    expect(exitCode).toBe(1);
+
+    const list = cli(dir, "conflicts", "list");
+    expect(list.stdout).toContain("T-001");
+    expect(list.stdout).not.toContain("No conflicts found");
+
+    const res = cli(dir, "resolve", "T-001", "--use", "theirs");
+    expect(res.exitCode).toBe(0);
+    const resolved = JSON.parse(readFileSync(join(dir, ".story", "tickets", "T-001.json"), "utf-8"));
+    expect(resolved.title).toBe("Edited Title");
+    expect(resolved.lifecycle).toBe("deleted");
+    expect(resolved._conflicts).toBeUndefined();
+  }, 20000);
+});
+
 describe("I5: non-team repos never invoke the driver", () => {
   it("a repo without the merge driver gets git's default conflict markers", () => {
     const dir = mkdtempSync(join(tmpdir(), "merge-e2e-plain-"));

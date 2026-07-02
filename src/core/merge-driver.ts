@@ -147,7 +147,32 @@ export function threeWayMerge(
 
   if (oursDeleted && theirsDeleted) {
     Object.assign(merged, ours);
-    attachConflicts(merged, mergeConflictSets(carried, []));
+    // ISS-787: both sides tombstoned. If the pre-tombstone BODIES diverged (a
+    // teammate edited content THEN deleted, while we only deleted), that edit
+    // would be silently lost. Compare ours vs theirs EXCLUDING _conflicts, the
+    // tombstone stamps, and every advisory release-group member (claims never
+    // block). On divergence, keep ours' tombstone as the body wholesale (advisory
+    // fields are excluded from the COMPARISON only, never rewritten) and surface a
+    // full-snapshot delete-edit _entity conflict so the edit is recoverable via
+    // resolve; otherwise merge clean exactly as before.
+    const releaseMembers = getCoupledGroups(entityType)
+      .filter((g) => g.onAmbiguous === "release")
+      .flatMap((g) => g.members);
+    const ignored = new Set<string>(["_conflicts", "lifecycle", "deletedAt", "deletedBy", ...releaseMembers]);
+    let bodiesDiverge = false;
+    for (const key of new Set([...Object.keys(ours), ...Object.keys(theirs)])) {
+      if (ignored.has(key)) continue;
+      if (!deepEqual(ours[key], theirs[key])) { bodiesDiverge = true; break; }
+    }
+    if (bodiesDiverge) {
+      conflicts.push({
+        fieldPath: "", field: "_entity", kind: "delete-edit",
+        base: entitySnapshot(base),
+        ours: entitySnapshot(ours),
+        theirs: entitySnapshot(theirs),
+      });
+    }
+    attachConflicts(merged, mergeConflictSets(carried, conflicts));
     return { merged, conflicts, clean: conflicts.length === 0 };
   }
 
@@ -208,13 +233,20 @@ export function threeWayMerge(
         const winner = cmp > 0 ? ours : theirs;
         for (const m of group.members) { merged[m] = winner[m]; handledByCoupled.add(m); }
       } else if (group.onAmbiguous === "release") {
-        // Advisory state (claims): never block a merge. Prefer the side that cleared the group;
-        // if neither cleared it, release the group by setting all members to null.
+        // Advisory state (claims): never block a merge. Prefer the side that cleared the
+        // group; if neither cleared it, release the group. Release is KEY DELETION, never
+        // a null write (ISS-759/ISS-652 doctrine): ClaimSchema is optional-not-nullable, so
+        // a claim:null body fails the loader schema and cascades into a blocking _entity
+        // conflict (ISS-786). A held member is kept only when a winner side still holds it.
         const oursCleared = group.members.every((m) => ours[m] == null);
         const theirsCleared = group.members.every((m) => theirs[m] == null);
         const winner = oursCleared ? ours : theirsCleared ? theirs : null;
         for (const m of group.members) {
-          merged[m] = winner ? winner[m] : null;
+          if (winner && winner[m] != null) {
+            merged[m] = winner[m];
+          } else {
+            delete merged[m];
+          }
           handledByCoupled.add(m);
         }
       } else {
