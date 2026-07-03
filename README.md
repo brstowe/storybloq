@@ -111,6 +111,7 @@ Inside Claude Code:
 - **`/story`** - loads project status, reads the latest handover, surfaces open tickets and issues, lists blocked work, summarizes recent changes.
 - **`/story auto T-001 T-002 ISS-013`** - autonomous mode scoped to those items. Drives a ticket through plan -> plan review -> implement -> tests -> code review -> commit with handovers at each checkpoint.
 - **`/story review T-001`** - runs the multi-lens review (see [Storybloq/lenses](https://github.com/Storybloq/lenses)) against a ticket's diff.
+- **`/story orchestrate`** - drives a multi-repo (or large single-repo) backlog as an orchestrator: scouts verify state, enrichment agents rewrite items into byte-verified specs, a cheaper tier implements when the client offers one, and the session model reviews and gates every ship.
 - **`/story handover`** - writes a session handover capturing decisions, blockers, and next steps.
 
 Outside Claude Code, the same state is one `storybloq` invocation away.

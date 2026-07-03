@@ -379,6 +379,16 @@ Evaluate frontend code against platform-specific design best practices.
 
 Creates issues automatically when storybloq MCP tools or CLI are available. Checks for existing design issues to avoid duplicates on repeated runs. Outputs markdown checklist as fallback when neither MCP nor CLI is available.
 
+## /story orchestrate
+
+Drive a multi-repo federation (or a large single-repo backlog) as an orchestrator: durable state in storybloq, implementation in background agents a tier below the session model when the client offers one, adversarial review gates on the session model.
+
+```
+/story orchestrate               # guard checks, explicit opt-in, then the wave loop
+```
+
+Requires explicit opt-in via AskUserQuestion before any agents are dispatched, and refuses to start while any federation node has an active autonomous session (one pen per repo; the per-node check reads each node's `.story/sessions/` directly because orchestrator status does not scan node repos). The full procedure -- enrichment template, sizing convention, 6-stage pipeline, workflow-script skeleton, critical rules -- is in `orchestrator-mode.md`. Needs a client with background dynamic workflows or subagents; degrades to `storybloq dispatch` or refuses cleanly otherwise.
+
 ## Common Workflows
 
 ### Session Start

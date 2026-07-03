@@ -53,6 +53,10 @@ describe("setup-skill", () => {
     expect(existsSync(join(PROJECT_ROOT, "src", "skill", "autonomous-mode.md"))).toBe(true);
   });
 
+  it("bundled orchestrator-mode.md exists in src/skill/", () => {
+    expect(existsSync(join(PROJECT_ROOT, "src", "skill", "orchestrator-mode.md"))).toBe(true);
+  });
+
   // -------------------------------------------------------------------------
   // Cross-file reference integrity
   // -------------------------------------------------------------------------
@@ -408,6 +412,7 @@ describe("setup-skill", () => {
     expect(tsContent).toContain('"setup-flow.md"');
     expect(tsContent).toContain('"autonomous-mode.md"');
     expect(tsContent).toContain('"reference.md"');
+    expect(tsContent).toContain('"orchestrator-mode.md"');
   });
 
   it("setup-skill.ts handles subdirectory skills with copyDirRecursive", async () => {
