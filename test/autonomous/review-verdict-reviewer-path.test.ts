@@ -318,15 +318,14 @@ describe("review stages record reviewerPath/reviewId for lens reviews (ISS-720)"
     expect(artifact.reviewId).toBeUndefined();
   });
 
-  it("plan-review records lenses-unverified (plan reviews never snapshot, so the gate always skips)", async () => {
-    // Production reality: writeFreshReviewSnapshot is gated to CODE_REVIEW
-    // (mcp-handlers.ts), so a plan review never writes an addressable snapshot.
-    // Its reviewId stays the non-addressable lens-<ts> form, synthesize's
-    // loadSnapshot returns snapshot_absent, and telemetry is written with
-    // verificationSkipped:true. A lens-backed plan review is therefore ALWAYS
-    // classified lenses-unverified -- this pins that reachable state rather than
-    // the lenses-verified state plan reviews cannot produce. The lenses-verified
-    // recording path is covered by the code-review cases above.
+  it("plan-review records lenses-unverified (plan reviews never anchor, so the gate always skips)", async () => {
+    // Production reality: the lens-harness synthesize only runs @storybloq/lenses
+    // T-026 anchoring for CODE_REVIEW, so a plan review never verifies evidence
+    // and its telemetry is written with verificationSkipped:true. A lens-backed
+    // plan review is therefore ALWAYS classified lenses-unverified -- this pins
+    // that reachable state rather than the lenses-verified state plan reviews
+    // cannot produce. The lenses-verified recording path is covered by the
+    // code-review cases above.
     writeTelemetry(sDir, [entry("lens-pr1", { verificationSkipped: true, verified: 0 })]);
     const { PlanReviewStage } = await import("../../src/autonomous/stages/plan-review.js");
     const stage = new PlanReviewStage();

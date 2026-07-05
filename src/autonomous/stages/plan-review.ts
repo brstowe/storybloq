@@ -3,7 +3,7 @@ import { buildLensHistoryUpdate } from "./types.js";
 import type { GuideReportInput } from "../session-types.js";
 import { REVIEW_VERDICTS, REVIEW_VERDICTS_PROSE, normalizeSeverity } from "../session-types.js";
 import { requiredRounds, nextReviewer } from "../review-depth.js";
-import { accumulateVerificationCounters } from "../review-lenses/verification-log.js";
+import { accumulateVerificationCounters } from "../lens-harness/verification-log.js";
 import { writeReviewVerdict, readReviewVerdict, buildTier1Verdict, classifyLensReviewPath, type ReviewVerdictArtifact } from "../review-verdict.js";
 import {
   currentStorybloqClient,
@@ -41,14 +41,14 @@ export class PlanReviewStage implements WorkflowStage {
         instruction: [
           `# Multi-Lens Plan Review — Round ${roundNum} of ${Math.max(minRounds, roundNum)} minimum`,
           "",
-          "This round uses the **multi-lens review orchestrator** for plan review. It fans out to specialized review agents (Clean Code, Security, Error Handling, and more) in parallel to evaluate the plan from multiple perspectives.",
+          "This round uses the **multi-lens review orchestrator** backed by @storybloq/lenses for plan review. It fans out to specialized review agents (Security, Error Handling, Clean Code, Concurrency, and more) in parallel, then merges findings programmatically. There is NO merger agent and NO judge agent.",
           "",
           "1. Read the plan file",
-          "2. Call `storybloq_review_lenses_prepare` with the plan text as diff, stage: PLAN_REVIEW, and ticketDescription",
-          "3. Spawn all lens subagents in parallel, dispatching each returned prompt as-is (it already embeds the plan text; do not append it again). If a prompt comes back empty (promptTruncated), reduce the scope and re-run that lens rather than dispatching a blank prompt.",
-          "4. Collect results and call `storybloq_review_lenses_synthesize` with the lens results",
-          "5. Run the merger agent with the returned mergerPrompt, then call `storybloq_review_lenses_judge`",
-          "6. Run the judge agent and report the final SynthesisResult verdict and findings, including the reviewId from prepare (so the recorded verdict reflects whether the verification gate ran)",
+          `2. Call \`storybloq_review_lenses_prepare\` with the plan text as diff, changedFiles: [], stage: PLAN_REVIEW, ticketDescription, and sessionId: "${ctx.state.sessionId}"`,
+          "3. Spawn all lens subagents in parallel, dispatching each returned prompt as-is (it already embeds the plan text; do not append it again). Each lens returns a single JSON object ({status, findings, error, notes}). If a prompt comes back empty (promptTruncated), reduce the scope and re-run that lens rather than dispatching a blank prompt.",
+          `4. Call \`storybloq_review_lenses_synthesize\` with lensResults: [{lens, output}] (output = each lens's raw JSON), plus activeLenses and skippedLenses from prepare, stage: PLAN_REVIEW, the reviewId returned by prepare, and the sessionId "${ctx.state.sessionId}". It returns the reviewVerdict envelope.`,
+          "5. Call `storybloq_review_lenses_judge` with the reviewVerdict from step 4. It returns the final deterministic verdict: approve, revise, or reject, with recommendFixRound.",
+          "6. Report the judge's verdict and the verdict findings, including the reviewId from prepare. Map finding severity \"blocking\" to \"critical\" when reporting.",
           "",
           "When done, call `storybloq_autonomous_guide` with:",
           '```json',
@@ -56,8 +56,9 @@ export class PlanReviewStage implements WorkflowStage {
           '```',
         ].join("\n"),
         reminders: [
-          "Report the exact verdict and findings from the synthesizer.",
+          "Report the exact verdict and findings from the judge tool.",
           "Lens subagents run in parallel with read-only tools (Read, Grep, Glob).",
+          "Do NOT spawn a merger or judge agent: synthesize and judge are programmatic.",
         ],
         transitionedFrom: ctx.state.previousState ?? undefined,
       };

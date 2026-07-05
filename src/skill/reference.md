@@ -545,9 +545,9 @@ The tools below are registered in full mode (inside a .story/ project).
 - **storybloq_lesson_update** (id, title?, content?, context?, tags?, status?, supersedes?) — Update lesson
 - **storybloq_lesson_reinforce** (id) — Reinforce lesson — increment count and update lastValidated
 - **storybloq_selftest** — Integration smoke test — create/update/delete cycle
-- **storybloq_review_lenses_prepare** (stage, diff, changedFiles, ticketDescription?, reviewRound?, priorDeferrals?) — Prepare multi-lens review — activation, secrets gate, context packaging, prompt building
-- **storybloq_review_lenses_synthesize** (stage?, lensResults, activeLenses, skippedLenses, reviewRound?, reviewId?) — Synthesize lens results — schema validation, blocking policy, merger prompt generation
-- **storybloq_review_lenses_judge** (mergerResultRaw, stage?, lensesCompleted, lensesFailed, lensesInsufficientContext?, lensesSkipped?, convergenceHistory?) — Prepare judge prompt — verdict calibration, convergence tracking
+- **storybloq_review_lenses_prepare** (stage, diff, changedFiles, ticketDescription?, reviewRound?, priorDeferrals?, sessionId?) — Prepare multi-lens review on @storybloq/lenses: activation, secrets gate, context packaging, complete lens prompts
+- **storybloq_review_lenses_synthesize** (stage?, lensResults, activeLenses, skippedLenses, reviewRound?, reviewId?, diff?, changedFiles?, sessionId?) — Run the @storybloq/lenses merger pipeline programmatically over raw lens outputs; returns the ReviewVerdict envelope (no merger agent)
+- **storybloq_review_lenses_judge** (reviewVerdict, convergenceHistory?) — Deterministic three-value verdict mapping over the synthesize ReviewVerdict plus convergence history (no judge agent)
 - **storybloq_autonomous_guide** (sessionId?, action, mode?, ticketId?) — Autonomous session orchestrator — call at every decision point to drive PICK_TICKET through COMPLETE
 - **storybloq_session_report** (sessionId) — Structured analysis of an autonomous session (works even if project state is corrupted)
 - **storybloq_register_subprocess** (pid, cmd, category?, sessionId?) — Register a running subprocess so monitors can tell slow builds from hung agents

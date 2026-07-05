@@ -45,9 +45,7 @@ import {
   registerSubprocess,
   unregisterSubprocess,
 } from "../autonomous/subprocess-registry.js";
-import { handlePrepare, handleSynthesize, handleJudge } from "../autonomous/review-lenses/mcp-handlers.js";
-import { validateCachedFindings } from "../autonomous/review-lenses/schema-validator.js";
-import type { LensFinding } from "../autonomous/review-lenses/types.js";
+import { handlePrepare, handleSynthesize, handleJudge, generateIssueKey } from "../autonomous/lens-harness/index.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 
 import { loadProject } from "../core/project-loader.js";
@@ -1201,7 +1199,7 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
   // ── T-189: Multi-lens review MCP tools ─────────────────────
 
   server.registerTool("storybloq_review_lenses_prepare", {
-    description: "Prepare a multi-lens code/plan review. Returns lens prompts for the agent to spawn as parallel subagents. Handles activation, secrets gate, context packaging, and caching.",
+    description: "Prepare a multi-lens code/plan review on the @storybloq/lenses registry. Activates lenses via the package surface rules, runs the secrets gate (redacting before content leaves the process), packages per-lens context, checks the round cache, and returns complete lens prompts for the agent to spawn as parallel subagents, with per-lens activation statuses disclosed.",
     inputSchema: {
       stage: z.enum(["CODE_REVIEW", "PLAN_REVIEW"]).describe("Review stage"),
       diff: z.string().describe("The diff (code review) or plan text (plan review) to review"),
@@ -1209,11 +1207,14 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
       ticketDescription: z.string().optional().describe("Current ticket description for context"),
       reviewRound: z.number().int().min(1).optional().describe("Review round (1 = first, 2+ = subsequent)"),
       priorDeferrals: z.array(z.string()).optional().describe("issueKeys of findings the agent intentionally deferred from prior rounds"),
-      sessionId: z.string().uuid().optional().describe("Active session ID. Pass it so prepare can snapshot the reviewed files, enabling the synthesize verification gate to check lens evidence quotes. Use the same reviewRound and the returned reviewId when you call synthesize."),
+      sessionId: z.string().uuid().optional().describe("Active session ID. Pass it so prepare can persist the round's cache keys and anchoring artifact for synthesize. Use the same reviewRound and the returned reviewId when you call synthesize."),
     },
   }, (args) => {
     try {
-      const result = handlePrepare({ ...args, projectRoot: pinnedRoot });
+      const sessionDir = args.sessionId
+        ? join(pinnedRoot, ".story", "sessions", args.sessionId)
+        : undefined;
+      const result = handlePrepare({ ...args, projectRoot: pinnedRoot, sessionDir });
       return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
     } catch (err) {
       const msg = err instanceof Error ? err.message.replace(/\/[^\s]+/g, "<path>") : "unknown error";
@@ -1222,22 +1223,22 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
   });
 
   server.registerTool("storybloq_review_lenses_synthesize", {
-    description: "Synthesize lens results after parallel review. Validates findings, applies blocking policy, classifies origin (introduced vs pre-existing), auto-files pre-existing issues, generates merger prompt. Call after collecting all lens subagent results.",
+    description: "Synthesize lens results after parallel review by running the @storybloq/lenses merger pipeline programmatically: per-lens schema parsing, evidence anchoring against the reviewed artifact, dedup, blocking policy, tension detection, coverage caps, and verdict computation. Returns the package ReviewVerdict envelope directly (no merger prompt, no merger agent). Also classifies origin (introduced vs pre-existing) and auto-files pre-existing issues. Call after collecting all lens subagent outputs, then pass reviewVerdict to storybloq_review_lenses_judge.",
     inputSchema: {
       stage: z.enum(["CODE_REVIEW", "PLAN_REVIEW"]).optional().describe("Review stage (defaults to CODE_REVIEW)"),
       lensResults: z.array(z.object({
-        lens: z.string(),
-        status: z.string(),
-        findings: z.array(z.any()),
-      })).describe("Results from each lens subagent"),
+        lens: z.string().describe("Lens id from prepare's activeLenses"),
+        output: z.unknown().describe("The lens subagent's raw output: the single JSON object ({status, findings, error, notes}) the lens prompt instructs it to emit, as an object or JSON string"),
+        cached: z.boolean().optional().describe("True when this entry echoes cachedFindings returned by prepare"),
+      })).describe("One entry per active lens with its raw output"),
       activeLenses: z.array(z.string()).describe("Active lens names from prepare step"),
       skippedLenses: z.array(z.string()).describe("Skipped lens names from prepare step"),
       reviewRound: z.number().int().min(1).optional().describe("Current review round"),
       reviewId: z.string().optional().describe("Review ID from prepare step"),
       // T-192: Origin classification inputs
-      diff: z.string().optional().describe("The diff being reviewed (for origin classification of findings into introduced vs pre-existing)"),
-      changedFiles: z.array(z.string()).optional().describe("Changed file paths from prepare step (for origin classification)"),
-      sessionId: z.string().uuid().optional().describe("Active session ID (for dedup of auto-filed pre-existing issues across review rounds)"),
+      diff: z.string().optional().describe("The diff being reviewed (for evidence anchoring and origin classification of findings into introduced vs pre-existing)"),
+      changedFiles: z.array(z.string()).optional().describe("Changed file paths from prepare step"),
+      sessionId: z.string().uuid().optional().describe("Active session ID (enables anchoring against prepare's redacted artifact, cache write-back, telemetry, and dedup of auto-filed pre-existing issues across review rounds)"),
     },
   }, async (args) => {
     try {
@@ -1246,7 +1247,20 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
         : undefined;
       const result = handleSynthesize({
         stage: args.stage,
-        lensResults: args.lensResults,
+        // Re-shape at the wire boundary: z.unknown() infers `output` as an
+        // optional property; the harness contract requires it present.
+        lensResults: args.lensResults.map((r) => ({
+          lens: r.lens,
+          // Defensive: prepare returns cache hits as a bare cachedFindings
+          // array. If the agent echoes that array directly instead of wrapping
+          // it in a LensOutput envelope, wrap it here so the cached lens is
+          // reused rather than rejected by LensOutputSchema as parse_failed.
+          output:
+            r.cached && Array.isArray(r.output)
+              ? { status: "ok", findings: r.output, error: null, notes: "cache" }
+              : r.output,
+          ...(r.cached !== undefined ? { cached: r.cached } : {}),
+        })),
         metadata: {
           activeLenses: args.activeLenses,
           skippedLenses: args.skippedLenses,
@@ -1270,12 +1284,12 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
         const sizeBeforeLoop = alreadyFiled.size;
 
         for (const f of result.preExistingFindings) {
-          const dedupKey = f.issueKey ?? `${f.file ?? ""}:${f.line ?? 0}:${f.category}`;
+          const dedupKey = generateIssueKey(f);
           if (alreadyFiled.has(dedupKey)) continue;
 
           try {
             const { handleIssueCreate } = await import("../cli/commands/issue.js");
-            const severityMap: Record<string, string> = { critical: "critical", major: "high", minor: "medium" };
+            const severityMap: Record<string, string> = { blocking: "critical", major: "high", minor: "medium" };
             const severity = severityMap[f.severity] ?? "medium";
             const issueResult = await handleIssueCreate(
               {
@@ -1322,51 +1336,31 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
   });
 
   server.registerTool("storybloq_review_lenses_judge", {
-    description: "Prepare the judge prompt for final verdict after merger. Applies verdict calibration rules and convergence tracking. Call after running the merger agent.",
+    description: "Deterministic final verdict mapping over the ReviewVerdict returned by synthesize. No judge agent: pipeline reject stays reject, revise stays revise, and an approve carrying major findings or partial lens coverage becomes approve with recommendFixRound true (the three-value verdict). Convergence history damps repeated majors-only recommendations once rounds stabilize; coverage gaps are never damped. Call after synthesize and report the returned verdict.",
     inputSchema: {
-      mergerResultRaw: z.string().describe("Raw JSON string output from the merger agent"),
-      stage: z.enum(["CODE_REVIEW", "PLAN_REVIEW"]).optional().describe("Review stage (defaults to CODE_REVIEW)"),
-      lensesCompleted: z.array(z.string()).describe("Lenses that completed successfully"),
-      lensesFailed: z.array(z.string()).describe("Lenses that failed or timed out"),
-      lensesInsufficientContext: z.array(z.string()).optional().describe("Lenses that returned insufficient-context"),
-      lensesSkipped: z.array(z.string()).optional().describe("Lenses not activated for this review"),
+      reviewVerdict: z.unknown().describe("The reviewVerdict object returned by storybloq_review_lenses_synthesize (or a JSON string of it)"),
       convergenceHistory: z.array(z.object({
         round: z.number(),
         verdict: z.string(),
         blocking: z.number(),
         important: z.number(),
         newCode: z.string(),
-      })).optional().describe("Prior round verdicts for convergence tracking"),
-      sourceFindings: z.array(z.unknown()).optional().describe(
-        "Pre-merger validated findings from the synthesize step (`validatedFindings`). Used to restore validator-owned markers that were stripped from the merger LLM's output. CDX-13.",
-      ),
+      })).optional().describe("Prior round verdicts for convergence damping"),
     },
   }, (args) => {
     try {
-      // CDX-R1-05: validate sourceFindings at the MCP boundary before
-      // handing them to restoreSourceMarkers. Malformed caller input (null
-      // entries, missing issueKey/evidence, wrong types) would otherwise
-      // throw deep inside restoration and get swallowed by parseMergerResult's
-      // outer try/catch, silently degrading the whole merger parse to the
-      // null fallback path and disabling CDX-13 restoration. Invalid entries
-      // are dropped; valid ones are passed through unchanged.
-      const { valid: validatedSources } = validateCachedFindings(
-        args.sourceFindings ?? [],
-      );
+      let verdictInput = args.reviewVerdict;
+      if (typeof verdictInput === "string") {
+        try { verdictInput = JSON.parse(verdictInput); } catch { /* schema parse reports it */ }
+      }
       const result = handleJudge({
-        mergerResultRaw: args.mergerResultRaw,
-        stage: args.stage,
-        lensesCompleted: args.lensesCompleted,
-        lensesFailed: args.lensesFailed,
-        lensesInsufficientContext: args.lensesInsufficientContext ?? [],
-        lensesSkipped: args.lensesSkipped ?? [],
+        reviewVerdict: verdictInput,
         convergenceHistory: args.convergenceHistory,
-        sourceFindings: validatedSources as readonly LensFinding[],
       });
       return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
     } catch (err) {
       const msg = err instanceof Error ? err.message.replace(/\/[^\s]+/g, "<path>") : "unknown error";
-      return { content: [{ type: "text" as const, text: `Error preparing judge: ${msg}` }], isError: true };
+      return { content: [{ type: "text" as const, text: `Error judging lens verdict: ${msg}` }], isError: true };
     }
   });
 }

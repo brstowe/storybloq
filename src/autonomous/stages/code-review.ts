@@ -4,8 +4,8 @@ import { buildLensHistoryUpdate } from "./types.js";
 import type { GuideReportInput } from "../session-types.js";
 import { REVIEW_VERDICTS, REVIEW_VERDICTS_PROSE, normalizeSeverity } from "../session-types.js";
 import { requiredRounds, nextReviewer } from "../review-depth.js";
-import { clearCache } from "../review-lenses/cache.js";
-import { accumulateVerificationCounters } from "../review-lenses/verification-log.js";
+import { clearCache } from "../lens-harness/cache.js";
+import { accumulateVerificationCounters } from "../lens-harness/verification-log.js";
 import { writeReviewVerdict, readReviewVerdict, buildTier1Verdict, classifyLensReviewPath, type ReviewVerdictArtifact } from "../review-verdict.js";
 import {
   nativeCodexReportInstruction,
@@ -59,21 +59,20 @@ export class CodeReviewStage implements WorkflowStage {
           "",
           `Capture the diff with: ${diffCommand}`,
           "",
-          "This round uses the **multi-lens review orchestrator**. It fans out to specialized review agents (Clean Code, Security, Error Handling, and more) in parallel, then synthesizes findings into a single verdict.",
+          "This round uses the **multi-lens review orchestrator** backed by @storybloq/lenses. It fans out to specialized review agents (Security, Error Handling, Clean Code, Concurrency, and more) in parallel, then merges findings programmatically into a single verdict. There is NO merger agent and NO judge agent.",
           "",
           "1. Capture the full diff and changed file list (`git diff --name-only`)",
-          `2. Call \`storybloq_review_lenses_prepare\` with the diff, changedFiles, stage: CODE_REVIEW, ticketDescription, reviewRound: ${roundNum}, and sessionId: "${ctx.state.sessionId}" (the sessionId lets prepare snapshot the reviewed files so findings can be verified)`,
-          "3. Spawn all lens subagents in parallel, dispatching each returned prompt as-is (it already embeds the diff; do not append the diff again). If a prompt comes back empty (promptTruncated), reduce the diff and re-run that lens rather than dispatching a blank prompt.",
-          `4. Collect results and call \`storybloq_review_lenses_synthesize\` with the lens results, plus the diff and changedFiles from step 1, the same reviewRound: ${roundNum}, the reviewId returned by prepare, and the sessionId "${ctx.state.sessionId}" (enables finding verification, origin classification, and issue filing for pre-existing findings)`,
-          "5. Run the merger agent with the returned mergerPrompt, then call `storybloq_review_lenses_judge`",
-          "6. Run the judge agent and report the final SynthesisResult verdict and findings, including the reviewId from prepare (so the recorded verdict reflects whether the verification gate ran)",
-          "",
-          "When done, report verdict and findings.",
+          `2. Call \`storybloq_review_lenses_prepare\` with the diff, changedFiles, stage: CODE_REVIEW, ticketDescription, reviewRound: ${roundNum}, and sessionId: "${ctx.state.sessionId}"`,
+          "3. Spawn all lens subagents in parallel, dispatching each returned prompt as-is (it already embeds the diff; do not append the diff again). Each lens returns a single JSON object ({status, findings, error, notes}). If a prompt comes back empty (promptTruncated), reduce the diff and re-run that lens rather than dispatching a blank prompt. For cached entries, do not spawn an agent; echo cachedFindings back in step 4 with cached: true.",
+          `4. Call \`storybloq_review_lenses_synthesize\` with lensResults: [{lens, output}] (output = each lens's raw JSON), plus activeLenses and skippedLenses from prepare, the diff and changedFiles from step 1, the same reviewRound: ${roundNum}, the reviewId returned by prepare, and the sessionId "${ctx.state.sessionId}". It runs the merger pipeline programmatically (anchoring, dedup, blocking policy, coverage caps) and returns the reviewVerdict envelope plus filedIssues for pre-existing findings.`,
+          "5. Call `storybloq_review_lenses_judge` with the reviewVerdict from step 4 (plus convergenceHistory on round 2+). It returns the final deterministic verdict: approve, revise, or reject, with recommendFixRound.",
+          "6. Report the judge's verdict and the verdict findings, including the reviewId from prepare. Map finding severity \"blocking\" to \"critical\" when reporting.",
         ].join("\n"),
         reminders: [
           diffReminder,
           "Do NOT compress or summarize the diff.",
           "Lens subagents run in parallel with read-only tools (Read, Grep, Glob).",
+          "Do NOT spawn a merger or judge agent: synthesize and judge are programmatic.",
           "Pre-existing issues in surrounding code are automatically classified and filed by the synthesize tool when you pass diff, changedFiles, and sessionId. Check filedIssues in the synthesize response.",
         ],
         transitionedFrom: ctx.state.previousState ?? undefined,

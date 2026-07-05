@@ -23,8 +23,9 @@ export type LensFindingDisposition = typeof LENS_FINDING_DISPOSITIONS[number];
  * SessionStateSchema. readSessionResilient only recovers invalid-enum values at
  * lensReviewHistory[*].disposition, so narrowing the stored verdict to an enum
  * would wedge resume on any legacy state.json carrying an out-of-vocabulary
- * verdict. The judge (review-lenses/judge.ts) also intentionally emits a
- * narrower set (no request_changes), so it is not unified here.
+ * verdict. The deterministic lens judge (lens-harness/judge.ts) also
+ * intentionally emits a narrower set (no request_changes), so it is not
+ * unified here.
  */
 export const REVIEW_VERDICTS = ["approve", "revise", "request_changes", "reject"] as const;
 export type ReviewVerdict = typeof REVIEW_VERDICTS[number];
@@ -53,9 +54,16 @@ export const REVIEW_VERDICTS_PROSE: string = (() => {
  * would silently skip the guard (letting an approve verdict through with an
  * effectively-critical finding). Normalize at the consumption point so the fix
  * holds regardless of how the report was constructed.
+ *
+ * ISS-823 (pen ruling R6): the @storybloq/lenses severity vocabulary tops out
+ * at "blocking" instead of "critical". This function is the artifact-write
+ * boundary for reported findings (per-severity counts, verdict artifact,
+ * lens history), so "blocking" is projected onto the legacy display value
+ * "critical" here.
  */
 export function normalizeSeverity(severity: string): string {
-  return severity.trim().toLowerCase();
+  const s = severity.trim().toLowerCase();
+  return s === "blocking" ? "critical" : s;
 }
 
 // ---------------------------------------------------------------------------

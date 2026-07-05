@@ -488,7 +488,7 @@ For team-mode projects, add CI validation to catch duplicate displayIds and stal
 
 ## Related projects
 
-- **[@storybloq/lenses](https://github.com/Storybloq/lenses)** - multi-lens code review MCP server. 8 specialized reviewers run in parallel and return structured verdicts.
+- **[@storybloq/lenses](https://github.com/Storybloq/lenses)** - multi-lens code review MCP server and library. 9 specialized reviewers run in parallel and return structured verdicts; the storybloq autonomous lens backend consumes it directly.
 - **[Storybloq for Mac](https://apps.apple.com/us/app/storybloq/id6761348691)** - native macOS app that watches `.story/` and updates live while Claude works. Free on the Mac App Store.
 
 ## Contributing

@@ -306,7 +306,7 @@ When starting work on a ticket, update its status to `inprogress`. When done, up
 
 **Frontend design guidance:** When working on UI or frontend tickets, read `design/design.md` in the same directory as this skill file for design principles and platform-specific best practices. Follow its priority order (clarity > hierarchy > platform correctness > accessibility > state completeness) and load the relevant platform reference. This applies to any ticket involving components, layouts, styling, or visual design.
 
-**Plan and code review:** Before implementing any plan, review it with the multi-lens review system. Read `review-lenses/review-lenses.md` in the same directory as this skill file and follow its workflow. This applies whether you used `/story plan`, native plan mode, or wrote the plan manually. The lens system runs 8 specialized reviewers in parallel (clean code, security, error handling, performance, API design, concurrency, test quality, accessibility) and synthesizes findings into a single verdict. After implementation, review the code diff the same way before committing.
+**Plan and code review:** Before implementing any plan, review it with the multi-lens review system. Read `review-lenses/review-lenses.md` in the same directory as this skill file and follow its workflow. This applies whether you used `/story plan`, native plan mode, or wrote the plan manually. The lens system runs 9 specialized reviewers in parallel (security, error handling, clean code, concurrency, performance, API design, test quality, accessibility, data safety) via the @storybloq/lenses registry and merges findings programmatically into a single verdict. After implementation, review the code diff the same way before committing.
 
 ## Managing Tickets and Issues
 
@@ -526,4 +526,4 @@ Additional skill documentation, loaded on demand:
 - **`design/design.md`** -- Frontend design evaluation and implementation guidance, with platform references in `design/references/`
 - **`federation-setup.md`** -- Federation setup flow for multi-repo orchestrator initialization
 - **`orchestrator-mode.md`** -- Orchestrator mode: tiered multi-agent backlog drive with enrichment pass, session-model review gates, and batched ships
-- **`review-lenses/review-lenses.md`** -- Multi-lens review orchestrator (8 specialized parallel reviewers), with lens prompts in `review-lenses/references/`
+- **`review-lenses/review-lenses.md`** -- Multi-lens review orchestrator (9 specialized parallel reviewers); prompt bodies and merge semantics live in the @storybloq/lenses package
