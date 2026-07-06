@@ -11,7 +11,7 @@
 
 <p align="center">
   <a href="https://www.npmjs.com/package/@storybloq/storybloq"><img src="https://img.shields.io/npm/v/@storybloq/storybloq?color=333&label=npm" alt="npm version" /></a>
-  <a href="https://github.com/Storybloq/storybloq/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-PolyForm--NC%201.0-blue" alt="License" /></a>
+  <a href="https://github.com/Storybloq/storybloq/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-PolyForm--Shield%201.0-blue" alt="License" /></a>
   <img src="https://img.shields.io/badge/node-%E2%89%A520-brightgreen" alt="Node" />
   <img src="https://img.shields.io/badge/claude%20code-compatible-orange" alt="Claude Code compatible" />
 </p>
@@ -507,6 +507,15 @@ npm run build
 
 ## License
 
-[PolyForm Noncommercial 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0/). Free for personal and noncommercial use. For commercial licensing, contact shayegh@me.com.
+[PolyForm Shield 1.0.0](https://polyformproject.org/licenses/shield/1.0.0/) - a source-available, non-compete license (not OSI open source).
+
+You may use storybloq for any purpose, including:
+
+- personal and hobby projects
+- open-source projects
+- internal company use
+- commercial software you are building
+
+You may not, without a separate license, use storybloq to build a product that competes with it: repackaging, reselling, hosting it as a managed service, or white-labeling it. For that, contact shayegh@me.com.
 
 See [LICENSE](./LICENSE) for the full text and [NOTICE](./NOTICE) for the required copyright notice you must propagate if you redistribute.
