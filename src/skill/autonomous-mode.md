@@ -73,11 +73,20 @@ Run Claude Code with: `claude --model claude-opus-4-6 --dangerously-skip-permiss
 - Compact/resume preserves targetWork -- the session continues where it left off
 - If all remaining targets are blocked by items outside the list, session ends with an explanation
 
+**Project targets:** a targetWork entry may be a project id from roadmap.projects
+(e.g. `/story auto tigris` -> `"targetWork": ["tigris"]`). The guide expands it
+in place to the project's remaining leaf tickets (in `order` sequence) followed
+by its open issues -- only items whose phase matches the project's phase count.
+Completed members are skipped like any other done target; a project with no
+assigned items is a hard error. Mixed lists work: `"targetWork": ["tigris", "T-099"]`.
+Pass the project id verbatim -- do NOT pre-expand it yourself.
+
 **Use when:**
 - Triaging a specific set of high-priority items
 - Breaking up work into focused sprints
 - Working through a dependency chain in order
 - Fixing a cascade of related issues
+- Driving a project (roadmap.projects grouping) to completion end-to-end
 
 ## Tiered Access -- Review, Plan, Guided Modes
 
@@ -102,6 +111,26 @@ The autonomous guide supports four execution tiers. Same guide, same handlers, d
 2. The guide enters PLAN -- write the implementation plan as a markdown file
 3. On plan review approve: session ends automatically. On revise/reject: revise plan, re-review
 4. The approved plan is saved in `.story/sessions/<id>/plan.md`
+
+### `/story plan <project-id>` -- Project-level planning
+
+"Help me plan the tigris project." Produces ONE plan document covering the whole
+project. This is a document-writing flow, NOT an autonomous session -- do not
+call `storybloq_autonomous_guide` for it (plan mode's ticketId requirement is
+deliberate; project planning happens outside the state machine).
+
+1. Resolve the project: `storybloq_project_list` (or `storybloq project list`) --
+   confirm the id exists and note its phase. If the arg matches no project, treat
+   the command as single-ticket plan mode instead.
+2. Gather the members: `storybloq_ticket_list` with `project: "<id>"` (and
+   `storybloq_issue_list` with `project: "<id>"`). Read each member's description;
+   read `storybloq_handover_latest` and any lessons digest for context.
+3. Write `.story/plans/project-<id>.md` covering: goal of the project, member
+   inventory (tickets in order + issues), sequencing and dependencies (blockedBy
+   edges within the project, cross-project blockers), shared design decisions,
+   risks, and a recommended `/story auto <project-id>` execution order.
+4. Present a summary and offer the follow-up: `/story auto <project-id>` to
+   execute the plan.
 
 ### `/story guided T-XXX` (deprecated -- alias for targeted auto)
 

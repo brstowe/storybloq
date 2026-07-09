@@ -40,8 +40,10 @@ This guard has precedence over every "do not ask the user" rule elsewhere in thi
 - `/story` -> full context load (default, see Step 2 below)
 - `/story auto` -> start autonomous mode (read `autonomous-mode.md` in the same directory as this skill file; if not found, tell user to run `storybloq setup --client all`)
 - `/story auto T-183 T-184 ISS-077` -> start targeted autonomous mode with ONLY those items in order (read `autonomous-mode.md`; pass the IDs as `targetWork` array in the start call)
+- `/story auto <project-id>` (e.g. `/story auto tigris`) -> targeted autonomous mode for a whole project: pass the project id verbatim in the `targetWork` array; the guide expands it to the project's remaining tickets (in order) and issues. Mixed lists work (`/story auto tigris T-099`). Project ids live in roadmap.projects (`storybloq project list`).
 - `/story review T-XXX` -> start review mode for a ticket (read `autonomous-mode.md` in the same directory as this skill file; if not found, tell user to run `storybloq setup --client all`)
 - `/story plan T-XXX` -> start plan mode for a ticket (read `autonomous-mode.md` in the same directory as this skill file; if not found, tell user to run `storybloq setup --client all`)
+- `/story plan <project-id>` (e.g. `/story plan tigris`) -> write ONE project-level plan document covering the whole project (read `autonomous-mode.md`, section "Project-level planning"). This is a document-writing flow, NOT an autonomous session -- do not call `storybloq_autonomous_guide`.
 - `/story handover` -> draft a session handover. Summarize the session's work, then call `storybloq_handover_create` with the drafted content and a descriptive slug
 - `/story snapshot` -> save project state (call `storybloq_snapshot` MCP tool)
 - `/story export` -> export project for sharing. Ask the user whether to export the current phase or the full project, then call `storybloq_export` with either `phase` or `all` set

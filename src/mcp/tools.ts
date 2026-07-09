@@ -13,7 +13,7 @@ import { resolveNodeRoot, checkNodeWritePermission, readOrchestratorConfig, type
 import { initProject } from "../core/init.js";
 import { handleNodeList } from "../cli/commands/node.js";
 import { resolveNodePath } from "../federation/resolver.js";
-import { TARGET_WORK_ID_REGEX, LENS_FINDING_DISPOSITIONS } from "../autonomous/session-types.js";
+import { TARGET_WORK_INPUT_REGEX, LENS_FINDING_DISPOSITIONS } from "../autonomous/session-types.js";
 import { findActiveSessionMinimal, readSessionResilient, sessionDir, isLeaseExpired } from "../autonomous/session.js";
 import { touchLastMcpCallFile } from "../autonomous/liveness.js";
 
@@ -1228,7 +1228,7 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
       action: z.enum(["start", "report", "resume", "pre_compact", "cancel"]).describe("Action to perform"),
       mode: z.enum(["auto", "review", "plan", "guided"]).optional().describe("Execution tier (start action only): auto=full autonomous, review=code review only, plan=plan+review, guided=single ticket"),
       ticketId: z.string().optional().describe("Ticket ID for tiered modes (review, plan, guided). Required for non-auto modes."),
-      targetWork: z.array(z.string().regex(TARGET_WORK_ID_REGEX)).max(150).optional().describe("For start action only: array of T-XXX and ISS-XXX IDs to work on in order. Empty or omitted = standard auto mode."),
+      targetWork: z.array(z.string().regex(TARGET_WORK_INPUT_REGEX)).max(150).optional().describe("For start action only: array of T-XXX / ISS-XXX IDs and/or project ids (from roadmap.projects) to work on in order — a project id expands to its remaining tickets and issues. Empty or omitted = standard auto mode."),
       report: z.object({
         completedAction: z.string().describe("What was completed"),
         ticketId: z.string().optional().describe("Ticket ID (for ticket_picked)"),

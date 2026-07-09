@@ -725,11 +725,41 @@ async function handleStart(root: string, args: GuideInput): Promise<McpToolResul
         continue;
       }
 
+      // Project targets expand in place to the project's remaining work:
+      // leaf tickets in order, then issues — phase-matching assignments only
+      // (a project belongs to exactly one phase).
+      const project = (targetProjectState.roadmap.projects ?? []).find(
+        (p) => p.id === id.toLowerCase(),
+      );
+      if (project) {
+        const memberTickets = targetProjectState.leafTickets
+          .filter((t) => t.project === project.id && t.phase === project.phase)
+          .sort((a, b) => a.order - b.order);
+        const memberIssues = targetProjectState.activeIssues
+          .filter((i) => i.project === project.id && i.phase === project.phase);
+        if (memberTickets.length + memberIssues.length === 0) {
+          return guideError(new Error(
+            `Project "${project.id}" has no assigned tickets or issues in phase "${project.phase}".`,
+          ));
+        }
+        for (const t of memberTickets) {
+          if (t.status === "complete") { alreadyDone.push(t.id); continue; }
+          resolvedCanonical.push(t.id);
+          if (t.displayId && t.displayId !== t.id) displayIdMap[t.id] = t.displayId;
+        }
+        for (const i of memberIssues) {
+          if (i.status === "resolved") { alreadyDone.push(i.id); continue; }
+          resolvedCanonical.push(i.id);
+          if (i.displayId && i.displayId !== i.id) displayIdMap[i.id] = i.displayId;
+        }
+        continue;
+      }
+
       invalidIds.push(id);
     }
     if (invalidIds.length > 0) {
       return guideError(new Error(
-        `Invalid target IDs: ${invalidIds.join(", ")}. Use T-XXX for tickets or ISS-XXX for issues.`,
+        `Invalid target IDs: ${invalidIds.join(", ")}. Use T-XXX for tickets, ISS-XXX for issues, or a project id from roadmap.projects.`,
       ));
     }
     validatedTargetWork = [...new Set(resolvedCanonical.filter(id => !alreadyDone.includes(id)))];

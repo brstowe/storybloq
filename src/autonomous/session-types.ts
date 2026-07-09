@@ -6,6 +6,14 @@ import { CROCKFORD_CLASS } from "../models/types.js";
 export const TARGET_WORK_ID_REGEX = new RegExp(`^(T-\\d+[a-z]?|ISS-\\d+|t-${CROCKFORD_CLASS}{16}|i-${CROCKFORD_CLASS}{16})$`);
 
 /**
+ * Input-side targetWork shape: item IDs plus project ids (lowercase slugs from
+ * roadmap.projects). The guide expands project ids to their member items before
+ * session creation, so persisted session state still only carries item IDs
+ * (TARGET_WORK_ID_REGEX above guards that stored shape).
+ */
+export const TARGET_WORK_INPUT_REGEX = new RegExp(`^(T-\\d+[a-z]?|ISS-\\d+|t-${CROCKFORD_CLASS}{16}|i-${CROCKFORD_CLASS}{16}|[a-z0-9]+(-[a-z0-9]+)*)$`);
+
+/**
  * ISS-556: Canonical dispositions for lens-review findings.
  * Used at the MCP input boundary AND in the persisted SessionStateSchema so
  * the write and read paths enforce the same vocabulary. Adding a value here
