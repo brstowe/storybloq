@@ -9,7 +9,10 @@ import {
 import { TicketSchema } from "../../models/ticket.js";
 import { IssueSchema } from "../../models/issue.js";
 import { RoadmapSchema } from "../../models/roadmap.js";
-import type { Roadmap, Phase } from "../../models/roadmap.js";
+import type { Roadmap, Phase, PhaseState } from "../../models/roadmap.js";
+
+// CLI-facing phase state: the stored states plus "active" to clear the field
+export type PhaseStateArg = PhaseState | "active";
 import {
   formatPhaseList,
   formatPhaseTickets,
@@ -102,6 +105,7 @@ export async function handlePhaseCreate(
     label: string;
     description: string;
     summary?: string;
+    state?: PhaseStateArg;
     after?: string;
     atStart: boolean;
   },
@@ -130,6 +134,7 @@ export async function handlePhaseCreate(
       name: args.name,
       description: args.description,
       ...(args.summary !== undefined && { summary: args.summary }),
+      ...(args.state !== undefined && args.state !== "active" && { state: args.state }),
     };
 
     const newPhases = [...state.roadmap.phases];
@@ -162,6 +167,7 @@ export async function handlePhaseRename(
     label?: string;
     description?: string;
     summary?: string;
+    state?: PhaseStateArg;
   },
   format: string,
   root: string,
@@ -182,6 +188,10 @@ export async function handlePhaseRename(
       ...(updates.description !== undefined && { description: updates.description }),
       ...(updates.summary !== undefined && { summary: updates.summary }),
     };
+    if (updates.state !== undefined) {
+      if (updates.state === "active") delete phase.state;
+      else phase.state = updates.state;
+    }
 
     const newPhases = [...state.roadmap.phases];
     newPhases[idx] = phase;
@@ -302,7 +312,16 @@ export async function handlePhaseDelete(
       }
 
       const newPhases = state.roadmap.phases.filter((p) => p.id !== id);
-      const newRoadmap: Roadmap = { ...state.roadmap, phases: newPhases };
+      // Projects follow their phase: retarget to the reassignment phase so
+      // moved tickets keep valid assignments
+      const newProjects = state.roadmap.projects?.map((proj) =>
+        proj.phase === id ? { ...proj, phase: reassign } : proj,
+      );
+      const newRoadmap: Roadmap = {
+        ...state.roadmap,
+        phases: newPhases,
+        ...(newProjects !== undefined && { projects: newProjects }),
+      };
       const parsedRoadmap = RoadmapSchema.parse(newRoadmap);
       const roadmapContent = serializeJSON(parsedRoadmap);
       const roadmapTarget = join(wrapDir, "roadmap.json");
@@ -311,7 +330,13 @@ export async function handlePhaseDelete(
       await runTransactionUnlocked(root, operations);
     } else {
       const newPhases = state.roadmap.phases.filter((p) => p.id !== id);
-      const newRoadmap: Roadmap = { ...state.roadmap, phases: newPhases };
+      // No reassignment target: projects in the deleted phase go with it
+      const newProjects = state.roadmap.projects?.filter((proj) => proj.phase !== id);
+      const newRoadmap: Roadmap = {
+        ...state.roadmap,
+        phases: newPhases,
+        ...(newProjects !== undefined && { projects: newProjects }),
+      };
       await writeRoadmapUnlocked(newRoadmap, root);
     }
   });

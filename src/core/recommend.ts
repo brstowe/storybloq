@@ -148,6 +148,21 @@ export function recommend(
     }
   }
 
+  // Parked phases (state: pending/paused/skipped) never surface in
+  // recommendations — that work is deliberately on hold
+  const parkedPhaseIds = new Set(
+    state.roadmap.phases.filter((p) => p.state).map((p) => p.id),
+  );
+  if (parkedPhaseIds.size > 0) {
+    for (const [id, rec] of dedup) {
+      const phase =
+        rec.kind === "ticket" ? state.ticketByID(id)?.phase :
+        rec.kind === "issue" ? state.issueByID(id)?.phase :
+        null;
+      if (phase != null && parkedPhaseIds.has(phase)) dedup.delete(id);
+    }
+  }
+
   // ISS-018: Handover context boost — tickets referenced in actionable sections get +50
   applyHandoverBoost(state, dedup, options);
 

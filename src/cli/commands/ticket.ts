@@ -75,10 +75,14 @@ const TICKET_CORE_METADATA_KEYS = new Set([
 // --- Read Handlers ---
 
 export function handleTicketList(
-  filters: { status?: string; phase?: string; type?: string },
+  filters: { status?: string; phase?: string; type?: string; project?: string },
   ctx: CommandContext,
 ): CommandResult {
   let tickets = [...ctx.state.leafTickets];
+
+  if (filters.project) {
+    tickets = tickets.filter((t) => t.project === filters.project);
+  }
 
   if (filters.status) {
     if (!TICKET_STATUSES.includes(filters.status as TicketStatus)) {
@@ -161,15 +165,19 @@ export function handleTicketMetaGet(
   return { output: formatMetadataValue(result.value, ctx.format) };
 }
 
-export function handleTicketNext(ctx: CommandContext, count: number = 1): CommandResult {
+export function handleTicketNext(
+  ctx: CommandContext,
+  count: number = 1,
+  includeParked: boolean = false,
+): CommandResult {
   if (count <= 1) {
     // Existing path — unchanged behavior, uses nextTicket (early-stop at blocked phase)
-    const outcome = nextTicket(ctx.state);
+    const outcome = nextTicket(ctx.state, { includeParked });
     const exitCode = outcome.kind === "found" ? ExitCode.OK : ExitCode.USER_ERROR;
     return { output: formatNextTicketOutcome(outcome, ctx.state, ctx.format), exitCode };
   }
   // Multi-candidate path — continues across blocked phases
-  const outcome = nextTickets(ctx.state, count);
+  const outcome = nextTickets(ctx.state, count, { includeParked });
   const exitCode = outcome.kind === "found" ? ExitCode.OK : ExitCode.USER_ERROR;
   return { output: formatNextTicketsOutcome(outcome, ctx.state, ctx.format), exitCode };
 }
@@ -185,6 +193,40 @@ function validatePhase(phase: string | null, ctx: { state: ProjectState }): void
   if (phase !== null && !ctx.state.roadmap.phases.some((p) => p.id === phase)) {
     throw new CliValidationError("invalid_input", `Phase "${phase}" not found in roadmap`);
   }
+}
+
+/** A project assignment must reference an existing project in the item's phase. */
+export function validateProjectAssignment(
+  project: string | null,
+  phase: string | null | undefined,
+  state: ProjectState,
+): void {
+  if (project === null) return;
+  const proj = (state.roadmap.projects ?? []).find((p) => p.id === project);
+  if (!proj) {
+    throw new CliValidationError("invalid_input", `Project "${project}" not found in roadmap`);
+  }
+  if (proj.phase !== phase) {
+    throw new CliValidationError(
+      "invalid_input",
+      `Project "${project}" belongs to phase "${proj.phase}" but the item is in phase "${phase ?? "none"}"`,
+    );
+  }
+}
+
+/**
+ * Phase moves invalidate a project assignment carried from the old phase
+ * (projects belong to exactly one phase). Returns the change to apply, if any.
+ */
+export function staleProjectClear(
+  existingProject: string | null | undefined,
+  newPhase: string | null,
+  state: ProjectState,
+): { project: null } | undefined {
+  if (existingProject == null) return undefined;
+  const proj = (state.roadmap.projects ?? []).find((p) => p.id === existingProject);
+  if (!proj || proj.phase !== newPhase) return { project: null };
+  return undefined;
 }
 
 function rethrowResolutionError(err: unknown, fallbackMsg: string): never {
@@ -292,6 +334,7 @@ export async function handleTicketCreate(
     description: string;
     blockedBy: string[];
     parentTicket: string | null;
+    project?: string | null;
   },
   format: string,
   root: string,
@@ -307,6 +350,9 @@ export async function handleTicketCreate(
 
   await withProjectLock(root, { strict: true }, async ({ state }) => {
     validatePhase(args.phase, { state });
+    if (args.project != null) {
+      validateProjectAssignment(args.project, args.phase, state);
+    }
     const resolvedBlockedBy = args.blockedBy.length > 0
       ? validateAndResolveBlockedBy(args.blockedBy, "", state)
       : [];
@@ -343,6 +389,7 @@ export async function handleTicketCreate(
       completedDate: null,
       blockedBy: resolvedBlockedBy,
       parentTicket: resolvedParent,
+      ...(args.project != null && { project: args.project }),
     };
 
     validatePostWriteState(ticket, state, true);
@@ -369,6 +416,7 @@ export async function handleTicketUpdate(
     blockedBy?: string[];
     crossNodeBlockedBy?: string[] | null;
     parentTicket?: string | null;
+    project?: string | null;
   },
   format: string,
   root: string,
@@ -403,6 +451,16 @@ export async function handleTicketUpdate(
     if (updates.phase !== undefined) {
       validatePhase(updates.phase, { state });
     }
+
+    const effectivePhase = updates.phase !== undefined ? updates.phase : existing.phase;
+    let projectChange: { project: string | null } | undefined;
+    if (updates.project !== undefined) {
+      validateProjectAssignment(updates.project, effectivePhase, state);
+      projectChange = { project: updates.project };
+    } else if (updates.phase !== undefined) {
+      projectChange = staleProjectClear(existing.project, updates.phase, state);
+    }
+
     const resolvedBlockedBy = updates.blockedBy
       ? validateAndResolveBlockedBy(updates.blockedBy, resolvedId, state)
       : undefined;
@@ -431,6 +489,7 @@ export async function handleTicketUpdate(
       ...(resolvedBlockedBy !== undefined && { blockedBy: resolvedBlockedBy }),
       ...(updates.crossNodeBlockedBy !== undefined && { crossNodeBlockedBy: updates.crossNodeBlockedBy ?? undefined }),
       ...(updates.parentTicket !== undefined && { parentTicket: resolvedParent }),
+      ...projectChange,
       ...statusChanges,
     };
 

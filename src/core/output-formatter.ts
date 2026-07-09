@@ -321,6 +321,7 @@ export function formatPhaseList(
     name: p.phase.name,
     description: p.phase.summary ?? p.phase.description,
     status: p.status,
+    state: p.phase.state ?? null,
     leafCount: p.leafCount,
   }));
 
@@ -331,7 +332,8 @@ export function formatPhaseList(
   const lines: string[] = [];
   for (const p of data) {
     const indicator = p.status === "complete" ? "[x]" : p.status === "inprogress" ? "[~]" : "[ ]";
-    lines.push(`${indicator} **${escapeMarkdownInline(p.name)}** (${p.id}) — ${p.leafCount} tickets — ${escapeMarkdownInline(truncate(p.description, 80))}`);
+    const parked = p.state ? ` [${p.state.toUpperCase()}]` : "";
+    lines.push(`${indicator}${parked} **${escapeMarkdownInline(p.name)}** (${p.id}) — ${p.leafCount} tickets — ${escapeMarkdownInline(truncate(p.description, 80))}`);
   }
   return lines.join("\n");
 }
@@ -396,6 +398,11 @@ export function formatNextTicketOutcome(
     case "all_complete":
       return "All phases complete.";
 
+    case "all_parked": {
+      const ids = outcome.parkedPhaseIds.map((p) => escapeMarkdownInline(p)).join(", ");
+      return `All remaining work is in parked phases (${ids}). Use --include-parked to include it.`;
+    }
+
     case "all_blocked": {
       return `All ${outcome.blockedCount} incomplete tickets in phase "${escapeMarkdownInline(outcome.phaseId)}" are blocked.`;
     }
@@ -442,6 +449,11 @@ export function formatNextTicketsOutcome(
 
     case "all_complete":
       return "All phases complete.";
+
+    case "all_parked": {
+      const ids = outcome.parkedPhaseIds.map((p) => escapeMarkdownInline(p)).join(", ");
+      return `All remaining work is in parked phases (${ids}). Use --include-parked to include it.`;
+    }
 
     case "all_blocked": {
       const details = outcome.phases

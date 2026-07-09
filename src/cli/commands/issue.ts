@@ -1,5 +1,6 @@
 import { displayIdOf } from "../../core/resolver.js";
 import { validateProject } from "../../core/validation.js";
+import { validateProjectAssignment, staleProjectClear } from "./ticket.js";
 import { resolveAndNormalizeTicketRef, resolveAndNormalizeIssueRef, RefResolutionError } from "../../core/ref-normalization.js";
 import { ProjectState } from "../../core/project-state.js";
 import {
@@ -77,10 +78,14 @@ function rethrowIssueResolutionError(err: unknown, fallbackMsg: string): never {
 // --- Read Handlers ---
 
 export function handleIssueList(
-  filters: { status?: string; severity?: string; component?: string; phase?: string },
+  filters: { status?: string; severity?: string; component?: string; phase?: string; project?: string },
   ctx: CommandContext,
 ): CommandResult {
   let issues = [...ctx.state.activeIssues];
+
+  if (filters.project) {
+    issues = issues.filter((i) => i.project === filters.project);
+  }
 
   if (filters.status) {
     if (!ISSUE_STATUSES.includes(filters.status as IssueStatus)) {
@@ -252,6 +257,7 @@ export async function handleIssueCreate(
     relatedTickets: string[];
     location: string[];
     phase?: string;
+    project?: string | null;
   },
   format: string,
   root: string,
@@ -268,6 +274,9 @@ export async function handleIssueCreate(
   await withProjectLock(root, { strict: true }, async ({ state }) => {
     if (args.phase && !state.roadmap.phases.some((p) => p.id === args.phase)) {
       throw new CliValidationError("invalid_input", `Phase "${args.phase}" not found in roadmap`);
+    }
+    if (args.project != null) {
+      validateProjectAssignment(args.project, args.phase ?? null, state);
     }
     const resolvedRelated = args.relatedTickets.length > 0
       ? validateAndResolveRelatedTickets(args.relatedTickets, state)
@@ -302,6 +311,7 @@ export async function handleIssueCreate(
       resolvedDate: null,
       relatedTickets: resolvedRelated,
       phase: args.phase ?? null,
+      ...(args.project != null && { project: args.project }),
     };
 
     validatePostWriteIssueState(issue, state, true);
@@ -329,6 +339,7 @@ export async function handleIssueUpdate(
     location?: string[];
     order?: number;
     phase?: string | null;
+    project?: string | null;
   },
   format: string,
   root: string,
@@ -365,6 +376,16 @@ export async function handleIssueUpdate(
         throw new CliValidationError("invalid_input", `Phase "${updates.phase}" not found in roadmap`);
       }
     }
+
+    const effectivePhase = updates.phase !== undefined ? updates.phase : existing.phase ?? null;
+    let projectChange: { project: string | null } | undefined;
+    if (updates.project !== undefined) {
+      validateProjectAssignment(updates.project, effectivePhase, state);
+      projectChange = { project: updates.project };
+    } else if (updates.phase !== undefined) {
+      projectChange = staleProjectClear(existing.project, updates.phase, state);
+    }
+
     const resolvedRelated = updates.relatedTickets
       ? validateAndResolveRelatedTickets(updates.relatedTickets, state)
       : undefined;
@@ -391,6 +412,7 @@ export async function handleIssueUpdate(
       ...(updates.location !== undefined && { location: updates.location }),
       ...(updates.order !== undefined && { order: updates.order }),
       ...(updates.phase !== undefined && { phase: updates.phase }),
+      ...projectChange,
       ...statusChanges,
     };
 

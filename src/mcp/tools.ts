@@ -128,7 +128,13 @@ import {
   handlePhaseCurrent,
   handlePhaseTickets,
   handlePhaseCreate,
+  handlePhaseRename,
 } from "../cli/commands/phase.js";
+import {
+  handleProjectList,
+  handleProjectCreate,
+  handleProjectUpdate,
+} from "../cli/commands/project.js";
 
 // --- Error classification ---
 
@@ -319,9 +325,11 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
     inputSchema: {
       count: z.number().int().min(1).max(10).optional()
         .describe("Number of candidates to return (default: 1)"),
+      includeParked: z.boolean().optional()
+        .describe("Include tickets in parked phases (state: pending/paused/skipped; default: false)"),
     },
   }, (args) => runMcpReadTool(pinnedRoot, (ctx) =>
-    handleTicketNext(ctx, args.count ?? 1),
+    handleTicketNext(ctx, args.count ?? 1, args.includeParked ?? false),
   ));
 
   server.registerTool("storybloq_ticket_blocked", {
@@ -375,6 +383,7 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
       status: z.enum(TICKET_STATUSES).optional().describe("Filter by status: open, inprogress, complete"),
       phase: z.string().optional().describe("Filter by phase ID"),
       type: z.enum(TICKET_TYPES).optional().describe("Filter by type: task, feature, chore"),
+      project: z.string().optional().describe("Filter by project ID"),
       node: nodeParam,
     },
   }, (args) => {
@@ -392,7 +401,7 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
         }
       }
       return handleTicketList(
-        { status: args.status, phase: args.phase, type: args.type },
+        { status: args.status, phase: args.phase, type: args.type, project: args.project },
         ctx,
       );
     }, eff.root);
@@ -425,6 +434,7 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
       severity: z.enum(ISSUE_SEVERITIES).optional().describe("Filter by severity: critical, high, medium, low"),
       component: z.string().optional().describe("Filter by component name"),
       phase: z.string().optional().describe("Filter by phase ID"),
+      project: z.string().optional().describe("Filter by project ID"),
       node: nodeParam,
     },
   }, (args) => {
@@ -444,7 +454,7 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
         }
       }
       return handleIssueList(
-        { status: args.status, severity: args.severity, component: args.component, phase: args.phase },
+        { status: args.status, severity: args.severity, component: args.component, phase: args.phase, project: args.project },
         ctx,
       );
     }, eff.root);
@@ -550,6 +560,7 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
       description: z.string().optional().describe("Ticket description"),
       blockedBy: z.array(TicketRefSchema).optional().describe("IDs of blocking tickets"),
       parentTicket: TicketRefSchema.optional().describe("Parent ticket ID (makes this a sub-ticket)"),
+      project: z.string().optional().describe("Project ID to assign (must belong to the ticket's phase)"),
       node: nodeParam,
     },
   }, (args) => {
@@ -564,6 +575,7 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
         description: args.description ?? "",
         blockedBy: args.blockedBy ?? [],
         parentTicket: args.parentTicket ?? null,
+        project: args.project ?? null,
       },
       format,
       root,
@@ -583,6 +595,7 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
       parentTicket: TicketRefSchema.nullable().optional().describe("Parent ticket ID (null to clear)"),
       blockedBy: z.array(TicketRefSchema).optional().describe("IDs of blocking tickets"),
       crossNodeBlockedBy: z.array(z.string().regex(CROSS_NODE_REF_REGEX)).nullable().optional().describe("Cross-node blocking refs (e.g. engine:T-061). Null to clear."),
+      project: z.string().nullable().optional().describe("Project ID to assign (must belong to the ticket's phase; null to clear)"),
       node: nodeParam,
     },
   }, (args) => {
@@ -601,6 +614,7 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
           parentTicket: args.parentTicket,
           blockedBy: args.blockedBy,
           crossNodeBlockedBy: args.crossNodeBlockedBy,
+          project: args.project,
         },
         format,
         root,
@@ -641,6 +655,7 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
       relatedTickets: z.array(TicketRefSchema).optional().describe("Related ticket IDs"),
       location: z.array(z.string()).optional().describe("File locations"),
       phase: z.string().optional().describe("Phase ID"),
+      project: z.string().optional().describe("Project ID to assign (must belong to the issue's phase)"),
       node: nodeParam,
     },
   }, (args) => {
@@ -656,6 +671,7 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
           relatedTickets: args.relatedTickets ?? [],
           location: args.location ?? [],
           phase: args.phase,
+          project: args.project ?? null,
         },
         format,
         root,
@@ -677,6 +693,7 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
       location: z.array(z.string()).optional().describe("File locations"),
       order: z.number().int().optional().describe("New sort order"),
       phase: z.string().nullable().optional().describe("New phase ID (null to clear)"),
+      project: z.string().nullable().optional().describe("Project ID to assign (must belong to the issue's phase; null to clear)"),
       node: nodeParam,
     },
   }, (args) => {
@@ -696,6 +713,7 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
           location: args.location,
           order: args.order,
           phase: args.phase,
+          project: args.project,
         },
         format,
         root,
@@ -881,6 +899,7 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
       label: z.string().describe("Phase label (e.g. 'PHASE 1')"),
       description: z.string().describe("Phase description"),
       summary: z.string().optional().describe("One-line summary for compact display"),
+      state: z.enum(["pending", "paused", "skipped"]).optional().describe("Phase state — parked states are excluded from work selection"),
       after: z.string().optional().describe("Insert after this phase ID"),
       atStart: z.boolean().optional().describe("Insert at beginning of roadmap"),
     },
@@ -892,9 +911,77 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
         label: args.label,
         description: args.description,
         summary: args.summary,
+        state: args.state,
         after: args.after,
         atStart: args.atStart ?? false,
       },
+      format,
+      root,
+    ),
+  ));
+
+  server.registerTool("storybloq_phase_update", {
+    description: "Update phase metadata or state (pending/paused/skipped park the phase; active clears)",
+    inputSchema: {
+      id: z.string().describe("Phase ID"),
+      name: z.string().optional().describe("New display name"),
+      label: z.string().optional().describe("New label"),
+      description: z.string().optional().describe("New description"),
+      summary: z.string().optional().describe("New one-line summary"),
+      state: z.enum(["pending", "paused", "skipped", "active"]).optional().describe("Phase state — parked states are excluded from work selection; active clears"),
+    },
+  }, (args) => runMcpWriteTool(pinnedRoot, (root, format) =>
+    handlePhaseRename(
+      args.id,
+      {
+        name: args.name,
+        label: args.label,
+        description: args.description,
+        summary: args.summary,
+        state: args.state,
+      },
+      format,
+      root,
+    ),
+  ));
+
+  // --- Project tools (phase groupings) ---
+
+  server.registerTool("storybloq_project_list", {
+    description: "List projects (named per-phase groupings) with assignment counts",
+    inputSchema: {
+      phase: z.string().optional().describe("Only projects in this phase"),
+    },
+  }, (args) => runMcpReadTool(pinnedRoot, (ctx) => handleProjectList(ctx, args.phase)));
+
+  server.registerTool("storybloq_project_create", {
+    description: "Create a project in a phase. Tickets/issues in that phase can then be assigned via their project field.",
+    inputSchema: {
+      id: z.string().describe("Project ID — lowercase alphanumeric with hyphens (e.g. 'docusign')"),
+      name: z.string().describe("Project display name"),
+      phase: z.string().describe("Phase this project belongs to"),
+      color: z.string().optional().describe("Display color (e.g. #4f7cff)"),
+    },
+  }, (args) => runMcpWriteTool(pinnedRoot, (root, format) =>
+    handleProjectCreate(
+      { id: args.id, name: args.name, phase: args.phase, color: args.color },
+      format,
+      root,
+    ),
+  ));
+
+  server.registerTool("storybloq_project_update", {
+    description: "Update project metadata. Moving a project to another phase makes existing assignments stale.",
+    inputSchema: {
+      id: z.string().describe("Project ID"),
+      name: z.string().optional().describe("New display name"),
+      phase: z.string().optional().describe("Move to this phase"),
+      color: z.string().optional().describe("New display color"),
+    },
+  }, (args) => runMcpWriteTool(pinnedRoot, (root, format) =>
+    handleProjectUpdate(
+      args.id,
+      { name: args.name, phase: args.phase, color: args.color },
       format,
       root,
     ),

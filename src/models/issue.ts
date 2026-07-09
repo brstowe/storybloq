@@ -26,6 +26,9 @@ export const IssueSchema = z
     // Optional fields — older issues may omit these
     order: z.number().int().optional(),
     phase: z.string().nullable().optional(),
+    // Optional ref into roadmap.projects; only meaningful while the issue's
+    // phase matches the project's phase
+    project: z.string().nullable().optional(),
     // Attribution fields — unused in v1
     createdBy: z.string().nullable().optional(),
     assignedTo: z.string().nullable().optional(),

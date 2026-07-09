@@ -24,7 +24,7 @@ import {
   CliValidationError,
 } from "./helpers.js";
 import { parseMetadataValue } from "./commands/metadata.js";
-import { formatError, ExitCode } from "../core/output-formatter.js";
+import { formatError, ExitCode, type OutputFormat } from "../core/output-formatter.js";
 
 // Handler imports — read handlers
 import { handleStatus } from "./commands/status.js";
@@ -39,6 +39,13 @@ import {
   handleHandoverCreate,
 } from "./commands/handover.js";
 import { handleBlockerList, handleBlockerAdd, handleBlockerClear } from "./commands/blocker.js";
+import {
+  handleProjectList,
+  handleProjectCreate,
+  handleProjectUpdate,
+  handleProjectDelete,
+  handleProjectMigrateSidecar,
+} from "./commands/project.js";
 import {
   handleTicketList,
   handleTicketGet,
@@ -97,6 +104,7 @@ import {
   handlePhaseRename,
   handlePhaseMove,
   handlePhaseDelete,
+  type PhaseStateArg,
 } from "./commands/phase.js";
 
 // Re-export init's register (init has no handler separation)
@@ -895,6 +903,193 @@ export function registerBlockerCommand(yargs: Argv): Argv {
 }
 
 // ---------------------------------------------------------------------------
+// project
+// ---------------------------------------------------------------------------
+
+export function registerProjectCommand(yargs: Argv): Argv {
+  // Shared write-command wrapper: root discovery + the standard error mapping
+  const runProjectWrite = async (
+    format: OutputFormat,
+    fn: (root: string) => Promise<{ output: string; exitCode?: number }>,
+  ): Promise<void> => {
+    const root = (
+      await import("../core/project-root-discovery.js")
+    ).discoverProjectRoot();
+    if (!root) {
+      writeOutput(formatError("not_found", "No .story/ project found.", format));
+      process.exitCode = ExitCode.USER_ERROR;
+      return;
+    }
+    try {
+      const result = await fn(root);
+      writeOutput(result.output);
+      process.exitCode = result.exitCode ?? ExitCode.OK;
+    } catch (err: unknown) {
+      if (err instanceof CliValidationError) {
+        writeOutput(formatError(err.code, err.message, format));
+        process.exitCode = ExitCode.USER_ERROR;
+        return;
+      }
+      const { ProjectLoaderError } = await import("../core/errors.js");
+      if (err instanceof ProjectLoaderError) {
+        writeOutput(formatError(err.code, err.message, format));
+        process.exitCode = ExitCode.USER_ERROR;
+        return;
+      }
+      const message = err instanceof Error ? err.message : String(err);
+      writeOutput(formatError("io_error", message, format));
+      process.exitCode = ExitCode.USER_ERROR;
+    }
+  };
+
+  return yargs.command(
+    "project",
+    "Project (phase grouping) operations",
+    (y) =>
+      y
+        .command(
+          "list",
+          "List projects with assignment counts",
+          (y2) => addFormatOption(y2).option("phase", {
+            type: "string",
+            describe: "Only projects in this phase",
+          }),
+          async (argv) => {
+            const format = parseOutputFormat(argv.format);
+            await runReadCommand(format, (ctx) =>
+              handleProjectList(ctx, argv.phase as string | undefined),
+            );
+          },
+        )
+        .command(
+          "create",
+          "Create a project in a phase",
+          (y2) =>
+            addFormatOption(
+              y2
+                .option("id", {
+                  type: "string",
+                  demandOption: true,
+                  describe: "Project ID (lowercase alphanumeric with hyphens)",
+                })
+                .option("name", {
+                  type: "string",
+                  demandOption: true,
+                  describe: "Project display name",
+                })
+                .option("phase", {
+                  type: "string",
+                  demandOption: true,
+                  describe: "Phase this project belongs to",
+                })
+                .option("color", {
+                  type: "string",
+                  describe: "Display color (e.g. #4f7cff)",
+                }),
+            ),
+          async (argv) => {
+            const format = parseOutputFormat(argv.format);
+            await runProjectWrite(format, (root) =>
+              handleProjectCreate(
+                {
+                  id: argv.id as string,
+                  name: argv.name as string,
+                  phase: argv.phase as string,
+                  color: argv.color as string | undefined,
+                },
+                format,
+                root,
+              ),
+            );
+          },
+        )
+        .command(
+          "update <id>",
+          "Update project metadata",
+          (y2) =>
+            addFormatOption(
+              y2
+                .positional("id", {
+                  type: "string",
+                  demandOption: true,
+                  describe: "Project ID",
+                })
+                .option("name", {
+                  type: "string",
+                  describe: "New display name",
+                })
+                .option("phase", {
+                  type: "string",
+                  describe: "Move to this phase (existing assignments in the old phase become stale)",
+                })
+                .option("color", {
+                  type: "string",
+                  describe: "New display color",
+                }),
+            ),
+          async (argv) => {
+            const format = parseOutputFormat(argv.format);
+            await runProjectWrite(format, (root) =>
+              handleProjectUpdate(
+                argv.id as string,
+                {
+                  name: argv.name as string | undefined,
+                  phase: argv.phase as string | undefined,
+                  color: argv.color as string | undefined,
+                },
+                format,
+                root,
+              ),
+            );
+          },
+        )
+        .command(
+          "delete <id>",
+          "Delete a project",
+          (y2) =>
+            addFormatOption(
+              y2
+                .positional("id", {
+                  type: "string",
+                  demandOption: true,
+                  describe: "Project ID",
+                })
+                .option("clear-assignments", {
+                  type: "boolean",
+                  default: false,
+                  describe: "Unassign any tickets/issues still assigned to the project",
+                }),
+            ),
+          async (argv) => {
+            const format = parseOutputFormat(argv.format);
+            await runProjectWrite(format, (root) =>
+              handleProjectDelete(
+                argv.id as string,
+                Boolean(argv.clearAssignments),
+                format,
+                root,
+              ),
+            );
+          },
+        )
+        .command(
+          "migrate-sidecar",
+          "Import a legacy dashboard projects.json sidecar into native storage",
+          (y2) => addFormatOption(y2),
+          async (argv) => {
+            const format = parseOutputFormat(argv.format);
+            await runProjectWrite(format, (root) =>
+              handleProjectMigrateSidecar(format, root),
+            );
+          },
+        )
+        .demandCommand(1, "Specify a project subcommand: list, create, update, delete, migrate-sidecar")
+        .strict(),
+    () => {},
+  );
+}
+
+// ---------------------------------------------------------------------------
 // ticket
 // ---------------------------------------------------------------------------
 
@@ -921,10 +1116,20 @@ export function registerTicketCommand(yargs: Argv): Argv {
                 .option("type", {
                   type: "string",
                   describe: "Filter by type",
+                })
+                .option("project", {
+                  type: "string",
+                  describe: "Filter by project",
                 }),
             )),
           async (argv) => {
             const format = parseOutputFormat(argv.format);
+            const filters = {
+              status: argv.status as string | undefined,
+              phase: argv.phase as string | undefined,
+              type: argv.type as string | undefined,
+              project: argv.project as string | undefined,
+            };
             const nodeName = argv.node as string | undefined;
             if (nodeName) {
               const orchRoot = (await import("../core/project-root-discovery.js")).discoverProjectRoot();
@@ -932,11 +1137,11 @@ export function registerTicketCommand(yargs: Argv): Argv {
               const eff = resolveRootWithNode(orchRoot, nodeName, false, format);
               if (!eff.ok) { writeOutput(eff.output); process.exitCode = ExitCode.USER_ERROR; return; }
               await runReadCommandWithRoot(format, eff.root, (ctx) =>
-                handleTicketList({ status: argv.status as string | undefined, phase: argv.phase as string | undefined, type: argv.type as string | undefined }, ctx),
+                handleTicketList(filters, ctx),
               );
             } else {
               await runReadCommand(format, (ctx) =>
-                handleTicketList({ status: argv.status as string | undefined, phase: argv.phase as string | undefined, type: argv.type as string | undefined }, ctx),
+                handleTicketList(filters, ctx),
               );
             }
           },
@@ -965,12 +1170,16 @@ export function registerTicketCommand(yargs: Argv): Argv {
             type: "number",
             default: 1,
             describe: "Number of candidates to suggest (1-10)",
+          }).option("include-parked", {
+            type: "boolean",
+            default: false,
+            describe: "Include tickets in parked phases (state: pending/paused/skipped)",
           }),
           async (argv) => {
             const format = parseOutputFormat(argv.format);
             const raw = Number(argv.count) || 1;
             const count = Math.max(1, Math.min(10, Math.floor(raw)));
-            await runReadCommand(format, (ctx) => handleTicketNext(ctx, count));
+            await runReadCommand(format, (ctx) => handleTicketNext(ctx, count, Boolean(argv.includeParked)));
           },
         )
         .command(
@@ -1019,6 +1228,10 @@ export function registerTicketCommand(yargs: Argv): Argv {
                   type: "string",
                   describe: "Parent ticket ID (makes this a sub-ticket)",
                 })
+                .option("project", {
+                  type: "string",
+                  describe: "Project to assign (must belong to the ticket's phase)",
+                })
                 .conflicts("description", "stdin"),
             )),
           async (argv) => {
@@ -1059,6 +1272,7 @@ export function registerTicketCommand(yargs: Argv): Argv {
                   ),
                   parentTicket:
                     argv["parent-ticket"] === "" ? null : (argv["parent-ticket"] as string | undefined) ?? null,
+                  project: argv.project === "" ? null : (argv.project as string | undefined) ?? null,
                 },
                 format,
                 eff.root,
@@ -1139,6 +1353,10 @@ export function registerTicketCommand(yargs: Argv): Argv {
                   type: "string",
                   describe: "Parent ticket ID",
                 })
+                .option("project", {
+                  type: "string",
+                  describe: "Project to assign (must belong to the ticket's phase). Empty string clears.",
+                })
                 .option("node", {
                   type: "string",
                   describe: "Node name (orchestrator only)",
@@ -1196,6 +1414,7 @@ export function registerTicketCommand(yargs: Argv): Argv {
                     : undefined,
                   crossNodeBlockedBy,
                   parentTicket: argv["parent-ticket"] === "" ? null : argv["parent-ticket"] as string | undefined,
+                  project: argv.project === "" ? null : argv.project as string | undefined,
                 },
                 format,
                 eff.root,
@@ -1543,6 +1762,10 @@ export function registerIssueCommand(yargs: Argv): Argv {
                 .option("phase", {
                   type: "string",
                   describe: "Filter by phase",
+                })
+                .option("project", {
+                  type: "string",
+                  describe: "Filter by project",
                 }),
             ),
           async (argv) => {
@@ -1554,6 +1777,7 @@ export function registerIssueCommand(yargs: Argv): Argv {
                   severity: argv.severity as string | undefined,
                   component: argv.component as string | undefined,
                   phase: argv.phase as string | undefined,
+                  project: argv.project as string | undefined,
                 },
                 ctx,
               ),
@@ -1620,6 +1844,10 @@ export function registerIssueCommand(yargs: Argv): Argv {
                   array: true,
                   describe: "File locations",
                 })
+                .option("project", {
+                  type: "string",
+                  describe: "Project to assign (must belong to the issue's phase)",
+                })
                 .conflicts("impact", "stdin")
                 .check((a) => {
                   if (!a.impact && !a.stdin) {
@@ -1664,6 +1892,7 @@ export function registerIssueCommand(yargs: Argv): Argv {
                     argv.location as string[] | undefined,
                   ),
                   phase: argv.phase === "" ? undefined : (argv.phase as string | undefined),
+                  project: argv.project === "" ? null : (argv.project as string | undefined) ?? null,
                 },
                 format,
                 root,
@@ -1749,6 +1978,10 @@ export function registerIssueCommand(yargs: Argv): Argv {
                   type: "string",
                   describe: "New phase ID",
                 })
+                .option("project", {
+                  type: "string",
+                  describe: "Project to assign (must belong to the issue's phase). Empty string clears.",
+                })
                 .conflicts("impact", "stdin"),
             ),
           async (argv) => {
@@ -1795,6 +2028,7 @@ export function registerIssueCommand(yargs: Argv): Argv {
                     : undefined,
                   order: argv.order as number | undefined,
                   phase: argv.phase === "" ? null : argv.phase as string | undefined,
+                  project: argv.project === "" ? null : argv.project as string | undefined,
                 },
                 format,
                 root,
@@ -2040,6 +2274,11 @@ export function registerPhaseCommand(yargs: Argv): Argv {
                   type: "string",
                   describe: "Short summary",
                 })
+                .option("state", {
+                  type: "string",
+                  choices: ["pending", "paused", "skipped", "active"],
+                  describe: "Phase state (parked states are excluded from work selection; active = default)",
+                })
                 .option("after", {
                   type: "string",
                   describe: "Insert after this phase ID",
@@ -2084,6 +2323,7 @@ export function registerPhaseCommand(yargs: Argv): Argv {
                   label: argv.label as string,
                   description: argv.description as string,
                   summary: argv.summary as string | undefined,
+                  state: argv.state as PhaseStateArg | undefined,
                   after: argv.after as string | undefined,
                   atStart: argv.atStart as boolean,
                 },
@@ -2139,6 +2379,11 @@ export function registerPhaseCommand(yargs: Argv): Argv {
                 .option("summary", {
                   type: "string",
                   describe: "New summary",
+                })
+                .option("state", {
+                  type: "string",
+                  choices: ["pending", "paused", "skipped", "active"],
+                  describe: "Phase state (parked states are excluded from work selection; active clears)",
                 }),
             ),
           async (argv) => {
@@ -2166,6 +2411,7 @@ export function registerPhaseCommand(yargs: Argv): Argv {
                   label: argv.label as string | undefined,
                   description: argv.description as string | undefined,
                   summary: argv.summary as string | undefined,
+                  state: argv.state as PhaseStateArg | undefined,
                 },
                 format,
                 root,

@@ -928,7 +928,18 @@ export function mergeRoadmap(
   const tBlockers = Array.isArray(t.blockers) ? t.blockers : [];
   merged.blockers = keyedArrayMerge(bBlockers, oBlockers, tBlockers, "name", "/blockers", conflicts, { blockerMode: true });
 
-  const handledKeys = new Set(["title", "date", "phases", "blockers", "_conflicts"]);
+  // projects[] is optional — only merge (and emit) it when some side has it
+  if (b.projects !== undefined || o.projects !== undefined || t.projects !== undefined) {
+    for (const src of [b, o, t]) {
+      if (src.projects !== undefined && !Array.isArray(src.projects)) throw new Error("projects must be an array");
+    }
+    const bProjects = Array.isArray(b.projects) ? b.projects : [];
+    const oProjects = Array.isArray(o.projects) ? o.projects : [];
+    const tProjects = Array.isArray(t.projects) ? t.projects : [];
+    merged.projects = keyedArrayMerge(bProjects, oProjects, tProjects, "id", "/projects", conflicts, { elementMerge: true });
+  }
+
+  const handledKeys = new Set(["title", "date", "phases", "blockers", "projects", "_conflicts"]);
   const extraKeys = new Set([...Object.keys(b), ...Object.keys(o), ...Object.keys(t)].filter((k) => !handledKeys.has(k)));
   for (const key of extraKeys) {
     const bVal = b[key];

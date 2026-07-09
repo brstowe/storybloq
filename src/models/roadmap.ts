@@ -16,6 +16,15 @@ export const BlockerSchema = z
 
 export type Blocker = z.infer<typeof BlockerSchema>;
 
+// Stored phase state, orthogonal to the ticket-derived status: a parked phase
+// (any of these values) is excluded from work selection (ticket next,
+// recommend, autonomous PICK_TICKET). Absent/null = active.
+export const PHASE_STATES = ["pending", "paused", "skipped"] as const;
+
+export const PhaseStateSchema = z.enum(PHASE_STATES);
+
+export type PhaseState = z.infer<typeof PhaseStateSchema>;
+
 export const PhaseSchema = z
   .object({
     id: z.string().min(1),
@@ -23,10 +32,25 @@ export const PhaseSchema = z
     name: z.string(),
     description: z.string(),
     summary: z.string().optional(),
+    state: PhaseStateSchema.nullable().optional(),
   })
   .passthrough();
 
 export type Phase = z.infer<typeof PhaseSchema>;
+
+// A project is a named grouping within a single phase; tickets/issues carry an
+// optional `project` ref. An assignment only counts while the item's phase
+// matches the project's phase (stale assignments are surfaced by validate).
+export const ProjectSchema = z
+  .object({
+    id: z.string().min(1),
+    name: z.string().min(1),
+    phase: z.string().min(1),
+    color: z.string().optional(),
+  })
+  .passthrough();
+
+export type Project = z.infer<typeof ProjectSchema>;
 
 export const RoadmapSchema = z
   .object({
@@ -34,6 +58,7 @@ export const RoadmapSchema = z
     date: DateSchema,
     phases: z.array(PhaseSchema),
     blockers: z.array(BlockerSchema),
+    projects: z.array(ProjectSchema).optional(),
   })
   .passthrough();
 

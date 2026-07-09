@@ -1275,6 +1275,8 @@ async function handleStart(root: string, args: GuideInput): Promise<McpToolResul
       ).join("\n");
     } else if (nextResult.kind === "all_complete") {
       candidatesText = "All tickets are complete. No work to do.";
+    } else if (nextResult.kind === "all_parked") {
+      candidatesText = `All remaining tickets are in parked phases (${nextResult.parkedPhaseIds.join(", ")}). Parked work is deliberately on hold — do not work on it. No active work to do.`;
     } else if (nextResult.kind === "all_blocked") {
       candidatesText = "All remaining tickets are blocked.";
     } else {

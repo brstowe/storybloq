@@ -199,6 +199,61 @@ export function validateProject(state: ProjectState): ValidationResult {
     }
   }
 
+  // Roadmap projects: duplicate IDs + phase refs
+  const projects = state.roadmap.projects ?? [];
+  const projectByID = new Map(projects.map((p) => [p.id, p]));
+  const projectIDCounts = new Map<string, number>();
+  for (const p of projects) {
+    projectIDCounts.set(p.id, (projectIDCounts.get(p.id) ?? 0) + 1);
+  }
+  for (const [id, count] of projectIDCounts) {
+    if (count > 1) {
+      findings.push({
+        level: "error",
+        code: "duplicate_project_id",
+        message: `Duplicate project ID: ${id} appears ${count} times.`,
+        entity: id,
+      });
+    }
+  }
+  for (const p of projects) {
+    if (!phaseIDs.has(p.phase)) {
+      findings.push({
+        level: "error",
+        code: "invalid_project_phase_ref",
+        message: `Project ${p.id} references unknown phase "${p.phase}".`,
+        entity: p.id,
+      });
+    }
+  }
+
+  // Project ref on an item: must exist; a phase mismatch is a stale
+  // assignment (warning — the item moved phase after being assigned)
+  const checkProjectRef = (
+    kind: "Ticket" | "Issue",
+    id: string,
+    project: string | null | undefined,
+    phase: string | null | undefined,
+  ): void => {
+    if (project == null) return;
+    const proj = projectByID.get(project);
+    if (!proj) {
+      findings.push({
+        level: "error",
+        code: "invalid_project_ref",
+        message: `${kind} ${id} references unknown project "${project}".`,
+        entity: id,
+      });
+    } else if (phase !== proj.phase) {
+      findings.push({
+        level: "warning",
+        code: "stale_project_assignment",
+        message: `${kind} ${id} is assigned to project "${project}" (phase "${proj.phase}") but is in phase "${phase ?? "none"}".`,
+        entity: id,
+      });
+    }
+  };
+
   // Ticket reference checks
   for (const t of state.tickets) {
     // Phase ref (null is valid — unphased)
@@ -210,6 +265,8 @@ export function validateProject(state: ProjectState): ValidationResult {
         entity: t.id,
       });
     }
+
+    checkProjectRef("Ticket", t.id, t.project, t.phase);
 
     // blockedBy refs
     for (const bid of t.blockedBy) {
@@ -330,6 +387,8 @@ export function validateProject(state: ProjectState): ValidationResult {
         entity: i.id,
       });
     }
+
+    checkProjectRef("Issue", i.id, i.project, i.phase);
 
     // Orphan open issue
     if (i.relatedTickets.length === 0 && i.status === "open") {

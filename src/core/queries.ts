@@ -36,11 +36,17 @@ export interface NextTicketEmpty {
   readonly kind: "empty_project";
 }
 
+export interface NextTicketAllParked {
+  readonly kind: "all_parked";
+  readonly parkedPhaseIds: readonly string[];
+}
+
 export type NextTicketOutcome =
   | NextTicketResult
   | NextTicketAllComplete
   | NextTicketAllBlocked
-  | NextTicketEmpty;
+  | NextTicketEmpty
+  | NextTicketAllParked;
 
 // --- Multi-candidate result types (nextTickets) ---
 
@@ -70,7 +76,8 @@ export type NextTicketsOutcome =
   | NextTicketsResult
   | NextTicketsAllBlocked
   | NextTicketAllComplete
-  | NextTicketEmpty;
+  | NextTicketEmpty
+  | NextTicketAllParked;
 
 export interface PhaseWithStatus {
   readonly phase: Phase;
@@ -85,17 +92,28 @@ export interface PhaseWithStatus {
  * (roadmap order). Skips phases with zero leaf tickets.
  * Returns discriminated outcome for exhaustive handling.
  */
-export function nextTicket(state: ProjectState): NextTicketOutcome {
+export function nextTicket(
+  state: ProjectState,
+  options?: { includeParked?: boolean },
+): NextTicketOutcome {
   const phases = state.roadmap.phases;
   if (phases.length === 0 || state.leafTickets.length === 0) {
     return { kind: "empty_project" };
   }
 
   let allPhasesComplete = true;
+  const parkedPhaseIds: string[] = [];
 
   for (const phase of phases) {
     const leaves = state.phaseTickets(phase.id);
     if (leaves.length === 0) continue; // skip empty/umbrella-only phases
+
+    // Parked phases (state: pending/paused/skipped) are excluded from work
+    // selection unless explicitly requested
+    if (phase.state && !options?.includeParked) {
+      if (leaves.some((t) => t.status !== "complete")) parkedPhaseIds.push(phase.id);
+      continue;
+    }
 
     const status = state.phaseStatus(phase.id);
     if (status === "complete") continue;
@@ -128,6 +146,10 @@ export function nextTicket(state: ProjectState): NextTicketOutcome {
   }
 
   if (allPhasesComplete) {
+    // Incomplete work exists but every phase holding it is parked
+    if (parkedPhaseIds.length > 0) {
+      return { kind: "all_parked", parkedPhaseIds };
+    }
     return { kind: "all_complete" };
   }
 
@@ -143,6 +165,7 @@ export function nextTicket(state: ProjectState): NextTicketOutcome {
 export function nextTickets(
   state: ProjectState,
   count: number,
+  options?: { includeParked?: boolean },
 ): NextTicketsOutcome {
   const effectiveCount = Math.max(1, count);
   const phases = state.roadmap.phases;
@@ -153,12 +176,20 @@ export function nextTickets(
   const candidates: NextTicketCandidate[] = [];
   const skippedBlockedPhases: SkippedBlockedPhase[] = [];
   let allPhasesComplete = true;
+  const parkedPhaseIds: string[] = [];
 
   for (const phase of phases) {
     if (candidates.length >= effectiveCount) break;
 
     const leaves = state.phaseTickets(phase.id);
     if (leaves.length === 0) continue;
+
+    // Parked phases (state: pending/paused/skipped) are excluded from work
+    // selection unless explicitly requested
+    if (phase.state && !options?.includeParked) {
+      if (leaves.some((t) => t.status !== "complete")) parkedPhaseIds.push(phase.id);
+      continue;
+    }
 
     const status = state.phaseStatus(phase.id);
     if (status === "complete") continue;
@@ -199,6 +230,10 @@ export function nextTickets(
   }
 
   if (allPhasesComplete) {
+    // Incomplete work exists but every phase holding it is parked
+    if (parkedPhaseIds.length > 0) {
+      return { kind: "all_parked", parkedPhaseIds };
+    }
     return { kind: "all_complete" };
   }
 

@@ -23,6 +23,9 @@ export const TicketSchema = z
     type: z.enum(TICKET_TYPES),
     status: z.enum(TICKET_STATUSES),
     phase: z.string().nullable(),
+    // Optional ref into roadmap.projects; only meaningful while the ticket's
+    // phase matches the project's phase
+    project: z.string().nullable().optional(),
     order: z.number().int(),
     createdDate: DateSchema,
     completedDate: DateSchema.nullable(),
