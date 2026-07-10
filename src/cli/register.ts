@@ -24,11 +24,13 @@ import {
   CliValidationError,
 } from "./helpers.js";
 import { parseMetadataValue } from "./commands/metadata.js";
-import { formatError, ExitCode } from "../core/output-formatter.js";
+import { formatError, formatLedgerIntegrity, ExitCode } from "../core/output-formatter.js";
+import { discoverIntegrityRoot, scanLedgerIntegrity } from "../core/ledger-integrity.js";
+import type { IssueSourceRefInput } from "../models/issue.js";
 
 // Handler imports — read handlers
 import { handleStatus } from "./commands/status.js";
-import { handleValidate } from "./commands/validate.js";
+import { handleValidateWithSourceRefs } from "./commands/validate.js";
 import { handleRepair, computeRepairs } from "./commands/repair.js";
 import { handleReconcile } from "./commands/reconcile.js";
 import { handleTeamDoctor } from "./commands/team-doctor.js";
@@ -113,6 +115,24 @@ import { handleReference } from "./commands/reference.js";
 // Selftest command
 import { handleSelftest } from "./commands/selftest.js";
 
+function parseIssueSourceRefs(values: string[] | undefined): IssueSourceRefInput[] | undefined {
+  if (!values) return undefined;
+  return values.map((value, index) => {
+    try {
+      const parsed = JSON.parse(value) as unknown;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error("expected a JSON object");
+      }
+      return parsed as IssueSourceRefInput;
+    } catch (err) {
+      throw new CliValidationError(
+        "invalid_input",
+        `Invalid --source-ref value ${index + 1}: ${(err as Error).message}`,
+      );
+    }
+  });
+}
+
 function addNodeOption<T>(y: Argv<T>): Argv<T & { node: string | undefined }> {
   return y.option("node", {
     type: "string",
@@ -158,10 +178,34 @@ export function registerValidateCommand(yargs: Argv): Argv {
   return yargs.command(
     "validate",
     "Reference integrity + schema checks",
-    (y) => addFormatOption(y),
+    (y) => addFormatOption(y.option("integrity-only", {
+      type: "boolean",
+      default: false,
+      describe: "Scan JSON and known schemas without loading project state",
+    })),
     async (argv) => {
       const format = parseOutputFormat(argv.format);
-      await runReadCommand(format, handleValidate);
+      const discovered = (
+        await import("../core/project-root-discovery.js")
+      ).discoverProjectRoot();
+      const root = discovered ?? await discoverIntegrityRoot();
+      if (!root) {
+        writeOutput(formatError("not_found", "No .story/ project found.", format));
+        process.exitCode = ExitCode.USER_ERROR;
+        return;
+      }
+
+      const integrityOnly = argv["integrity-only"] as boolean;
+      const integrity = await scanLedgerIntegrity(root, {
+        includeAuxiliary: integrityOnly,
+      });
+      if (integrityOnly || !integrity.valid) {
+        writeOutput(formatLedgerIntegrity(integrity, format));
+        process.exitCode = integrity.valid ? ExitCode.OK : ExitCode.VALIDATION_ERROR;
+        return;
+      }
+
+      await runReadCommandWithRoot(format, root, handleValidateWithSourceRefs);
     },
   );
 }
@@ -1620,6 +1664,19 @@ export function registerIssueCommand(yargs: Argv): Argv {
                   array: true,
                   describe: "File locations",
                 })
+                .option("source-ref", {
+                  type: "string",
+                  array: true,
+                  describe: "Structured source reference as a JSON object",
+                })
+                .option("dedupe-key", {
+                  type: "string",
+                  describe: "Idempotency key for reviewer or automation retries",
+                })
+                .option("created-by", {
+                  type: "string",
+                  describe: "Reviewer or agent that created the issue",
+                })
                 .conflicts("impact", "stdin")
                 .check((a) => {
                   if (!a.impact && !a.stdin) {
@@ -1663,6 +1720,9 @@ export function registerIssueCommand(yargs: Argv): Argv {
                   location: normalizeArrayOption(
                     argv.location as string[] | undefined,
                   ),
+                  sourceRefs: parseIssueSourceRefs(argv["source-ref"] as string[] | undefined),
+                  dedupeKey: argv["dedupe-key"] as string | undefined,
+                  createdBy: argv["created-by"] as string | undefined,
                   phase: argv.phase === "" ? undefined : (argv.phase as string | undefined),
                 },
                 format,
@@ -1741,6 +1801,11 @@ export function registerIssueCommand(yargs: Argv): Argv {
                   array: true,
                   describe: "File locations",
                 })
+                .option("source-ref", {
+                  type: "string",
+                  array: true,
+                  describe: "Replacement structured source reference as a JSON object",
+                })
                 .option("order", {
                   type: "number",
                   describe: "New sort order",
@@ -1793,6 +1858,7 @@ export function registerIssueCommand(yargs: Argv): Argv {
                   location: argv.location
                     ? normalizeArrayOption(argv.location as string[])
                     : undefined,
+                  sourceRefs: parseIssueSourceRefs(argv["source-ref"] as string[] | undefined),
                   order: argv.order as number | undefined,
                   phase: argv.phase === "" ? null : argv.phase as string | undefined,
                 },

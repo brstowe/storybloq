@@ -10,6 +10,7 @@ import type { Roadmap } from "../models/roadmap.js";
 import type { ProjectState } from "./project-state.js";
 import type { LoadWarning } from "./errors.js";
 import type { ValidationResult } from "./validation.js";
+import type { LedgerIntegrityResult } from "./ledger-integrity.js";
 import type { NextTicketOutcome, NextTicketsOutcome } from "./queries.js";
 import type { RecommendResult } from "./recommend.js";
 import type { ReconcileResult } from "./reconcile.js";
@@ -562,6 +563,15 @@ export function formatIssue(
   if (issue.location.length > 0) {
     lines.push(`Location: ${issue.location.join(", ")}`);
   }
+  if (issue.sourceRefs && issue.sourceRefs.length > 0) {
+    const refs = issue.sourceRefs.map((ref) => {
+      const end = ref.endLine ?? ref.startLine;
+      const revision = ref.revision ? ` @ ${ref.revision.slice(0, 12)}` : "";
+      const review = ref.reviewId ? ` [${ref.reviewId}]` : "";
+      return `${ref.path}:${ref.startLine}-${end}${revision}${review}`;
+    });
+    lines.push(`Source evidence: ${refs.join(", ")}`);
+  }
   if (issue.relatedTickets.length > 0) {
     const display = state
       ? issue.relatedTickets.map((ref) => resolveTicketRefDisplay(ref, state)).join(", ")
@@ -650,6 +660,36 @@ export function formatValidation(
     }
   }
 
+  return lines.join("\n");
+}
+
+export function formatLedgerIntegrity(
+  result: LedgerIntegrityResult,
+  format: OutputFormat,
+): string {
+  if (format === "json") {
+    return JSON.stringify(successEnvelope(result), null, 2);
+  }
+
+  const lines = [
+    result.valid ? "Ledger integrity passed." : "Ledger integrity failed.",
+    `Scanned: ${result.scannedFiles} JSON file(s) | Errors: ${result.errorCount}`,
+    `Critical: ${result.criticalErrorCount} | Items: ${result.itemErrorCount} | Auxiliary: ${result.auxiliaryErrorCount}`,
+  ];
+  if (result.skippedSymlinks > 0) {
+    lines.push(`Skipped symlinks: ${result.skippedSymlinks}`);
+  }
+  if (result.findings.length > 0) {
+    lines.push("");
+    for (const finding of result.findings) {
+      const position = finding.line
+        ? ` at line ${finding.line}${finding.column ? `, column ${finding.column}` : ""}`
+        : "";
+      lines.push(
+        `ERROR [${finding.classification}] ${escapeMarkdownInline(finding.file)}${position}: ${escapeMarkdownInline(finding.message)}`,
+      );
+    }
+  }
   return lines.join("\n");
 }
 
@@ -1507,7 +1547,7 @@ export function formatReference(
   lines.push("");
   for (const tool of mcpTools) {
     const params = tool.params?.length ? ` (${tool.params.join(", ")})` : "";
-    lines.push(`- **${tool.name}**${params} — ${tool.description}`);
+    lines.push(`- **${tool.name}**${params} - ${tool.description}`);
   }
 
   lines.push("");

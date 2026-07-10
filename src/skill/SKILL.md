@@ -272,6 +272,8 @@ Don't duplicate what's already in the handover -- lessons are structured, tagged
 
 When working on a task and you encounter a bug, inconsistency, or improvement opportunity that is out of scope for the current ticket, create an issue using `storybloq issue create` (CLI) with a clear title, severity, and impact description. Don't fix it in the current task, don't ignore it -- log it. This keeps the issue tracker growing organically and ensures nothing discovered during work is lost. When orchestrating (`/story orchestrate`), anything the orchestrator files for later execution must be portable enough for the lowest permitted execution tier, so every ticket or issue you file is born in the enrichment template documented in `orchestrator-mode.md`, not a bare paragraph.
 
+**External and manual review filing:** Confirmed findings belong in the ledger directly, without a human copy/paste relay. Search for an existing issue first, then call `storybloq_issue_create` with reviewer attribution in `createdBy`, a stable retry identity in `dedupeKey`, and structured `sourceRefs` containing the review ID plus the reviewed path, line range, and revision when known. A good cross-agent key is `<review-id>:<finding-id>`; retries with the same key return the existing issue. Keep the new issue `open`. The implementing agent owns status and resolution. File uncertain design questions as notes or ask the owner instead of presenting them as confirmed defects. Never store source excerpts in custom metadata; Storybloq captures a line-range hash.
+
 When starting work on a ticket, update its status to `inprogress`. When done, update to `complete` in the same commit as the code change.
 
 **Frontend design guidance:** When working on UI or frontend tickets, read `design/design.md` in the same directory as this skill file for design principles and platform-specific best practices. Follow its priority order (clarity > hierarchy > platform correctness > accessibility > state completeness) and load the relevant platform reference. This applies to any ticket involving components, layouts, styling, or visual design.
@@ -285,13 +287,13 @@ Ticket and issue create/update operations are available via both CLI and MCP too
 CLI examples:
 - `storybloq ticket create --title "..." --type task --phase p0`
 - `storybloq ticket update T-001 --status complete`
-- `storybloq issue create --title "..." --severity high --impact "..."`
+- `storybloq issue create --title "..." --severity high --impact "..." --created-by "reviewer" --dedupe-key "review-42:finding-3" --source-ref '{"path":"src/file.ts","startLine":42,"revision":"<commit-sha>","reviewId":"review-42"}'`
 
 MCP examples:
 - `storybloq_ticket_create` with `title`, `type`, and optional `phase`, `description`, `blockedBy`, `parentTicket`
 - `storybloq_ticket_update` with `id` and optional `status`, `title`, `order`, `description`, `phase`, `parentTicket`
-- `storybloq_issue_create` with `title`, `severity`, `impact`, and optional `components`, `relatedTickets`, `location`, `phase`
-- `storybloq_issue_update` with `id` and optional `status`, `title`, `severity`, `impact`, `resolution`, `components`, `relatedTickets`, `location`
+- `storybloq_issue_create` with `title`, `severity`, `impact`, and optional `components`, `relatedTickets`, `location`, `sourceRefs`, `dedupeKey`, `createdBy`, `phase`
+- `storybloq_issue_update` with `id` and optional `status`, `title`, `severity`, `impact`, `resolution`, `components`, `relatedTickets`, `location`, `sourceRefs`
 
 Read operations (list, get, next, blocked) are available via both CLI and MCP.
 

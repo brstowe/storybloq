@@ -21,6 +21,8 @@ describe("T-385: field classification", () => {
     expect(rules.severity).toBeDefined();
     expect(rules.relatedTickets).toBeDefined();
     expect(rules.components).toBeDefined();
+    expect(rules.sourceRefs?.kind).toBe("commutative");
+    expect(rules.dedupeKey?.kind).toBe("identity");
   });
 
   it("coupled groups are symmetric", () => {

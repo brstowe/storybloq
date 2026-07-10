@@ -104,6 +104,18 @@ describe("validateProject", () => {
     expect(validateProject(state).findings.some((f) => f.code === "duplicate_issue_id")).toBe(true);
   });
 
+  it("reports duplicate issue dedupe keys", () => {
+    const state = makeState({
+      issues: [
+        makeIssue({ id: "ISS-001", dedupeKey: "review:shared" }),
+        makeIssue({ id: "ISS-002", dedupeKey: "review:shared" }),
+      ],
+    });
+    expect(
+      validateProject(state).findings.some((f) => f.code === "duplicate_issue_dedupe_key"),
+    ).toBe(true);
+  });
+
   it("reports duplicate note IDs", () => {
     const state = makeState({
       notes: [makeNote({ id: "N-001" }), makeNote({ id: "N-001" })],

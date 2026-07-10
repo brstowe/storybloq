@@ -90,14 +90,14 @@ storybloq issue get <id> [--format json|md]
 Create a new issue
 
 ```
-storybloq issue create --title <t> --severity <s> --impact <i> [--components <c>] [--related-tickets <ids>] [--location <locs>] [--phase <p>] [--format json|md]
+storybloq issue create --title <t> --severity <s> --impact <i> [--components <c>] [--related-tickets <ids>] [--location <locs>] [--source-ref <json>] [--dedupe-key <key>] [--created-by <reviewer>] [--phase <p>] [--format json|md]
 ```
 
 ### issue update
 Update an issue
 
 ```
-storybloq issue update <id> [--status <s>] [--title <t>] [--severity <sev>] [--impact <i>] [--resolution <r>] [--components <c>] [--related-tickets <ids>] [--location <locs>] [--order <n>] [--phase <p>] [--format json|md]
+storybloq issue update <id> [--status <s>] [--title <t>] [--severity <sev>] [--impact <i>] [--resolution <r>] [--components <c>] [--related-tickets <ids>] [--location <locs>] [--source-ref <json>] [--order <n>] [--phase <p>] [--format json|md]
 ```
 
 ### issue meta
@@ -297,10 +297,10 @@ storybloq lesson delete <id> [--hard] [--format json|md]
 ```
 
 ### validate
-Reference integrity + schema checks on all .story/ files
+Reference, schema, source-provenance, and loader-independent JSON checks
 
 ```
-storybloq validate [--format json|md]
+storybloq validate [--integrity-only] [--format json|md]
 ```
 
 ### snapshot
@@ -311,7 +311,7 @@ storybloq snapshot [--quiet] [--format json|md]
 ```
 
 ### recap
-Session diff — changes since last snapshot + suggested actions
+Session diff: changes since last snapshot + suggested actions
 
 ```
 storybloq recap [--format json|md]
@@ -339,7 +339,7 @@ storybloq reference [--format json|md]
 ```
 
 ### selftest
-Run integration smoke test — create/update/delete cycle across all entity types
+Run integration smoke test: create/update/delete cycle across all entity types
 
 ```
 storybloq selftest [--format json|md]
@@ -503,59 +503,59 @@ storybloq node remove <name> [--format json|md]
 
 The tools below are registered in full mode (inside a .story/ project).
 
-- **storybloq_status** (format?) — Project summary: phase statuses, ticket/issue counts, blockers. Markdown is the default; JSON includes full active/resumable session ownership and lease metadata.
-- **storybloq_phase_list** — All phases with derived status
-- **storybloq_phase_current** — First non-complete phase
-- **storybloq_phase_tickets** (phaseId) — Leaf tickets for a specific phase
-- **storybloq_ticket_list** (status?, phase?, type?) — List leaf tickets with optional filters
-- **storybloq_ticket_get** (id) — Get a ticket by ID
-- **storybloq_ticket_meta_get** (id, path?) — Get custom passthrough metadata from a ticket
-- **storybloq_ticket_next** (count?) — Highest-priority unblocked ticket(s)
-- **storybloq_ticket_blocked** — All blocked tickets with dependencies
-- **storybloq_issue_list** (status?, severity?, component?, phase?) — List issues with optional filters
-- **storybloq_issue_get** (id) — Get an issue by ID
-- **storybloq_issue_meta_get** (id, path?) — Get custom passthrough metadata from an issue
-- **storybloq_handover_list** — List handover filenames (newest first)
-- **storybloq_handover_latest** — Content of most recent handover
-- **storybloq_handover_get** (filename) — Content of a specific handover
-- **storybloq_handover_create** (content, slug?) — Create a handover from markdown content
-- **storybloq_blocker_list** — All roadmap blockers with status
-- **storybloq_validate** — Reference integrity + schema checks
-- **storybloq_recap** — Session diff — changes since last snapshot
-- **storybloq_recommend** (count?) — Context-aware ranked work suggestions
-- **storybloq_snapshot** — Save current project state snapshot
-- **storybloq_export** (phase?, all?) — Self-contained project document
-- **storybloq_note_list** (status?, tag?) — List notes
-- **storybloq_note_get** (id) — Get note by ID
-- **storybloq_note_create** (content, title?, tags?) — Create note
-- **storybloq_note_update** (id, content?, title?, tags?, status?) — Update note
-- **storybloq_ticket_create** (title, type, phase?, description?, blockedBy?, parentTicket?) — Create ticket
-- **storybloq_ticket_update** (id, status?, title?, type?, order?, description?, phase?, parentTicket?, blockedBy?) — Update ticket
-- **storybloq_ticket_meta_set** (id, path, value) — Set custom passthrough metadata on a ticket
-- **storybloq_ticket_meta_unset** (id, path) — Unset custom passthrough metadata from a ticket
-- **storybloq_issue_create** (title, severity, impact, components?, relatedTickets?, location?, phase?) — Create issue
-- **storybloq_issue_update** (id, status?, title?, severity?, impact?, resolution?, components?, relatedTickets?, location?, order?, phase?) — Update issue
-- **storybloq_issue_meta_set** (id, path, value) — Set custom passthrough metadata on an issue
-- **storybloq_issue_meta_unset** (id, path) — Unset custom passthrough metadata from an issue
-- **storybloq_phase_create** (id, name, label, description, summary?, after?, atStart?) — Create phase in roadmap
-- **storybloq_lesson_list** (status?, tag?, source?) — List lessons
-- **storybloq_lesson_get** (id) — Get lesson by ID
-- **storybloq_lesson_digest** — Ranked digest of active lessons for context loading
-- **storybloq_lesson_create** (title, content, context, source, tags?, supersedes?) — Create lesson
-- **storybloq_lesson_update** (id, title?, content?, context?, tags?, status?, supersedes?) — Update lesson
-- **storybloq_lesson_reinforce** (id) — Reinforce lesson — increment count and update lastValidated
-- **storybloq_selftest** — Integration smoke test — create/update/delete cycle
-- **storybloq_review_lenses_prepare** (stage, diff, changedFiles, ticketDescription?, reviewRound?, priorDeferrals?, sessionId?) — Prepare multi-lens review on @storybloq/lenses: activation, secrets gate, context packaging, complete lens prompts
-- **storybloq_review_lenses_synthesize** (stage?, lensResults, activeLenses, skippedLenses, reviewRound?, reviewId?, diff?, changedFiles?, sessionId?) — Run the @storybloq/lenses merger pipeline programmatically over raw lens outputs; returns the ReviewVerdict envelope (no merger agent)
-- **storybloq_review_lenses_judge** (reviewVerdict, convergenceHistory?) — Deterministic three-value verdict mapping over the synthesize ReviewVerdict plus convergence history (no judge agent)
-- **storybloq_autonomous_guide** (sessionId?, action, mode?, ticketId?, clientTaskId?, takeover?) — Autonomous session orchestrator -- call at every decision point to drive PICK_TICKET through COMPLETE
-- **storybloq_session_report** (sessionId) — Structured analysis of an autonomous session (works even if project state is corrupted)
-- **storybloq_register_subprocess** (pid, cmd, category?, sessionId?) — Register a running subprocess so monitors can tell slow builds from hung agents
-- **storybloq_unregister_subprocess** (pid, sessionId?) — Unregister a subprocess after it completes (idempotent)
-- **storybloq_node_list** — List configured federation nodes in an orchestrator project
-- **storybloq_node_init** (node, type?, language?) — Initialize .story/ in a federation child node from the orchestrator
-- **storybloq_node_add** (name, path, role?, kind?) — Add a federation node to an orchestrator project's config
-- **storybloq_node_update** (name, path?, role?) — Update a federation node's metadata (shallow-merge)
+- **storybloq_status** (format?) - Project summary: phase statuses, ticket/issue counts, blockers. Markdown is the default; JSON includes full active/resumable session ownership and lease metadata.
+- **storybloq_phase_list** - All phases with derived status
+- **storybloq_phase_current** - First non-complete phase
+- **storybloq_phase_tickets** (phaseId) - Leaf tickets for a specific phase
+- **storybloq_ticket_list** (status?, phase?, type?) - List leaf tickets with optional filters
+- **storybloq_ticket_get** (id) - Get a ticket by ID
+- **storybloq_ticket_meta_get** (id, path?) - Get custom passthrough metadata from a ticket
+- **storybloq_ticket_next** (count?) - Highest-priority unblocked ticket(s)
+- **storybloq_ticket_blocked** - All blocked tickets with dependencies
+- **storybloq_issue_list** (status?, severity?, component?, phase?) - List issues with optional filters
+- **storybloq_issue_get** (id) - Get an issue by ID
+- **storybloq_issue_meta_get** (id, path?) - Get custom passthrough metadata from an issue
+- **storybloq_handover_list** - List handover filenames (newest first)
+- **storybloq_handover_latest** - Content of most recent handover
+- **storybloq_handover_get** (filename) - Content of a specific handover
+- **storybloq_handover_create** (content, slug?) - Create a handover from markdown content
+- **storybloq_blocker_list** - All roadmap blockers with status
+- **storybloq_validate** (format?, integrityOnly?) - Reference, schema, source-provenance, and loader-independent JSON checks
+- **storybloq_recap** - Session diff: changes since last snapshot
+- **storybloq_recommend** (count?) - Context-aware ranked work suggestions
+- **storybloq_snapshot** - Save current project state snapshot
+- **storybloq_export** (phase?, all?) - Self-contained project document
+- **storybloq_note_list** (status?, tag?) - List notes
+- **storybloq_note_get** (id) - Get note by ID
+- **storybloq_note_create** (content, title?, tags?) - Create note
+- **storybloq_note_update** (id, content?, title?, tags?, status?) - Update note
+- **storybloq_ticket_create** (title, type, phase?, description?, blockedBy?, parentTicket?) - Create ticket
+- **storybloq_ticket_update** (id, status?, title?, type?, order?, description?, phase?, parentTicket?, blockedBy?) - Update ticket
+- **storybloq_ticket_meta_set** (id, path, value) - Set custom passthrough metadata on a ticket
+- **storybloq_ticket_meta_unset** (id, path) - Unset custom passthrough metadata from a ticket
+- **storybloq_issue_create** (title, severity, impact, components?, relatedTickets?, location?, sourceRefs?, dedupeKey?, createdBy?, phase?) - Create issue with optional durable review provenance and retry deduplication
+- **storybloq_issue_update** (id, status?, title?, severity?, impact?, resolution?, components?, relatedTickets?, location?, sourceRefs?, order?, phase?) - Update issue
+- **storybloq_issue_meta_set** (id, path, value) - Set custom passthrough metadata on an issue
+- **storybloq_issue_meta_unset** (id, path) - Unset custom passthrough metadata from an issue
+- **storybloq_phase_create** (id, name, label, description, summary?, after?, atStart?) - Create phase in roadmap
+- **storybloq_lesson_list** (status?, tag?, source?) - List lessons
+- **storybloq_lesson_get** (id) - Get lesson by ID
+- **storybloq_lesson_digest** - Ranked digest of active lessons for context loading
+- **storybloq_lesson_create** (title, content, context, source, tags?, supersedes?) - Create lesson
+- **storybloq_lesson_update** (id, title?, content?, context?, tags?, status?, supersedes?) - Update lesson
+- **storybloq_lesson_reinforce** (id) - Reinforce lesson: increment count and update lastValidated
+- **storybloq_selftest** - Integration smoke test: create/update/delete cycle
+- **storybloq_review_lenses_prepare** (stage, diff, changedFiles, ticketDescription?, reviewRound?, priorDeferrals?, sessionId?) - Prepare multi-lens review on @storybloq/lenses: activation, secrets gate, context packaging, complete lens prompts
+- **storybloq_review_lenses_synthesize** (stage?, lensResults, activeLenses, skippedLenses, reviewRound?, reviewId?, diff?, changedFiles?, sessionId?) - Run the @storybloq/lenses merger pipeline programmatically over raw lens outputs; returns the ReviewVerdict envelope (no merger agent)
+- **storybloq_review_lenses_judge** (reviewVerdict, convergenceHistory?) - Deterministic three-value verdict mapping over the synthesize ReviewVerdict plus convergence history (no judge agent)
+- **storybloq_autonomous_guide** (sessionId?, action, mode?, ticketId?, clientTaskId?, takeover?) - Autonomous session orchestrator -- call at every decision point to drive PICK_TICKET through COMPLETE
+- **storybloq_session_report** (sessionId) - Structured analysis of an autonomous session (works even if project state is corrupted)
+- **storybloq_register_subprocess** (pid, cmd, category?, sessionId?) - Register a running subprocess so monitors can tell slow builds from hung agents
+- **storybloq_unregister_subprocess** (pid, sessionId?) - Unregister a subprocess after it completes (idempotent)
+- **storybloq_node_list** - List configured federation nodes in an orchestrator project
+- **storybloq_node_init** (node, type?, language?) - Initialize .story/ in a federation child node from the orchestrator
+- **storybloq_node_add** (name, path, role?, kind?) - Add a federation node to an orchestrator project's config
+- **storybloq_node_update** (name, path?, role?) - Update a federation node's metadata (shallow-merge)
 
 ### MCP Tools (degraded mode)
 

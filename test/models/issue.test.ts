@@ -1,7 +1,11 @@
 import { describe, it, expect } from "vitest";
 import { resolve } from "node:path";
 import { fixturesDir, readJson } from "../helpers.js";
-import { IssueSchema } from "../../src/models/issue.js";
+import {
+  IssueSchema,
+  IssueSourceRefInputSchema,
+  IssueSourceRefSchema,
+} from "../../src/models/issue.js";
 
 describe("IssueSchema", () => {
   describe("valid issues", () => {
@@ -116,6 +120,67 @@ describe("IssueSchema", () => {
           expect(reparsed.data.extraField).toBe("preserved");
         }
       }
+    });
+  });
+
+  describe("source references", () => {
+    const hash = "a".repeat(64);
+
+    it("accepts durable revision and hash provenance", () => {
+      const result = IssueSourceRefSchema.safeParse({
+        path: "src/example.ts",
+        startLine: 4,
+        endLine: 6,
+        revision: "abcdef12",
+        contentHash: hash,
+        reviewId: "review-1",
+      });
+      expect(result.success).toBe(true);
+    });
+
+    it("allows write input without a hash so the handler can capture it", () => {
+      expect(IssueSourceRefInputSchema.safeParse({
+        path: "src/example.ts",
+        startLine: 4,
+      }).success).toBe(true);
+    });
+
+    it("requires durable persisted provenance", () => {
+      expect(IssueSourceRefSchema.safeParse({
+        path: "src/example.ts",
+        startLine: 4,
+      }).success).toBe(false);
+    });
+
+    it.each([
+      "/tmp/example.ts",
+      "../example.ts",
+      "src/../example.ts",
+      "src\\example.ts",
+      "src/example.ts:4",
+    ])("rejects unsafe source path %s", (path) => {
+      expect(IssueSourceRefInputSchema.safeParse({ path, startLine: 1 }).success).toBe(false);
+    });
+
+    it("rejects reversed line ranges and malformed hashes", () => {
+      expect(IssueSourceRefInputSchema.safeParse({
+        path: "src/example.ts",
+        startLine: 5,
+        endLine: 4,
+      }).success).toBe(false);
+      expect(IssueSourceRefSchema.safeParse({
+        path: "src/example.ts",
+        startLine: 1,
+        contentHash: "not-a-hash",
+      }).success).toBe(false);
+    });
+
+    it("rejects control characters in provenance identifiers", () => {
+      expect(IssueSourceRefInputSchema.safeParse({
+        path: "src/example.ts",
+        startLine: 1,
+        reviewId: "review\u001b[2J",
+      }).success).toBe(false);
     });
   });
 });

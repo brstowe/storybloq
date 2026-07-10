@@ -165,7 +165,7 @@ All commands accept `--format json|md` (default `md`). Pipe JSON through `jq` fo
 |---------|-------------|
 | `storybloq init [--name] [--type orchestrator] [--force]` | Scaffold `.story/` (add `--type orchestrator` for multi-repo) |
 | `storybloq status` | Project summary with phase statuses, counts, and risks |
-| `storybloq validate` | Reference integrity + schema checks |
+| `storybloq validate [--integrity-only]` | Reference, schema, source-provenance, and loader-independent JSON checks |
 | `storybloq setup --client claude\|codex\|all [--skip-hooks]` | Install Storybloq skills, register MCP, and configure client hooks |
 | `storybloq setup-skill [--skip-hooks]` | Compatibility alias for `storybloq setup --client claude` |
 | `storybloq recommend --count N` | Context-aware work suggestions |
@@ -201,8 +201,8 @@ All commands accept `--format json|md` (default `md`). Pipe JSON through `jq` fo
 |---------|-------------|
 | `storybloq issue list [--status] [--severity] [--component] [--phase]` | List issues |
 | `storybloq issue get <id>` | Issue detail |
-| `storybloq issue create --title --severity --impact [--components] [--related-tickets] [--location]` | Create |
-| `storybloq issue update <id> [--status] [--title] [--severity] ...` | Update |
+| `storybloq issue create --title --severity --impact [--components] [--related-tickets] [--location] [--source-ref <json>] [--dedupe-key] [--created-by]` | Create, with optional durable review evidence and retry identity |
+| `storybloq issue update <id> [--status] [--title] [--severity] [--source-ref <json>] ...` | Update |
 | `storybloq issue meta get\|set\|unset <id> [path] [value]` | Manage custom passthrough metadata |
 | `storybloq issue delete <id>` | Delete |
 
@@ -369,6 +369,15 @@ Full type definitions ship with the package (`exports.types`).
   "components": ["mac-app"],
   "impact": "Dragging tickets on trackpad requires multiple tries.",
   "location": ["macos/Views/KanbanCard.swift:42"],
+  "sourceRefs": [{
+    "path": "macos/Views/KanbanCard.swift",
+    "startLine": 42,
+    "revision": "5ac37f94f7023b18f72d8e3fcf43dd64f54c11d7",
+    "contentHash": "f5b1b1b65dca3d9d86adf7c5d49082aa4dc09e7903ab46ce50e8cc6b4812e4cf",
+    "reviewId": "review-2026-04-15"
+  }],
+  "dedupeKey": "review-2026-04-15:finding-3",
+  "createdBy": "external-reviewer",
   "discoveredDate": "2026-04-15",
   "resolvedDate": null,
   "relatedTickets": []
@@ -378,6 +387,12 @@ Full type definitions ship with the package (`exports.types`).
 Each record is its own file. IDs are sequential within type (`T-001`, `T-002`, ...). Relationships are single-canonical-owner: a ticket's `blockedBy` field points at blocker tickets, and the reverse (who-blocks-me) is derived by scanning.
 
 Create operations are safe to run in parallel. ID assignment and the create write happen together under a project lock, so concurrent creators are serialized and each receives a distinct sequential ID. A create can never silently overwrite an existing record; under heavy simultaneous contention a creator fails loudly with an error rather than colliding.
+
+Issue `sourceRefs` preserve review evidence independently of mutable `path:line` display strings. Storybloq hashes only the normalized referenced line range and never stores source excerpts. A supplied revision is resolved to a Git commit; otherwise Storybloq captures the working-tree range and records HEAD only when those bytes match. `storybloq validate` reports an error when original evidence cannot be resolved, a warning when valid historical evidence moved or changed at HEAD, and no finding when it still matches.
+
+Use `storybloq validate --integrity-only` when damaged `config.json` or `roadmap.json` prevents normal loading. This read-only preflight scans every `.story/**/*.json` file in one pass, reports parser positions where available, and separates critical singleton failures from skippable item and auxiliary-file failures. It never rewrites damaged files.
+
+Confirmed manual or external review findings should be filed directly as open issues. Search first, pass reviewer attribution in `createdBy`, attach the review ID and revision through `sourceRefs`, and use a stable `dedupeKey` such as `<review-id>:<finding-id>` so retries are idempotent. Keep uncertain design questions as notes or owner questions; the implementing agent owns issue status and resolution.
 
 Ticket and issue records preserve unknown JSON fields. Use `storybloq ticket meta` and `storybloq issue meta` to read or mutate those custom passthrough fields without touching core Storybloq fields. Values are JSON, and dot paths address nested objects, for example `storybloq ticket meta set T-001 integration.linear '"ABC-123"'`.
 

@@ -10,6 +10,67 @@ import {
   ConflictEntrySchema,
 } from "./types.js";
 
+const SOURCE_HASH_PATTERN = /^[a-f0-9]{64}$/i;
+const REVISION_PATTERN = /^[a-f0-9]{4,64}$/i;
+
+function hasNoControlCharacters(value: string): boolean {
+  return !/[\x00-\x1f\x7f]/.test(value);
+}
+
+function isSafeSourcePath(value: string): boolean {
+  if (value.startsWith("/") || value.includes("\\") || value.includes(":")) return false;
+  if (!hasNoControlCharacters(value)) return false;
+  const segments = value.split("/");
+  return segments.every((segment) => segment.length > 0 && segment !== "." && segment !== "..");
+}
+
+function opaqueId(max: number) {
+  return z.string().min(1).max(max).refine(
+    hasNoControlCharacters,
+    "Value must not contain control characters",
+  );
+}
+
+const IssueSourceRefBaseSchema = z
+  .object({
+    path: z.string().min(1).max(1024).refine(isSafeSourcePath, "Source path must be a safe repo-relative POSIX path"),
+    startLine: z.number().int().positive(),
+    endLine: z.number().int().positive().optional(),
+    revision: z.string().regex(REVISION_PATTERN, "Revision must be a hexadecimal Git object ID").optional(),
+    snapshotId: opaqueId(256).optional(),
+    contentHash: z.string().regex(SOURCE_HASH_PATTERN, "Content hash must be a SHA-256 hex digest").optional(),
+    reviewId: opaqueId(256).optional(),
+  })
+  .strict()
+  .superRefine((ref, ctx) => {
+    if (ref.endLine !== undefined && ref.endLine < ref.startLine) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["endLine"],
+        message: "End line must be greater than or equal to start line",
+      });
+    }
+  });
+
+/** Input shape accepted at write boundaries before Storybloq captures a hash. */
+export const IssueSourceRefInputSchema = IssueSourceRefBaseSchema;
+
+/** Durable source reference. A revision or captured line-range hash is required. */
+export const IssueSourceRefSchema = IssueSourceRefBaseSchema.superRefine((ref, ctx) => {
+  if (!ref.revision && !ref.contentHash) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["contentHash"],
+      message: "A durable source reference requires revision or contentHash",
+    });
+  }
+});
+
+export type IssueSourceRefInput = z.input<typeof IssueSourceRefInputSchema>;
+export type IssueSourceRef = z.infer<typeof IssueSourceRefSchema>;
+
+export const IssueDedupeKeySchema = opaqueId(512);
+
 export const IssueSchema = z
   .object({
     id: IssueIdSchema,
@@ -20,6 +81,8 @@ export const IssueSchema = z
     impact: z.string(),
     resolution: z.string().nullable(),
     location: z.array(z.string()),
+    sourceRefs: z.array(IssueSourceRefSchema).optional(),
+    dedupeKey: IssueDedupeKeySchema.optional(),
     discoveredDate: DateSchema,
     resolvedDate: DateSchema.nullable(),
     relatedTickets: z.array(TicketIdSchema),

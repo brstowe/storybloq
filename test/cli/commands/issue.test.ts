@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { mkdtemp, rm, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, rm, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -316,6 +316,88 @@ describe("handleIssueCreate", () => {
     expect(parsed.data.phase).toBe("p0");
   });
 
+  it("captures structured source provenance without storing source text", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "issue-create-"));
+    tmpDirs.push(dir);
+    await initProject(dir, { name: "test" });
+    await writeFile(join(dir, "source.ts"), "one\ntwo\nthree\n", "utf8");
+
+    const result = await handleIssueCreate(
+      {
+        title: "Anchored",
+        severity: "high",
+        impact: "broken",
+        components: [],
+        relatedTickets: [],
+        location: ["source.ts:2"],
+        sourceRefs: [{ path: "source.ts", startLine: 2, reviewId: "review-1" }],
+        createdBy: "external-reviewer",
+      },
+      "json",
+      dir,
+    );
+
+    const issue = JSON.parse(result.output).data;
+    expect(issue.createdBy).toBe("external-reviewer");
+    expect(issue.sourceRefs).toEqual([
+      expect.objectContaining({
+        path: "source.ts",
+        startLine: 2,
+        reviewId: "review-1",
+        contentHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+      }),
+    ]);
+    expect(JSON.stringify(issue)).not.toContain("two");
+  });
+
+  it("returns the existing issue for a repeated dedupe key", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "issue-create-"));
+    tmpDirs.push(dir);
+    await initProject(dir, { name: "test" });
+    const args = {
+      title: "One finding",
+      severity: "medium",
+      impact: "broken",
+      components: [],
+      relatedTickets: [],
+      location: [],
+      dedupeKey: "review:file.ts:4:error-handling",
+    };
+
+    const first = JSON.parse((await handleIssueCreate(args, "json", dir)).output);
+    const second = JSON.parse((await handleIssueCreate(args, "json", dir)).output);
+    const files = await readdir(join(dir, ".story", "issues"));
+
+    expect(second.data.id).toBe(first.data.id);
+    expect(second.meta).toEqual({ deduplicated: true });
+    expect(files.filter((file) => file.endsWith(".json"))).toHaveLength(1);
+  });
+
+  it("deduplicates before re-reading source evidence on a retry", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "issue-create-"));
+    tmpDirs.push(dir);
+    await initProject(dir, { name: "test" });
+    const sourcePath = join(dir, "source.ts");
+    await writeFile(sourcePath, "one\ntwo\n", "utf8");
+    const args = {
+      title: "One finding",
+      severity: "medium",
+      impact: "broken",
+      components: [],
+      relatedTickets: [],
+      location: ["source.ts:2"],
+      sourceRefs: [{ path: "source.ts", startLine: 2 }],
+      dedupeKey: "review:source.ts:2:error-handling",
+    };
+
+    const first = JSON.parse((await handleIssueCreate(args, "json", dir)).output);
+    await rm(sourcePath);
+    const second = JSON.parse((await handleIssueCreate(args, "json", dir)).output);
+
+    expect(second.data.id).toBe(first.data.id);
+    expect(second.meta).toEqual({ deduplicated: true });
+  });
+
   it("rejects nonexistent phase", async () => {
     const dir = await mkdtemp(join(tmpdir(), "issue-create-"));
     tmpDirs.push(dir);
@@ -416,6 +498,28 @@ describe("handleIssueUpdate", () => {
     const result = await handleIssueUpdate("ISS-001", { phase: "p0" }, "json", dir);
     const parsed = JSON.parse(result.output);
     expect(parsed.data.phase).toBe("p0");
+  });
+
+  it("replaces and normalizes structured source provenance", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "issue-update-"));
+    tmpDirs.push(dir);
+    await setupIssue(dir);
+    await writeFile(join(dir, "source.ts"), "one\ntwo\n", "utf8");
+
+    const result = await handleIssueUpdate(
+      "ISS-001",
+      { sourceRefs: [{ path: "source.ts", startLine: 2 }] },
+      "json",
+      dir,
+    );
+
+    expect(JSON.parse(result.output).data.sourceRefs[0]).toEqual(
+      expect.objectContaining({
+        path: "source.ts",
+        startLine: 2,
+        contentHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+      }),
+    );
   });
 
   it("clears phase to null", async () => {

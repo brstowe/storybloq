@@ -79,14 +79,14 @@ export const COMMANDS: readonly CommandEntry[] = [
   {
     name: "issue create",
     description: "Create a new issue",
-    usage: "storybloq issue create --title <t> --severity <s> --impact <i> [--components <c>] [--related-tickets <ids>] [--location <locs>] [--phase <p>] [--format json|md]",
-    flags: ["--title", "--severity", "--impact", "--components", "--related-tickets", "--location", "--phase"],
+    usage: "storybloq issue create --title <t> --severity <s> --impact <i> [--components <c>] [--related-tickets <ids>] [--location <locs>] [--source-ref <json>] [--dedupe-key <key>] [--created-by <reviewer>] [--phase <p>] [--format json|md]",
+    flags: ["--title", "--severity", "--impact", "--components", "--related-tickets", "--location", "--source-ref", "--dedupe-key", "--created-by", "--phase"],
   },
   {
     name: "issue update",
     description: "Update an issue",
-    usage: "storybloq issue update <id> [--status <s>] [--title <t>] [--severity <sev>] [--impact <i>] [--resolution <r>] [--components <c>] [--related-tickets <ids>] [--location <locs>] [--order <n>] [--phase <p>] [--format json|md]",
-    flags: ["--status", "--title", "--severity", "--impact", "--resolution", "--components", "--related-tickets", "--location", "--order", "--phase"],
+    usage: "storybloq issue update <id> [--status <s>] [--title <t>] [--severity <sev>] [--impact <i>] [--resolution <r>] [--components <c>] [--related-tickets <ids>] [--location <locs>] [--source-ref <json>] [--order <n>] [--phase <p>] [--format json|md]",
+    flags: ["--status", "--title", "--severity", "--impact", "--resolution", "--components", "--related-tickets", "--location", "--source-ref", "--order", "--phase"],
   },
   {
     name: "issue meta",
@@ -245,8 +245,9 @@ export const COMMANDS: readonly CommandEntry[] = [
   },
   {
     name: "validate",
-    description: "Reference integrity + schema checks on all .story/ files",
-    usage: "storybloq validate [--format json|md]",
+    description: "Reference, schema, source-provenance, and loader-independent JSON checks",
+    usage: "storybloq validate [--integrity-only] [--format json|md]",
+    flags: ["--integrity-only"],
   },
   {
     name: "snapshot",
@@ -256,7 +257,7 @@ export const COMMANDS: readonly CommandEntry[] = [
   },
   {
     name: "recap",
-    description: "Session diff — changes since last snapshot + suggested actions",
+    description: "Session diff: changes since last snapshot + suggested actions",
     usage: "storybloq recap [--format json|md]",
   },
   {
@@ -277,7 +278,7 @@ export const COMMANDS: readonly CommandEntry[] = [
   },
   {
     name: "selftest",
-    description: "Run integration smoke test — create/update/delete cycle across all entity types",
+    description: "Run integration smoke test: create/update/delete cycle across all entity types",
     usage: "storybloq selftest [--format json|md]",
   },
   {
@@ -423,8 +424,8 @@ export const MCP_TOOLS: readonly McpToolEntry[] = [
   { name: "storybloq_handover_get", description: "Content of a specific handover", params: ["filename"] },
   { name: "storybloq_handover_create", description: "Create a handover from markdown content", params: ["content", "slug?"] },
   { name: "storybloq_blocker_list", description: "All roadmap blockers with status" },
-  { name: "storybloq_validate", description: "Reference integrity + schema checks" },
-  { name: "storybloq_recap", description: "Session diff — changes since last snapshot" },
+  { name: "storybloq_validate", description: "Reference, schema, source-provenance, and loader-independent JSON checks", params: ["format?", "integrityOnly?"] },
+  { name: "storybloq_recap", description: "Session diff: changes since last snapshot" },
   { name: "storybloq_recommend", description: "Context-aware ranked work suggestions", params: ["count?"] },
   { name: "storybloq_snapshot", description: "Save current project state snapshot" },
   { name: "storybloq_export", description: "Self-contained project document", params: ["phase?", "all?"] },
@@ -436,8 +437,8 @@ export const MCP_TOOLS: readonly McpToolEntry[] = [
   { name: "storybloq_ticket_update", description: "Update ticket", params: ["id", "status?", "title?", "type?", "order?", "description?", "phase?", "parentTicket?", "blockedBy?"] },
   { name: "storybloq_ticket_meta_set", description: "Set custom passthrough metadata on a ticket", params: ["id", "path", "value"] },
   { name: "storybloq_ticket_meta_unset", description: "Unset custom passthrough metadata from a ticket", params: ["id", "path"] },
-  { name: "storybloq_issue_create", description: "Create issue", params: ["title", "severity", "impact", "components?", "relatedTickets?", "location?", "phase?"] },
-  { name: "storybloq_issue_update", description: "Update issue", params: ["id", "status?", "title?", "severity?", "impact?", "resolution?", "components?", "relatedTickets?", "location?", "order?", "phase?"] },
+  { name: "storybloq_issue_create", description: "Create issue with optional durable review provenance and retry deduplication", params: ["title", "severity", "impact", "components?", "relatedTickets?", "location?", "sourceRefs?", "dedupeKey?", "createdBy?", "phase?"] },
+  { name: "storybloq_issue_update", description: "Update issue", params: ["id", "status?", "title?", "severity?", "impact?", "resolution?", "components?", "relatedTickets?", "location?", "sourceRefs?", "order?", "phase?"] },
   { name: "storybloq_issue_meta_set", description: "Set custom passthrough metadata on an issue", params: ["id", "path", "value"] },
   { name: "storybloq_issue_meta_unset", description: "Unset custom passthrough metadata from an issue", params: ["id", "path"] },
   { name: "storybloq_phase_create", description: "Create phase in roadmap", params: ["id", "name", "label", "description", "summary?", "after?", "atStart?"] },
@@ -446,8 +447,8 @@ export const MCP_TOOLS: readonly McpToolEntry[] = [
   { name: "storybloq_lesson_digest", description: "Ranked digest of active lessons for context loading" },
   { name: "storybloq_lesson_create", description: "Create lesson", params: ["title", "content", "context", "source", "tags?", "supersedes?"] },
   { name: "storybloq_lesson_update", description: "Update lesson", params: ["id", "title?", "content?", "context?", "tags?", "status?", "supersedes?"] },
-  { name: "storybloq_lesson_reinforce", description: "Reinforce lesson — increment count and update lastValidated", params: ["id"] },
-  { name: "storybloq_selftest", description: "Integration smoke test — create/update/delete cycle" },
+  { name: "storybloq_lesson_reinforce", description: "Reinforce lesson: increment count and update lastValidated", params: ["id"] },
+  { name: "storybloq_selftest", description: "Integration smoke test: create/update/delete cycle" },
   { name: "storybloq_review_lenses_prepare", description: "Prepare multi-lens review on @storybloq/lenses: activation, secrets gate, context packaging, complete lens prompts", params: ["stage", "diff", "changedFiles", "ticketDescription?", "reviewRound?", "priorDeferrals?", "sessionId?"] },
   { name: "storybloq_review_lenses_synthesize", description: "Run the @storybloq/lenses merger pipeline programmatically over raw lens outputs; returns the ReviewVerdict envelope (no merger agent)", params: ["stage?", "lensResults", "activeLenses", "skippedLenses", "reviewRound?", "reviewId?", "diff?", "changedFiles?", "sessionId?"] },
   { name: "storybloq_review_lenses_judge", description: "Deterministic three-value verdict mapping over the synthesize ReviewVerdict plus convergence history (no judge agent)", params: ["reviewVerdict", "convergenceHistory?"] },
