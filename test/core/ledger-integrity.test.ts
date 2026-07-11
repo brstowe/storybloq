@@ -51,6 +51,10 @@ describe("loader-independent ledger integrity", () => {
       line: expect.any(Number),
       column: expect.any(Number),
     }));
+    for (const finding of result.findings.filter((entry) => entry.code === "invalid_json")) {
+      expect(finding.line).toEqual(expect.any(Number));
+      expect(finding.column).toEqual(expect.any(Number));
+    }
   });
 
   it("distinguishes known schema failures from JSON syntax failures", async () => {

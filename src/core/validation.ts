@@ -74,7 +74,7 @@ export function validateProject(state: ProjectState): ValidationResult {
 
   // Dedupe keys are idempotency identities, so two issues may never share one.
   const issueDedupeKeys = new Map<string, string[]>();
-  for (const issue of state.issues) {
+  for (const issue of state.activeIssues) {
     if (!issue.dedupeKey) continue;
     const ids = issueDedupeKeys.get(issue.dedupeKey) ?? [];
     ids.push(displayIdOf(issue));

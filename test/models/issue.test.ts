@@ -145,6 +145,22 @@ describe("IssueSchema", () => {
       }).success).toBe(true);
     });
 
+    it("keeps write input strict while persisted refs preserve additive fields", () => {
+      const candidate = {
+        path: "src/example.ts",
+        startLine: 4,
+        contentHash: hash,
+        futureEvidence: { provider: "review-v2" },
+      };
+
+      expect(IssueSourceRefInputSchema.safeParse(candidate).success).toBe(false);
+      const persisted = IssueSourceRefSchema.safeParse(candidate);
+      expect(persisted.success).toBe(true);
+      if (persisted.success) {
+        expect(persisted.data.futureEvidence).toEqual({ provider: "review-v2" });
+      }
+    });
+
     it("requires durable persisted provenance", () => {
       expect(IssueSourceRefSchema.safeParse({
         path: "src/example.ts",

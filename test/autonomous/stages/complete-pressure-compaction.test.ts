@@ -9,7 +9,9 @@ import {
   pressureMeetsThreshold,
 } from "../../../src/autonomous/context-pressure.js";
 import type { FullSessionState } from "../../../src/autonomous/session-types.js";
+import "../../../src/autonomous/stages/index.js";
 import { CompleteStage } from "../../../src/autonomous/stages/complete.js";
+import { HandoverStage } from "../../../src/autonomous/stages/handover.js";
 import {
   isStageAdvance,
   StageContext,
@@ -48,6 +50,7 @@ function makeState(overrides: Partial<FullSessionState> = {}): FullSessionState 
     compactPending: false,
     compactPreparedAt: null,
     resumeBlocked: false,
+    contextRotation: null,
     terminationReason: null,
     waitingForRetry: false,
     lastGuideCall: now,
@@ -206,8 +209,42 @@ describe("CompleteStage pressure compaction", () => {
     }
     expect(instructionOf(result)).toContain("Context Rotation Required");
     expect(instructionOf(result)).not.toContain('"action": "pre_compact"');
+    expect(ctx.state.contextRotation).toMatchObject({
+      level: "high",
+      compactThreshold: "high",
+      ticketsDone: 1,
+      issuesDone: 0,
+    });
     expect(ctx.state.state).toBe("COMPLETE");
     expect(ctx.state.status).toBe("active");
+  });
+
+  it("runs enabled post-complete stages before a pressure-rotation handover", async () => {
+    addOpenWork();
+    const state = makeState({
+      contextPressure: {
+        level: "low",
+        guideCallCount: 60,
+        ticketsCompleted: 1,
+        compactionCount: 0,
+        eventsLogBytes: 0,
+      },
+    });
+    const recipe: ResolvedRecipe = {
+      ...makeRecipe(),
+      postComplete: ["LESSON_CAPTURE"],
+      stages: { LESSON_CAPTURE: { enabled: true } },
+    };
+    const ctx = new StageContext(root, sessionDir, state, recipe);
+
+    const result = await stage.enter(ctx);
+
+    expect(result.action).toBe("goto");
+    if (result.action === "goto") {
+      expect(result.target).toBe("LESSON_CAPTURE");
+    }
+    expect(ctx.state.pipelinePhase).toBe("postComplete");
+    expect(ctx.state.contextRotation?.level).toBe("high");
   });
 
   it("waits for critical pressure when configured conservatively", async () => {
@@ -232,6 +269,10 @@ describe("CompleteStage pressure compaction", () => {
     const result = await stage.enter(ctx);
 
     expect(isStageAdvance(result)).toBe(true);
+    if (isStageAdvance(result) && result.action === "goto") {
+      expect(result.target).toBe("PICK_TICKET");
+    }
+    expect(ctx.state.contextRotation).toBeNull();
   });
 
   it("routes to HANDOVER at critical pressure under the critical threshold", async () => {
@@ -332,5 +373,27 @@ describe("CompleteStage pressure compaction", () => {
 
     expect(readdirSync(join(root, ".story", "handovers"))).toHaveLength(1);
     expect(ctx.state.lastCheckpointWorkCount).toBe(3);
+  });
+
+  it("preserves rotation reason and remaining targets in the final handover", async () => {
+    const state = makeState({
+      state: "HANDOVER",
+      targetWorkDisplayIds: { "i-0123456789abcdef": "ISS-042" },
+      contextRotation: {
+        level: "high",
+        compactThreshold: "high",
+        ticketsDone: 1,
+        issuesDone: 0,
+        remainingTargets: ["i-0123456789abcdef", "T-099"],
+      },
+    });
+    const ctx = new StageContext(root, sessionDir, state, makeRecipe());
+
+    const result = await new HandoverStage().enter(ctx);
+
+    expect(result.instruction).toContain("Context Rotation Required");
+    expect(result.instruction).toContain("ISS-042");
+    expect(result.instruction).toContain("T-099");
+    expect(result.reminders).toContain("Do not select another item in this session.");
   });
 });

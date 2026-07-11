@@ -291,7 +291,7 @@ export async function handleIssueCreate(
 
   await withProjectLock(root, { strict: true }, async ({ state }) => {
     if (args.dedupeKey) {
-      const existing = state.issues.find((issue) => issue.dedupeKey === args.dedupeKey);
+      const existing = state.activeIssues.find((issue) => issue.dedupeKey === args.dedupeKey);
       if (existing) {
         createdIssue = existing;
         deduplicated = true;

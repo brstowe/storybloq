@@ -238,38 +238,51 @@ export async function validateIssueSourceRefs(
       const endLine = rangeEnd(ref);
       const lineCount = endLine - ref.startLine + 1;
       let expectedHash = ref.contentHash?.toLowerCase();
+      let unavailableRevision: Error | null = null;
 
       if (ref.revision) {
+        let revision: string | null = null;
         try {
-          const revision = await cachedRevision(ref.revision);
-          const original = await cachedSource(revision, ref.path);
-          const originalHash = hashSourceRange(original, ref.startLine, endLine);
-          if (expectedHash && expectedHash !== originalHash) {
+          revision = await cachedRevision(ref.revision);
+        } catch (err) {
+          unavailableRevision = err as Error;
+        }
+
+        if (revision) {
+          try {
+            const original = await cachedSource(revision, ref.path);
+            const originalHash = hashSourceRange(original, ref.startLine, endLine);
+            if (expectedHash && expectedHash !== originalHash) {
+              findings.push({
+                level: "error",
+                code: "source_ref_original_mismatch",
+                message: `${ref.path}:${ref.startLine} does not match its recorded content hash at ${revision.slice(0, 12)}.`,
+                entity,
+              });
+              continue;
+            }
+            expectedHash = originalHash;
+          } catch (err) {
             findings.push({
               level: "error",
-              code: "source_ref_original_mismatch",
-              message: `${ref.path}:${ref.startLine} does not match its recorded content hash at ${revision.slice(0, 12)}.`,
+              code: "source_ref_original_unresolvable",
+              message: `Cannot resolve ${ref.path}:${ref.startLine} at revision ${revision}: ${(err as Error).message}`,
               entity,
             });
             continue;
           }
-          expectedHash = originalHash;
-        } catch (err) {
-          findings.push({
-            level: "error",
-            code: "source_ref_original_unresolvable",
-            message: `Cannot resolve ${ref.path}:${ref.startLine} at revision ${ref.revision}: ${(err as Error).message}`,
-            entity,
-          });
-          continue;
         }
       }
 
       if (!expectedHash) {
         findings.push({
           level: "error",
-          code: "source_ref_original_unverifiable",
-          message: `${ref.path}:${ref.startLine} has neither a resolvable revision nor a content hash.`,
+          code: unavailableRevision
+            ? "source_ref_original_unresolvable"
+            : "source_ref_original_unverifiable",
+          message: unavailableRevision
+            ? `Cannot resolve ${ref.path}:${ref.startLine} at revision ${ref.revision}: ${unavailableRevision.message}`
+            : `${ref.path}:${ref.startLine} has neither a resolvable revision nor a content hash.`,
           entity,
         });
         continue;
@@ -285,23 +298,62 @@ export async function validateIssueSourceRefs(
           current = await readWorkingSource(root, ref.path);
           currentLabel = "the working tree";
         }
-      } catch {
-        findings.push({
-          level: "warning",
-          code: "source_ref_missing_at_head",
-          message: `${ref.path}:${ref.startLine} is valid historically but the path is absent at HEAD.`,
-          entity,
-        });
+      } catch (err) {
+        findings.push(unavailableRevision
+          ? {
+              level: "error",
+              code: "source_ref_original_unresolvable",
+              message: `Cannot verify ${ref.path}:${ref.startLine} after revision ${ref.revision} became unavailable: ${(err as Error).message}`,
+              entity,
+            }
+          : {
+              level: "warning",
+              code: "source_ref_missing_at_head",
+              message: `${ref.path}:${ref.startLine} is valid historically but the path is absent at HEAD.`,
+              entity,
+            });
         continue;
       }
 
       try {
-        if (hashSourceRange(current, ref.startLine, endLine) === expectedHash) continue;
+        if (hashSourceRange(current, ref.startLine, endLine) === expectedHash) {
+          if (unavailableRevision) {
+            findings.push({
+              level: "warning",
+              code: "source_ref_revision_unavailable",
+              message: `${ref.path}:${ref.startLine}-${endLine} still matches ${currentLabel}, but revision ${ref.revision} is unavailable.`,
+              entity,
+            });
+          }
+          continue;
+        }
       } catch {
         // Search the full current file before classifying the reference as stale.
       }
 
       const matches = findMatchingRanges(current, expectedHash, lineCount);
+      if (unavailableRevision) {
+        if (matches.length > 0) {
+          const location = matches.length === 1
+            ? `${ref.path}:${matches[0]}-${matches[0]! + lineCount - 1}`
+            : `${matches.length} ranges`;
+          findings.push({
+            level: "warning",
+            code: "source_ref_revision_unavailable",
+            message: `${ref.path}:${ref.startLine}-${endLine} matches ${location} at ${currentLabel}, but revision ${ref.revision} is unavailable.`,
+            entity,
+          });
+        } else {
+          findings.push({
+            level: "error",
+            code: "source_ref_original_unresolvable",
+            message: `Cannot resolve ${ref.path}:${ref.startLine} at revision ${ref.revision}, and its content hash does not match ${currentLabel}.`,
+            entity,
+          });
+        }
+        continue;
+      }
+
       if (matches.length === 1) {
         findings.push({
           level: "warning",

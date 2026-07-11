@@ -133,7 +133,7 @@ describe("issue source provenance", () => {
     expect(findings[0]?.message).toContain("example.ts:3-3");
   });
 
-  it("errors when the original revision cannot be resolved", async () => {
+  it("warns when an unavailable revision still matches HEAD by content hash", async () => {
     const { root } = await makeRepo("one\ntwo\nthree\n");
     const findings = await validateIssueSourceRefs(root, [
       makeIssue({
@@ -143,6 +143,54 @@ describe("issue source provenance", () => {
           startLine: 2,
           revision: "deadbeef",
           contentHash: hashSourceRange("one\ntwo\nthree\n", 2),
+        }],
+      }),
+    ]);
+
+    expect(findings).toEqual([
+      expect.objectContaining({
+        level: "warning",
+        code: "source_ref_revision_unavailable",
+      }),
+    ]);
+  });
+
+  it("errors when neither an unavailable revision nor HEAD verifies the hash", async () => {
+    const { root } = await makeRepo("one\ntwo\nthree\n");
+    const findings = await validateIssueSourceRefs(root, [
+      makeIssue({
+        id: "ISS-001",
+        sourceRefs: [{
+          path: "example.ts",
+          startLine: 2,
+          revision: "deadbeef",
+          contentHash: hashSourceRange("one\ndifferent\nthree\n", 2),
+        }],
+      }),
+    ]);
+
+    expect(findings).toEqual([
+      expect.objectContaining({
+        level: "error",
+        code: "source_ref_original_unresolvable",
+      }),
+    ]);
+  });
+
+  it("does not use the hash fallback for an invalid path at a reachable revision", async () => {
+    const { root, revision } = await makeRepo("one\ntwo\nthree\n");
+    await writeFile(join(root, "later.ts"), "matching\n", "utf8");
+    git(root, "add", "later.ts");
+    git(root, "commit", "-qm", "add later source");
+
+    const findings = await validateIssueSourceRefs(root, [
+      makeIssue({
+        id: "ISS-001",
+        sourceRefs: [{
+          path: "later.ts",
+          startLine: 1,
+          revision,
+          contentHash: hashSourceRange("matching\n", 1),
         }],
       }),
     ]);

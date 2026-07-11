@@ -104,6 +104,7 @@ export function createSession(
       workItemsAtLastCompaction: 0,
       eventsLogBytesAtLastCompaction: 0,
     },
+    contextRotation: null,
     pendingProjectMutation: null,
     resumeFromRevision: null,
     preCompactState: null,

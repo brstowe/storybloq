@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -70,7 +70,7 @@ describe("issue provenance through registered MCP tools", () => {
     });
   });
 
-  it("preserves verified lens provenance when auto-filing pre-existing findings", async () => {
+  it("preserves lens provenance, review-scopes retries, and files later recurrences", async () => {
     const root = await mkdtemp(join(tmpdir(), "mcp-lens-provenance-"));
     tempDirs.push(root);
     await initProject(root, { name: "issues" });
@@ -86,7 +86,7 @@ describe("issue provenance through registered MCP tools", () => {
       category: "unchecked-error",
       file: "source.ts",
       line: 2,
-      snippet: { quote: "const value = risky();", startLine: 2 },
+      snippet: { quote: "const value = risky();\n", startLine: 2 },
       description: "A pre-existing risky call is unchecked.",
       suggestion: "Handle the failure.",
       confidence: 0.95,
@@ -124,7 +124,7 @@ describe("issue provenance through registered MCP tools", () => {
     expect(files).toHaveLength(1);
     expect(issue).toMatchObject({
       createdBy: "review-lenses:error-handling",
-      dedupeKey: "error-handling:source.ts:2:unchecked-error",
+      dedupeKey: expect.stringMatching(/^review-lenses:[a-f0-9]{64}$/),
       sourceRefs: [expect.objectContaining({
         path: "source.ts",
         startLine: 2,
@@ -133,6 +133,82 @@ describe("issue provenance through registered MCP tools", () => {
       })],
     });
     expect(JSON.stringify(issue)).not.toContain("const value = risky()");
+
+    await writeFile(
+      join(root, ".story", "issues", files[0]!),
+      JSON.stringify({
+        ...issue,
+        status: "resolved",
+        resolution: "Fixed after the first review.",
+        resolvedDate: "2026-07-11",
+      }),
+      "utf8",
+    );
+    const recurrenceArgs = schema.parse({ ...args, reviewId: "lens-provenance-2" });
+    const recurrence = JSON.parse((await tool.handler(recurrenceArgs)).content[0]!.text);
+    const recurrenceFiles = (await readdir(join(root, ".story", "issues")))
+      .filter((file) => file.endsWith(".json"));
+    const recurrenceIssues = await Promise.all(recurrenceFiles.map(async (file) =>
+      JSON.parse(await readFile(join(root, ".story", "issues", file), "utf8")),
+    ));
+
+    expect(recurrence.filedIssues).toHaveLength(1);
+    expect(recurrence.filedIssues[0].issueId).not.toBe(first.filedIssues[0].issueId);
+    expect(recurrenceFiles).toHaveLength(2);
+    expect(recurrenceIssues.map((record) => record.status).sort()).toEqual(["open", "resolved"]);
+    expect(new Set(recurrenceIssues.map((record) => record.dedupeKey)).size).toBe(2);
+  });
+
+  it("files a verified finding without sourceRefs when provenance enrichment is unsafe", async () => {
+    const root = await mkdtemp(join(tmpdir(), "mcp-lens-provenance-"));
+    tempDirs.push(root);
+    await initProject(root, { name: "issues" });
+    await writeFile(join(root, "source.ts"), "const value = risky();\n", "utf8");
+    await symlink("source.ts", join(root, "linked.ts"));
+
+    const tool = captureTools(root).get("storybloq_review_lenses_synthesize");
+    if (!tool) throw new Error("storybloq_review_lenses_synthesize was not registered");
+    const schema = z.object(tool.config.inputSchema);
+    const empty = { status: "ok", findings: [], error: null, notes: null };
+    const finding = {
+      id: "eh-symlink",
+      severity: "major",
+      category: "unchecked-error",
+      file: "linked.ts",
+      line: 1,
+      snippet: { quote: "const value = risky();", startLine: 1 },
+      description: "A pre-existing risky call is unchecked.",
+      suggestion: "Handle the failure.",
+      confidence: 0.95,
+    };
+    const args = schema.parse({
+      stage: "CODE_REVIEW",
+      reviewId: "lens-provenance-symlink",
+      reviewRound: 1,
+      activeLenses: ["security", "error-handling", "clean-code", "concurrency"],
+      skippedLenses: ["performance", "api-design", "test-quality", "accessibility", "data-safety"],
+      lensResults: [
+        { lens: "security", output: empty },
+        { lens: "error-handling", output: { ...empty, findings: [finding] } },
+        { lens: "clean-code", output: empty },
+        { lens: "concurrency", output: empty },
+      ],
+      diff: "diff --git a/changed.ts b/changed.ts\n--- a/changed.ts\n+++ b/changed.ts\n@@ -1 +1 @@\n-old\n+new",
+      changedFiles: ["changed.ts"],
+    });
+
+    const result = JSON.parse((await tool.handler(args)).content[0]!.text);
+    const files = (await readdir(join(root, ".story", "issues"))).filter((file) => file.endsWith(".json"));
+    const issue = JSON.parse(await readFile(join(root, ".story", "issues", files[0]!), "utf8"));
+
+    expect(result.preExistingFindings).toHaveLength(1);
+    expect(result.filedIssues).toHaveLength(1);
+    expect(result.filingWarnings).toContainEqual(expect.objectContaining({
+      code: "source_provenance_omitted",
+    }));
+    expect(files).toHaveLength(1);
+    expect(issue.location).toEqual(["linked.ts:1"]);
+    expect(issue.sourceRefs).toBeUndefined();
   });
 
   it("rejects unsafe source paths at the real MCP schema boundary", async () => {

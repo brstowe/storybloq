@@ -46,7 +46,7 @@ describe("storybloq_validate integrity preflight through MCP", () => {
 
     const result = await tool.handler({ format: "json" });
     const parsed = JSON.parse(result.content[0]!.text);
-    expect(result.isError).toBeUndefined();
+    expect(result.isError).toBe(true);
     expect(parsed.data).toMatchObject({
       valid: false,
       criticalErrorCount: 2,
@@ -66,6 +66,7 @@ describe("storybloq_validate integrity preflight through MCP", () => {
     if (!tool) throw new Error("storybloq_validate was not registered");
     const result = await tool.handler({ format: "json", integrityOnly: true });
     const parsed = JSON.parse(result.content[0]!.text);
+    expect(result.isError).toBeUndefined();
     expect(parsed.data.findings).toContainEqual(expect.objectContaining({
       file: ".story/sessions/fixture/state.json",
       classification: "auxiliary",

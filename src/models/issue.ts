@@ -31,40 +31,47 @@ function opaqueId(max: number) {
   );
 }
 
-const IssueSourceRefBaseSchema = z
-  .object({
-    path: z.string().min(1).max(1024).refine(isSafeSourcePath, "Source path must be a safe repo-relative POSIX path"),
-    startLine: z.number().int().positive(),
-    endLine: z.number().int().positive().optional(),
-    revision: z.string().regex(REVISION_PATTERN, "Revision must be a hexadecimal Git object ID").optional(),
-    snapshotId: opaqueId(256).optional(),
-    contentHash: z.string().regex(SOURCE_HASH_PATTERN, "Content hash must be a SHA-256 hex digest").optional(),
-    reviewId: opaqueId(256).optional(),
-  })
+const IssueSourceRefObjectSchema = z.object({
+  path: z.string().min(1).max(1024).refine(isSafeSourcePath, "Source path must be a safe repo-relative POSIX path"),
+  startLine: z.number().int().positive(),
+  endLine: z.number().int().positive().optional(),
+  revision: z.string().regex(REVISION_PATTERN, "Revision must be a hexadecimal Git object ID").optional(),
+  snapshotId: opaqueId(256).optional(),
+  contentHash: z.string().regex(SOURCE_HASH_PATTERN, "Content hash must be a SHA-256 hex digest").optional(),
+  reviewId: opaqueId(256).optional(),
+});
+
+function validateSourceRefRange(
+  ref: z.infer<typeof IssueSourceRefObjectSchema>,
+  ctx: z.RefinementCtx,
+): void {
+  if (ref.endLine !== undefined && ref.endLine < ref.startLine) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["endLine"],
+      message: "End line must be greater than or equal to start line",
+    });
+  }
+}
+
+/** Input shape accepted at write boundaries before Storybloq captures a hash. */
+export const IssueSourceRefInputSchema = IssueSourceRefObjectSchema
   .strict()
+  .superRefine(validateSourceRefRange);
+
+/** Durable source reference. A revision or captured line-range hash is required. */
+export const IssueSourceRefSchema = IssueSourceRefObjectSchema
+  .passthrough()
+  .superRefine(validateSourceRefRange)
   .superRefine((ref, ctx) => {
-    if (ref.endLine !== undefined && ref.endLine < ref.startLine) {
+    if (!ref.revision && !ref.contentHash) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
-        path: ["endLine"],
-        message: "End line must be greater than or equal to start line",
+        path: ["contentHash"],
+        message: "A durable source reference requires revision or contentHash",
       });
     }
   });
-
-/** Input shape accepted at write boundaries before Storybloq captures a hash. */
-export const IssueSourceRefInputSchema = IssueSourceRefBaseSchema;
-
-/** Durable source reference. A revision or captured line-range hash is required. */
-export const IssueSourceRefSchema = IssueSourceRefBaseSchema.superRefine((ref, ctx) => {
-  if (!ref.revision && !ref.contentHash) {
-    ctx.addIssue({
-      code: z.ZodIssueCode.custom,
-      path: ["contentHash"],
-      message: "A durable source reference requires revision or contentHash",
-    });
-  }
-});
 
 export type IssueSourceRefInput = z.input<typeof IssueSourceRefInputSchema>;
 export type IssueSourceRef = z.infer<typeof IssueSourceRefSchema>;

@@ -116,6 +116,18 @@ describe("validateProject", () => {
     ).toBe(true);
   });
 
+  it("ignores deleted issues when checking duplicate dedupe keys", () => {
+    const state = makeState({
+      issues: [
+        makeIssue({ id: "ISS-001", dedupeKey: "review:shared", lifecycle: "deleted" }),
+        makeIssue({ id: "ISS-002", dedupeKey: "review:shared" }),
+      ],
+    });
+    expect(
+      validateProject(state).findings.some((f) => f.code === "duplicate_issue_dedupe_key"),
+    ).toBe(false);
+  });
+
   it("reports duplicate note IDs", () => {
     const state = makeState({
       notes: [makeNote({ id: "N-001" }), makeNote({ id: "N-001" })],

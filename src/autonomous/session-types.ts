@@ -539,6 +539,16 @@ export const SessionStateSchema = z.object({
     eventsLogBytesAtLastCompaction: z.number().int().min(0).optional(),
   }).default({ level: "low", guideCallCount: 0, ticketsCompleted: 0, compactionCount: 0, eventsLogBytes: 0 }),
 
+  // Persist why COMPLETE must rotate instead of selecting more work. This
+  // survives optional post-complete stages and crash recovery.
+  contextRotation: z.object({
+    level: z.enum(["low", "medium", "high", "critical"]),
+    compactThreshold: z.string(),
+    ticketsDone: z.number().int().min(0),
+    issuesDone: z.number().int().min(0),
+    remainingTargets: z.array(z.string()).max(150).default([]),
+  }).nullable().default(null),
+
   // Pending project mutation (for crash recovery)
   pendingProjectMutation: z.any().nullable().default(null),
 

@@ -22,7 +22,7 @@ export async function handleValidateWithSourceRefs(
 ): Promise<CommandResult> {
   const baseResult = validateProject(ctx.state);
   const merged = mergeValidation(baseResult, ctx.warnings);
-  const sourceFindings = await validateIssueSourceRefs(ctx.root, ctx.state.issues);
+  const sourceFindings = await validateIssueSourceRefs(ctx.root, ctx.state.activeIssues);
   const complete = appendValidationFindings(merged, sourceFindings);
   return {
     output: formatValidation(complete, ctx.format),

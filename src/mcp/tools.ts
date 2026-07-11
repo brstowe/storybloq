@@ -46,7 +46,7 @@ import {
   registerSubprocess,
   unregisterSubprocess,
 } from "../autonomous/subprocess-registry.js";
-import { handlePrepare, handleSynthesize, handleJudge, generateIssueKey } from "../autonomous/lens-harness/index.js";
+import { handlePrepare, handleSynthesize, handleJudge, generateIssueKey, generateReviewFilingKey } from "../autonomous/lens-harness/index.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 
 import { loadProject } from "../core/project-loader.js";
@@ -387,7 +387,10 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
     });
     if (args.integrityOnly || !integrity.valid) {
       try { touchMcpLiveness(pinnedRoot); } catch { /* best-effort */ }
-      return { content: [{ type: "text" as const, text: formatLedgerIntegrity(integrity, format) }] };
+      return {
+        content: [{ type: "text" as const, text: formatLedgerIntegrity(integrity, format) }],
+        ...(integrity.criticalErrorCount > 0 ? { isError: true } : {}),
+      };
     }
     return runMcpReadTool(pinnedRoot, handleValidateWithSourceRefs, undefined, format);
   });
@@ -1331,6 +1334,8 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
 
       // T-192: Auto-file pre-existing findings as issues
       const filedIssues: { issueKey: string; issueId: string }[] = [];
+      const filingWarnings: { issueKey: string; code: string; message: string }[] = [];
+      const filingErrors: { issueKey: string; code: string; message: string }[] = [];
       if (result.preExistingFindings.length > 0) {
         const sessionDir = args.sessionId
           ? join(pinnedRoot, ".story", "sessions", args.sessionId)
@@ -1339,38 +1344,56 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
         const sizeBeforeLoop = alreadyFiled.size;
 
         for (const f of result.preExistingFindings) {
-          const dedupKey = generateIssueKey(f);
-          if (alreadyFiled.has(dedupKey)) continue;
+          const issueKey = generateIssueKey(f);
+          if (alreadyFiled.has(issueKey)) continue;
 
           try {
             const { handleIssueCreate } = await import("../cli/commands/issue.js");
             const severityMap: Record<string, string> = { blocking: "critical", major: "high", minor: "medium" };
             const severity = severityMap[f.severity] ?? "medium";
+            const quote = f.snippet?.quote.replace(/\r\n?/g, "\n");
+            const quoteLines = quote
+              ? quote.endsWith("\n") ? quote.slice(0, -1).split("\n").length : quote.split("\n").length
+              : 1;
             const sourceRefs = f.file && f.line != null
               ? [{
                   path: f.file,
                   startLine: f.line,
-                  ...(f.snippet && f.snippet.quote.split(/\r?\n/).length > 1
-                    ? { endLine: f.line + f.snippet.quote.split(/\r?\n/).length - 1 }
+                  ...(quoteLines > 1
+                    ? { endLine: f.line + quoteLines - 1 }
                     : {}),
                   reviewId: args.reviewId ?? "unknown",
                 }]
               : undefined;
-            const issueResult = await handleIssueCreate(
-              {
-                title: `[pre-existing] [${f.category}] ${f.description.slice(0, 60)}`,
-                severity,
-                impact: f.description,
-                components: ["review-lenses"],
-                relatedTickets: [],
-                location: f.file && f.line != null ? [`${f.file}:${f.line}`] : [],
-                sourceRefs,
-                dedupeKey: dedupKey,
-                createdBy: `review-lenses:${f.contributingLenses.join(",")}`,
-              },
-              "json",
-              pinnedRoot,
-            );
+            const createArgs = {
+              title: `[pre-existing] [${f.category}] ${f.description.slice(0, 60)}`,
+              severity,
+              impact: f.description,
+              components: ["review-lenses"],
+              relatedTickets: [],
+              location: f.file && f.line != null ? [`${f.file}:${f.line}`] : [],
+              sourceRefs,
+              dedupeKey: generateReviewFilingKey(args.reviewId ?? "unknown", f),
+              createdBy: `review-lenses:${f.contributingLenses.join(",")}`,
+            };
+            let issueResult;
+            try {
+              issueResult = await handleIssueCreate(createArgs, "json", pinnedRoot);
+            } catch (err) {
+              if (!(sourceRefs && err instanceof CliValidationError && err.code === "invalid_input")) {
+                throw err;
+              }
+              filingWarnings.push({
+                issueKey,
+                code: "source_provenance_omitted",
+                message: "The finding was filed without structured source provenance because the source reference could not be normalized.",
+              });
+              issueResult = await handleIssueCreate(
+                { ...createArgs, sourceRefs: undefined },
+                "json",
+                pinnedRoot,
+              );
+            }
 
             let issueId: string | undefined;
             try {
@@ -1382,11 +1405,14 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
             }
 
             if (issueId) {
-              filedIssues.push({ issueKey: dedupKey, issueId });
-              alreadyFiled.add(dedupKey);
+              filedIssues.push({ issueKey, issueId });
+              alreadyFiled.add(issueKey);
             }
-          } catch {
-            // Best-effort filing; finding still goes through review pipeline
+          } catch (err) {
+            const message = err instanceof Error
+              ? err.message.replace(/\/[^\s]+/g, "<path>")
+              : "unknown error";
+            filingErrors.push({ issueKey, code: "issue_filing_failed", message });
           }
         }
 
@@ -1395,7 +1421,7 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
         }
       }
 
-      const output = { ...result, filedIssues };
+      const output = { ...result, filedIssues, filingWarnings, filingErrors };
       return { content: [{ type: "text" as const, text: JSON.stringify(output, null, 2) }] };
     } catch (err) {
       const msg = err instanceof Error ? err.message.replace(/\/[^\s]+/g, "<path>") : "unknown error";

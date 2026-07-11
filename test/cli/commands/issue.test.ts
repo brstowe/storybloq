@@ -398,6 +398,32 @@ describe("handleIssueCreate", () => {
     expect(second.meta).toEqual({ deduplicated: true });
   });
 
+  it("does not deduplicate a new finding onto a deleted team-mode issue", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "issue-create-"));
+    tmpDirs.push(dir);
+    await initProject(dir, { name: "test" });
+    await enableTeamMode(dir);
+    const args = {
+      title: "Recurring finding",
+      severity: "high",
+      impact: "broken",
+      components: [],
+      relatedTickets: [],
+      location: [],
+      dedupeKey: "review:recurring-finding",
+    };
+
+    const first = JSON.parse((await handleIssueCreate(args, "json", dir)).output).data;
+    await handleIssueDelete(first.id, "md", dir);
+    const second = JSON.parse((await handleIssueCreate(args, "json", dir)).output);
+    const { state } = await loadProject(dir);
+
+    expect(second.meta).toBeUndefined();
+    expect(second.data.id).not.toBe(first.id);
+    expect(second.data.lifecycle).not.toBe("deleted");
+    expect(state.activeIssues.map((issue) => issue.id)).toEqual([second.data.id]);
+  });
+
   it("rejects nonexistent phase", async () => {
     const dir = await mkdtemp(join(tmpdir(), "issue-create-"));
     tmpDirs.push(dir);

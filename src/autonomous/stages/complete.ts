@@ -96,13 +96,22 @@ export class CompleteStage implements WorkflowStage {
       nextTarget === "PICK_TICKET" &&
       pressureMeetsThreshold(pressure, ctx.state.config.compactThreshold)
     ) {
+      ctx.writeState({
+        contextRotation: {
+          level: pressure,
+          compactThreshold: ctx.state.config.compactThreshold,
+          ticketsDone,
+          issuesDone,
+          remainingTargets: targetedRemaining ?? [],
+        },
+      });
       ctx.appendEvent("pressure_rotation_requested", {
         level: pressure,
         compactThreshold: ctx.state.config.compactThreshold,
         ticketsDone,
         issuesDone,
       });
-      return this.buildPressureRotationResult(ctx, pressure, ticketsDone, issuesDone);
+      return this.buildHandoverResult(ctx, targetedRemaining, ticketsDone, issuesDone);
     }
 
     if (nextTarget === "HANDOVER") {
@@ -126,10 +135,11 @@ export class CompleteStage implements WorkflowStage {
 
   private buildPressureRotationResult(
     ctx: StageContext,
-    pressure: string,
-    ticketsDone: number,
-    issuesDone: number,
   ): StageAdvance {
+    const rotation = ctx.state.contextRotation;
+    if (!rotation) {
+      throw new Error("Pressure rotation result requires persisted rotation context");
+    }
     return {
       action: "goto",
       target: "HANDOVER",
@@ -137,8 +147,8 @@ export class CompleteStage implements WorkflowStage {
         instruction: [
           "# Context Rotation Required",
           "",
-          `Context pressure is **${pressure}**, which reached the configured \`compactThreshold\` (**${ctx.state.config.compactThreshold}**).`,
-          `${ticketsDone} ticket(s) and ${issuesDone} issue(s) are complete. The current item is finalized, and more work remains.`,
+          `Context pressure is **${rotation.level}**, which reached the configured \`compactThreshold\` (**${rotation.compactThreshold}**).`,
+          `${rotation.ticketsDone} ticket(s) and ${rotation.issuesDone} issue(s) are complete. The current item is finalized, and more work remains.`,
           "",
           "Compaction was not confirmed, and Storybloq cannot invoke the client's compaction command. End this bounded session at the clean item boundary and write a handover for the next task.",
           "",
@@ -219,6 +229,10 @@ export class CompleteStage implements WorkflowStage {
     if (postResult.kind === "found") {
       ctx.writeState({ pipelinePhase: "postComplete" as const });
       return { action: "goto", target: postResult.stage.id };
+    }
+
+    if (ctx.state.contextRotation) {
+      return this.buildPressureRotationResult(ctx);
     }
 
     const handoverHeader = targetedRemaining !== null
