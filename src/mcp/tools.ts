@@ -17,6 +17,8 @@ import { TARGET_WORK_ID_REGEX, LENS_FINDING_DISPOSITIONS } from "../autonomous/s
 import { CLIENT_TASK_ID_PATTERN } from "../autonomous/client-profile.js";
 import { findActiveSessionMinimal, readSessionResilient, sessionDir, isLeaseExpired } from "../autonomous/session.js";
 import { touchLastMcpCallFile } from "../autonomous/liveness.js";
+import { ConfigSchema } from "../models/config.js";
+import { registerBusTools } from "./bus-tools.js";
 
 // ISS-407: Cache active session dir to avoid O(n) directory scan on every MCP call.
 // Expires after 30s -- long enough to amortize hot-path calls, short enough
@@ -25,7 +27,7 @@ const _SESSION_CACHE_TTL_MS = 30_000;
 let _cachedSessionDir: string | null = null;
 let _cachedSessionAt = 0;
 
-function touchMcpLiveness(pinnedRoot: string): void {
+export function touchMcpLiveness(pinnedRoot: string): void {
   const now = Date.now();
   if (_cachedSessionDir && now - _cachedSessionAt < _SESSION_CACHE_TTL_MS) {
     touchLastMcpCallFile(_cachedSessionDir);
@@ -303,6 +305,15 @@ function resolveEffectiveRootForWrite(pinnedRoot: string, nodeName?: string): { 
 }
 
 export function registerAllTools(server: McpServer, pinnedRoot: string): void {
+  try {
+    const parsed = ConfigSchema.safeParse(JSON.parse(readFileSync(join(pinnedRoot, ".story", "config.json"), "utf-8")));
+    if (parsed.success && parsed.data.features.bus === true) {
+      registerBusTools(server, pinnedRoot, () => touchMcpLiveness(pinnedRoot));
+    }
+  } catch {
+    // Normal tools still register. Project loading reports config damage.
+  }
+
   // --- No-arg tools ---
 
   server.registerTool("storybloq_status", {

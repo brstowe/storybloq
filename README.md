@@ -41,7 +41,7 @@ The real cost isn't wasted setup time. It's repeated mistakes, relitigated desig
 Every project gets a `.story/` directory of JSON and markdown files. Tickets, issues, roadmap phases, session handovers, and lessons learned all live there, tracked by git, readable by any AI.
 
 - **CLI:** `storybloq` - inspect and mutate `.story/` from the terminal.
-- **MCP server:** 53 tools Claude Code and Codex can call directly, no subprocess spawning.
+- **MCP server:** structured tools Claude Code and Codex can call directly, with five additional tools when the local Bus is enabled. No subprocess spawning.
 - **Skill:** `/story` in Claude Code or `$story` in Codex loads project state at the start of every session.
 - **Mac app:** native sidebar that watches `.story/` and updates live while your AI client works (separate product, free on the App Store).
 
@@ -113,6 +113,7 @@ Inside Claude Code or Codex:
 - **`/story auto T-001 T-002 ISS-013` / `$story auto T-001 T-002 ISS-013`** - autonomous mode scoped to those items. Drives a ticket through plan -> plan review -> implement -> tests -> code review -> commit with handovers at each checkpoint.
 - **`/story review T-001` / `$story review T-001`** - runs the multi-lens review (see [Storybloq/lenses](https://github.com/Storybloq/lenses)) against a ticket's diff.
 - **`/story orchestrate` / `$story orchestrate`** - drives a multi-repo (or large single-repo) backlog when the client exposes exact callable workflow/subagent tools. Codex uses `multi_agent_v1.spawn_agent`, its normalized `multi_agent_v1__spawn_agent` identifier, or an exact `spawn_agent` tool. The Claude Agent View-backed `storybloq dispatch` command is shipped; a product-managed Codex dispatch backend is not.
+- **`/story bus` / `$story bus`** - polls a task-bound local Bus endpoint so an implementer and an independent reviewer can exchange advisory findings without copy and paste.
 - **`/story handover` / `$story handover`** - writes a session handover capturing decisions, blockers, and next steps.
 
 Both clients support context loading, autonomous mode, MCP, and compaction/status hooks. Codex Desktop can open an autonomous session's owning task and relay an exact owner response to it; Codex CLI safely falls back to a manual task switch. Autonomous code review defaults to a 12-round landing cap (clamped upward by ticket risk): unresolved critical findings and rejects still block, while non-blocking findings become follow-up issues at the cap. Set `recipeOverrides.stages.CODE_REVIEW.maxReviewRounds` to `0` to disable the cap explicitly.
@@ -120,6 +121,22 @@ Both clients support context loading, autonomous mode, MCP, and compaction/statu
 `recipeOverrides.compactThreshold` accepts `medium`, `high` (default), or `critical`. The value selects both the pressure limits and the rotation trigger: `medium` uses lower limits and rotates at medium pressure, while `critical` uses higher limits and waits for critical pressure. At a clean COMPLETE boundary, threshold pressure ends the bounded session through HANDOVER because Storybloq cannot invoke a client compaction command. When the client itself compacts, the PreCompact and SessionStart hooks preserve the same session; pressure resets only after SessionStart confirms `source: compact`.
 
 Outside the AI client, the same state is one `storybloq` invocation away.
+
+## Storybloq Bus
+
+Storybloq Bus is an optional local coordination protocol for one implementer task and one reviewer task. Runtime state lives under gitignored `.story/bus/`; confirmed findings still become canonical Storybloq issues with durable source provenance before they are sent as issue notices.
+
+```bash
+storybloq bus init
+storybloq bus join implementer --client codex
+storybloq bus join reviewer --client claude
+storybloq bus hooks enable --client codex
+storybloq bus hooks enable --client claude
+```
+
+The foreground protocol includes send, poll, acknowledge, thread state, status, doctor, export, and ship checks. Messages are hash-chained, idempotent, bounded, task-bound, secret-screened, and delivered through crash-recoverable recipient mailboxes. Critical messages require a matching unresolved critical issue by default. Bus text is always peer-agent advice: it never grants owner approval or authorizes merge, push, signing, deployment, credentials, spending, or destructive actions.
+
+V1 does not include a daemon, process spawning, headless resume, or automatic offline wake. Natural SessionStart/Stop hooks and explicit polling are the delivery paths. Codex Desktop remains non-wakeable.
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/Storybloq/storybloq/main/assets/autonomous.png" alt="Autonomous mode running a ticket through plan, implement, test, review" />
@@ -224,6 +241,21 @@ All commands accept `--format json|md` (default `md`). Pipe JSON through `jq` fo
 | `storybloq snapshot` · `storybloq recap` | Capture state and diff against the last snapshot |
 | `storybloq export [--phase <id>] [--all] [--format json\|md]` | Self-contained project document |
 
+### Storybloq Bus (opt-in)
+
+| Command | Description |
+|---------|-------------|
+| `storybloq bus init` | Enable the local Bus and create gitignored runtime state |
+| `storybloq bus join implementer\|reviewer [--client] [--replace]` | Bind the current client task to one exclusive role |
+| `storybloq bus send ...` | Create a thread or send a reply with a required idempotency key |
+| `storybloq bus poll` | Read unacknowledged messages for the task-bound endpoint |
+| `storybloq bus ack <message-id> --disposition ...` | Record accepted, rejected, or deferred delivery state |
+| `storybloq bus thread show\|update ...` | Inspect or transition a participant thread |
+| `storybloq bus hooks enable\|disable [--client]` | Control guarded live delivery for this project |
+| `storybloq bus status\|doctor` | Inspect state and validate integrity |
+| `storybloq bus check --ship` | Fail when critical Bus work blocks release |
+| `storybloq bus export <thread-id>` | Explicitly export one runtime transcript |
+
 ### Federation (orchestrator projects)
 
 | Command | Description |
@@ -262,7 +294,7 @@ codex mcp add storybloq --env STORYBLOQ_CLIENT=codex -- storybloq --mcp
 
 The server imports the same TypeScript modules as the CLI directly, so there's no subprocess overhead. It auto-discovers the project root by walking up from the working directory to the nearest `.story/` parent.
 
-**53 tools** grouped by responsibility:
+The base tools are grouped by responsibility. Bus-enabled projects register five additional tools at MCP process start; restart connected clients after `storybloq bus init`.
 
 ### Read (no side effects)
 
@@ -279,6 +311,12 @@ The server imports the same TypeScript modules as the CLI directly, so there's n
 `storybloq_review_lenses_prepare` · `storybloq_review_lenses_judge` · `storybloq_review_lenses_synthesize` orchestrate the multi-lens review loop (requires [@storybloq/lenses](https://github.com/Storybloq/lenses)).
 
 `storybloq_session_report` · `storybloq_register_subprocess` · `storybloq_unregister_subprocess` surface session health to the Mac app.
+
+### Storybloq Bus (feature-gated)
+
+`storybloq_bus_send` · `storybloq_bus_poll` · `storybloq_bus_ack` · `storybloq_bus_thread_get` · `storybloq_bus_thread_update`
+
+Every call requires a stable endpoint id and the current validated client task id. Poll and thread outputs mark peer content as advisory authority. `storybloq_bus_poll` and `storybloq_bus_thread_get` are read-only; the other three retain normal MCP write approvals.
 
 ### Federation (orchestrator projects)
 
@@ -323,6 +361,8 @@ Injects a compact-aware resume prompt. Codex setup uses the same command with `-
   }
 }
 ```
+
+`storybloq bus hooks enable` is a separate project opt-in. It adds endpoint metadata and pending counts to SessionStart, and permits the synchronous Stop hook to block once for each new mailbox cursor. Peer payload bytes never appear in hook output. Claude's shared hook structure is upgraded once and remains guarded by project-local policy; Codex uses `storybloq hook-status --client codex`.
 
 ## Library usage
 

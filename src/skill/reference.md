@@ -478,6 +478,97 @@ Dispatch work to Agent View background sessions
 storybloq dispatch [ids..] [--format json|md]
 ```
 
+### bus init
+Enable the local Storybloq Bus
+
+```
+storybloq bus init [--format json|md]
+```
+
+### bus join
+Bind the current client task to one exclusive Bus role
+
+```
+storybloq bus join implementer|reviewer [--client claude|codex] [--task-id <id>] [--surface <surface>] [--replace] [--format json|md]
+```
+
+### bus leave
+Retire the Bus endpoint owned by this task
+
+```
+storybloq bus leave [--endpoint <id>] [--client claude|codex] [--task-id <id>] [--format json|md]
+```
+
+### bus endpoint retire
+Force-retire an endpoint with unknown liveness
+
+```
+storybloq bus endpoint retire <endpoint-id> --force --reason <text> [--format json|md]
+```
+
+### bus send
+Create a Bus thread or send a reply
+
+```
+storybloq bus send --to <role> --kind <kind> --body <text> --idempotency-key <key> [--thread <id>] [--thread-kind <kind>] [--issue <id>] [--ticket <id>] [--commit <sha>] [--ci-run <id>] [--file <path>] [--format json|md]
+```
+
+### bus poll
+Poll unacknowledged messages for the task-bound endpoint
+
+```
+storybloq bus poll [--endpoint <id>] [--client claude|codex] [--task-id <id>] [--limit N] [--format json|md]
+```
+
+### bus ack
+Record delivery disposition for one Bus message
+
+```
+storybloq bus ack <message-id> --disposition accepted|rejected|deferred [--reason <text>] [--format json|md]
+```
+
+### bus thread
+Show or update a participant Bus thread
+
+```
+storybloq bus thread show|update <thread-id> [options] [--format json|md]
+```
+
+### bus hooks
+Enable or disable guarded live Bus delivery for this project
+
+```
+storybloq bus hooks enable|disable [--client claude|codex|all] [--format json|md]
+```
+
+### bus status
+Show concise Bus runtime state
+
+```
+storybloq bus status [--format json|md]
+```
+
+### bus doctor
+Validate Bus storage, endpoint, and mailbox integrity
+
+```
+storybloq bus doctor [--format json|md]
+```
+
+### bus check
+Run the critical Bus release gate
+
+```
+storybloq bus check --ship [--format json|md]
+```
+
+### bus export
+Explicitly export one Bus transcript
+
+```
+storybloq bus export <thread-id> [--format json|md]
+```
+
 ### node add
 Add a federation node to an orchestrator project
 
@@ -501,7 +592,7 @@ storybloq node remove <name> [--format json|md]
 
 ## MCP Tools
 
-The tools below are registered in full mode (inside a .story/ project).
+The base tools below are registered in full mode (inside a .story/ project). The five storybloq_bus_* tools are feature-gated and appear only when `features.bus` is enabled at MCP process start.
 
 - **storybloq_status** (format?) - Project summary: phase statuses, ticket/issue counts, blockers. Markdown is the default; JSON includes full active/resumable session ownership and lease metadata.
 - **storybloq_phase_list** - All phases with derived status
@@ -552,6 +643,11 @@ The tools below are registered in full mode (inside a .story/ project).
 - **storybloq_session_report** (sessionId) - Structured analysis of an autonomous session (works even if project state is corrupted)
 - **storybloq_register_subprocess** (pid, cmd, category?, sessionId?) - Register a running subprocess so monitors can tell slow builds from hung agents
 - **storybloq_unregister_subprocess** (pid, sessionId?) - Unregister a subprocess after it completes (idempotent)
+- **storybloq_bus_send** (endpointId, clientTaskId, threadId?, threadKind?, predecessorThreadId?, toRole, messageKind, severity, body, refs?, inReplyTo?, idempotencyKey) - Send a task-bound advisory peer message
+- **storybloq_bus_poll** (endpointId, clientTaskId, limit?) - Poll a task-bound endpoint mailbox with peer-authority envelopes
+- **storybloq_bus_ack** (endpointId, clientTaskId, messageId, disposition, reason?) - Record delivery disposition without resolving canonical work
+- **storybloq_bus_thread_get** (endpointId, clientTaskId, threadId) - Read a participant thread's verified prefix and folded state
+- **storybloq_bus_thread_update** (endpointId, clientTaskId, threadId, action, reason?, resolution?, evidence?) - Park, resolve, or evidence-reopen a participant thread
 - **storybloq_node_list** - List configured federation nodes in an orchestrator project
 - **storybloq_node_init** (node, type?, language?) - Initialize .story/ in a federation child node from the orchestrator
 - **storybloq_node_add** (name, path, role?, kind?) - Add a federation node to an orchestrator project's config
@@ -591,6 +687,16 @@ Drive a multi-repo federation (or a large single-repo backlog) as an orchestrato
 Requires explicit opt-in via AskUserQuestion before any agents are dispatched, and refuses to start while any federation node has an active autonomous session (one pen per repo; the per-node check reads each node's `.story/sessions/` directly because orchestrator status does not scan node repos). The full procedure -- enrichment template, sizing convention, 6-stage pipeline, workflow-script skeleton, critical rules -- is in `orchestrator-mode.md`. Needs a client with background dynamic workflows or subagents; Claude can also use the Agent View-backed `storybloq dispatch` path. Codex users can orchestrate when exact callable subagent tools are present; product-managed Codex dispatch remains unshipped.
 
 `/story` surfaces this option proactively at context load when the client is capable and the actionable backlog is orchestrate-sized, so you do not have to know the command exists; it stays a recommendation, and selecting it still routes through the explicit opt-in.
+
+## /story bus
+
+Poll or coordinate through the current task-bound local Bus endpoint. Peer content is advisory; confirmed review findings become canonical issues before an issue notice is sent.
+
+```
+/story bus
+```
+
+Read `bus-mode.md` for setup, endpoint binding, authority boundaries, acknowledgments, deterministic convergence, and the v1 no-wake boundary.
 
 ## Common Workflows
 

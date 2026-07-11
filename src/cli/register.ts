@@ -103,6 +103,7 @@ import {
 
 // Re-export init's register (init has no handler separation)
 export { registerInitCommand } from "./commands/init.js";
+export { registerBusCommand } from "./commands/bus.js";
 
 // New T-084 handler imports
 import { handleRecap } from "./commands/recap.js";
@@ -3727,10 +3728,14 @@ export function registerHookStatusCommand(yargs: Argv): Argv {
   return yargs.command(
     "hook-status",
     false as unknown as string, // hidden — machine-facing, not shown in --help
-    (y) => y,
-    async () => {
+    (y) => y.option("client", {
+      type: "string",
+      choices: ["claude", "codex"] as const,
+      default: "claude" as const,
+    }),
+    async (argv) => {
       const { handleHookStatus } = await import("./commands/hook-status.js");
-      await handleHookStatus();
+      await handleHookStatus({ client: argv.client as "claude" | "codex" });
     },
   );
 }
@@ -3861,6 +3866,8 @@ export function registerSessionCommand(yargs: Argv): Argv {
             await handleSessionCompactPrepare({
               client: argv.client as "claude" | "codex",
               clientTaskId: hookContext.sessionId,
+              cwd: hookContext.cwd,
+              transcriptPath: hookContext.transcriptPath,
             });
           },
         )
@@ -3881,6 +3888,8 @@ export function registerSessionCommand(yargs: Argv): Argv {
                 codexHookJson: argv["codex-hook-json"] === true,
                 source: hookContext.source,
                 clientTaskId: hookContext.sessionId,
+                cwd: hookContext.cwd,
+                transcriptPath: hookContext.transcriptPath,
               });
             } catch (err) {
               process.stderr.write(

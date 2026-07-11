@@ -433,6 +433,107 @@ export async function registerStopHook(
   return registerHook("Stop", { type: "command", command, async: true }, settingsPath);
 }
 
+export const CLAUDE_BUS_SESSION_START_MATCHER = "startup|resume|clear|compact";
+
+/**
+ * Upgrades the existing Claude hook entries for guarded Bus delivery.
+ * The Stop command becomes synchronous and SessionStart runs for every source.
+ * Project-local hook policy still decides whether either path emits Bus output.
+ */
+export async function enableClaudeBusHooks(
+  settingsPath?: string,
+  binPath?: string,
+): Promise<{ changed: boolean; skipped: boolean }> {
+  const path = settingsPath ?? join(homedir(), ".claude", "settings.json");
+  const bin = binPath ?? resolveStorybloqBin();
+  if (!bin) return { changed: false, skipped: true };
+
+  const sessionCommand = formatHookCommand(bin, SESSIONSTART_SUBCOMMAND);
+  const stopCommand = formatHookCommand(bin, STOP_SUBCOMMAND);
+  const sessionRegistered = await registerSessionStartHook(path, bin);
+  const stopRegistered = await registerStopHook(path, bin);
+  if (sessionRegistered === "skipped" || stopRegistered === "skipped") {
+    return { changed: false, skipped: true };
+  }
+
+  let settings: Record<string, unknown>;
+  try {
+    settings = JSON.parse(await readFile(path, "utf-8")) as Record<string, unknown>;
+  } catch {
+    return { changed: false, skipped: true };
+  }
+  if (typeof settings.hooks !== "object" || settings.hooks === null || Array.isArray(settings.hooks)) {
+    return { changed: false, skipped: true };
+  }
+  const hooks = settings.hooks as Record<string, unknown>;
+  if (!Array.isArray(hooks.SessionStart) || !Array.isArray(hooks.Stop)) {
+    return { changed: false, skipped: true };
+  }
+
+  let changed = false;
+  const sessionGroups = hooks.SessionStart as unknown[];
+  let sessionEntry: HookEntry | null = null;
+  let sessionMatches = 0;
+  let canonicalSessionMatches = 0;
+  for (let i = sessionGroups.length - 1; i >= 0; i--) {
+    const group = sessionGroups[i];
+    if (typeof group !== "object" || group === null) continue;
+    const matcherGroup = group as MatcherGroup;
+    if (!Array.isArray(matcherGroup.hooks)) continue;
+    const retained: unknown[] = [];
+    for (const entry of matcherGroup.hooks) {
+      if (isHookWithCommand(entry, sessionCommand)) {
+        sessionMatches += 1;
+        if ((matcherGroup.matcher ?? "") === CLAUDE_BUS_SESSION_START_MATCHER) {
+          canonicalSessionMatches += 1;
+        }
+        if (!sessionEntry) sessionEntry = entry as HookEntry;
+        changed = changed || (matcherGroup.matcher ?? "") !== CLAUDE_BUS_SESSION_START_MATCHER;
+      } else {
+        retained.push(entry);
+      }
+    }
+    matcherGroup.hooks = retained;
+    if (retained.length === 0) sessionGroups.splice(i, 1);
+  }
+  if (!sessionEntry) return { changed: false, skipped: true };
+  const sessionWasCanonical = sessionMatches === 1 && canonicalSessionMatches === 1;
+  if (sessionMatches > 1) changed = true;
+  let targetGroup = sessionGroups.find((group) =>
+    typeof group === "object" && group !== null &&
+    ((group as MatcherGroup).matcher ?? "") === CLAUDE_BUS_SESSION_START_MATCHER &&
+    Array.isArray((group as MatcherGroup).hooks),
+  ) as MatcherGroup | undefined;
+  if (!targetGroup) {
+    targetGroup = { matcher: CLAUDE_BUS_SESSION_START_MATCHER, hooks: [] };
+    sessionGroups.push(targetGroup);
+    if (!sessionWasCanonical) changed = true;
+  }
+  targetGroup.hooks!.push(sessionEntry);
+
+  for (const group of hooks.Stop as unknown[]) {
+    if (typeof group !== "object" || group === null) continue;
+    const matcherGroup = group as MatcherGroup;
+    if (!Array.isArray(matcherGroup.hooks)) continue;
+    for (const entry of matcherGroup.hooks) {
+      if (!isHookWithCommand(entry, stopCommand)) continue;
+      const hook = entry as HookEntry;
+      if ("async" in hook) {
+        delete hook.async;
+        changed = true;
+      }
+    }
+  }
+
+  if (!changed) return { changed: false, skipped: false };
+  try {
+    await atomicWriteFollowingSymlink(path, JSON.stringify(settings, null, 2) + "\n");
+    return { changed: true, skipped: false };
+  } catch {
+    return { changed: false, skipped: true };
+  }
+}
+
 /**
  * Removes a hook command from settings.json. Used for migration (ISS-032).
  */
@@ -514,6 +615,10 @@ export function formatCodexPreCompactCommand(binPath: string): string {
   return formatHookCommand(binPath, `${PRECOMPACT_SUBCOMMAND} --client codex`);
 }
 
+export function formatCodexStopCommand(binPath: string): string {
+  return formatHookCommand(binPath, `${STOP_SUBCOMMAND} --client codex`);
+}
+
 export type CodexHookType = "PreCompact" | "SessionStart" | "Stop";
 
 export interface CodexHookCounts {
@@ -525,7 +630,7 @@ export interface CodexHookCounts {
 const CODEX_HOOK_ACCEPTED_RESTS: Record<CodexHookType, readonly string[]> = {
   PreCompact: [PRECOMPACT_SUBCOMMAND, `${PRECOMPACT_SUBCOMMAND} --client codex`],
   SessionStart: [SESSIONSTART_SUBCOMMAND, `${SESSIONSTART_SUBCOMMAND} --codex-hook-json`],
-  Stop: [STOP_SUBCOMMAND],
+  Stop: [STOP_SUBCOMMAND, `${STOP_SUBCOMMAND} --client codex`],
 };
 
 const ZERO_CODEX_HOOK_COUNTS: CodexHookCounts = {
@@ -593,7 +698,7 @@ async function handleSetupClaude(options: SetupSkillOptions = {}): Promise<void>
   const skillContent = await readFile(join(srcSkillDir, "SKILL.md"), "utf-8");
   await writeFile(join(skillDir, "SKILL.md"), skillContent, "utf-8");
 
-  const supportFiles = ["setup-flow.md", "autonomous-mode.md", "reference.md", "federation-setup.md", "orchestrator-mode.md"];
+  const supportFiles = ["setup-flow.md", "autonomous-mode.md", "reference.md", "federation-setup.md", "orchestrator-mode.md", "bus-mode.md"];
   const writtenFiles = ["SKILL.md"];
   const missingFiles: string[] = [];
   for (const filename of supportFiles) {
@@ -792,6 +897,8 @@ export const CODEX_READ_ONLY_APPROVAL_TOOLS = [
   "storybloq_recommend",
   "storybloq_export",
   "storybloq_session_report",
+  "storybloq_bus_poll",
+  "storybloq_bus_thread_get",
   "storybloq_node_list",
 ] as const;
 
@@ -1280,7 +1387,7 @@ export async function refreshExistingCodexHooks(
   }
 
   if (counts.Stop > 0) {
-    const command = formatHookCommand(bin, STOP_SUBCOMMAND);
+    const command = formatCodexStopCommand(bin);
     await refreshType(
       "Stop",
       CODEX_HOOK_ACCEPTED_RESTS.Stop,
@@ -1419,7 +1526,7 @@ async function handleSetupCodex(options: SetupSkillOptions = {}): Promise<void> 
   if (!skipHooks && resolvedBin !== null) {
     const precompactCmd = formatCodexPreCompactCommand(resolvedBin);
     const sessionStartCmd = formatCodexSessionStartCommand(resolvedBin);
-    const stopCmd = formatHookCommand(resolvedBin, STOP_SUBCOMMAND);
+    const stopCmd = formatCodexStopCommand(resolvedBin);
     const migratedPre = await migrateCodexHookVariants(
       "PreCompact",
       [PRECOMPACT_SUBCOMMAND, `${PRECOMPACT_SUBCOMMAND} --client codex`],
@@ -1432,7 +1539,7 @@ async function handleSetupCodex(options: SetupSkillOptions = {}): Promise<void> 
       sessionStartCmd,
     );
     if (migratedStart > 0) log(`  Migrated ${migratedStart} stale Codex SessionStart hook entr${migratedStart === 1 ? "y" : "ies"}`);
-    const migratedStop = await migrateCodexHookVariants("Stop", [STOP_SUBCOMMAND], stopCmd);
+    const migratedStop = await migrateCodexHookVariants("Stop", CODEX_HOOK_ACCEPTED_RESTS.Stop, stopCmd);
     if (migratedStop > 0) log(`  Migrated ${migratedStop} stale Codex Stop hook entr${migratedStop === 1 ? "y" : "ies"}`);
 
     const precompactResult = await registerCodexHook(

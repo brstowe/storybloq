@@ -17,7 +17,14 @@ export {
   RoadmapSchema,
   type Roadmap,
 } from "./roadmap.js";
-export { ConfigSchema, FeaturesSchema, type Config, type Features } from "./config.js";
+export {
+  BusConfigSchema,
+  ConfigSchema,
+  FeaturesSchema,
+  type BusConfig,
+  type Config,
+  type Features,
+} from "./config.js";
 export {
   DateSchema,
   TicketIdSchema,
