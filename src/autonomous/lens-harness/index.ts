@@ -21,7 +21,7 @@ export { packageContext } from "./context-packager.js";
 export { runSecretsGate, redactContent, redactArtifactSecrets } from "./secrets-gate.js";
 export { parseDiffScope, classifyOrigin } from "./diff-scope.js";
 export type { DiffScope } from "./diff-scope.js";
-export { generateIssueKey } from "./issue-key.js";
+export { generateIssueKey, generateReviewFilingKey } from "./issue-key.js";
 export { resolveAndValidate } from "./path-safety.js";
 export {
   buildCacheKey,

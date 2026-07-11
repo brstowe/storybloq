@@ -3,7 +3,7 @@ import type { WorkflowStage, StageResult, StageAdvance, StageContext } from "./t
 import { buildLensHistoryUpdate } from "./types.js";
 import type { GuideReportInput } from "../session-types.js";
 import { REVIEW_VERDICTS, REVIEW_VERDICTS_PROSE, normalizeSeverity } from "../session-types.js";
-import { requiredRounds, nextReviewer } from "../review-depth.js";
+import { normalizeRiskLevel, requiredRounds, nextReviewer } from "../review-depth.js";
 import { effectiveCodeReviewMaxRounds } from "../session-diagnostics.js";
 import { clearCache } from "../lens-harness/cache.js";
 import { accumulateVerificationCounters } from "../lens-harness/verification-log.js";
@@ -33,8 +33,9 @@ export class CodeReviewStage implements WorkflowStage {
     const codeReviews = ctx.state.reviews.code;
     const roundNum = codeReviews.length + 1;
     const reviewer = nextReviewer(codeReviews, backends, ctx.state.codexUnavailable, ctx.state.codexUnavailableSince);
-    const risk = ctx.state.ticket?.realizedRisk ?? ctx.state.ticket?.risk ?? "low";
-    const rounds = requiredRounds(risk as "low" | "medium" | "high");
+    const storedRisk = ctx.state.ticket?.realizedRisk ?? ctx.state.ticket?.risk;
+    const risk = storedRisk == null ? "low" : normalizeRiskLevel(storedRisk, "high");
+    const rounds = requiredRounds(risk);
     const mergeBase = ctx.state.git.mergeBase;
     const isIssueFix = !!ctx.state.currentIssue;
     const issueHeader = isIssueFix
@@ -213,8 +214,9 @@ export class CodeReviewStage implements WorkflowStage {
       ctx.writeState({ codexUnavailable: true, codexUnavailableSince: new Date().toISOString() });
     }
 
-    const risk = ctx.state.ticket?.realizedRisk ?? ctx.state.ticket?.risk ?? "low";
-    const minRounds = requiredRounds(risk as "low" | "medium" | "high");
+    const storedRisk = ctx.state.ticket?.realizedRisk ?? ctx.state.ticket?.risk;
+    const risk = storedRisk == null ? "low" : normalizeRiskLevel(storedRisk, "high");
+    const minRounds = requiredRounds(risk);
     const maxReviewRounds = effectiveCodeReviewMaxRounds(risk, ctx.recipe.stages);
     // ISS-073: Only count unresolved findings (open/contested) as contradictory with approve
     const hasCriticalOrMajor = findings.some(

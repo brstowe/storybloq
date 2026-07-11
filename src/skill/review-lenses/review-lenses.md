@@ -111,6 +111,8 @@ The tool runs the package merger pipeline programmatically (per-lens schema pars
 - `preExistingFindings` / `preExistingCount` -- findings classified pre-existing off the diff scope (harness output). The MCP tool response additionally carries `filedIssues` when it auto-files those as issues.
 - `lensesCompleted` / `lensesFailed` / `lensesSkipped`
 
+Auto-filed pre-existing findings stay `open` and carry a deterministic `dedupeKey`, lens attribution in `createdBy`, and a structured `sourceRefs` entry with the review ID. Storybloq hashes the referenced line range and does not persist the lens snippet. Repeating synthesis returns the existing issue instead of filing a duplicate. The implementing agent, not the reviewer, owns later status and resolution changes.
+
 ### Step 6: Judge (deterministic; no judge agent)
 
 Call `storybloq_review_lenses_judge` with the `reviewVerdict` from Step 5 (plus `convergenceHistory` on round 2+):

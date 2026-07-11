@@ -9,6 +9,7 @@ import { canClaim, buildClaim } from "../../core/claims.js";
 import { gitUserEmail } from "../git-inspector.js";
 import { displayIdOf } from "../../core/resolver.js";
 import { storybloqClientProfile } from "../client-profile.js";
+import { reviewRiskForTicket } from "../review-depth.js";
 
 /**
  * PICK_TICKET stage -- Claude selects the next ticket to work on.
@@ -281,7 +282,13 @@ export class PickTicketStage implements WorkflowStage {
 
     // Stage field updates (persisted atomically with state transition by processAdvance)
     ctx.updateDraft({
-      ticket: { id: ticket.id, displayId: ticket.displayId, title: ticket.title, claimed: true },
+      ticket: {
+        id: ticket.id,
+        displayId: ticket.displayId,
+        title: ticket.title,
+        risk: reviewRiskForTicket(ticket),
+        claimed: true,
+      },
       reviews: { plan: [], code: [] },
       finalizeCheckpoint: null,
       landingDecision: null,

@@ -192,7 +192,7 @@ describe("PlanStage", () => {
   });
 
   it("report() advances with plan review instruction when plan exists", async () => {
-    const state = makeState({ state: "PLAN", ticket: { id: "T-001", title: "Test", claimed: true } });
+    const state = makeState({ state: "PLAN", ticket: { id: "T-001", title: "Test", claimed: true, risk: "high" } });
     writeFileSync(join(sessionDir, "plan.md"), "# Implementation Plan\n\n1. Step one\n2. Step two\n", "utf-8");
     // Need .story directory for project lock
     mkdirSync(join(testRoot, ".story", "tickets"), { recursive: true });
@@ -204,8 +204,10 @@ describe("PlanStage", () => {
     const ctx = new StageContext(testRoot, sessionDir, state, makeRecipe());
     const advance = await stage.report(ctx, { completedAction: "plan_written" });
     expect(advance.action).toBe("advance");
+    expect(ctx.state.ticket?.risk).toBe("high");
     if (advance.action === "advance" && "result" in advance && advance.result) {
       expect(advance.result.instruction).toContain("Plan Review");
+      expect(advance.result.instruction).toContain("Round 1 of 3 minimum");
     }
   });
 
@@ -294,6 +296,7 @@ describe("CompleteStage", () => {
     writeFileSync(join(testRoot, ".story", "tickets", "T-999.json"), JSON.stringify({
       id: "T-999", title: "Test", description: "", type: "task", status: "open",
       phase: null, order: 10, createdDate: "2026-01-01", completedDate: null, blockedBy: [],
+      parentTicket: null,
     }), "utf-8");
     const state = makeState({
       state: "COMPLETE",
@@ -323,6 +326,12 @@ describe("CompleteStage", () => {
     writeFileSync(join(testRoot, ".story", "tickets", "T-999.json"), JSON.stringify({
       id: "T-999", title: "Test", description: "", type: "task", status: "open",
       phase: null, order: 10, createdDate: "2026-01-01", completedDate: null, blockedBy: [],
+      parentTicket: null,
+    }), "utf-8");
+    writeFileSync(join(testRoot, ".story", "issues", "ISS-999.json"), JSON.stringify({
+      id: "ISS-999", title: "Remaining work", status: "open", severity: "medium",
+      components: [], impact: "Keeps the session active.", resolution: null,
+      resolvedDate: null, discoveredDate: "2026-01-01", relatedTickets: [], location: [],
     }), "utf-8");
     const state = makeState({
       state: "COMPLETE",
@@ -511,5 +520,20 @@ describe("PickTicketStage", () => {
     }
     // State should have ticket set
     expect(ctx.state.ticket?.id).toBe("T-001");
+    expect(ctx.state.ticket?.risk).toBe("low");
+  });
+
+  it("report() persists canonical reviewRisk metadata into session state", async () => {
+    writeFileSync(join(testRoot, ".story", "tickets", "T-001.json"), JSON.stringify({
+      id: "T-001", title: "Risky ticket", description: "Build something", type: "task",
+      status: "open", phase: null, order: 10, createdDate: "2026-01-01",
+      completedDate: null, blockedBy: [], reviewRisk: "high",
+    }), "utf-8");
+    const ctx = new StageContext(testRoot, sessionDir, makeState(), makeRecipe());
+
+    const advance = await stage.report(ctx, { completedAction: "ticket_picked", ticketId: "T-001" });
+
+    expect(advance.action).toBe("advance");
+    expect(ctx.state.ticket?.risk).toBe("high");
   });
 });

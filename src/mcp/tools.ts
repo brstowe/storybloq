@@ -17,6 +17,8 @@ import { TARGET_WORK_ID_REGEX, LENS_FINDING_DISPOSITIONS } from "../autonomous/s
 import { CLIENT_TASK_ID_PATTERN } from "../autonomous/client-profile.js";
 import { findActiveSessionMinimal, readSessionResilient, sessionDir, isLeaseExpired } from "../autonomous/session.js";
 import { touchLastMcpCallFile } from "../autonomous/liveness.js";
+import { ConfigSchema } from "../models/config.js";
+import { registerBusTools } from "./bus-tools.js";
 
 // ISS-407: Cache active session dir to avoid O(n) directory scan on every MCP call.
 // Expires after 30s -- long enough to amortize hot-path calls, short enough
@@ -25,7 +27,7 @@ const _SESSION_CACHE_TTL_MS = 30_000;
 let _cachedSessionDir: string | null = null;
 let _cachedSessionAt = 0;
 
-function touchMcpLiveness(pinnedRoot: string): void {
+export function touchMcpLiveness(pinnedRoot: string): void {
   const now = Date.now();
   if (_cachedSessionDir && now - _cachedSessionAt < _SESSION_CACHE_TTL_MS) {
     touchLastMcpCallFile(_cachedSessionDir);
@@ -46,11 +48,13 @@ import {
   registerSubprocess,
   unregisterSubprocess,
 } from "../autonomous/subprocess-registry.js";
-import { handlePrepare, handleSynthesize, handleJudge, generateIssueKey } from "../autonomous/lens-harness/index.js";
+import { handlePrepare, handleSynthesize, handleJudge, generateIssueKey, generateReviewFilingKey } from "../autonomous/lens-harness/index.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 
 import { loadProject } from "../core/project-loader.js";
 import { ProjectLoaderError, INTEGRITY_WARNING_TYPES } from "../core/errors.js";
+import { scanLedgerIntegrity } from "../core/ledger-integrity.js";
+import { formatLedgerIntegrity } from "../core/output-formatter.js";
 import { CliValidationError } from "../cli/helpers.js";
 import {
   TICKET_ID_REGEX,
@@ -71,12 +75,16 @@ import {
   type OutputFormat,
 } from "../models/types.js";
 import type { CommandContext, CommandResult } from "../cli/types.js";
+import {
+  IssueDedupeKeySchema,
+  IssueSourceRefInputSchema,
+} from "../models/issue.js";
 
 import { withProjectLock } from "../core/project-loader.js";
 
 // Handler imports — pure functions, no run.ts side effects
 import { handleStatus } from "../cli/commands/status.js";
-import { handleValidate } from "../cli/commands/validate.js";
+import { handleValidateWithSourceRefs } from "../cli/commands/validate.js";
 import {
   handleHandoverList,
   handleHandoverLatest,
@@ -297,6 +305,15 @@ function resolveEffectiveRootForWrite(pinnedRoot: string, nodeName?: string): { 
 }
 
 export function registerAllTools(server: McpServer, pinnedRoot: string): void {
+  try {
+    const parsed = ConfigSchema.safeParse(JSON.parse(readFileSync(join(pinnedRoot, ".story", "config.json"), "utf-8")));
+    if (parsed.success && parsed.data.features.bus === true) {
+      registerBusTools(server, pinnedRoot, () => touchMcpLiveness(pinnedRoot));
+    }
+  } catch {
+    // Normal tools still register. Project loading reports config damage.
+  }
+
   // --- No-arg tools ---
 
   server.registerTool("storybloq_status", {
@@ -369,8 +386,25 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
   }, () => runMcpReadTool(pinnedRoot, handleBlockerList));
 
   server.registerTool("storybloq_validate", {
-    description: "Reference integrity + schema checks on all .story/ files",
-  }, () => runMcpReadTool(pinnedRoot, handleValidate));
+    description: "Reference integrity + schema checks. The integrity preflight works even when critical JSON prevents normal project loading.",
+    inputSchema: {
+      format: z.enum(["md", "json"]).optional().describe("Output format (default: md)"),
+      integrityOnly: z.boolean().optional().describe("Scan all .story JSON without loading project state"),
+    },
+  }, async (args) => {
+    const format = args.format ?? "md";
+    const integrity = await scanLedgerIntegrity(pinnedRoot, {
+      includeAuxiliary: args.integrityOnly === true,
+    });
+    if (args.integrityOnly || !integrity.valid) {
+      try { touchMcpLiveness(pinnedRoot); } catch { /* best-effort */ }
+      return {
+        content: [{ type: "text" as const, text: formatLedgerIntegrity(integrity, format) }],
+        ...(integrity.criticalErrorCount > 0 ? { isError: true } : {}),
+      };
+    }
+    return runMcpReadTool(pinnedRoot, handleValidateWithSourceRefs, undefined, format);
+  });
 
   // --- Parameterized tools ---
 
@@ -663,6 +697,9 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
       components: z.array(z.string()).optional().describe("Affected components"),
       relatedTickets: z.array(TicketRefSchema).optional().describe("Related ticket IDs"),
       location: z.array(z.string()).optional().describe("File locations"),
+      sourceRefs: z.array(IssueSourceRefInputSchema).optional().describe("Structured source provenance. Missing hashes are captured from the reviewed revision or working tree."),
+      dedupeKey: IssueDedupeKeySchema.optional().describe("Idempotency key. A repeated create returns the existing issue."),
+      createdBy: z.string().min(1).max(256).optional().describe("Reviewer or agent attribution"),
       phase: z.string().optional().describe("Phase ID"),
       node: nodeParam,
     },
@@ -678,6 +715,9 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
           components: args.components ?? [],
           relatedTickets: args.relatedTickets ?? [],
           location: args.location ?? [],
+          sourceRefs: args.sourceRefs,
+          dedupeKey: args.dedupeKey,
+          createdBy: args.createdBy,
           phase: args.phase,
         },
         format,
@@ -698,6 +738,7 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
       components: z.array(z.string()).optional().describe("Affected components"),
       relatedTickets: z.array(TicketRefSchema).optional().describe("Related ticket IDs"),
       location: z.array(z.string()).optional().describe("File locations"),
+      sourceRefs: z.array(IssueSourceRefInputSchema).optional().describe("Replacement structured source provenance"),
       order: z.number().int().optional().describe("New sort order"),
       phase: z.string().nullable().optional().describe("New phase ID (null to clear)"),
       node: nodeParam,
@@ -717,6 +758,7 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
           components: args.components,
           relatedTickets: args.relatedTickets,
           location: args.location,
+          sourceRefs: args.sourceRefs,
           order: args.order,
           phase: args.phase,
         },
@@ -1303,6 +1345,8 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
 
       // T-192: Auto-file pre-existing findings as issues
       const filedIssues: { issueKey: string; issueId: string }[] = [];
+      const filingWarnings: { issueKey: string; code: string; message: string }[] = [];
+      const filingErrors: { issueKey: string; code: string; message: string }[] = [];
       if (result.preExistingFindings.length > 0) {
         const sessionDir = args.sessionId
           ? join(pinnedRoot, ".story", "sessions", args.sessionId)
@@ -1311,25 +1355,56 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
         const sizeBeforeLoop = alreadyFiled.size;
 
         for (const f of result.preExistingFindings) {
-          const dedupKey = generateIssueKey(f);
-          if (alreadyFiled.has(dedupKey)) continue;
+          const issueKey = generateIssueKey(f);
+          if (alreadyFiled.has(issueKey)) continue;
 
           try {
             const { handleIssueCreate } = await import("../cli/commands/issue.js");
             const severityMap: Record<string, string> = { blocking: "critical", major: "high", minor: "medium" };
             const severity = severityMap[f.severity] ?? "medium";
-            const issueResult = await handleIssueCreate(
-              {
-                title: `[pre-existing] [${f.category}] ${f.description.slice(0, 60)}`,
-                severity,
-                impact: f.description,
-                components: ["review-lenses"],
-                relatedTickets: [],
-                location: f.file && f.line != null ? [`${f.file}:${f.line}`] : [],
-              },
-              "json",
-              pinnedRoot,
-            );
+            const quote = f.snippet?.quote.replace(/\r\n?/g, "\n");
+            const quoteLines = quote
+              ? quote.endsWith("\n") ? quote.slice(0, -1).split("\n").length : quote.split("\n").length
+              : 1;
+            const sourceRefs = f.file && f.line != null
+              ? [{
+                  path: f.file,
+                  startLine: f.line,
+                  ...(quoteLines > 1
+                    ? { endLine: f.line + quoteLines - 1 }
+                    : {}),
+                  reviewId: args.reviewId ?? "unknown",
+                }]
+              : undefined;
+            const createArgs = {
+              title: `[pre-existing] [${f.category}] ${f.description.slice(0, 60)}`,
+              severity,
+              impact: f.description,
+              components: ["review-lenses"],
+              relatedTickets: [],
+              location: f.file && f.line != null ? [`${f.file}:${f.line}`] : [],
+              sourceRefs,
+              dedupeKey: generateReviewFilingKey(args.reviewId ?? "unknown", f),
+              createdBy: `review-lenses:${f.contributingLenses.join(",")}`,
+            };
+            let issueResult;
+            try {
+              issueResult = await handleIssueCreate(createArgs, "json", pinnedRoot);
+            } catch (err) {
+              if (!(sourceRefs && err instanceof CliValidationError && err.code === "invalid_input")) {
+                throw err;
+              }
+              filingWarnings.push({
+                issueKey,
+                code: "source_provenance_omitted",
+                message: "The finding was filed without structured source provenance because the source reference could not be normalized.",
+              });
+              issueResult = await handleIssueCreate(
+                { ...createArgs, sourceRefs: undefined },
+                "json",
+                pinnedRoot,
+              );
+            }
 
             let issueId: string | undefined;
             try {
@@ -1341,11 +1416,14 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
             }
 
             if (issueId) {
-              filedIssues.push({ issueKey: dedupKey, issueId });
-              alreadyFiled.add(dedupKey);
+              filedIssues.push({ issueKey, issueId });
+              alreadyFiled.add(issueKey);
             }
-          } catch {
-            // Best-effort filing; finding still goes through review pipeline
+          } catch (err) {
+            const message = err instanceof Error
+              ? err.message.replace(/\/[^\s]+/g, "<path>")
+              : "unknown error";
+            filingErrors.push({ issueKey, code: "issue_filing_failed", message });
           }
         }
 
@@ -1354,7 +1432,7 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
         }
       }
 
-      const output = { ...result, filedIssues };
+      const output = { ...result, filedIssues, filingWarnings, filingErrors };
       return { content: [{ type: "text" as const, text: JSON.stringify(output, null, 2) }] };
     } catch (err) {
       const msg = err instanceof Error ? err.message.replace(/\/[^\s]+/g, "<path>") : "unknown error";

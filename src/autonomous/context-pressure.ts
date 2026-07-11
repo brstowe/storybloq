@@ -7,18 +7,20 @@ import type { FullSessionState, PressureLevel } from "./session-types.js";
 interface Limits { calls: number; tickets: number; bytes: number; }
 
 /**
- * Threshold presets keyed by compactThreshold config value.
- * "high" = default (moderate) — compact when pressure reaches "high".
- * "critical" = conservative — only compact at critical pressure.
- * "medium" = aggressive — compact earlier.
+ * Threshold presets keyed by compactThreshold config value. The setting has
+ * two coordinated effects: it selects the signal limits below and the minimum
+ * pressure rank accepted by pressureMeetsThreshold().
+ * "high" = default (moderate); rotate when pressure reaches "high".
+ * "critical" = conservative; use higher limits and rotate only at critical.
+ * "medium" = aggressive; use lower limits and rotate at medium.
  *
  * Default tier ("high") thresholds:
- * | Level    | Condition                              | Action           |
- * |----------|----------------------------------------|------------------|
- * | low      | <30 calls, <3 tickets, <150KB events   | Continue         |
- * | medium   | 30+ calls OR 3+ tickets OR >150KB      | Evaluate         |
- * | high     | 60+ calls OR 5+ tickets OR >800KB      | (logged only)    |
- * | critical | >90 calls OR 8+ tickets OR >1.5MB      | (logged only)    |
+ * | Level    | Condition                              | Action                    |
+ * |----------|----------------------------------------|---------------------------|
+ * | low      | <30 calls, <3 tickets, <150KB events   | Continue                  |
+ * | medium   | 30+ calls OR 3+ tickets OR >150KB      | Continue                  |
+ * | high     | 60+ calls OR 5+ tickets OR >800KB      | Rotate at next COMPLETE   |
+ * | critical | >90 calls OR 8+ tickets OR >1.5MB      | Rotate at next COMPLETE   |
  */
 const THRESHOLDS: Record<string, { critical: Limits; high: Limits; medium: Limits }> = {
   critical: {
@@ -45,10 +47,15 @@ const THRESHOLDS: Record<string, { critical: Limits; high: Limits; medium: Limit
  */
 export function evaluatePressure(state: FullSessionState): PressureLevel {
   const calls = state.contextPressure?.guideCallCount ?? state.guideCallCount ?? 0;
-  // ISS-084: Always compute from source arrays (not cached counter) to avoid
-  // stale values during chained goto transitions (e.g., FINALIZE -> COMPLETE)
-  const tickets = (state.completedTickets?.length ?? 0) + (state.resolvedIssues?.length ?? 0);
-  const eventsBytes = state.contextPressure?.eventsLogBytes ?? 0;
+  // ISS-084: Compute work from source arrays, then subtract the last successful
+  // compaction baseline. Session completion history remains cumulative while
+  // pressure measures only work performed in the current context window.
+  const totalWork = (state.completedTickets?.length ?? 0) + (state.resolvedIssues?.length ?? 0);
+  const workBaseline = state.contextPressure?.workItemsAtLastCompaction ?? 0;
+  const tickets = Math.max(0, totalWork - workBaseline);
+  const totalEventsBytes = state.contextPressure?.eventsLogBytes ?? 0;
+  const eventsBaseline = state.contextPressure?.eventsLogBytesAtLastCompaction ?? 0;
+  const eventsBytes = Math.max(0, totalEventsBytes - eventsBaseline);
 
   const tier = state.config?.compactThreshold ?? "high";
   const t = THRESHOLDS[tier] ?? THRESHOLDS["high"]!;
@@ -57,4 +64,41 @@ export function evaluatePressure(state: FullSessionState): PressureLevel {
   if (calls >= t.high.calls || tickets >= t.high.tickets || eventsBytes > t.high.bytes) return "high";
   if (calls >= t.medium.calls || tickets >= t.medium.tickets || eventsBytes > t.medium.bytes) return "medium";
   return "low";
+}
+
+const PRESSURE_ORDER: Readonly<Record<PressureLevel, number>> = {
+  low: 0,
+  medium: 1,
+  high: 2,
+  critical: 3,
+};
+
+const COMPACT_THRESHOLD_RANK: Readonly<Record<string, number>> = {
+  medium: PRESSURE_ORDER.medium,
+  high: PRESSURE_ORDER.high,
+  critical: PRESSURE_ORDER.critical,
+};
+
+/** Unknown and legacy threshold values preserve the existing high fallback. */
+export function pressureMeetsThreshold(
+  level: PressureLevel,
+  compactThreshold: string | null | undefined,
+): boolean {
+  const threshold = COMPACT_THRESHOLD_RANK[compactThreshold ?? ""] ?? PRESSURE_ORDER.high;
+  return PRESSURE_ORDER[level] >= threshold;
+}
+
+/** Reset pressure only after COMPACT recovery has successfully resumed. */
+export function pressureAfterCompaction(
+  state: FullSessionState,
+): FullSessionState["contextPressure"] {
+  const totalWork = (state.completedTickets?.length ?? 0) + (state.resolvedIssues?.length ?? 0);
+  return {
+    ...state.contextPressure,
+    level: "low",
+    guideCallCount: 0,
+    compactionCount: (state.contextPressure?.compactionCount ?? 0) + 1,
+    workItemsAtLastCompaction: totalWork,
+    eventsLogBytesAtLastCompaction: state.contextPressure?.eventsLogBytes ?? 0,
+  };
 }

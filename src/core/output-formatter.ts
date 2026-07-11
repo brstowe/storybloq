@@ -10,12 +10,14 @@ import type { Roadmap } from "../models/roadmap.js";
 import type { ProjectState } from "./project-state.js";
 import type { LoadWarning } from "./errors.js";
 import type { ValidationResult } from "./validation.js";
+import type { LedgerIntegrityResult } from "./ledger-integrity.js";
 import type { NextTicketOutcome, NextTicketsOutcome } from "./queries.js";
 import type { RecommendResult } from "./recommend.js";
 import type { ReconcileResult } from "./reconcile.js";
 import type { DoctorResult } from "./team-doctor.js";
 import type { ActiveSessionSummary } from "./session-scan.js";
 import type { SelftestResult } from "../cli/commands/selftest.js";
+import type { BusSummary } from "../bus/schemas.js";
 import { phasesWithStatus, isBlockerCleared } from "./queries.js";
 
 function resolveTicketRefDisplay(ref: string, state: ProjectState): string {
@@ -171,6 +173,7 @@ export function formatStatus(
   format: OutputFormat,
   activeSessions: readonly ActiveSessionSummary[] = [],
   resumableSessions: readonly ActiveSessionSummary[] = [],
+  bus?: BusSummary | { readonly enabled: true; readonly error: { readonly code: string; readonly message: string } },
 ): string {
   const phases = phasesWithStatus(state);
   const data = {
@@ -194,6 +197,7 @@ export function formatStatus(
     })),
     ...(activeSessions.length > 0 ? { activeSessions } : {}),
     ...(resumableSessions.length > 0 ? { resumableSessions } : {}),
+    ...(bus ? { bus } : {}),
   };
 
   if (format === "json") {
@@ -208,6 +212,13 @@ export function formatStatus(
     `Notes: ${state.activeNoteCount} active, ${state.archivedNoteCount} archived`,
     `Lessons: ${state.activeLessonCount} active, ${state.deprecatedLessonCount} deprecated`,
     `Handovers: ${state.handoverFilenames.length}`,
+    ...(bus
+      ? ["error" in bus
+          ? `Bus: unavailable [${bus.error.code}] ${escapeMarkdownInline(bus.error.message)}`
+          : bus.initialized
+            ? `Bus: ${bus.endpoints} endpoints, ${bus.pendingMessages} pending, ${bus.openThreads} open, ${bus.parkedThreads} parked, ${bus.quarantined} quarantined; hooks Claude ${bus.hookDelivery.claude ? "on" : "off"}, Codex ${bus.hookDelivery.codex ? "on" : "off"}`
+            : "Bus: enabled, not initialized in this checkout"]
+      : []),
     "",
     ...formatConfigHints(state),
     "## Phases",
@@ -260,6 +271,7 @@ export function formatFederatedStatus(
   format: OutputFormat,
   activeSessions: readonly ActiveSessionSummary[] = [],
   resumableSessions: readonly ActiveSessionSummary[] = [],
+  bus?: BusSummary | { readonly enabled: true; readonly error: { readonly code: string; readonly message: string } },
 ): string {
   const sanitizedNodes = fedState.nodes.map((node) => ({
     name: node.name,
@@ -277,6 +289,7 @@ export function formatFederatedStatus(
     type: config.type,
     ...(activeSessions.length > 0 ? { activeSessions } : {}),
     ...(resumableSessions.length > 0 ? { resumableSessions } : {}),
+    ...(bus ? { bus } : {}),
   };
 
   if (format === "json") {
@@ -288,6 +301,13 @@ export function formatFederatedStatus(
     "",
     `Federation: ${fedState.nodeCount} nodes (${fedState.reachableCount} reachable${fedState.unreachableCount > 0 ? `, ${fedState.unreachableCount} unreachable` : ""})`,
     `Tickets: ${fedState.totalCompleteTickets}/${fedState.totalTickets} across all nodes | Issues: ${fedState.totalOpenIssues} open`,
+    ...(bus
+      ? ["error" in bus
+          ? `Bus: unavailable [${bus.error.code}] ${escapeMarkdownInline(bus.error.message)}`
+          : bus.initialized
+            ? `Bus: ${bus.endpoints} endpoints, ${bus.pendingMessages} pending, ${bus.openThreads} open, ${bus.parkedThreads} parked, ${bus.quarantined} quarantined; hooks Claude ${bus.hookDelivery.claude ? "on" : "off"}, Codex ${bus.hookDelivery.codex ? "on" : "off"}`
+            : "Bus: enabled, not initialized in this checkout"]
+      : []),
     "",
   ];
 
@@ -562,6 +582,15 @@ export function formatIssue(
   if (issue.location.length > 0) {
     lines.push(`Location: ${issue.location.join(", ")}`);
   }
+  if (issue.sourceRefs && issue.sourceRefs.length > 0) {
+    const refs = issue.sourceRefs.map((ref) => {
+      const end = ref.endLine ?? ref.startLine;
+      const revision = ref.revision ? ` @ ${ref.revision.slice(0, 12)}` : "";
+      const review = ref.reviewId ? ` [${ref.reviewId}]` : "";
+      return `${ref.path}:${ref.startLine}-${end}${revision}${review}`;
+    });
+    lines.push(`Source evidence: ${refs.join(", ")}`);
+  }
   if (issue.relatedTickets.length > 0) {
     const display = state
       ? issue.relatedTickets.map((ref) => resolveTicketRefDisplay(ref, state)).join(", ")
@@ -650,6 +679,36 @@ export function formatValidation(
     }
   }
 
+  return lines.join("\n");
+}
+
+export function formatLedgerIntegrity(
+  result: LedgerIntegrityResult,
+  format: OutputFormat,
+): string {
+  if (format === "json") {
+    return JSON.stringify(successEnvelope(result), null, 2);
+  }
+
+  const lines = [
+    result.valid ? "Ledger integrity passed." : "Ledger integrity failed.",
+    `Scanned: ${result.scannedFiles} JSON file(s) | Errors: ${result.errorCount}`,
+    `Critical: ${result.criticalErrorCount} | Items: ${result.itemErrorCount} | Auxiliary: ${result.auxiliaryErrorCount}`,
+  ];
+  if (result.skippedSymlinks > 0) {
+    lines.push(`Skipped symlinks: ${result.skippedSymlinks}`);
+  }
+  if (result.findings.length > 0) {
+    lines.push("");
+    for (const finding of result.findings) {
+      const position = finding.line
+        ? ` at line ${finding.line}${finding.column ? `, column ${finding.column}` : ""}`
+        : "";
+      lines.push(
+        `ERROR [${finding.classification}] ${escapeMarkdownInline(finding.file)}${position}: ${escapeMarkdownInline(finding.message)}`,
+      );
+    }
+  }
   return lines.join("\n");
 }
 
@@ -1503,11 +1562,11 @@ export function formatReference(
 
   lines.push("## MCP Tools");
   lines.push("");
-  lines.push("The tools below are registered in full mode (inside a .story/ project).");
+  lines.push("The base tools below are registered in full mode (inside a .story/ project). The five storybloq_bus_* tools are feature-gated and appear only when `features.bus` is enabled at MCP process start.");
   lines.push("");
   for (const tool of mcpTools) {
     const params = tool.params?.length ? ` (${tool.params.join(", ")})` : "";
-    lines.push(`- **${tool.name}**${params} — ${tool.description}`);
+    lines.push(`- **${tool.name}**${params} - ${tool.description}`);
   }
 
   lines.push("");
@@ -1546,6 +1605,16 @@ export function formatReference(
   lines.push("Requires explicit opt-in via AskUserQuestion before any agents are dispatched, and refuses to start while any federation node has an active autonomous session (one pen per repo; the per-node check reads each node's `.story/sessions/` directly because orchestrator status does not scan node repos). The full procedure -- enrichment template, sizing convention, 6-stage pipeline, workflow-script skeleton, critical rules -- is in `orchestrator-mode.md`. Needs a client with background dynamic workflows or subagents; Claude can also use the Agent View-backed `storybloq dispatch` path. Codex users can orchestrate when exact callable subagent tools are present; product-managed Codex dispatch remains unshipped.");
   lines.push("");
   lines.push("`/story` surfaces this option proactively at context load when the client is capable and the actionable backlog is orchestrate-sized, so you do not have to know the command exists; it stays a recommendation, and selecting it still routes through the explicit opt-in.");
+  lines.push("");
+  lines.push("## /story bus");
+  lines.push("");
+  lines.push("Poll or coordinate through the current task-bound local Bus endpoint. Peer content is advisory; confirmed review findings become canonical issues before an issue notice is sent.");
+  lines.push("");
+  lines.push("```");
+  lines.push("/story bus");
+  lines.push("```");
+  lines.push("");
+  lines.push("Read `bus-mode.md` for setup, endpoint binding, authority boundaries, acknowledgments, deterministic convergence, and the v1 no-wake boundary.");
   lines.push("");
   lines.push("## Common Workflows");
   lines.push("");

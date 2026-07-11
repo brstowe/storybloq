@@ -20,6 +20,31 @@ const SENSITIVE_PATTERNS = [
 export type RiskLevel = "low" | "medium" | "high";
 
 /**
+ * Normalize persisted or user-authored review risk. Missing values use the
+ * caller's fallback; malformed explicit values should normally fail closed.
+ */
+export function normalizeRiskLevel(
+  value: unknown,
+  fallback: RiskLevel = "low",
+): RiskLevel {
+  return value === "low" || value === "medium" || value === "high"
+    ? value
+    : fallback;
+}
+
+/**
+ * Resolve a ticket's plan-time review seed without claiming the generic
+ * `risk` metadata key. `reviewRisk` is canonical; `risk` remains a legacy
+ * compatibility fallback for projects that adopted the public PR convention.
+ */
+export function reviewRiskForTicket(
+  ticket: Record<string, unknown>,
+): RiskLevel {
+  const explicit = ticket.reviewRisk ?? ticket.risk;
+  return explicit == null ? "low" : normalizeRiskLevel(explicit, "high");
+}
+
+/**
  * Assess risk from diff stats and optionally file paths.
  * <50 lines = low, 50-200 = medium, >200 = high.
  * Sensitive paths escalate one level.

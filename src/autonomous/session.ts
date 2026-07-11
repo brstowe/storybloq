@@ -101,13 +101,18 @@ export function createSession(
       ticketsCompleted: 0,
       compactionCount: 0,
       eventsLogBytes: 0,
+      workItemsAtLastCompaction: 0,
+      eventsLogBytesAtLastCompaction: 0,
     },
+    contextRotation: null,
     pendingProjectMutation: null,
     resumeFromRevision: null,
     preCompactState: null,
     compactPending: false,
     compactPreparedAt: null,
+    compactObservedAt: null,
     resumeBlocked: false,
+    lastCheckpointWorkCount: 0,
     terminationReason: null,
     waitingForRetry: false,
     lastGuideCall: now,
@@ -498,6 +503,23 @@ export interface CompactPrepareResult {
   resumeFromRevision: number;
 }
 
+/** True only after the post-compaction SessionStart hook observed this cycle. */
+export function wasCompactionObserved(state: FullSessionState): boolean {
+  return state.state === "COMPACT" && state.compactPending && !!state.compactObservedAt;
+}
+
+/** Record proof that the client completed the pending compaction cycle. */
+export function markCompactionObserved(
+  dir: string,
+  state: FullSessionState,
+  observedAt = new Date().toISOString(),
+): FullSessionState {
+  if (state.state !== "COMPACT" || !state.compactPending) {
+    throw new Error("Cannot observe compaction without a pending COMPACT session");
+  }
+  return writeSessionSync(dir, { ...state, compactObservedAt: observedAt });
+}
+
 /**
  * Prepare a session for compaction. Used by BOTH the CLI hook (session-compact-prepare)
  * and the guide's handlePreCompact action. Sets state=COMPACT with compactPending marker.
@@ -518,7 +540,13 @@ export function prepareForCompact(
     const updatedGit = opts?.expectedHead
       ? { ...state.git, expectedHead: opts.expectedHead }
       : state.git;
-    writeSessionSync(dir, { ...state, compactPreparedAt: new Date().toISOString(), resumeBlocked: false, git: updatedGit });
+    writeSessionSync(dir, {
+      ...state,
+      compactPreparedAt: new Date().toISOString(),
+      compactObservedAt: null,
+      resumeBlocked: false,
+      git: updatedGit,
+    });
     return {
       sessionId: state.sessionId,
       preCompactState: state.preCompactState ?? state.state,
@@ -541,6 +569,7 @@ export function prepareForCompact(
     resumeFromRevision: state.revision,
     compactPending: true,
     compactPreparedAt: new Date().toISOString(),
+    compactObservedAt: null,
     resumeBlocked: false,
     git: { ...state.git, expectedHead: opts?.expectedHead ?? state.git.expectedHead },
   });

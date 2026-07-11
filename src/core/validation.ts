@@ -72,6 +72,24 @@ export function validateProject(state: ProjectState): ValidationResult {
     }
   }
 
+  // Dedupe keys are idempotency identities, so two issues may never share one.
+  const issueDedupeKeys = new Map<string, string[]>();
+  for (const issue of state.activeIssues) {
+    if (!issue.dedupeKey) continue;
+    const ids = issueDedupeKeys.get(issue.dedupeKey) ?? [];
+    ids.push(displayIdOf(issue));
+    issueDedupeKeys.set(issue.dedupeKey, ids);
+  }
+  for (const [key, ids] of issueDedupeKeys) {
+    if (ids.length < 2) continue;
+    findings.push({
+      level: "error",
+      code: "duplicate_issue_dedupe_key",
+      message: `Issue dedupe key "${key}" is shared by ${ids.join(", ")}.`,
+      entity: null,
+    });
+  }
+
   // Duplicate note IDs
   const noteIDCounts = new Map<string, number>();
   for (const n of state.notes) {
@@ -453,6 +471,25 @@ export function mergeValidation(
     warningCount,
     infoCount,
     findings: allFindings,
+  };
+}
+
+/** Add validation findings from an I/O-backed validation pass. */
+export function appendValidationFindings(
+  result: ValidationResult,
+  extra: readonly ValidationFinding[],
+): ValidationResult {
+  if (extra.length === 0) return result;
+  const findings = [...result.findings, ...extra];
+  const errorCount = findings.filter((finding) => finding.level === "error").length;
+  const warningCount = findings.filter((finding) => finding.level === "warning").length;
+  const infoCount = findings.filter((finding) => finding.level === "info").length;
+  return {
+    valid: errorCount === 0,
+    errorCount,
+    warningCount,
+    infoCount,
+    findings,
   };
 }
 

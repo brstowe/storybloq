@@ -1,6 +1,6 @@
-import type { WorkflowStage, StageResult, StageAdvance, StageContext } from "./types.js";
+import type { WorkflowStage, StageAdvance, StageContext } from "./types.js";
 import type { GuideReportInput } from "../session-types.js";
-import { evaluatePressure } from "../context-pressure.js";
+import { evaluatePressure, pressureMeetsThreshold } from "../context-pressure.js";
 import { nextTickets } from "../../core/queries.js";
 import { findFirstPostComplete, type NextStageResult } from "./registry.js";
 import { isTargetedMode, getRemainingTargets, buildTargetedCandidatesText, buildTargetedPickInstruction, buildTargetedStuckHandover } from "../target-work.js";
@@ -9,9 +9,10 @@ import { detectBranchAffinity, buildAffinityAnnotation } from "../branch-affinit
 /**
  * COMPLETE stage -- Ticket completed, decide next action.
  *
- * enter(): Auto-advances -- evaluates pressure, checks ticket cap, routes to
- *          PICK_TICKET (continue) or HANDOVER (done). Returns StageAdvance,
- *          not StageResult, so the walker processes it immediately.
+ * enter(): Evaluates pressure and the ticket cap. It normally auto-advances to
+ *          PICK_TICKET or HANDOVER. Because neither supported client exposes a
+ *          callable compaction action, threshold pressure ends at HANDOVER
+ *          instead of claiming that client context was compacted.
  *
  * report(): Not normally called -- CompleteStage auto-advances from enter().
  *           If called (e.g. crash recovery), delegates to enter() logic.
@@ -57,9 +58,6 @@ export class CompleteStage implements WorkflowStage {
       } as StageAdvance;
     }
 
-    // ISS-084: Checkpoint at handoverInterval boundaries
-    await this.tryCheckpoint(ctx, totalWorkDone, ticketsDone, issuesDone);
-
     // Load project state for routing decisions
     let projectState;
     try {
@@ -94,9 +92,35 @@ export class CompleteStage implements WorkflowStage {
       }
     }
 
+    if (
+      nextTarget === "PICK_TICKET" &&
+      pressureMeetsThreshold(pressure, ctx.state.config.compactThreshold)
+    ) {
+      ctx.writeState({
+        contextRotation: {
+          level: pressure,
+          compactThreshold: ctx.state.config.compactThreshold,
+          ticketsDone,
+          issuesDone,
+          remainingTargets: targetedRemaining ?? [],
+        },
+      });
+      ctx.appendEvent("pressure_rotation_requested", {
+        level: pressure,
+        compactThreshold: ctx.state.config.compactThreshold,
+        ticketsDone,
+        issuesDone,
+      });
+      return this.buildHandoverResult(ctx, targetedRemaining, ticketsDone, issuesDone);
+    }
+
     if (nextTarget === "HANDOVER") {
       return this.buildHandoverResult(ctx, targetedRemaining, ticketsDone, issuesDone);
     }
+
+    // ISS-084: Checkpoint only when this session will continue. A terminal or
+    // pressure-rotation handover supersedes the periodic checkpoint.
+    await this.tryCheckpoint(ctx, totalWorkDone, ticketsDone, issuesDone);
 
     // PICK_TICKET path
     if (targetedRemaining !== null) {
@@ -107,6 +131,37 @@ export class CompleteStage implements WorkflowStage {
 
   async report(ctx: StageContext, _report: GuideReportInput): Promise<StageAdvance> {
     return this.enter(ctx);
+  }
+
+  private buildPressureRotationResult(
+    ctx: StageContext,
+  ): StageAdvance {
+    const rotation = ctx.state.contextRotation;
+    if (!rotation) {
+      throw new Error("Pressure rotation result requires persisted rotation context");
+    }
+    return {
+      action: "goto",
+      target: "HANDOVER",
+      result: {
+        instruction: [
+          "# Context Rotation Required",
+          "",
+          `Context pressure is **${rotation.level}**, which reached the configured \`compactThreshold\` (**${rotation.compactThreshold}**).`,
+          `${rotation.ticketsDone} ticket(s) and ${rotation.issuesDone} issue(s) are complete. The current item is finalized, and more work remains.`,
+          "",
+          "Compaction was not confirmed, and Storybloq cannot invoke the client's compaction command. End this bounded session at the clean item boundary and write a handover for the next task.",
+          "",
+          'Call me with completedAction: "handover_written" and include the content in handoverContent.',
+        ].join("\n"),
+        reminders: [
+          "Do not select another item in this session.",
+          "Write the context-rotation handover now.",
+        ],
+        transitionedFrom: "COMPLETE",
+        contextAdvice: "ok",
+      },
+    };
   }
 
   // ---------------------------------------------------------------------------
@@ -121,7 +176,12 @@ export class CompleteStage implements WorkflowStage {
   ): Promise<void> {
     const handoverInterval = ctx.state.config.handoverInterval ?? 5;
     if (handoverInterval <= 0 || totalWorkDone <= 0 || totalWorkDone % handoverInterval !== 0) return;
+    const previousCheckpointWorkCount = ctx.state.lastCheckpointWorkCount ?? 0;
+    if (previousCheckpointWorkCount >= totalWorkDone) return;
 
+    // Persist the boundary before the external handover write. Checkpoints are
+    // best-effort, so a crash may omit one, but it must never duplicate one.
+    ctx.writeState({ lastCheckpointWorkCount: totalWorkDone });
     try {
       const { handleHandoverCreate } = await import("../../cli/commands/handover.js");
       const completedIds = ctx.state.completedTickets.map((t) => (t as Record<string, unknown>).displayId as string | undefined ?? t.id).join(", ");
@@ -136,7 +196,12 @@ export class CompleteStage implements WorkflowStage {
         "This is an automatic mid-session checkpoint. The session is still active.",
       ].join("\n");
       await handleHandoverCreate(content, "checkpoint", "md", ctx.root);
-    } catch { /* best-effort */ }
+    } catch {
+      try {
+        ctx.writeState({ lastCheckpointWorkCount: previousCheckpointWorkCount });
+      } catch { /* best-effort */ }
+      return;
+    }
 
     try {
       const { loadProject } = await import("../../core/project-loader.js");
@@ -164,6 +229,10 @@ export class CompleteStage implements WorkflowStage {
     if (postResult.kind === "found") {
       ctx.writeState({ pipelinePhase: "postComplete" as const });
       return { action: "goto", target: postResult.stage.id };
+    }
+
+    if (ctx.state.contextRotation) {
+      return this.buildPressureRotationResult(ctx);
     }
 
     const handoverHeader = targetedRemaining !== null

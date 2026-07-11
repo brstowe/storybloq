@@ -3,6 +3,7 @@ import {
   currentClientTaskId,
   currentStorybloqClient,
   isSameOwnerTask,
+  legacyClaudeSessionIdForOwner,
   normalizeClientTaskId,
   ownerTaskForClient,
   ownerTaskForCurrentClient,
@@ -37,6 +38,16 @@ describe("Storybloq client profile", () => {
       displayName: "Claude Code",
       storyCommand: "/story",
     });
+  });
+
+  it("derives legacy Claude telemetry from canonical task ownership", () => {
+    const claudeOwner = ownerTaskForClient("claude", "claude-task", "now");
+    const codexOwner = ownerTaskForClient("codex", "codex-task", "now");
+
+    expect(legacyClaudeSessionIdForOwner(claudeOwner, "stale")).toBe("claude-task");
+    expect(legacyClaudeSessionIdForOwner(codexOwner, "stale")).toBeNull();
+    expect(legacyClaudeSessionIdForOwner(null, "legacy-task")).toBe("legacy-task");
+    expect(legacyClaudeSessionIdForOwner(undefined, undefined)).toBeUndefined();
   });
 
   it("resolves Codex and its native command", () => {

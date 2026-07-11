@@ -81,3 +81,16 @@ export function isSameOwnerTask(
 ): boolean {
   return !!owner && !!candidate && owner.client === candidate.client && owner.id === candidate.id;
 }
+
+/**
+ * Project canonical task ownership into the legacy Claude-only telemetry field.
+ * Ownerless sessions preserve their compatibility value until recovery binds
+ * an owner; known Codex ownership must never point at a stale Claude task.
+ */
+export function legacyClaudeSessionIdForOwner(
+  owner: OwnerTask | null | undefined,
+  ownerlessFallback: string | null | undefined,
+): string | null | undefined {
+  if (!owner) return ownerlessFallback;
+  return owner.client === "claude" ? owner.id : null;
+}

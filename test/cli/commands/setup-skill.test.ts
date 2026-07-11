@@ -57,6 +57,10 @@ describe("setup-skill", () => {
     expect(existsSync(join(PROJECT_ROOT, "src", "skill", "orchestrator-mode.md"))).toBe(true);
   });
 
+  it("bundled bus-mode.md exists in src/skill/", () => {
+    expect(existsSync(join(PROJECT_ROOT, "src", "skill", "bus-mode.md"))).toBe(true);
+  });
+
   it("bundled Codex skill metadata exists in src/skill/agents/", () => {
     expect(existsSync(join(PROJECT_ROOT, "src", "skill", "agents", "openai.yaml"))).toBe(true);
   });
@@ -595,6 +599,7 @@ describe("setup-skill", () => {
     expect(tsContent).toContain('"autonomous-mode.md"');
     expect(tsContent).toContain('"reference.md"');
     expect(tsContent).toContain('"orchestrator-mode.md"');
+    expect(tsContent).toContain('"bus-mode.md"');
   });
 
   it("setup-skill.ts handles subdirectory skills with copyDirRecursive", async () => {
@@ -1916,7 +1921,7 @@ describe("Codex setup helpers", () => {
     expect(startCurrent?.hooks.map((h) => h.command)).toEqual([
       "/usr/local/bin/storybloq session resume-prompt --codex-hook-json",
     ]);
-    expect(stopCommands).toEqual(["/usr/local/bin/storybloq hook-status"]);
+    expect(stopCommands).toEqual(["/usr/local/bin/storybloq hook-status --client codex"]);
     expect(settings.hooks.PreCompact).toBeUndefined();
   });
 });

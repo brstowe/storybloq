@@ -38,6 +38,7 @@ async function runCli(): Promise<void> {
   const { writeOutput } = await import("./run.js");
   const {
     registerInitCommand,
+    registerBusCommand,
     registerStatusCommand,
     registerPhaseCommand,
     registerTicketCommand,
@@ -123,6 +124,7 @@ async function runCli(): Promise<void> {
     });
 
   cli = registerInitCommand(cli);
+  cli = registerBusCommand(cli);
   cli = registerStatusCommand(cli);
   cli = registerPhaseCommand(cli);
   cli = registerTicketCommand(cli);

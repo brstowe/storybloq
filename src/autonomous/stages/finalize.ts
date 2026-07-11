@@ -1,6 +1,9 @@
 import type { WorkflowStage, StageResult, StageAdvance, StageContext } from "./types.js";
 import type { GuideReportInput } from "../session-types.js";
 import { gitDiffCachedNames, gitHead, gitDiffTreeNames, gitResolveCommit, gitRevListAncestryPath } from "../git-inspector.js";
+import { checkBusShip } from "../../bus/store.js";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 
 /**
  * FINALIZE stage — 3-checkpoint sub-machine for staging, pre-commit, and commit.
@@ -25,6 +28,11 @@ export class FinalizeStage implements WorkflowStage {
     // ISS-031: Already committed (re-entry guard)
     if (ctx.state.finalizeCheckpoint === "committed") {
       return { action: "advance" };
+    }
+
+    const busBlockers = await busShipBlockers(ctx);
+    if (busBlockers.length > 0) {
+      return { instruction: formatBusBlockers(busBlockers) };
     }
 
     // ISS-105/ISS-106: Detect pre-existing commit before instructing staging.
@@ -104,6 +112,11 @@ export class FinalizeStage implements WorkflowStage {
     // ISS-031: Already committed — advance regardless of action (re-entry guard)
     if (checkpoint === "committed") {
       return { action: "advance" };
+    }
+
+    const busBlockers = await busShipBlockers(ctx);
+    if (busBlockers.length > 0) {
+      return { action: "retry", instruction: formatBusBlockers(busBlockers) };
     }
 
     // --- Checkpoint: stage ---
@@ -491,4 +504,31 @@ export class FinalizeStage implements WorkflowStage {
 
 function ticketLabel(ctx: StageContext): string {
   return ctx.state.ticket?.displayId ?? ctx.state.ticket?.id ?? "unknown";
+}
+
+async function busShipBlockers(ctx: StageContext): Promise<string[]> {
+  try {
+    const raw = JSON.parse(await readFile(join(ctx.root, ".story", "config.json"), "utf-8")) as {
+      features?: { bus?: unknown };
+    };
+    if (raw.features?.bus !== true) return [];
+  } catch {
+    return [];
+  }
+  try {
+    return [...(await checkBusShip(ctx.root)).blockers];
+  } catch (err) {
+    return [`Bus integrity check failed: ${err instanceof Error ? err.message : String(err)}`];
+  }
+}
+
+function formatBusBlockers(blockers: readonly string[]): string {
+  return [
+    "# Finalize blocked by Storybloq Bus",
+    "",
+    "Resolve the following Bus gate before committing:",
+    ...blockers.map((blocker) => `- ${blocker}`),
+    "",
+    "Use `storybloq bus check --ship` for delivery blockers or `storybloq bus doctor` for runtime integrity, then report the FINALIZE action again.",
+  ].join("\n");
 }

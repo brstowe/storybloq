@@ -180,7 +180,7 @@ describe("prepareForCompact", () => {
     expect(result.resumeFromRevision).toBeGreaterThanOrEqual(state.revision);
   });
 
-  it("is idempotent — second call refreshes timestamp only", async () => {
+  it("is idempotent and clears prior observation for the new compact attempt", async () => {
     const state = makeState({ state: "IMPLEMENT" });
     const dir = await createTestSession(state);
 
@@ -192,6 +192,7 @@ describe("prepareForCompact", () => {
       state: "COMPACT",
       compactPending: true,
       compactPreparedAt: new Date().toISOString(),
+      compactObservedAt: new Date().toISOString(),
       preCompactState: "IMPLEMENT",
       resumeFromRevision: state.revision,
     });
@@ -200,6 +201,7 @@ describe("prepareForCompact", () => {
 
     expect(result2.preCompactState).toBe("IMPLEMENT"); // preserved
     expect(result2.resumeFromRevision).toBe(state.revision); // preserved
+    expect(readSession(dir)?.compactObservedAt).toBeNull();
   });
 
   it("from HANDOVER sets preCompactState = PICK_TICKET", async () => {
@@ -430,6 +432,36 @@ describe("handleSessionResumePrompt", () => {
     const context = JSON.parse(out).hookSpecificOutput.additionalContext as string;
     expect(context).toContain(`"sessionId": "${sessionId}"`);
     expect(context).toContain('"clientTaskId": "codex-task-123"');
+    expect(readSession(sessDir)?.compactObservedAt).toEqual(expect.any(String));
+  });
+
+  it("does not mark compaction observed for a non-compact SessionStart source", async () => {
+    const root = await makeProjectRoot();
+    const real = realpathSync(root);
+    const sessionId = "00000000-0000-0000-0000-000000000018";
+    const sessDir = join(real, ".story", "sessions", sessionId);
+    mkdirSync(sessDir, { recursive: true });
+    writeSessionSync(sessDir, makeState({
+      sessionId,
+      state: "COMPACT",
+      compactPending: true,
+      compactPreparedAt: new Date().toISOString(),
+      preCompactState: "IMPLEMENT",
+      ownerTask: { client: "codex", id: "codex-task-123", boundAt: "2026-07-09T00:00:00Z" },
+      lease: {
+        workspaceId: real,
+        lastHeartbeat: new Date().toISOString(),
+        expiresAt: new Date(Date.now() + 45 * 60 * 1000).toISOString(),
+      },
+    }));
+
+    await runResumePromptCapturing(root, {
+      codexHookJson: true,
+      source: "resume",
+      clientTaskId: "codex-task-123",
+    });
+
+    expect(readSession(sessDir)?.compactObservedAt).toBeNull();
   });
 
   it("prefers Claude's explicit hook identity over an inherited MCP identity", async () => {
@@ -497,6 +529,7 @@ describe("handleSessionResumePrompt", () => {
     expect(context).toContain("another live Codex task");
     expect(context).toContain("Recover here only after confirming that task is gone");
     expect(context).not.toContain('"action": "resume"');
+    expect(readSession(sessDir)?.compactObservedAt).toBeNull();
   });
 
   it("recovers a live unowned legacy COMPACT session in the current task", async () => {
@@ -979,34 +1012,6 @@ describe("findActiveSessionFull with compactPending", () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// Guide state transition logic (unit tests for the routing decisions)
-// ---------------------------------------------------------------------------
-
-describe("handleReportComplete critical pressure routing", () => {
-  it("critical pressure routes to PICK_TICKET with advisory (not HANDOVER)", () => {
-    // Simulate the routing logic from handleReportComplete
-    const pressure = "critical";
-    const maxTickets = 0; // no limit
-    const ticketsDone = 3;
-
-    let nextState: string;
-    let advice = "ok";
-
-    if (maxTickets > 0 && ticketsDone >= maxTickets) {
-      nextState = "HANDOVER";
-    } else if (pressure === "critical") {
-      advice = "compact-now";
-      nextState = "PICK_TICKET"; // ISS-032: advisory, hooks handle compaction
-    } else {
-      nextState = "PICK_TICKET";
-    }
-
-    expect(nextState).toBe("PICK_TICKET");
-    expect(advice).toBe("compact-now");
-  });
-});
-
 describe("handleReportHandover always SESSION_END", () => {
   it("no compact-continue branch — handover always ends session", () => {
     // The compact-continue branch was removed in ISS-032
@@ -1230,13 +1235,12 @@ describe("operation ordering", () => {
 // ---------------------------------------------------------------------------
 
 describe("evaluatePressure with compaction context", () => {
-  it("critical pressure at default tier triggers compact-now advisory", () => {
+  it("returns critical pressure at the default tier", () => {
     const state = makeState({
       contextPressure: { level: "low", guideCallCount: 91, ticketsCompleted: 0, compactionCount: 0, eventsLogBytes: 0 },
     });
 
     const pressure = evaluatePressure(state);
     expect(pressure).toBe("critical");
-    // Guide would set contextAdvice: "compact-now" and route to PICK_TICKET
   });
 });

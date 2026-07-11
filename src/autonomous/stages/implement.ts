@@ -1,6 +1,6 @@
 import type { WorkflowStage, StageResult, StageAdvance, StageContext } from "./types.js";
 import type { GuideReportInput } from "../session-types.js";
-import { assessRisk } from "../review-depth.js";
+import { assessRisk, normalizeRiskLevel } from "../review-depth.js";
 import { gitDiffStat, gitDiffNames } from "../git-inspector.js";
 
 /**
@@ -45,7 +45,8 @@ export class ImplementStage implements WorkflowStage {
     }
 
     // Risk recomputation from actual diff
-    let realizedRisk = ctx.state.ticket?.risk ?? "low";
+    const storedRisk = ctx.state.ticket?.risk;
+    let realizedRisk = storedRisk == null ? "low" : normalizeRiskLevel(storedRisk, "high");
     const mergeBase = ctx.state.git.mergeBase;
     if (mergeBase) {
       const diffResult = await gitDiffStat(ctx.root, mergeBase);

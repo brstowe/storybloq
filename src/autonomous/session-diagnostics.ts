@@ -1,4 +1,4 @@
-import { requiredRounds, type RiskLevel } from "./review-depth.js";
+import { normalizeRiskLevel, requiredRounds, type RiskLevel } from "./review-depth.js";
 import type { EventEntry, FullSessionState } from "./session-types.js";
 
 export const DEFAULT_CODE_REVIEW_MAX_ROUNDS = 12;
@@ -31,7 +31,7 @@ export interface SessionDiagnosticSummary {
 type StageConfigMap = Readonly<Record<string, Readonly<Record<string, unknown>>>> | null | undefined;
 
 function riskLevel(value: string | null | undefined): RiskLevel {
-  return value === "medium" || value === "high" ? value : "low";
+  return value == null ? "low" : normalizeRiskLevel(value, "high");
 }
 
 export function configuredCodeReviewMaxRounds(stages: StageConfigMap): number {

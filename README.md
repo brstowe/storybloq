@@ -41,7 +41,7 @@ The real cost isn't wasted setup time. It's repeated mistakes, relitigated desig
 Every project gets a `.story/` directory of JSON and markdown files. Tickets, issues, roadmap phases, session handovers, and lessons learned all live there, tracked by git, readable by any AI.
 
 - **CLI:** `storybloq` - inspect and mutate `.story/` from the terminal.
-- **MCP server:** 53 tools Claude Code and Codex can call directly, no subprocess spawning.
+- **MCP server:** structured tools Claude Code and Codex can call directly, with five additional tools when the local Bus is enabled. No subprocess spawning.
 - **Skill:** `/story` in Claude Code or `$story` in Codex loads project state at the start of every session.
 - **Mac app:** native sidebar that watches `.story/` and updates live while your AI client works (separate product, free on the App Store).
 
@@ -113,11 +113,32 @@ Inside Claude Code or Codex:
 - **`/story auto T-001 T-002 ISS-013` / `$story auto T-001 T-002 ISS-013`** - autonomous mode scoped to those items. Drives a ticket through plan -> plan review -> implement -> tests -> code review -> commit with handovers at each checkpoint.
 - **`/story review T-001` / `$story review T-001`** - runs the multi-lens review (see [Storybloq/lenses](https://github.com/Storybloq/lenses)) against a ticket's diff.
 - **`/story orchestrate` / `$story orchestrate`** - drives a multi-repo (or large single-repo) backlog when the client exposes exact callable workflow/subagent tools. Codex uses `multi_agent_v1.spawn_agent`, its normalized `multi_agent_v1__spawn_agent` identifier, or an exact `spawn_agent` tool. The Claude Agent View-backed `storybloq dispatch` command is shipped; a product-managed Codex dispatch backend is not.
+- **`/story bus` / `$story bus`** - polls a task-bound local Bus endpoint so an implementer and an independent reviewer can exchange advisory findings without copy and paste.
 - **`/story handover` / `$story handover`** - writes a session handover capturing decisions, blockers, and next steps.
 
 Both clients support context loading, autonomous mode, MCP, and compaction/status hooks. Codex Desktop can open an autonomous session's owning task and relay an exact owner response to it; Codex CLI safely falls back to a manual task switch. Autonomous code review defaults to a 12-round landing cap (clamped upward by ticket risk): unresolved critical findings and rejects still block, while non-blocking findings become follow-up issues at the cap. Set `recipeOverrides.stages.CODE_REVIEW.maxReviewRounds` to `0` to disable the cap explicitly.
 
+`recipeOverrides.compactThreshold` accepts `medium`, `high` (default), or `critical`. The value selects both the pressure limits and the rotation trigger: `medium` uses lower limits and rotates at medium pressure, while `critical` uses higher limits and waits for critical pressure. At a clean COMPLETE boundary, threshold pressure ends the bounded session through HANDOVER because Storybloq cannot invoke a client compaction command. When the client itself compacts, the PreCompact and SessionStart hooks preserve the same session; pressure resets only after SessionStart confirms `source: compact`.
+
 Outside the AI client, the same state is one `storybloq` invocation away.
+
+## Storybloq Bus
+
+Storybloq Bus is an optional local coordination protocol for one implementer task and one reviewer task. Runtime state lives under gitignored `.story/bus/`; confirmed findings still become canonical Storybloq issues with durable source provenance before they are sent as issue notices.
+
+```bash
+storybloq bus init
+storybloq bus join implementer --client codex
+storybloq bus join reviewer --client claude
+storybloq bus hooks enable --client codex
+storybloq bus hooks enable --client claude
+```
+
+Bus runtime is local and gitignored, so run `storybloq bus init` once in each checkout that will participate. Status and doctor report a fresh checkout as enabled but not initialized; that healthy inactive state does not block commits or autonomous FINALIZE. Other Bus commands and MCP tools never initialize the runtime implicitly. Initialization rejects symlinked ignore files and negation patterns because it cannot safely prove that Git will exclude the complete runtime otherwise.
+
+The foreground protocol includes send, poll, acknowledge, thread state, status, doctor, export, and ship checks. Messages are hash-chained, idempotent, bounded, task-bound, secret-screened, and delivered through crash-recoverable recipient mailboxes. Critical messages require a matching unresolved critical issue by default. Bus text is always peer-agent advice: it never grants owner approval or authorizes merge, push, signing, deployment, credentials, spending, or destructive actions.
+
+V1 does not include a daemon, process spawning, headless resume, or automatic offline wake. Natural SessionStart/Stop hooks and explicit polling are the delivery paths. Codex Desktop remains non-wakeable.
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/Storybloq/storybloq/main/assets/autonomous.png" alt="Autonomous mode running a ticket through plan, implement, test, review" />
@@ -163,7 +184,7 @@ All commands accept `--format json|md` (default `md`). Pipe JSON through `jq` fo
 |---------|-------------|
 | `storybloq init [--name] [--type orchestrator] [--force]` | Scaffold `.story/` (add `--type orchestrator` for multi-repo) |
 | `storybloq status` | Project summary with phase statuses, counts, and risks |
-| `storybloq validate` | Reference integrity + schema checks |
+| `storybloq validate [--integrity-only]` | Reference, schema, source-provenance, and loader-independent JSON checks |
 | `storybloq setup --client claude\|codex\|all [--skip-hooks]` | Install Storybloq skills, register MCP, and configure client hooks |
 | `storybloq setup-skill [--skip-hooks]` | Compatibility alias for `storybloq setup --client claude` |
 | `storybloq recommend --count N` | Context-aware work suggestions |
@@ -199,8 +220,8 @@ All commands accept `--format json|md` (default `md`). Pipe JSON through `jq` fo
 |---------|-------------|
 | `storybloq issue list [--status] [--severity] [--component] [--phase]` | List issues |
 | `storybloq issue get <id>` | Issue detail |
-| `storybloq issue create --title --severity --impact [--components] [--related-tickets] [--location]` | Create |
-| `storybloq issue update <id> [--status] [--title] [--severity] ...` | Update |
+| `storybloq issue create --title --severity --impact [--components] [--related-tickets] [--location] [--source-ref <json>] [--dedupe-key] [--created-by]` | Create, with optional durable review evidence and retry identity |
+| `storybloq issue update <id> [--status] [--title] [--severity] [--source-ref <json>] ...` | Update |
 | `storybloq issue meta get\|set\|unset <id> [path] [value]` | Manage custom passthrough metadata |
 | `storybloq issue delete <id>` | Delete |
 
@@ -221,6 +242,21 @@ All commands accept `--format json|md` (default `md`). Pipe JSON through `jq` fo
 | `storybloq blocker list` · `blocker add` · `blocker clear` | External dependencies blocking progress |
 | `storybloq snapshot` · `storybloq recap` | Capture state and diff against the last snapshot |
 | `storybloq export [--phase <id>] [--all] [--format json\|md]` | Self-contained project document |
+
+### Storybloq Bus (opt-in)
+
+| Command | Description |
+|---------|-------------|
+| `storybloq bus init` | Enable the local Bus and create gitignored runtime state |
+| `storybloq bus join implementer\|reviewer [--client] [--replace]` | Bind the current client task to one exclusive role |
+| `storybloq bus send ...` | Create a thread or send a reply with a required idempotency key |
+| `storybloq bus poll` | Read unacknowledged messages for the task-bound endpoint |
+| `storybloq bus ack <message-id> --disposition ...` | Record accepted, rejected, or deferred delivery state |
+| `storybloq bus thread show\|update ...` | Inspect or transition a participant thread |
+| `storybloq bus hooks enable\|disable [--client]` | Control guarded live delivery for this project |
+| `storybloq bus status\|doctor` | Inspect state and validate integrity |
+| `storybloq bus check --ship` | Fail when critical Bus work blocks release |
+| `storybloq bus export <thread-id>` | Explicitly export one runtime transcript |
 
 ### Federation (orchestrator projects)
 
@@ -260,7 +296,7 @@ codex mcp add storybloq --env STORYBLOQ_CLIENT=codex -- storybloq --mcp
 
 The server imports the same TypeScript modules as the CLI directly, so there's no subprocess overhead. It auto-discovers the project root by walking up from the working directory to the nearest `.story/` parent.
 
-**53 tools** grouped by responsibility:
+The base tools are grouped by responsibility. Bus-enabled projects register five additional tools at MCP process start; restart connected clients after `storybloq bus init`.
 
 ### Read (no side effects)
 
@@ -277,6 +313,12 @@ The server imports the same TypeScript modules as the CLI directly, so there's n
 `storybloq_review_lenses_prepare` · `storybloq_review_lenses_judge` · `storybloq_review_lenses_synthesize` orchestrate the multi-lens review loop (requires [@storybloq/lenses](https://github.com/Storybloq/lenses)).
 
 `storybloq_session_report` · `storybloq_register_subprocess` · `storybloq_unregister_subprocess` surface session health to the Mac app.
+
+### Storybloq Bus (feature-gated)
+
+`storybloq_bus_send` · `storybloq_bus_poll` · `storybloq_bus_ack` · `storybloq_bus_thread_get` · `storybloq_bus_thread_update`
+
+Every call requires a stable endpoint id and the current validated client task id. Poll and thread outputs mark peer content as advisory authority. `storybloq_bus_poll` and `storybloq_bus_thread_get` are read-only with respect to canonical tracked project state; poll may reconcile gitignored `.story/bus/` runtime metadata. The other three retain normal MCP write approvals.
 
 ### Federation (orchestrator projects)
 
@@ -321,6 +363,8 @@ Injects a compact-aware resume prompt. Codex setup uses the same command with `-
   }
 }
 ```
+
+`storybloq bus hooks enable` is a separate project opt-in. It adds endpoint metadata and pending counts to SessionStart, and permits the synchronous Stop hook to block once for each new mailbox cursor. Peer payload bytes never appear in hook output. Claude's shared hook structure is upgraded once and remains guarded by project-local policy; Codex uses `storybloq hook-status --client codex`.
 
 ## Library usage
 
@@ -367,6 +411,15 @@ Full type definitions ship with the package (`exports.types`).
   "components": ["mac-app"],
   "impact": "Dragging tickets on trackpad requires multiple tries.",
   "location": ["macos/Views/KanbanCard.swift:42"],
+  "sourceRefs": [{
+    "path": "macos/Views/KanbanCard.swift",
+    "startLine": 42,
+    "revision": "5ac37f94f7023b18f72d8e3fcf43dd64f54c11d7",
+    "contentHash": "f5b1b1b65dca3d9d86adf7c5d49082aa4dc09e7903ab46ce50e8cc6b4812e4cf",
+    "reviewId": "review-2026-04-15"
+  }],
+  "dedupeKey": "review-2026-04-15:finding-3",
+  "createdBy": "external-reviewer",
   "discoveredDate": "2026-04-15",
   "resolvedDate": null,
   "relatedTickets": []
@@ -377,7 +430,15 @@ Each record is its own file. IDs are sequential within type (`T-001`, `T-002`, .
 
 Create operations are safe to run in parallel. ID assignment and the create write happen together under a project lock, so concurrent creators are serialized and each receives a distinct sequential ID. A create can never silently overwrite an existing record; under heavy simultaneous contention a creator fails loudly with an error rather than colliding.
 
+Issue `sourceRefs` preserve review evidence independently of mutable `path:line` display strings. Storybloq hashes only the normalized referenced line range and never stores source excerpts. A supplied revision is resolved to a Git commit; otherwise Storybloq captures the working-tree range and records HEAD only when those bytes match. `storybloq validate` reports an error when original evidence cannot be resolved, a warning when valid historical evidence moved or changed at HEAD, and no finding when it still matches.
+
+Use `storybloq validate --integrity-only` when damaged `config.json` or `roadmap.json` prevents normal loading. This read-only preflight scans every `.story/**/*.json` file in one pass, reports parser positions where available, and separates critical singleton failures from skippable item and auxiliary-file failures. It never rewrites damaged files.
+
+Confirmed manual or external review findings should be filed directly as open issues. Search first, pass reviewer attribution in `createdBy`, attach the review ID and revision through `sourceRefs`, and use a stable `dedupeKey` such as `<review-id>:<finding-id>` so retries are idempotent. Keep uncertain design questions as notes or owner questions; the implementing agent owns issue status and resolution.
+
 Ticket and issue records preserve unknown JSON fields. Use `storybloq ticket meta` and `storybloq issue meta` to read or mutate those custom passthrough fields without touching core Storybloq fields. Values are JSON, and dot paths address nested objects, for example `storybloq ticket meta set T-001 integration.linear '"ABC-123"'`.
+
+Autonomous plan-review depth can be seeded per ticket with `reviewRisk` metadata (`low`, `medium`, or `high`). For example, `storybloq ticket meta set T-001 reviewRisk '"high"'` requires at least three plan-review rounds. Legacy `risk` metadata is also recognized, but `reviewRisk` is the canonical key. This setting changes review depth only; it never skips a review stage.
 
 ## Example workflow
 

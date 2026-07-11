@@ -11,6 +11,7 @@ import {
   findResumableSession,
   findSessionById,
   prepareForCompact,
+  markCompactionObserved,
   writeSessionSync,
   withSessionLock,
   appendEvent,
@@ -30,6 +31,15 @@ import { loadProject } from "../../core/project-loader.js";
 import { writeResumeMarker, removeResumeMarker } from "../../autonomous/resume-marker.js";
 import { findLatestHandover } from "../../federation/handover-utils.js";
 import { join } from "node:path";
+import {
+  consumeCompactionSuccession,
+  findEndpointForTask,
+  isBusHookDeliveryEnabled,
+  mintCompactionSuccession,
+  pendingMailboxCursor,
+  refreshEndpointForSessionStart,
+  type BusEndpoint,
+} from "../../bus/index.js";
 
 // ---------------------------------------------------------------------------
 // session-compact-prepare (PreCompact hook)
@@ -46,25 +56,41 @@ import { join } from "node:path";
 export interface SessionCompactPrepareOptions {
   readonly client?: StorybloqClient;
   readonly clientTaskId?: string;
+  readonly cwd?: string;
+  readonly transcriptPath?: string;
 }
 
 export async function handleSessionCompactPrepare(
   options: SessionCompactPrepareOptions = {},
 ): Promise<void> {
-  const root = discoverProjectRoot();
+  const root = discoverProjectRoot(options.cwd);
   if (!root) return; // No .story/ — silent no-op
+
+  const client = options.client ?? "claude";
+  const environmentTaskId = client === "codex"
+    ? process.env.CODEX_THREAD_ID
+    : process.env.CLAUDE_CODE_SESSION_ID;
+  const clientTaskId = normalizeClientTaskId(options.clientTaskId)
+    ?? normalizeClientTaskId(environmentTaskId);
+
+  if (clientTaskId && options.transcriptPath) {
+    try {
+      await mintCompactionSuccession({
+        root,
+        client,
+        clientTaskId,
+        transcriptPath: options.transcriptPath,
+      });
+    } catch {
+      // Bus succession is best-effort; manual polling remains available.
+    }
+  }
 
   try {
     await withSessionLock(root, async () => {
       const active = findActiveSessionFull(root);
       if (!active) return; // No active session — silent no-op
 
-      const client = options.client ?? "claude";
-      const environmentTaskId = client === "codex"
-        ? process.env.CODEX_THREAD_ID
-        : process.env.CLAUDE_CODE_SESSION_ID;
-      const clientTaskId = normalizeClientTaskId(options.clientTaskId)
-        ?? normalizeClientTaskId(environmentTaskId);
       const callerTask = ownerTaskForClient(client, clientTaskId);
       const sameOwner = isSameOwnerTask(active.state.ownerTask, callerTask);
       const legacySameOwner = !active.state.ownerTask &&
@@ -109,6 +135,7 @@ export async function handleSessionCompactPrepare(
     // Lock acquisition or other failure — emit stderr, exit 0
     process.stderr.write(`[storybloq] compact-prepare failed: ${err instanceof Error ? err.message : String(err)}\n`);
   }
+
 }
 
 // ---------------------------------------------------------------------------
@@ -170,6 +197,8 @@ async function buildCompactionBreadcrumb(root: string): Promise<string | null> {
 export interface SessionStartHookContext {
   readonly source?: string;
   readonly sessionId?: string;
+  readonly cwd?: string;
+  readonly transcriptPath?: string;
 }
 
 export async function readHookStdinContext(
@@ -179,6 +208,8 @@ export async function readHookStdinContext(
   if (stream.isTTY) return {};
   const raw = await new Promise<string>((resolve) => {
     let data = "";
+    let bytes = 0;
+    let oversized = false;
     let done = false;
     const finish = (): void => {
       if (done) return;
@@ -187,8 +218,14 @@ export async function readHookStdinContext(
       resolve(data);
     };
     const onData = (chunk: Buffer | string): void => {
+      bytes += Buffer.byteLength(chunk);
+      if (bytes > 65536) {
+        oversized = true;
+        data = "";
+        finish();
+        return;
+      }
       data += chunk.toString();
-      if (data.length > 65536) finish(); // cap: hook JSON is tiny
     };
     const cleanup = (): void => {
       clearTimeout(timer);
@@ -218,13 +255,27 @@ export async function readHookStdinContext(
   try {
     const trimmed = raw.trim();
     if (!trimmed) return {};
-    const parsed = JSON.parse(trimmed) as { source?: unknown; session_id?: unknown };
+    const parsed = JSON.parse(trimmed) as {
+      source?: unknown;
+      session_id?: unknown;
+      cwd?: unknown;
+      transcript_path?: unknown;
+    };
     const sessionId = typeof parsed.session_id === "string"
       ? normalizeClientTaskId(parsed.session_id)
       : null;
+    const cwd = typeof parsed.cwd === "string" && parsed.cwd.length > 0 && parsed.cwd.length <= 4096
+      ? parsed.cwd
+      : undefined;
+    const transcriptPath = typeof parsed.transcript_path === "string" &&
+      parsed.transcript_path.length > 0 && parsed.transcript_path.length <= 4096
+      ? parsed.transcript_path
+      : undefined;
     return {
       ...(typeof parsed.source === "string" ? { source: parsed.source } : {}),
       ...(sessionId ? { sessionId } : {}),
+      ...(cwd ? { cwd } : {}),
+      ...(transcriptPath ? { transcriptPath } : {}),
     };
   } catch {
     return {};
@@ -246,6 +297,18 @@ function codexTaskMarker(clientTaskId: string | undefined): string {
     : "";
 }
 
+function busEndpointMarker(endpoint: BusEndpoint, pending: { cursor: number; count: number }): string {
+  return [
+    "[storybloq-bus-endpoint]",
+    `endpoint=${endpoint.endpointId}`,
+    `role=${endpoint.role}`,
+    `pending=${pending.count}`,
+    `cursor=${pending.cursor}`,
+    "[/storybloq-bus-endpoint]",
+    "",
+  ].join("\n");
+}
+
 /**
  * SessionStart hook entry point. Outputs resume instruction for compacted sessions.
  * - Resolves project root + workspace from cwd
@@ -258,7 +321,13 @@ function codexTaskMarker(clientTaskId: string | undefined): string {
  * - Never throws; always exits 0 (hook must not block compaction)
  */
 export async function handleSessionResumePrompt(
-  options: { codexHookJson?: boolean; source?: string; clientTaskId?: string } = {},
+  options: {
+    codexHookJson?: boolean;
+    source?: string;
+    clientTaskId?: string;
+    cwd?: string;
+    transcriptPath?: string;
+  } = {},
 ): Promise<void> {
   try {
     const environmentTaskId = options.codexHookJson
@@ -267,12 +336,36 @@ export async function handleSessionResumePrompt(
     const explicitTaskId = normalizeClientTaskId(options.clientTaskId);
     const inheritedTaskId = normalizeClientTaskId(environmentTaskId);
     const clientTaskId = explicitTaskId ?? inheritedTaskId ?? undefined;
-    const root = discoverProjectRoot();
+    const root = discoverProjectRoot(options.cwd);
     if (!root) return; // No .story/ -- silent
+
+    const client: StorybloqClient = options.codexHookJson ? "codex" : "claude";
+    let busMarker = "";
+    if (clientTaskId) {
+      try {
+        let endpoint = options.source === "compact" && options.transcriptPath
+          ? await consumeCompactionSuccession({
+              root,
+              client,
+              clientTaskId,
+              transcriptPath: options.transcriptPath,
+            })
+          : null;
+        endpoint ??= await findEndpointForTask(root, client, clientTaskId);
+        if (endpoint) {
+          endpoint = await refreshEndpointForSessionStart(root, endpoint.endpointId, clientTaskId);
+          if (await isBusHookDeliveryEnabled(root, client)) {
+            busMarker = busEndpointMarker(endpoint, await pendingMailboxCursor(root, endpoint.role));
+          }
+        }
+      } catch {
+        // Session continuity must not depend on Bus endpoint refresh.
+      }
+    }
 
     const writeResumeMessage = (message: string): void => {
       if (options.codexHookJson) {
-        const additionalContext = codexTaskMarker(clientTaskId) + message;
+        const additionalContext = codexTaskMarker(clientTaskId) + busMarker + message;
         process.stdout.write(JSON.stringify({
           hookSpecificOutput: {
             hookEventName: "SessionStart",
@@ -281,7 +374,7 @@ export async function handleSessionResumePrompt(
         }) + "\n");
         return;
       }
-      process.stdout.write(message);
+      process.stdout.write(busMarker + message);
     };
 
     const match = findResumableSession(root);
@@ -300,16 +393,17 @@ export async function handleSessionResumePrompt(
       if (shouldEmitBreadcrumb) {
         const breadcrumb = await buildCompactionBreadcrumb(root);
         if (breadcrumb) writeResumeMessage(breadcrumb);
-      } else if (options.codexHookJson && clientTaskId) {
+      } else if ((options.codexHookJson && clientTaskId) || busMarker) {
         writeResumeMessage("");
       }
       return;
     }
 
-    const { info, stale } = match;
+    let { info } = match;
+    const { stale } = match;
     const sessionId = info.state.sessionId;
     const callerTask = ownerTaskForClient(
-      options.codexHookJson ? "codex" : "claude",
+      client,
       clientTaskId,
     );
     const sameOwner = isSameOwnerTask(info.state.ownerTask, callerTask);
@@ -324,6 +418,32 @@ export async function handleSessionResumePrompt(
       info.state.ticket?.displayId ?? info.state.ticket?.id ?? "The autonomous ticket",
       40,
     );
+
+    // The SessionStart hook is the proof that client context actually changed.
+    // A guide-level pre_compact call only prepares state and must not reset
+    // pressure by itself. Mark only a verified owner on source=compact.
+    if (options.source === "compact" && verifiedSameOwner) {
+      try {
+        const observed = await withSessionLock(root, async () => {
+          const current = findSessionById(root, sessionId);
+          if (!current || current.state.state !== "COMPACT" || !current.state.compactPending) {
+            return null;
+          }
+          const written = markCompactionObserved(current.dir, current.state);
+          appendEvent(current.dir, {
+            rev: written.revision,
+            type: "client_compaction_observed",
+            timestamp: written.compactObservedAt!,
+            data: { source: options.source, client: callerTask?.client ?? null },
+          });
+          return { ...current, state: written };
+        });
+        if (observed) info = observed;
+      } catch {
+        // Best-effort hook metadata. Resume remains safe because pressure is
+        // preserved when this marker cannot be written.
+      }
+    }
 
     if (!callerTask && hasRecordedOwner) {
       const command = options.codexHookJson ? "$story" : "/story";
@@ -437,6 +557,7 @@ export async function handleSessionClearCompact(root: string, sessionId?: string
         compactPending: true,
         resumeBlocked: false,
         compactPreparedAt: new Date().toISOString(),
+        compactObservedAt: null,
       });
       const hasKnownLiveOwner = !isLeaseExpired(info.state) &&
         (!!info.state.ownerTask || !!info.state.claudeCodeSessionId);
@@ -458,6 +579,7 @@ export async function handleSessionClearCompact(root: string, sessionId?: string
       terminationReason: "admin_recovery",
       compactPending: false,
       compactPreparedAt: null,
+      compactObservedAt: null,
       resumeBlocked: false,
     });
     writeShutdownMarker(info.dir);
@@ -547,6 +669,7 @@ export async function handleSessionStop(root: string, sessionId?: string): Promi
       deferralsUnfiled: hasUnfiledDeferrals,
       compactPending: false,
       compactPreparedAt: null,
+      compactObservedAt: null,
       resumeBlocked: false,
       preCompactState: null,
       resumeFromRevision: null,

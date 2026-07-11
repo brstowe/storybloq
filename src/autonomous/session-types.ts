@@ -535,7 +535,19 @@ export const SessionStateSchema = z.object({
     ticketsCompleted: z.number().default(0),
     compactionCount: z.number().default(0),
     eventsLogBytes: z.number().default(0),
+    workItemsAtLastCompaction: z.number().int().min(0).optional(),
+    eventsLogBytesAtLastCompaction: z.number().int().min(0).optional(),
   }).default({ level: "low", guideCallCount: 0, ticketsCompleted: 0, compactionCount: 0, eventsLogBytes: 0 }),
+
+  // Persist why COMPLETE must rotate instead of selecting more work. This
+  // survives optional post-complete stages and crash recovery.
+  contextRotation: z.object({
+    level: z.enum(["low", "medium", "high", "critical"]),
+    compactThreshold: z.string(),
+    ticketsDone: z.number().int().min(0),
+    issuesDone: z.number().int().min(0),
+    remainingTargets: z.array(z.string()).max(150).default([]),
+  }).nullable().default(null),
 
   // Pending project mutation (for crash recovery)
   pendingProjectMutation: z.any().nullable().default(null),
@@ -545,7 +557,11 @@ export const SessionStateSchema = z.object({
   preCompactState: z.string().nullable().default(null),
   compactPending: z.boolean().default(false),
   compactPreparedAt: z.string().nullable().default(null),
+  compactObservedAt: z.string().nullable().default(null),
   resumeBlocked: z.boolean().default(false),
+
+  // Last cumulative work boundary reserved for an automatic checkpoint handover.
+  lastCheckpointWorkCount: z.number().int().min(0).default(0),
 
   // Session termination
   terminationReason: z

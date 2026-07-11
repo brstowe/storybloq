@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 /**
  * Deterministic issue key generation for finding dedup at the filing boundary
  * (ISS-823 carry-over from the retired review-lenses fork, adapted to the
@@ -31,4 +33,15 @@ export function generateIssueKey(finding: KeyableFinding): string {
   // Unlocated fallback: no file/line
   const descWords = finding.description.split(/\s+/).slice(0, 20).join(" ");
   return `${lens}:${finding.category}:${djb2(descWords)}`;
+}
+
+/** Idempotency identity for one finding occurrence in one review. */
+export function generateReviewFilingKey(
+  reviewId: string,
+  finding: KeyableFinding,
+): string {
+  const digest = createHash("sha256")
+    .update(JSON.stringify([reviewId, generateIssueKey(finding)]), "utf8")
+    .digest("hex");
+  return `review-lenses:${digest}`;
 }

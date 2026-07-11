@@ -1,5 +1,13 @@
 export { TicketSchema, type Ticket } from "./ticket.js";
-export { IssueSchema, type Issue } from "./issue.js";
+export {
+  IssueSchema,
+  IssueDedupeKeySchema,
+  IssueSourceRefInputSchema,
+  IssueSourceRefSchema,
+  type Issue,
+  type IssueSourceRef,
+  type IssueSourceRefInput,
+} from "./issue.js";
 export { NoteSchema, type Note } from "./note.js";
 export {
   BlockerSchema,
@@ -9,7 +17,14 @@ export {
   RoadmapSchema,
   type Roadmap,
 } from "./roadmap.js";
-export { ConfigSchema, FeaturesSchema, type Config, type Features } from "./config.js";
+export {
+  BusConfigSchema,
+  ConfigSchema,
+  FeaturesSchema,
+  type BusConfig,
+  type Config,
+  type Features,
+} from "./config.js";
 export {
   DateSchema,
   TicketIdSchema,

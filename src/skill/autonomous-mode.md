@@ -14,6 +14,8 @@ This file is referenced from SKILL.md for `/story auto` / `$story auto`, review,
 4. The guide advances through: PICK_TICKET -> PLAN -> PLAN_REVIEW -> IMPLEMENT -> CODE_REVIEW -> FINALIZE -> COMPLETE -> loop
 5. Continue until the guide returns SESSION_END
 
+**Ticket review depth:** Optional ticket metadata `reviewRisk` accepts `low`, `medium`, or `high` and sets the minimum PLAN_REVIEW depth to one, two, or three rounds. Set it with `storybloq ticket meta set T-001 reviewRisk '"high"'` or `storybloq_ticket_meta_set`. Legacy `risk` metadata remains compatible. Malformed explicit values fail closed to high, and risk metadata never skips a review stage.
+
 **Frontend design:** If the current ticket involves UI, frontend, components, layouts, or styling, read `design/design.md` in the same directory as the skill file for design principles. Load the relevant platform reference from `design/references/`. Apply the priority order (clarity > hierarchy > platform correctness > accessibility > state completeness) during both planning and implementation.
 
 ## Precedence: task-aware active-session guard
@@ -29,7 +31,7 @@ Before any guide call that could start, resume, or cancel a session, run SKILL.m
 **Critical rules for autonomous mode:**
 - Do NOT use client-native plan mode -- write plans as markdown files in `.story/sessions/<id>/plan.md`.
 - Do NOT ask the user for confirmation or approval during the normal pipeline. The guard asks only for foreign/recovery choices; same-owner continuation is automatic.
-- Do NOT stop or summarize between tickets -- call the guide IMMEDIATELY
+- Do NOT stop or summarize between tickets unless the guide reaches a context-rotation HANDOVER -- otherwise call the guide IMMEDIATELY
 - Do NOT wrap autonomous execution in scheduler or automation loops such as Claude Code's `/loop` skill, `ScheduleWakeup`, `CronCreate`, Codex automations, or thread wakeups. The state machine IS the loop: PICK_TICKET -> PLAN -> ... -> COMPLETE -> PICK_TICKET. "Continue immediately" means advance on THIS turn, not schedule a future wakeup. Scheduler and automation tools persist across compactions independent of conversation state, so a scheduled chain can self-perpetuate through compact/resume and keep burning prompt cache + compute; the user has no natural interrupt point because each turn looks like "just one more small close." The only correct pacing is the guide's `report` -> next-action cadence. See ISS-588 for the observed failure mode.
 - Follow the guide's instructions exactly -- it specifies which tools to call, what parameters to use
 - After each step completes, call `storybloq_autonomous_guide` with `action: "report"`, `clientTaskId` when known, and the results
@@ -40,12 +42,12 @@ Before any guide call that could start, resume, or cancel a session, run SKILL.m
 
 **Codex:** use a trusted repo and a sandbox/approval profile that allows the intended edits and test commands. Ensure Storybloq MCP is registered with `STORYBLOQ_CLIENT=codex`, then restart Codex or start a new session after setup or MCP source changes so the live MCP process reloads. Check `/hooks` after setup: Codex requires non-managed command hooks to be reviewed and trusted before they run, so an installed `SessionStart`, `PreCompact`, or `Stop` hook is not necessarily active until trusted. `$story auto` does not require Codex subagents; keep the guide loop in the main thread unless the user explicitly chooses `$story orchestrate`.
 
-**Storybloq handles compaction automatically** when hooks are installed and trusted. Context is preserved across compactions; do not cancel only because context feels large.
+**Storybloq preserves compaction automatically** when hooks are installed and trusted, but it cannot invoke the client's user-level compaction command. A real client compaction runs PreCompact and then SessionStart; the same session resumes and pressure resets only when SessionStart confirms `source: compact`. `compactThreshold` (`medium`, `high`, or `critical`) selects both pressure limits and the rotation trigger. If pressure reaches the trigger at a clean COMPLETE boundary without confirmed client compaction, the guide ends the bounded session through HANDOVER.
 
-**If the guide says to compact:** In the owning task, call the guide with `action: "pre_compact"` and `clientTaskId`, run the client's compaction command, then let the SessionStart marker/guard resume the same full `sessionId` with `clientTaskId`. No second confirmation is needed when `ownerTask` matches or when migrating an unowned legacy session. A different recorded owner requires confirmation that the old task is gone plus `takeover: true`.
+**For an explicit user-triggered compaction:** In the owning task, call the guide with `action: "pre_compact"` and `clientTaskId`, then have the user run the client's compaction command. Do not call `resume` before the post-compaction SessionStart hook runs. The marker/guard then resumes the same full `sessionId` with `clientTaskId`. No second confirmation is needed when `ownerTask` matches or when migrating an unowned legacy session. A different recorded owner requires confirmation that the old task is gone plus `takeover: true`.
 
 **If something goes wrong:**
-- Context feels large -- do nothing, compaction is automatic via hooks. (No guide call -- no authorization needed.)
+- Context feels large -- continue the guide. Do not cancel manually; verified client compaction preserves the session, and threshold pressure rotates through HANDOVER at the next clean boundary.
 - Compaction happened -- rerun Step 0.5. If `ownerTask` matches or is absent on a legacy COMPACT session, resume automatically. If the compacted lease expired, ask for `Resume here`; if another live task owns it, open/message that task unless the user explicitly confirms it is gone and requests takeover.
 - Session stuck after compact -- inspect with `storybloq_session_report`. A verified same owner may run `storybloq session clear-compact <full-sessionId>` for a stale or blocked marker, then resume that same full id with `clientTaskId`. An expired session still requires explicit recovery selection. Never clear a foreign live lease.
 - Unrecoverable error -- `storybloq session stop <sessionId>` is destructive and must never be called bare. Require exact typed `cancel <T>` confirmation, resolve `<T>` to the full id, and stop only that session.

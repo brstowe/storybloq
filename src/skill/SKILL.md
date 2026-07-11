@@ -24,7 +24,7 @@ This guard runs on EVERY Storybloq invocation regardless of subcommand. It MUST 
 - If `ToolSearch` itself is not available or returns an error on this harness, SKIP the prelude and continue to step 1. Do NOT treat a missing `ToolSearch` tool as evidence that MCP is unavailable — step 1's `storybloq_status` call will either succeed (MCP already surfaced) or its failure will route the skill to the Step 0 setup/CLI-fallback path below.
 - The prelude is idempotent: on terminal CLI sessions where `storybloq_*` tools are already in the base list, it simply returns the same tool set.
 
-**Whitelist semantics (not blacklist).** While ownership is unresolved, the ONLY permitted actions are the tool-discovery prelude, the exact identity probe above, `storybloq_status` with `{ "format": "json" }`, `storybloq_session_report`, structured/plain-text questioning, and the exact Codex task tools named below. `storybloq_autonomous_guide` is allowed only for automatic same-owner or unowned-legacy COMPACT continuation, explicit expired-COMPACT recovery, confirmed-owner-gone COMPACT takeover, or typed cancellation. No file read/write, ledger mutation, subcommand dispatch, or direct access to `.story/sessions/` is permitted. Monitoring is read-only and ends after the report; it never opens a nested Resume/Cancel prompt.
+**Whitelist semantics (not blacklist).** While ownership is unresolved, the ONLY permitted actions are the tool-discovery prelude, the exact identity probe above, `storybloq_status` with `{ "format": "json" }`, `storybloq_session_report`, structured/plain-text questioning, and the exact Codex task tools named below. `storybloq_autonomous_guide` is allowed only for automatic same-owner or unowned-legacy COMPACT continuation, explicit expired-COMPACT recovery, confirmed-owner-gone COMPACT takeover, or typed cancellation. The five `storybloq_bus_*` tools are a narrow exception only for an explicit bus invocation or an injected endpoint marker with pending work; they require the current task-bound endpoint and never authorize autonomous-session mutation. A confirmed Bus review finding may also use one idempotent `storybloq_issue_create` call with `dedupeKey`, `sourceRefs`, and reviewer attribution before sending its issue notice. No other file read/write, ledger mutation, subcommand dispatch, or direct access to `.story/sessions/` is permitted. Monitoring is read-only and ends after the report; it never opens a nested Resume/Cancel prompt.
 
 1. Call `storybloq_status` once with `{ "format": "json" }`. Read both `activeSessions` and `resumableSessions`; deduplicate by full `sessionId`. Each record may include `ownerTask`, `leaseState`, `leaseExpiresAt`, and `compactPending`. If JSON format is unavailable from an older server, call Markdown status once and treat a live non-COMPACT session as unverifiable legacy (Monitor or other work only). For a COMPACT session, follow a SessionStart resume instruction only after the user asks to continue; the guide remains authoritative. Reuse this status result during context loading.
 
@@ -62,6 +62,7 @@ This guard overrides every no-confirmation rule elsewhere. A non-COMPACT live le
 - `/story review-lenses` -> run multi-lens review on current diff (read `review-lenses/review-lenses.md` in the same directory as this skill file; if not found, tell user to run `storybloq setup --client all`). Note: the autonomous guide invokes lenses automatically when `reviewBackends` includes `"lenses"` -- this command is for manual/debug use.
 - `/story federation` -> set up multi-repo orchestrator (read `federation-setup.md` in the same directory as this skill file; if not found, tell user to run `storybloq setup --client all`)
 - `/story orchestrate` -> drive the backlog as orchestrator/pen with tiered background agents (read `orchestrator-mode.md` in the same directory as this skill file; if not found, tell user to run `storybloq setup --client all`)
+- `/story bus` -> poll or coordinate with the current task-bound Storybloq Bus endpoint (read `bus-mode.md` in the same directory as this skill file; if not found, tell user to run `storybloq setup --client all`)
 - `/story help` -> show all capabilities (read `reference.md` in the same directory as this skill file; if not found, tell user to run `storybloq setup --client all`)
 
 If the user's intent doesn't match any of these, use the full context load.
@@ -272,6 +273,8 @@ Don't duplicate what's already in the handover -- lessons are structured, tagged
 
 When working on a task and you encounter a bug, inconsistency, or improvement opportunity that is out of scope for the current ticket, create an issue using `storybloq issue create` (CLI) with a clear title, severity, and impact description. Don't fix it in the current task, don't ignore it -- log it. This keeps the issue tracker growing organically and ensures nothing discovered during work is lost. When orchestrating (`/story orchestrate`), anything the orchestrator files for later execution must be portable enough for the lowest permitted execution tier, so every ticket or issue you file is born in the enrichment template documented in `orchestrator-mode.md`, not a bare paragraph.
 
+**External and manual review filing:** Confirmed findings belong in the ledger directly, without a human copy/paste relay. Search for an existing issue first, then call `storybloq_issue_create` with reviewer attribution in `createdBy`, a stable retry identity in `dedupeKey`, and structured `sourceRefs` containing the review ID plus the reviewed path, line range, and revision when known. A good cross-agent key is `<review-id>:<finding-id>`; retries with the same key return the existing issue. Keep the new issue `open`. The implementing agent owns status and resolution. File uncertain design questions as notes or ask the owner instead of presenting them as confirmed defects. Never store source excerpts in custom metadata; Storybloq captures a line-range hash.
+
 When starting work on a ticket, update its status to `inprogress`. When done, update to `complete` in the same commit as the code change.
 
 **Frontend design guidance:** When working on UI or frontend tickets, read `design/design.md` in the same directory as this skill file for design principles and platform-specific best practices. Follow its priority order (clarity > hierarchy > platform correctness > accessibility > state completeness) and load the relevant platform reference. This applies to any ticket involving components, layouts, styling, or visual design.
@@ -285,13 +288,13 @@ Ticket and issue create/update operations are available via both CLI and MCP too
 CLI examples:
 - `storybloq ticket create --title "..." --type task --phase p0`
 - `storybloq ticket update T-001 --status complete`
-- `storybloq issue create --title "..." --severity high --impact "..."`
+- `storybloq issue create --title "..." --severity high --impact "..." --created-by "reviewer" --dedupe-key "review-42:finding-3" --source-ref '{"path":"src/file.ts","startLine":42,"revision":"<commit-sha>","reviewId":"review-42"}'`
 
 MCP examples:
 - `storybloq_ticket_create` with `title`, `type`, and optional `phase`, `description`, `blockedBy`, `parentTicket`
 - `storybloq_ticket_update` with `id` and optional `status`, `title`, `order`, `description`, `phase`, `parentTicket`
-- `storybloq_issue_create` with `title`, `severity`, `impact`, and optional `components`, `relatedTickets`, `location`, `phase`
-- `storybloq_issue_update` with `id` and optional `status`, `title`, `severity`, `impact`, `resolution`, `components`, `relatedTickets`, `location`
+- `storybloq_issue_create` with `title`, `severity`, `impact`, and optional `components`, `relatedTickets`, `location`, `sourceRefs`, `dedupeKey`, `createdBy`, `phase`
+- `storybloq_issue_update` with `id` and optional `status`, `title`, `severity`, `impact`, `resolution`, `components`, `relatedTickets`, `location`, `sourceRefs`
 
 Read operations (list, get, next, blocked) are available via both CLI and MCP.
 
@@ -419,7 +422,7 @@ Do NOT search source code for this. The full config.json schema is shown below. 
   "recipe": "string (default: coding)",
   "recipeOverrides": {
     "maxTicketsPerSession": "number (0 = unlimited, default: 0)",
-    "compactThreshold": "string (high/medium/low, default: high)",
+    "compactThreshold": "string (medium/high/critical; selects pressure limits and rotation trigger; default: high)",
     "reviewBackends": ["codex", "agent"],
     "handoverInterval": "number (default: 3)",
     "stages": {
