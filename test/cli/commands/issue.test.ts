@@ -14,6 +14,7 @@ import {
 } from "../../../src/cli/commands/issue.js";
 import { ExitCode } from "../../../src/core/output-formatter.js";
 import { CliValidationError } from "../../../src/cli/helpers.js";
+import { handleTicketCreate } from "../../../src/cli/commands/ticket.js";
 import { initProject } from "../../../src/core/init.js";
 import { loadProject } from "../../../src/core/project-loader.js";
 import { makeState, makeIssue } from "../../core/test-factories.js";
@@ -266,6 +267,34 @@ describe("handleIssueCreate", () => {
     const parsed = JSON.parse(result.output);
     expect(parsed.version).toBe(1);
     expect(parsed.data.id).toBe("ISS-001");
+  });
+
+  it("defaults phase to the current working phase when omitted (fork)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "issue-create-"));
+    tmpDirs.push(dir);
+    await initProject(dir, { name: "test" });
+    // Seed a ticket into p0 so it becomes the current phase; without leaf
+    // tickets currentPhase() returns null and the fallback keeps phase null.
+    await handleTicketCreate(
+      { title: "Seed", type: "task", phase: "p0", description: "", blockedBy: [], parentTicket: null },
+      "md", dir,
+    );
+    const result = await handleIssueCreate(
+      { title: "Review issue", severity: "high", impact: "x", components: [], relatedTickets: [], location: [] },
+      "json", dir,
+    );
+    expect(JSON.parse(result.output).data.phase).toBe("p0");
+  });
+
+  it("leaves phase null when no phase is active (fork)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "issue-create-"));
+    tmpDirs.push(dir);
+    await initProject(dir, { name: "test" });
+    const result = await handleIssueCreate(
+      { title: "Orphan issue", severity: "low", impact: "x", components: [], relatedTickets: [], location: [] },
+      "json", dir,
+    );
+    expect(JSON.parse(result.output).data.phase).toBeNull();
   });
 
   it("rejects invalid severity", async () => {

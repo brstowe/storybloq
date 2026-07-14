@@ -1209,7 +1209,7 @@ export function registerTicketCommand(yargs: Argv): Argv {
                 })
                 .option("phase", {
                   type: "string",
-                  describe: "Phase ID",
+                  describe: "Phase ID (defaults to the current working phase if omitted)",
                 })
                 .option("description", {
                   type: "string",
@@ -1827,7 +1827,7 @@ export function registerIssueCommand(yargs: Argv): Argv {
                 })
                 .option("phase", {
                   type: "string",
-                  describe: "Phase ID",
+                  describe: "Phase ID (defaults to the current working phase if omitted)",
                 })
                 .option("components", {
                   type: "string",

@@ -312,6 +312,35 @@ describe("handleTicketCreate", () => {
     ).rejects.toThrow("not found in roadmap");
   });
 
+  it("defaults phase to the current working phase when omitted (fork)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ticket-create-"));
+    tmpDirs.push(dir);
+    await initProject(dir, { name: "test" });
+    // Seed a ticket into p0 so it becomes the current (first non-complete
+    // phase with leaf tickets); otherwise currentPhase() returns null.
+    await handleTicketCreate(
+      { title: "Seed", type: "task", phase: "p0", description: "", blockedBy: [], parentTicket: null },
+      "md", dir,
+    );
+    const result = await handleTicketCreate(
+      { title: "No phase given", type: "task", phase: null, description: "", blockedBy: [], parentTicket: null },
+      "json", dir,
+    );
+    expect(JSON.parse(result.output).data.phase).toBe("p0");
+  });
+
+  it("leaves phase null when no phase is active (fork)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ticket-create-"));
+    tmpDirs.push(dir);
+    await initProject(dir, { name: "test" });
+    // No tickets anywhere, so currentPhase() returns null and the fallback applies.
+    const result = await handleTicketCreate(
+      { title: "No phase given", type: "task", phase: null, description: "", blockedBy: [], parentTicket: null },
+      "json", dir,
+    );
+    expect(JSON.parse(result.output).data.phase).toBeNull();
+  });
+
   it("sets createdDate to today", async () => {
     const dir = await mkdtemp(join(tmpdir(), "ticket-create-"));
     tmpDirs.push(dir);

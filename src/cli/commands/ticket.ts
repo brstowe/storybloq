@@ -1,5 +1,5 @@
 import { displayIdOf } from "../../core/resolver.js";
-import { nextTicket, nextTickets, blockedTickets } from "../../core/queries.js";
+import { nextTicket, nextTickets, blockedTickets, currentPhase } from "../../core/queries.js";
 import { nextTicketID, nextOrder, allocateTeamTicketId } from "../../core/id-allocation.js";
 import { reserveDisplayId } from "../../core/remote-refs.js";
 import { resolveAndNormalizeTicketRef, RefResolutionError } from "../../core/ref-normalization.js";
@@ -349,9 +349,13 @@ export async function handleTicketCreate(
   let createdTicket: Ticket | undefined;
 
   await withProjectLock(root, { strict: true }, async ({ state }) => {
-    validatePhase(args.phase, { state });
+    // Fork: when no phase is given, default to the current working phase so
+    // items (esp. review-raised ones) never land unphased and hidden from
+    // phase-filtered views. Falls back to null only when no phase is active.
+    const phase = args.phase ?? currentPhase(state)?.id ?? null;
+    validatePhase(phase, { state });
     if (args.project != null) {
-      validateProjectAssignment(args.project, args.phase, state);
+      validateProjectAssignment(args.project, phase, state);
     }
     const resolvedBlockedBy = args.blockedBy.length > 0
       ? validateAndResolveBlockedBy(args.blockedBy, "", state)
@@ -373,7 +377,7 @@ export async function handleTicketCreate(
       id = nextTicketID(state.tickets);
       displayId = undefined;
     }
-    const order = nextOrder(args.phase, state);
+    const order = nextOrder(phase, state);
     const createdAt = new Date().toISOString();
     const ticket: Ticket = {
       id,
@@ -382,7 +386,7 @@ export async function handleTicketCreate(
       description: args.description,
       type: args.type as TicketType,
       status: "open",
-      phase: args.phase,
+      phase,
       order,
       createdDate: createdAt.slice(0, 10),
       ...(isTeam && { createdAt }),

@@ -1,5 +1,6 @@
 import { displayIdOf } from "../../core/resolver.js";
 import { validateProject } from "../../core/validation.js";
+import { currentPhase } from "../../core/queries.js";
 import { validateProjectAssignment, staleProjectClear } from "./ticket.js";
 import { resolveAndNormalizeTicketRef, resolveAndNormalizeIssueRef, RefResolutionError } from "../../core/ref-normalization.js";
 import { ProjectState } from "../../core/project-state.js";
@@ -272,11 +273,15 @@ export async function handleIssueCreate(
   let createdIssue: Issue | undefined;
 
   await withProjectLock(root, { strict: true }, async ({ state }) => {
-    if (args.phase && !state.roadmap.phases.some((p) => p.id === args.phase)) {
-      throw new CliValidationError("invalid_input", `Phase "${args.phase}" not found in roadmap`);
+    // Fork: default to the current working phase when none is given so
+    // review-raised issues never land unphased and hidden from phase-filtered
+    // views. Falls back to null only when no phase is active.
+    const phase = args.phase ?? currentPhase(state)?.id ?? null;
+    if (phase && !state.roadmap.phases.some((p) => p.id === phase)) {
+      throw new CliValidationError("invalid_input", `Phase "${phase}" not found in roadmap`);
     }
     if (args.project != null) {
-      validateProjectAssignment(args.project, args.phase ?? null, state);
+      validateProjectAssignment(args.project, phase, state);
     }
     const resolvedRelated = args.relatedTickets.length > 0
       ? validateAndResolveRelatedTickets(args.relatedTickets, state)
@@ -310,7 +315,7 @@ export async function handleIssueCreate(
       ...(isTeam && { createdAt }),
       resolvedDate: null,
       relatedTickets: resolvedRelated,
-      phase: args.phase ?? null,
+      phase,
       ...(args.project != null && { project: args.project }),
     };
 

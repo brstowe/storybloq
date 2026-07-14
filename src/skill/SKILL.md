@@ -319,6 +319,8 @@ CLI examples:
 - `storybloq ticket update T-001 --status complete`
 - `storybloq issue create --title "..." --severity high --impact "..."`
 
+Phase defaulting: if `phase` is omitted on ticket/issue create, it defaults to the current working phase (first non-complete phase with tickets), so items never land unphased. Pass `--phase` / `phase` explicitly to file into a different phase.
+
 MCP examples:
 - `storybloq_ticket_create` with `title`, `type`, and optional `phase`, `description`, `blockedBy`, `parentTicket`
 - `storybloq_ticket_update` with `id` and optional `status`, `title`, `order`, `description`, `phase`, `parentTicket`

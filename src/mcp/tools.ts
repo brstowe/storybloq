@@ -556,7 +556,7 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
     inputSchema: {
       title: z.string().describe("Ticket title"),
       type: z.enum(TICKET_TYPES).describe("Ticket type: task, feature, chore"),
-      phase: z.string().optional().describe("Phase ID"),
+      phase: z.string().optional().describe("Phase ID (defaults to the current working phase if omitted)"),
       description: z.string().optional().describe("Ticket description"),
       blockedBy: z.array(TicketRefSchema).optional().describe("IDs of blocking tickets"),
       parentTicket: TicketRefSchema.optional().describe("Parent ticket ID (makes this a sub-ticket)"),
@@ -654,7 +654,7 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
       components: z.array(z.string()).optional().describe("Affected components"),
       relatedTickets: z.array(TicketRefSchema).optional().describe("Related ticket IDs"),
       location: z.array(z.string()).optional().describe("File locations"),
-      phase: z.string().optional().describe("Phase ID"),
+      phase: z.string().optional().describe("Phase ID (defaults to the current working phase if omitted)"),
       project: z.string().optional().describe("Project ID to assign (must belong to the issue's phase)"),
       node: nodeParam,
     },
