@@ -71,8 +71,22 @@ function tryDiscoverRoot(): string | null {
 function registerDegradedTools(server: McpServer): void {
   const degradedStatus = server.registerTool("storybloq_status", {
     description: "Project summary — returns guidance if no .story/ project found",
-  }, () => Promise.resolve({
-    content: [{ type: "text" as const, text: "No .story/ project found. Use storybloq_init to create one, or navigate to a directory with .story/." }],
+    inputSchema: {
+      format: z.enum(["md", "json"]).optional().describe("Output format (default: md)"),
+    },
+  }, (args) => Promise.resolve({
+    content: [{
+      type: "text" as const,
+      text: args.format === "json"
+        ? JSON.stringify({
+            version: 1,
+            error: {
+              code: "not_found",
+              message: "No .story/ project found. Use storybloq_init to create one, or navigate to a directory with .story/.",
+            },
+          }, null, 2)
+        : "No .story/ project found. Use storybloq_init to create one, or navigate to a directory with .story/.",
+    }],
     isError: true,
   }));
 

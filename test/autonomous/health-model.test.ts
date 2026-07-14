@@ -458,6 +458,118 @@ describe("deriveHealthState (full derivation)", () => {
     expect(["healthy", "working"]).toContain(result.healthState);
   });
 
+  it("includes semantic diagnostics for non-converging code review", () => {
+    writeTelemetry(sessionDir, "alive", String(Date.now()));
+    writeTelemetry(sessionDir, "lastMcpCall", new Date().toISOString());
+    writeState(sessionDir, {
+      sessionId: "test-session",
+      status: "active",
+      state: "IMPLEMENT",
+      substageStartedAt: new Date().toISOString(),
+      ticketStartedAt: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
+      ticket: { id: "T-044", displayId: "T-044", title: "Durability fix", risk: "low", claimed: true },
+      completedTickets: [],
+      filedDeferrals: [{ fingerprint: "a", issueId: "ISS-001" }],
+      pendingDeferrals: [],
+      reviews: {
+        plan: [],
+        code: Array.from({ length: 12 }, (_, idx) => ({
+          round: idx + 1,
+          reviewer: "agent",
+          verdict: "revise",
+          findingCount: 3,
+          criticalCount: 0,
+          majorCount: 2,
+          suggestionCount: 0,
+          timestamp: new Date().toISOString(),
+        })),
+      },
+    });
+    writeFileSync(join(sessionDir, "events.log"), Array.from({ length: 12 }, (_, idx) => JSON.stringify({
+      rev: idx + 1,
+      type: "transition",
+      timestamp: "2026-07-09T10:00:00Z",
+      data: { from: "CODE_REVIEW", to: "IMPLEMENT", action: "back" },
+    })).join("\n") + "\n");
+
+    const result = deriveHealthState(sessionDir);
+    const details = result.details as {
+      diagnostics?: Array<{ code: string }>;
+      codeReview?: { rounds: number; lastCriticalCount: number; lastUnresolvedCriticalCount: number | null; ticketAgeMs: number };
+    };
+
+    expect(["healthy", "working"]).toContain(result.healthState);
+    expect(details.diagnostics?.map((d) => d.code)).toContain("code_review_non_converging");
+    expect(details.diagnostics?.map((d) => d.code)).toContain("landable_uncommitted");
+    expect(details.codeReview?.rounds).toBe(12);
+    expect(details.codeReview?.lastCriticalCount).toBe(0);
+    expect(details.codeReview?.lastUnresolvedCriticalCount).toBeNull();
+    expect(details.codeReview?.ticketAgeMs).toBeGreaterThan(0);
+  });
+
+  it("uses unresolved critical counts while preserving raw critical diagnostics", () => {
+    writeTelemetry(sessionDir, "alive", String(Date.now()));
+    writeTelemetry(sessionDir, "lastMcpCall", new Date().toISOString());
+    writeState(sessionDir, {
+      sessionId: "test-session",
+      status: "active",
+      state: "FINALIZE",
+      substageStartedAt: new Date().toISOString(),
+      ticketStartedAt: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
+      ticket: { id: "T-044", displayId: "T-044", title: "Durability fix", risk: "low", claimed: true },
+      completedTickets: [],
+      filedDeferrals: [],
+      pendingDeferrals: [],
+      reviews: {
+        plan: [],
+        code: Array.from({ length: 12 }, (_, idx) => ({
+          round: idx + 1,
+          reviewer: "agent",
+          verdict: "revise",
+          findingCount: 1,
+          criticalCount: 1,
+          unresolvedCriticalCount: 0,
+          majorCount: 0,
+          suggestionCount: 0,
+          timestamp: new Date().toISOString(),
+        })),
+      },
+      landingDecision: {
+        stage: "CODE_REVIEW",
+        round: 12,
+        maxReviewRounds: 12,
+        reason: "max_review_rounds_no_blocking",
+        findingCounts: { critical: 1, major: 0, minor: 0, suggestion: 0 },
+        timestamp: new Date().toISOString(),
+      },
+    });
+
+    const result = deriveHealthState(sessionDir);
+    const details = result.details as {
+      diagnostics?: Array<{ code: string }>;
+      codeReview?: { lastCriticalCount: number; lastUnresolvedCriticalCount: number };
+    };
+    expect(details.diagnostics?.map((d) => d.code)).toContain("landable_uncommitted");
+    expect(details.codeReview?.lastCriticalCount).toBe(1);
+    expect(details.codeReview?.lastUnresolvedCriticalCount).toBe(0);
+  });
+
+  it("keeps liveness health available when semantic diagnostic fields are malformed", () => {
+    writeTelemetry(sessionDir, "alive", String(Date.now()));
+    writeTelemetry(sessionDir, "lastMcpCall", new Date().toISOString());
+    writeState(sessionDir, {
+      sessionId: "test-session",
+      status: "active",
+      state: "IMPLEMENT",
+      reviews: { code: { not: "an array" } },
+    });
+
+    expect(() => deriveHealthState(sessionDir)).not.toThrow();
+    const result = deriveHealthState(sessionDir);
+    expect(["healthy", "working"]).toContain(result.healthState);
+    expect(result.details).toEqual({});
+  });
+
   it("never throws on missing session directory", () => {
     const badDir = join(tmpDir, "nonexistent");
     expect(() => deriveHealthState(badDir)).not.toThrow();

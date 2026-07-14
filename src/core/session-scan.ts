@@ -7,6 +7,9 @@
 import { readdirSync, readFileSync, type Dirent } from "node:fs";
 import { join } from "node:path";
 import { isContainedSessionDir } from "../autonomous/session-selector.js";
+import { normalizeClientTaskId, type OwnerTask } from "../autonomous/client-profile.js";
+
+export type SessionLeaseState = "live" | "expired" | "missing" | "invalid";
 
 export interface ActiveSessionSummary {
   readonly sessionId: string;
@@ -14,6 +17,15 @@ export interface ActiveSessionSummary {
   readonly mode: string;
   readonly ticketId: string | null;
   readonly ticketTitle: string | null;
+  readonly ownerTask?: OwnerTask | null;
+  readonly leaseExpiresAt?: string | null;
+  readonly leaseState?: SessionLeaseState;
+  readonly compactPending?: boolean;
+}
+
+export interface SessionScanResult {
+  readonly activeSessions: readonly ActiveSessionSummary[];
+  readonly resumableSessions: readonly ActiveSessionSummary[];
 }
 
 /**
@@ -21,15 +33,25 @@ export interface ActiveSessionSummary {
  * Returns an empty array if no sessions directory or no active sessions.
  */
 export function scanActiveSessions(root: string): readonly ActiveSessionSummary[] {
+  return scanSessionSummaries(root).activeSessions;
+}
+
+/**
+ * Scan active sessions and compacted recovery candidates in one filesystem pass.
+ * A live compacted session remains in activeSessions for backward compatibility.
+ * Expired compacted sessions appear separately in resumableSessions.
+ */
+export function scanSessionSummaries(root: string): SessionScanResult {
   const sessDir = join(root, ".story", "sessions");
   let entries: Dirent[];
   try {
     entries = readdirSync(sessDir, { withFileTypes: true }) as Dirent[];
   } catch {
-    return [];
+    return { activeSessions: [], resumableSessions: [] };
   }
 
-  const results: ActiveSessionSummary[] = [];
+  const activeSessions: ActiveSessionSummary[] = [];
+  const resumableSessions: ActiveSessionSummary[] = [];
 
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
@@ -50,27 +72,54 @@ export function scanActiveSessions(root: string): readonly ActiveSessionSummary[
       continue;
     }
 
-    // Only active sessions with non-expired lease
     if (parsed.status !== "active") continue;
     if (parsed.state === "SESSION_END") continue;
 
     const lease = parsed.lease as Record<string, unknown> | undefined;
-    if (lease?.expiresAt) {
-      const expires = new Date(lease.expiresAt as string).getTime();
-      if (!Number.isNaN(expires) && expires <= Date.now()) continue;
-    } else {
-      continue; // No lease or missing expiresAt — treat as expired/invalid
-    }
+    const leaseExpiresAt = typeof lease?.expiresAt === "string" ? lease.expiresAt : null;
+    const expires = leaseExpiresAt ? new Date(leaseExpiresAt).getTime() : Number.NaN;
+    const leaseState: SessionLeaseState = !leaseExpiresAt
+      ? "missing"
+      : Number.isNaN(expires)
+        ? "invalid"
+        : expires <= Date.now()
+          ? "expired"
+          : "live";
 
     const ticket = parsed.ticket as Record<string, unknown> | undefined;
-    results.push({
-      sessionId: (parsed.sessionId as string) ?? entry.name,
-      state: (parsed.state as string) ?? "unknown",
-      mode: (parsed.mode as string) ?? "auto",
-      ticketId: (ticket?.id as string) ?? null,
-      ticketTitle: (ticket?.title as string) ?? null,
-    });
+    const rawOwner = parsed.ownerTask as Record<string, unknown> | undefined;
+    const ownerTaskId = typeof rawOwner?.id === "string"
+      ? normalizeClientTaskId(rawOwner.id)
+      : null;
+    const ownerTask = rawOwner &&
+      (rawOwner.client === "claude" || rawOwner.client === "codex") &&
+      ownerTaskId !== null &&
+      typeof rawOwner.boundAt === "string"
+      ? {
+          client: rawOwner.client,
+          id: ownerTaskId,
+          boundAt: rawOwner.boundAt,
+        } satisfies OwnerTask
+      : null;
+    const summary: ActiveSessionSummary = {
+      sessionId: typeof parsed.sessionId === "string" ? parsed.sessionId : entry.name,
+      state: typeof parsed.state === "string" ? parsed.state : "unknown",
+      mode: typeof parsed.mode === "string" ? parsed.mode : "auto",
+      ticketId: typeof ticket?.id === "string" ? ticket.id : null,
+      ticketTitle: typeof ticket?.title === "string" ? ticket.title : null,
+      ownerTask,
+      leaseExpiresAt,
+      leaseState,
+      compactPending: parsed.compactPending === true,
+    };
+
+    if (leaseState === "live") activeSessions.push(summary);
+    if (summary.state === "COMPACT" && summary.compactPending && leaseState !== "live") {
+      resumableSessions.push(summary);
+    }
   }
 
-  return results;
+  activeSessions.sort((a, b) => a.sessionId.localeCompare(b.sessionId));
+  resumableSessions.sort((a, b) => a.sessionId.localeCompare(b.sessionId));
+  return { activeSessions, resumableSessions };
 }

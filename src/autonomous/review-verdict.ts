@@ -31,6 +31,7 @@ export interface ReviewVerdictArtifact {
   readonly verdict: string;
   readonly findingsCount: number;
   readonly severityCounts: SeverityCounts;
+  readonly unresolvedCriticalCount?: number;
   readonly startedAt: string;
   readonly durationMs: number;
   readonly summary: string;
@@ -50,6 +51,7 @@ export interface Tier1ReviewVerdict {
   readonly verdict: string;
   readonly findingCount: number;
   readonly criticalCount: number;
+  readonly unresolvedCriticalCount?: number;
   readonly majorCount: number;
   readonly suggestionCount: number;
   readonly durationMs: number;
@@ -187,17 +189,38 @@ export function readReviewVerdict(
 // ---------------------------------------------------------------------------
 
 export function buildTier1Verdict(artifact: ReviewVerdictArtifact): Tier1ReviewVerdict {
+  const unresolvedCriticalCount = artifact.unresolvedCriticalCount ?? deriveUnresolvedCriticalCount(artifact);
   return {
     stage: artifact.stage,
     round: artifact.round,
     verdict: artifact.verdict,
     findingCount: artifact.findingsCount,
     criticalCount: artifact.severityCounts.critical,
+    unresolvedCriticalCount,
     majorCount: artifact.severityCounts.major,
     suggestionCount: artifact.severityCounts.suggestion,
     durationMs: artifact.durationMs,
     summary: artifact.summary,
   };
+}
+
+function deriveUnresolvedCriticalCount(artifact: ReviewVerdictArtifact): number {
+  let unresolved = 0;
+  let criticalFindings = 0;
+  for (const finding of artifact.findings) {
+    if (!finding || typeof finding !== "object") continue;
+    const record = finding as Record<string, unknown>;
+    if (String(record.severity).toLowerCase() !== "critical") continue;
+    criticalFindings += 1;
+    if (typeof record.disposition !== "string") {
+      return artifact.severityCounts.critical;
+    }
+    const disposition = record.disposition.toLowerCase();
+    if (disposition !== "addressed" && disposition !== "deferred") unresolved += 1;
+  }
+  return criticalFindings === artifact.severityCounts.critical
+    ? unresolved
+    : artifact.severityCounts.critical;
 }
 
 // ---------------------------------------------------------------------------

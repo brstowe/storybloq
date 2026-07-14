@@ -111,6 +111,7 @@ export function buildMismatchHandoverInstruction(
   affinity: BranchAffinity,
   attemptedPick: string,
   sessionId: string,
+  storyCommand: "/story" | "$story" = "/story",
 ): string {
   return [
     "# Branch Mismatch -- Session Ending",
@@ -121,8 +122,8 @@ export function buildMismatchHandoverInstruction(
     "Write a handover documenting this mismatch and end the session.",
     "",
     "**To work on other tickets after this session ends:**",
-    "- Switch to `main` and run `/story auto` from there",
-    `- Use targeted mode: \`/story auto ${attemptedPick}\` (skips the branch check)`,
+    `- Switch to \`main\` and run \`${storyCommand} auto\` from there`,
+    `- Use targeted mode: \`${storyCommand} auto ${attemptedPick}\` (skips the branch check)`,
     '- Set `branchStrategy: "per-ticket"` in config (auto-creates branches per ticket)',
     "",
     "Call `storybloq_autonomous_guide` with:",

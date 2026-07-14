@@ -12,6 +12,17 @@ function isStringRecord(value: unknown): value is Record<string, string> {
     && Object.values(value as Record<string, unknown>).every((v) => typeof v === "string");
 }
 
+function leaseMetadata(session: SessionState): {
+  leaseExpiresAt: string | null;
+  leaseState: "live" | "expired" | "missing" | "invalid";
+} {
+  const leaseExpiresAt = session.lease?.expiresAt ?? null;
+  if (!leaseExpiresAt) return { leaseExpiresAt, leaseState: "missing" };
+  const expires = new Date(leaseExpiresAt).getTime();
+  if (Number.isNaN(expires)) return { leaseExpiresAt, leaseState: "invalid" };
+  return { leaseExpiresAt, leaseState: expires <= Date.now() ? "expired" : "live" };
+}
+
 export function buildActivePayload(
   session: SessionState,
   telemetry?: {
@@ -23,6 +34,7 @@ export function buildActivePayload(
 ): StatusPayloadActive {
   const issueDisplayIds = isStringRecord(session.resolvedIssueDisplayIds) ? session.resolvedIssueDisplayIds : {};
   const targetDisplayIds = isStringRecord(session.targetWorkDisplayIds) ? session.targetWorkDisplayIds : {};
+  const lease = leaseMetadata(session);
 
   return {
     schemaVersion: CURRENT_STATUS_SCHEMA_VERSION,
@@ -48,6 +60,10 @@ export function buildActivePayload(
     pendingInstruction: session.pendingInstruction ?? null,
     pendingInstructionSetAt: session.pendingInstructionSetAt ?? null,
     claudeCodeSessionId: session.claudeCodeSessionId ?? null,
+    ownerTask: session.ownerTask ?? null,
+    leaseExpiresAt: lease.leaseExpiresAt,
+    leaseState: lease.leaseState,
+    compactPending: session.compactPending === true,
     binaryFingerprint: session.binaryFingerprint ?? null,
     runningSubprocesses: telemetry?.runningSubprocesses ?? session.runningSubprocesses ?? null,
     lastReviewVerdict: session.lastReviewVerdict ?? null,

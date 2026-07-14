@@ -1,10 +1,10 @@
 /**
  * ISS-570 G3: Skill-dir version marker + silent auto-refresh.
  *
- * The /story skill lives at ~/.claude/skills/story/. After `storybloq
- * setup --client claude`, the skill contains a copy of SKILL.md, setup-flow.md,
- * autonomous-mode.md, reference.md, and review-lenses content from
- * whichever version of the CLI wrote them.
+ * The Storybloq skill is installed into per-client skill directories. After
+ * `storybloq setup --client ...`, the skill contains a copy of SKILL.md,
+ * setup-flow.md, autonomous-mode.md, reference.md, and review-lenses content
+ * from whichever version of the CLI wrote them.
  *
  * When a user runs `npm install -g @storybloq/storybloq@latest`, the CLI
  * binary updates but the skill dir stays on the OLD skill files until
@@ -23,18 +23,59 @@ import { homedir } from "node:os";
 
 const MARKER_FILE = ".storybloq-version";
 
-function skillDir(): string {
-  return join(homedir(), ".claude", "skills", "story");
+export type SkillInstallTarget = "claude" | "codex" | "codexCompat";
+
+interface SkillTargetInfo {
+  readonly id: SkillInstallTarget;
+  readonly client: "claude" | "codex";
+  readonly dir: string;
+  readonly displayPath: string;
 }
 
-function markerPath(): string {
-  return join(skillDir(), MARKER_FILE);
+function targetInfo(target: SkillInstallTarget): SkillTargetInfo {
+  switch (target) {
+    case "claude":
+      return {
+        id: target,
+        client: "claude",
+        dir: join(homedir(), ".claude", "skills", "story"),
+        displayPath: "~/.claude/skills/story/",
+      };
+    case "codex":
+      return {
+        id: target,
+        client: "codex",
+        dir: join(homedir(), ".agents", "skills", "story"),
+        displayPath: "~/.agents/skills/story/",
+      };
+    case "codexCompat": {
+      const codexHome = process.env.CODEX_HOME;
+      return {
+        id: target,
+        client: "codex",
+        dir: join(codexHome ?? join(homedir(), ".codex"), "skills", "story"),
+        displayPath: codexHome ? "$CODEX_HOME/skills/story/" : "~/.codex/skills/story/",
+      };
+    }
+  }
+}
+
+function skillTargets(): readonly SkillTargetInfo[] {
+  return [targetInfo("claude"), targetInfo("codex"), targetInfo("codexCompat")];
+}
+
+function skillDir(target: SkillInstallTarget = "claude"): string {
+  return targetInfo(target).dir;
+}
+
+function markerPath(target: SkillInstallTarget = "claude"): string {
+  return join(skillDir(target), MARKER_FILE);
 }
 
 /** Read the CLI version that last wrote the skill dir. null if missing. */
-export function readSkillMarker(): string | null {
+export function readSkillMarker(target: SkillInstallTarget = "claude"): string | null {
   try {
-    const p = markerPath();
+    const p = markerPath(target);
     if (!existsSync(p)) return null;
     const text = readFileSync(p, "utf-8").trim();
     return text.length > 0 ? text : null;
@@ -44,21 +85,54 @@ export function readSkillMarker(): string | null {
 }
 
 /** Write the CLI version marker. Best-effort; errors are swallowed. */
-export function writeSkillMarker(version: string): void {
+export function writeSkillMarker(version: string, target: SkillInstallTarget = "claude"): void {
   try {
-    mkdirSync(skillDir(), { recursive: true });
-    writeFileSync(markerPath(), version + "\n", "utf-8");
+    mkdirSync(skillDir(target), { recursive: true });
+    writeFileSync(markerPath(target), version + "\n", "utf-8");
   } catch {
     // Marker write is best-effort.
   }
 }
 
 /** True when the skill dir exists AND the marker is stale or missing. */
-export function isSkillStale(runningVersion: string): boolean {
+export function isSkillStale(runningVersion: string, target: SkillInstallTarget = "claude"): boolean {
   if (!runningVersion || runningVersion === "0.0.0-dev") return false;
-  if (!existsSync(join(skillDir(), "SKILL.md"))) return false; // no skill dir = not stale, just uninstalled
-  const marker = readSkillMarker();
+  if (!existsSync(join(skillDir(target), "SKILL.md"))) return false; // no skill dir = not stale, just uninstalled
+  const marker = readSkillMarker(target);
   return marker !== runningVersion;
+}
+
+function codexConfigPath(): string {
+  return join(process.env.CODEX_HOME ?? join(homedir(), ".codex"), "config.toml");
+}
+
+function hasCodexStorybloqServer(configPath: string): boolean {
+  try {
+    const raw = readFileSync(configPath, "utf-8");
+    return /^\s*\[mcp_servers\.storybloq\]\s*(?:#.*)?$/m.test(raw);
+  } catch {
+    return false;
+  }
+}
+
+async function refreshCodexConfigIfPresent(): Promise<void> {
+  const configPath = codexConfigPath();
+  if (!existsSync(configPath)) return;
+  if (!hasCodexStorybloqServer(configPath)) return;
+
+  try {
+    const { ensureCodexClientEnv } = await import("../cli/commands/setup-skill.js");
+    const env = await ensureCodexClientEnv(configPath);
+    if (env === "updated") {
+      process.stderr.write("storybloq: refreshed Codex Storybloq MCP config on version advance\n");
+    }
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    process.stderr.write(
+      `storybloq: Codex MCP config refresh failed (non-fatal): ${msg}\n` +
+      `  Run 'storybloq setup --client codex' manually to retry.\n`,
+    );
+  }
 }
 
 /**
@@ -73,17 +147,48 @@ export function isSkillStale(runningVersion: string): boolean {
  * runs.
  */
 export async function autoRefreshSkillIfStale(runningVersion: string): Promise<boolean> {
-  if (!isSkillStale(runningVersion)) return false;
+  const staleTargets = skillTargets().filter((target) => isSkillStale(runningVersion, target.id));
+  if (staleTargets.length === 0) return false;
 
   try {
     const { copyDirRecursive, resolveSkillSourceDir, resolveStorybloqBin } =
       await import("../cli/commands/setup-skill.js");
     const src = resolveSkillSourceDir();
-    await copyDirRecursive(src, skillDir());
-    writeSkillMarker(runningVersion);
-    process.stderr.write(
-      `storybloq: refreshed /story skill files at ~/.claude/skills/story/ to match CLI v${runningVersion}\n`,
-    );
+    let refreshedClaude = false;
+    let refreshedCodex = false;
+
+    for (const target of staleTargets) {
+      await copyDirRecursive(src, target.dir);
+      writeSkillMarker(runningVersion, target.id);
+      refreshedClaude = refreshedClaude || target.client === "claude";
+      refreshedCodex = refreshedCodex || target.client === "codex";
+      process.stderr.write(
+        `storybloq: refreshed skill files at ${target.displayPath} to match CLI v${runningVersion}\n`,
+      );
+    }
+
+    if (refreshedCodex) {
+      await refreshCodexConfigIfPresent();
+      try {
+        const { refreshExistingCodexHooks, resolveStorybloqBin } =
+          await import("../cli/commands/setup-skill.js");
+        const bin = resolveStorybloqBin();
+        if (bin !== null) {
+          const codexHookRefresh = await refreshExistingCodexHooks(bin);
+          if (codexHookRefresh.changed > 0) {
+            process.stderr.write(
+              `storybloq: refreshed ${codexHookRefresh.changed} Codex hook entr${codexHookRefresh.changed === 1 ? "y" : "ies"} on version advance\n`,
+            );
+          }
+        }
+      } catch (codexHookErr: unknown) {
+        const codexHookMsg = codexHookErr instanceof Error ? codexHookErr.message : String(codexHookErr);
+        process.stderr.write(
+          `storybloq: Codex hook refresh failed (non-fatal): ${codexHookMsg}\n` +
+          `  Run 'storybloq setup --client codex' manually to retry.\n`,
+        );
+      }
+    }
 
     // ISS-590: migrate stale legacy-basename hook entries (for example
     // claudestory-named hooks left behind after migrating from
@@ -107,7 +212,7 @@ export async function autoRefreshSkillIfStale(runningVersion: string): Promise<b
     // Best-effort: if the storybloq bin cannot be resolved there is
     // nothing to re-register against, and any failure logs but does
     // not block the refresh.
-    const bin = resolveStorybloqBin();
+    const bin = refreshedClaude ? resolveStorybloqBin() : null;
     if (bin !== null) {
       try {
         const { countLegacyHooks, sweepLegacyHooks } = await import("./hook-migration.js");

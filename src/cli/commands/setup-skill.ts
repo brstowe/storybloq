@@ -433,6 +433,107 @@ export async function registerStopHook(
   return registerHook("Stop", { type: "command", command, async: true }, settingsPath);
 }
 
+export const CLAUDE_BUS_SESSION_START_MATCHER = "startup|resume|clear|compact";
+
+/**
+ * Upgrades the existing Claude hook entries for guarded Bus delivery.
+ * The Stop command becomes synchronous and SessionStart runs for every source.
+ * Project-local hook policy still decides whether either path emits Bus output.
+ */
+export async function enableClaudeBusHooks(
+  settingsPath?: string,
+  binPath?: string,
+): Promise<{ changed: boolean; skipped: boolean }> {
+  const path = settingsPath ?? join(homedir(), ".claude", "settings.json");
+  const bin = binPath ?? resolveStorybloqBin();
+  if (!bin) return { changed: false, skipped: true };
+
+  const sessionCommand = formatHookCommand(bin, SESSIONSTART_SUBCOMMAND);
+  const stopCommand = formatHookCommand(bin, STOP_SUBCOMMAND);
+  const sessionRegistered = await registerSessionStartHook(path, bin);
+  const stopRegistered = await registerStopHook(path, bin);
+  if (sessionRegistered === "skipped" || stopRegistered === "skipped") {
+    return { changed: false, skipped: true };
+  }
+
+  let settings: Record<string, unknown>;
+  try {
+    settings = JSON.parse(await readFile(path, "utf-8")) as Record<string, unknown>;
+  } catch {
+    return { changed: false, skipped: true };
+  }
+  if (typeof settings.hooks !== "object" || settings.hooks === null || Array.isArray(settings.hooks)) {
+    return { changed: false, skipped: true };
+  }
+  const hooks = settings.hooks as Record<string, unknown>;
+  if (!Array.isArray(hooks.SessionStart) || !Array.isArray(hooks.Stop)) {
+    return { changed: false, skipped: true };
+  }
+
+  let changed = false;
+  const sessionGroups = hooks.SessionStart as unknown[];
+  let sessionEntry: HookEntry | null = null;
+  let sessionMatches = 0;
+  let canonicalSessionMatches = 0;
+  for (let i = sessionGroups.length - 1; i >= 0; i--) {
+    const group = sessionGroups[i];
+    if (typeof group !== "object" || group === null) continue;
+    const matcherGroup = group as MatcherGroup;
+    if (!Array.isArray(matcherGroup.hooks)) continue;
+    const retained: unknown[] = [];
+    for (const entry of matcherGroup.hooks) {
+      if (isHookWithCommand(entry, sessionCommand)) {
+        sessionMatches += 1;
+        if ((matcherGroup.matcher ?? "") === CLAUDE_BUS_SESSION_START_MATCHER) {
+          canonicalSessionMatches += 1;
+        }
+        if (!sessionEntry) sessionEntry = entry as HookEntry;
+        changed = changed || (matcherGroup.matcher ?? "") !== CLAUDE_BUS_SESSION_START_MATCHER;
+      } else {
+        retained.push(entry);
+      }
+    }
+    matcherGroup.hooks = retained;
+    if (retained.length === 0) sessionGroups.splice(i, 1);
+  }
+  if (!sessionEntry) return { changed: false, skipped: true };
+  const sessionWasCanonical = sessionMatches === 1 && canonicalSessionMatches === 1;
+  if (sessionMatches > 1) changed = true;
+  let targetGroup = sessionGroups.find((group) =>
+    typeof group === "object" && group !== null &&
+    ((group as MatcherGroup).matcher ?? "") === CLAUDE_BUS_SESSION_START_MATCHER &&
+    Array.isArray((group as MatcherGroup).hooks),
+  ) as MatcherGroup | undefined;
+  if (!targetGroup) {
+    targetGroup = { matcher: CLAUDE_BUS_SESSION_START_MATCHER, hooks: [] };
+    sessionGroups.push(targetGroup);
+    if (!sessionWasCanonical) changed = true;
+  }
+  targetGroup.hooks!.push(sessionEntry);
+
+  for (const group of hooks.Stop as unknown[]) {
+    if (typeof group !== "object" || group === null) continue;
+    const matcherGroup = group as MatcherGroup;
+    if (!Array.isArray(matcherGroup.hooks)) continue;
+    for (const entry of matcherGroup.hooks) {
+      if (!isHookWithCommand(entry, stopCommand)) continue;
+      const hook = entry as HookEntry;
+      if ("async" in hook) {
+        delete hook.async;
+        changed = true;
+      }
+    }
+  }
+
+  if (!changed) return { changed: false, skipped: false };
+  try {
+    await atomicWriteFollowingSymlink(path, JSON.stringify(settings, null, 2) + "\n");
+    return { changed: true, skipped: false };
+  } catch {
+    return { changed: false, skipped: true };
+  }
+}
+
 /**
  * Removes a hook command from settings.json. Used for migration (ISS-032).
  */
@@ -510,6 +611,55 @@ export function formatCodexSessionStartCommand(binPath: string): string {
   return formatHookCommand(binPath, `${SESSIONSTART_SUBCOMMAND} --codex-hook-json`);
 }
 
+export function formatCodexPreCompactCommand(binPath: string): string {
+  return formatHookCommand(binPath, `${PRECOMPACT_SUBCOMMAND} --client codex`);
+}
+
+export function formatCodexStopCommand(binPath: string): string {
+  return formatHookCommand(binPath, `${STOP_SUBCOMMAND} --client codex`);
+}
+
+export type CodexHookType = "PreCompact" | "SessionStart" | "Stop";
+
+export interface CodexHookCounts {
+  PreCompact: number;
+  SessionStart: number;
+  Stop: number;
+}
+
+const CODEX_HOOK_ACCEPTED_RESTS: Record<CodexHookType, readonly string[]> = {
+  PreCompact: [PRECOMPACT_SUBCOMMAND, `${PRECOMPACT_SUBCOMMAND} --client codex`],
+  SessionStart: [SESSIONSTART_SUBCOMMAND, `${SESSIONSTART_SUBCOMMAND} --codex-hook-json`],
+  Stop: [STOP_SUBCOMMAND, `${STOP_SUBCOMMAND} --client codex`],
+};
+
+const ZERO_CODEX_HOOK_COUNTS: CodexHookCounts = {
+  PreCompact: 0,
+  SessionStart: 0,
+  Stop: 0,
+};
+
+export const CODEX_SESSION_START_MATCHER = "startup|resume|clear|compact";
+export const CODEX_PRECOMPACT_MATCHER = "manual|auto";
+
+function pruneEmptyMatcherGroups(
+  hookArray: unknown[],
+  candidates: ReadonlySet<unknown>,
+): number {
+  let removed = 0;
+  for (let i = hookArray.length - 1; i >= 0; i--) {
+    const group = hookArray[i];
+    if (!candidates.has(group)) continue;
+    if (typeof group !== "object" || group === null) continue;
+    const g = group as MatcherGroup;
+    if (Array.isArray(g.hooks) && g.hooks.length === 0) {
+      hookArray.splice(i, 1);
+      removed += 1;
+    }
+  }
+  return removed;
+}
+
 /**
  * Installs the /story skill globally for Claude Code.
  *
@@ -548,7 +698,7 @@ async function handleSetupClaude(options: SetupSkillOptions = {}): Promise<void>
   const skillContent = await readFile(join(srcSkillDir, "SKILL.md"), "utf-8");
   await writeFile(join(skillDir, "SKILL.md"), skillContent, "utf-8");
 
-  const supportFiles = ["setup-flow.md", "autonomous-mode.md", "reference.md", "federation-setup.md", "orchestrator-mode.md"];
+  const supportFiles = ["setup-flow.md", "autonomous-mode.md", "reference.md", "federation-setup.md", "orchestrator-mode.md", "bus-mode.md"];
   const writtenFiles = ["SKILL.md"];
   const missingFiles: string[] = [];
   for (const filename of supportFiles) {
@@ -586,7 +736,7 @@ async function handleSetupClaude(options: SetupSkillOptions = {}): Promise<void>
     const pkgJson = JSON.parse(
       await readFile(join(dirname(fileURLToPath(import.meta.url)), "..", "package.json"), "utf-8")
     ) as { version?: string };
-    if (pkgJson.version) writeSkillMarker(pkgJson.version);
+    if (pkgJson.version) writeSkillMarker(pkgJson.version, "claude");
   } catch {
     // Marker write is best-effort; skill still works without it.
   }
@@ -720,6 +870,8 @@ async function handleSetupClaude(options: SetupSkillOptions = {}): Promise<void>
   }
 }
 
+// "Read-only" here means canonical tracked project state. Bus poll may repair
+// and advance gitignored .story/bus runtime metadata while remaining advisory.
 export const CODEX_READ_ONLY_APPROVAL_TOOLS = [
   "storybloq_status",
   "storybloq_phase_list",
@@ -747,6 +899,8 @@ export const CODEX_READ_ONLY_APPROVAL_TOOLS = [
   "storybloq_recommend",
   "storybloq_export",
   "storybloq_session_report",
+  "storybloq_bus_poll",
+  "storybloq_bus_thread_get",
   "storybloq_node_list",
 ] as const;
 
@@ -770,6 +924,18 @@ function codexHooksPath(): string {
 
 function codexConfigPath(): string {
   return join(codexHome(), "config.toml");
+}
+
+export async function ensureCodexHomeDir(home = codexHome()): Promise<"created" | "exists" | "skipped"> {
+  const existed = existsSync(home);
+  try {
+    await mkdir(home, { recursive: true });
+    return existed ? "exists" : "created";
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    process.stderr.write(`Failed to create Codex home directory ${home}: ${message}\n`);
+    return "skipped";
+  }
 }
 
 function parseCodexVersion(output: string): string | null {
@@ -933,7 +1099,7 @@ export async function ensureCodexClientEnv(
 }
 
 export async function migrateCodexHookVariants(
-  hookType: "SessionStart" | "Stop",
+  hookType: CodexHookType,
   acceptedRests: readonly string[],
   newCommand: string,
   hooksPath = codexHooksPath(),
@@ -961,6 +1127,7 @@ export async function migrateCodexHookVariants(
 
   const hookArray = hooks[hookType] as unknown[];
   let removedCount = 0;
+  const emptiedByMigration = new Set<unknown>();
   for (const group of hookArray) {
     if (typeof group !== "object" || group === null) continue;
     const g = group as MatcherGroup;
@@ -977,10 +1144,13 @@ export async function migrateCodexHookVariants(
       if (!STORYBLOQ_LEGACY_BASENAMES.has(parsed.binBasename)) return true;
       return !acceptedRests.includes(parsed.rest);
     });
-    removedCount += before - g.hooks.length;
+    const removed = before - g.hooks.length;
+    removedCount += removed;
+    if (removed > 0 && g.hooks.length === 0) emptiedByMigration.add(group);
   }
 
   if (removedCount === 0) return 0;
+  pruneEmptyMatcherGroups(hookArray, emptiedByMigration);
 
   // Atomic write that follows a symlinked hooks.json (issue #12)
   try {
@@ -993,7 +1163,7 @@ export async function migrateCodexHookVariants(
 }
 
 export async function registerCodexHook(
-  hookType: "SessionStart" | "Stop",
+  hookType: CodexHookType,
   hookEntry: HookEntry,
   hooksPath = codexHooksPath(),
   matcher?: string,
@@ -1041,18 +1211,46 @@ export async function registerCodexHook(
 
   const hookArray = hooks[hookType] as unknown[];
   const hookCommand = hookEntry.command;
+  const targetMatcher = matcher ?? "";
   if (hookCommand) {
+    let foundInTargetMatcher = false;
+    let removedFromWrongMatcher = false;
+    const emptiedByMove = new Set<unknown>();
     for (const group of hookArray) {
       if (typeof group !== "object" || group === null) continue;
       const g = group as MatcherGroup;
       if (!Array.isArray(g.hooks)) continue;
-      for (const entry of g.hooks) {
-        if (isHookWithCommand(entry, hookCommand)) return "exists";
+      const groupMatcher = g.matcher ?? "";
+      const before = g.hooks.length;
+      g.hooks = g.hooks.filter((entry) => {
+        if (!isHookWithCommand(entry, hookCommand)) return true;
+        if (groupMatcher === targetMatcher) {
+          foundInTargetMatcher = true;
+          return true;
+        }
+        return false;
+      });
+      if (before !== g.hooks.length) {
+        // Same command under an older matcher. Re-add it below under the
+        // current matcher so hook source coverage can be upgraded in place.
+        removedFromWrongMatcher = true;
+        if (g.hooks.length === 0) emptiedByMove.add(group);
       }
+    }
+    const prunedEmptyGroups = pruneEmptyMatcherGroups(hookArray, emptiedByMove);
+    if (foundInTargetMatcher) {
+      if (!removedFromWrongMatcher && prunedEmptyGroups === 0) return "exists";
+      try {
+        await atomicWriteFollowingSymlink(hooksPath, JSON.stringify(settings, null, 2) + "\n");
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        process.stderr.write(`Failed to write Codex hooks.json: ${message}\n`);
+        return "skipped";
+      }
+      return "registered";
     }
   }
 
-  const targetMatcher = matcher ?? "";
   let appended = false;
   for (const group of hookArray) {
     if (typeof group !== "object" || group === null) continue;
@@ -1081,6 +1279,128 @@ export async function registerCodexHook(
   return "registered";
 }
 
+export async function countCodexStorybloqHooks(
+  hooksPath = codexHooksPath(),
+): Promise<CodexHookCounts> {
+  if (!existsSync(hooksPath)) return { ...ZERO_CODEX_HOOK_COUNTS };
+
+  let raw: string;
+  try {
+    raw = await readFile(hooksPath, "utf-8");
+  } catch {
+    return { ...ZERO_CODEX_HOOK_COUNTS };
+  }
+
+  let settings: Record<string, unknown>;
+  try {
+    settings = JSON.parse(raw) as Record<string, unknown>;
+    if (typeof settings !== "object" || settings === null || Array.isArray(settings)) {
+      return { ...ZERO_CODEX_HOOK_COUNTS };
+    }
+  } catch {
+    return { ...ZERO_CODEX_HOOK_COUNTS };
+  }
+
+  if (!("hooks" in settings) || typeof settings.hooks !== "object" || settings.hooks === null) {
+    return { ...ZERO_CODEX_HOOK_COUNTS };
+  }
+
+  const hooks = settings.hooks as Record<string, unknown>;
+  const counts: CodexHookCounts = { ...ZERO_CODEX_HOOK_COUNTS };
+
+  for (const hookType of Object.keys(CODEX_HOOK_ACCEPTED_RESTS) as CodexHookType[]) {
+    if (!(hookType in hooks) || !Array.isArray(hooks[hookType])) continue;
+    const hookArray = hooks[hookType] as unknown[];
+    const acceptedRests = CODEX_HOOK_ACCEPTED_RESTS[hookType];
+    for (const group of hookArray) {
+      if (typeof group !== "object" || group === null) continue;
+      const g = group as MatcherGroup;
+      if (!Array.isArray(g.hooks)) continue;
+      for (const entry of g.hooks) {
+        if (typeof entry !== "object" || entry === null) continue;
+        const e = entry as HookEntry;
+        if (e.type !== "command" || typeof e.command !== "string") continue;
+        const parsed = parseHookCommand(e.command);
+        if (parsed === null) continue;
+        if (!STORYBLOQ_LEGACY_BASENAMES.has(parsed.binBasename)) continue;
+        if (!acceptedRests.includes(parsed.rest)) continue;
+        counts[hookType] += 1;
+      }
+    }
+  }
+
+  return counts;
+}
+
+export interface CodexHookRefreshResult {
+  detected: number;
+  changed: number;
+  skipped: boolean;
+}
+
+export async function refreshExistingCodexHooks(
+  binPath?: string,
+  hooksPath = codexHooksPath(),
+): Promise<CodexHookRefreshResult> {
+  const bin = binPath ?? resolveStorybloqBin();
+  if (bin === null) return { detected: 0, changed: 0, skipped: true };
+
+  const counts = await countCodexStorybloqHooks(hooksPath);
+  const detected = counts.PreCompact + counts.SessionStart + counts.Stop;
+  if (detected === 0) return { detected, changed: 0, skipped: false };
+
+  let changed = 0;
+  let skipped = false;
+
+  async function refreshType(
+    hookType: CodexHookType,
+    acceptedRests: readonly string[],
+    command: string,
+    hookEntry: HookEntry,
+    matcher?: string,
+  ): Promise<void> {
+    const migrated = await migrateCodexHookVariants(hookType, acceptedRests, command, hooksPath);
+    changed += migrated;
+    const registered = await registerCodexHook(hookType, hookEntry, hooksPath, matcher);
+    if (registered === "registered") changed += 1;
+    if (registered === "skipped") skipped = true;
+  }
+
+  if (counts.PreCompact > 0) {
+    const command = formatCodexPreCompactCommand(bin);
+    await refreshType(
+      "PreCompact",
+      CODEX_HOOK_ACCEPTED_RESTS.PreCompact,
+      command,
+      { type: "command", command, statusMessage: "Preparing Storybloq session" },
+      CODEX_PRECOMPACT_MATCHER,
+    );
+  }
+
+  if (counts.SessionStart > 0) {
+    const command = formatCodexSessionStartCommand(bin);
+    await refreshType(
+      "SessionStart",
+      CODEX_HOOK_ACCEPTED_RESTS.SessionStart,
+      command,
+      { type: "command", command, statusMessage: "Loading Storybloq session" },
+      CODEX_SESSION_START_MATCHER,
+    );
+  }
+
+  if (counts.Stop > 0) {
+    const command = formatCodexStopCommand(bin);
+    await refreshType(
+      "Stop",
+      CODEX_HOOK_ACCEPTED_RESTS.Stop,
+      command,
+      { type: "command", command, statusMessage: "Updating Storybloq status" },
+    );
+  }
+
+  return { detected, changed, skipped };
+}
+
 async function handleSetupCodex(options: SetupSkillOptions = {}): Promise<void> {
   const { skipHooks = false } = options;
 
@@ -1106,14 +1426,29 @@ async function handleSetupCodex(options: SetupSkillOptions = {}): Promise<void> 
   log(`  ${writtenFiles.join(" + ")} written`);
 
   const compatSkillDir = join(codexHome(), "skills", "story");
+  let compatRefreshSucceeded = false;
   if (existsSync(join(compatSkillDir, "SKILL.md"))) {
     try {
       const compatFiles = await copyDirRecursive(srcSkillDir, compatSkillDir);
+      compatRefreshSucceeded = true;
       log(`  Refreshed existing Codex skill copy at ${compatSkillDir}/ (${compatFiles.length} files)`);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       process.stderr.write(`Warning: Codex skill copy refresh failed: ${msg}\n`);
     }
+  }
+
+  try {
+    const { writeSkillMarker } = await import("../../core/skill-version-marker.js");
+    const pkgJson = JSON.parse(
+      await readFile(join(dirname(fileURLToPath(import.meta.url)), "..", "package.json"), "utf-8")
+    ) as { version?: string };
+    if (pkgJson.version) {
+      writeSkillMarker(pkgJson.version, "codex");
+      if (compatRefreshSucceeded) writeSkillMarker(pkgJson.version, "codexCompat");
+    }
+  } catch {
+    // Marker write is best-effort; skill still works without it.
   }
 
   let cliInPath = false;
@@ -1131,7 +1466,7 @@ async function handleSetupCodex(options: SetupSkillOptions = {}): Promise<void> 
     const version = parseCodexVersion(versionOutput);
     if (!version || compareVersions(version, "0.130.0") < 0) {
       log(`  Warning: Codex CLI ${version ?? "version unknown"} detected. Storybloq Codex hooks require Codex 0.130.0 or newer.`);
-      log("  If hooks do not run, add [features] codex_hooks = true to ~/.codex/config.toml.");
+      log("  If hooks do not run, ensure [features] hooks = true in ~/.codex/config.toml.");
     }
   } catch {
     // codex not in PATH
@@ -1139,23 +1474,30 @@ async function handleSetupCodex(options: SetupSkillOptions = {}): Promise<void> 
 
   if (cliInPath && codexInPath) {
     let mcpReadyForConfig = false;
-    try {
-      execFileSync("codex", ["mcp", "add", "storybloq", "--env", "STORYBLOQ_CLIENT=codex", "--", "storybloq", "--mcp"], {
-        stdio: "pipe",
-        timeout: 10000,
-      });
-      mcpReadyForConfig = true;
-      log("  Codex MCP server registered globally");
-    } catch (err: unknown) {
-      const message = commandErrorText(err);
-      const isAlreadyRegistered = /already exists|already configured|duplicate/i.test(message);
-      if (isAlreadyRegistered) {
+    const codexHomeResult = await ensureCodexHomeDir();
+    if (codexHomeResult === "skipped") {
+      log("");
+      log("Codex MCP registration failed: could not create Codex home directory.");
+      log("  To register manually: codex mcp add storybloq --env STORYBLOQ_CLIENT=codex -- storybloq --mcp");
+    } else {
+      try {
+        execFileSync("codex", ["mcp", "add", "storybloq", "--env", "STORYBLOQ_CLIENT=codex", "--", "storybloq", "--mcp"], {
+          stdio: "pipe",
+          timeout: 10000,
+        });
         mcpReadyForConfig = true;
-        log("  Codex MCP server already registered globally");
-      } else {
-        log("");
-        log(`Codex MCP registration failed: ${message.split("\n")[0]}`);
-        log("  To register manually: codex mcp add storybloq --env STORYBLOQ_CLIENT=codex -- storybloq --mcp");
+        log("  Codex MCP server registered globally");
+      } catch (err: unknown) {
+        const message = commandErrorText(err);
+        const isAlreadyRegistered = /already exists|already configured|duplicate/i.test(message);
+        if (isAlreadyRegistered) {
+          mcpReadyForConfig = true;
+          log("  Codex MCP server already registered globally");
+        } else {
+          log("");
+          log(`Codex MCP registration failed: ${message.split("\n")[0]}`);
+          log("  To register manually: codex mcp add storybloq --env STORYBLOQ_CLIENT=codex -- storybloq --mcp");
+        }
       }
     }
 
@@ -1184,22 +1526,38 @@ async function handleSetupCodex(options: SetupSkillOptions = {}): Promise<void> 
 
   const resolvedBin = resolveStorybloqBin();
   if (!skipHooks && resolvedBin !== null) {
+    const precompactCmd = formatCodexPreCompactCommand(resolvedBin);
     const sessionStartCmd = formatCodexSessionStartCommand(resolvedBin);
-    const stopCmd = formatHookCommand(resolvedBin, STOP_SUBCOMMAND);
+    const stopCmd = formatCodexStopCommand(resolvedBin);
+    const migratedPre = await migrateCodexHookVariants(
+      "PreCompact",
+      [PRECOMPACT_SUBCOMMAND, `${PRECOMPACT_SUBCOMMAND} --client codex`],
+      precompactCmd,
+    );
+    if (migratedPre > 0) log(`  Migrated ${migratedPre} stale Codex PreCompact hook entr${migratedPre === 1 ? "y" : "ies"}`);
     const migratedStart = await migrateCodexHookVariants(
       "SessionStart",
       [SESSIONSTART_SUBCOMMAND, `${SESSIONSTART_SUBCOMMAND} --codex-hook-json`],
       sessionStartCmd,
     );
     if (migratedStart > 0) log(`  Migrated ${migratedStart} stale Codex SessionStart hook entr${migratedStart === 1 ? "y" : "ies"}`);
-    const migratedStop = await migrateCodexHookVariants("Stop", [STOP_SUBCOMMAND], stopCmd);
+    const migratedStop = await migrateCodexHookVariants("Stop", CODEX_HOOK_ACCEPTED_RESTS.Stop, stopCmd);
     if (migratedStop > 0) log(`  Migrated ${migratedStop} stale Codex Stop hook entr${migratedStop === 1 ? "y" : "ies"}`);
+
+    const precompactResult = await registerCodexHook(
+      "PreCompact",
+      { type: "command", command: precompactCmd, statusMessage: "Preparing Storybloq session" },
+      undefined,
+      CODEX_PRECOMPACT_MATCHER,
+    );
+    if (precompactResult === "registered") log("  Codex PreCompact hook registered");
+    if (precompactResult === "exists") log("  Codex PreCompact hook already configured");
 
     const sessionStartResult = await registerCodexHook(
       "SessionStart",
       { type: "command", command: sessionStartCmd, statusMessage: "Loading Storybloq session" },
       undefined,
-      "startup|resume|clear",
+      CODEX_SESSION_START_MATCHER,
     );
     if (sessionStartResult === "registered") log("  Codex SessionStart hook registered");
     if (sessionStartResult === "exists") log("  Codex SessionStart hook already configured");
@@ -1218,6 +1576,18 @@ async function handleSetupCodex(options: SetupSkillOptions = {}): Promise<void> 
     log("Install globally first, then re-run setup:");
     log("  npm install -g @storybloq/storybloq@latest");
     log("  storybloq setup --client codex");
+  }
+
+  if (!skipHooks) {
+    const counts = await countCodexStorybloqHooks();
+    const installedTypes = (Object.entries(counts) as Array<[CodexHookType, number]>)
+      .filter(([, count]) => count > 0)
+      .map(([type]) => type);
+    if (installedTypes.length === 3) {
+      log("  Codex hooks installed (trust: unknown). Open /hooks in Codex to review and trust them.");
+    } else if (installedTypes.length > 0) {
+      log(`  Warning: Codex hooks are partially installed (${installedTypes.join(", ")}); trust is unknown. Re-run setup, then review /hooks.`);
+    }
   }
 
   log("");

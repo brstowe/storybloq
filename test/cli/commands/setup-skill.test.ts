@@ -57,6 +57,14 @@ describe("setup-skill", () => {
     expect(existsSync(join(PROJECT_ROOT, "src", "skill", "orchestrator-mode.md"))).toBe(true);
   });
 
+  it("bundled bus-mode.md exists in src/skill/", () => {
+    expect(existsSync(join(PROJECT_ROOT, "src", "skill", "bus-mode.md"))).toBe(true);
+  });
+
+  it("bundled Codex skill metadata exists in src/skill/agents/", () => {
+    expect(existsSync(join(PROJECT_ROOT, "src", "skill", "agents", "openai.yaml"))).toBe(true);
+  });
+
   it("orchestrator-mode.md requires orchestrator-filed tickets and issues to use the enrichment template", async () => {
     const content = await readFile(join(PROJECT_ROOT, "src", "skill", "orchestrator-mode.md"), "utf-8");
     // R1: narrowed subject -- tickets and issues, never "every item"
@@ -153,10 +161,72 @@ describe("setup-skill", () => {
     expect(modelEconomy).not.toMatch(/\b(Opus|Fable|Sonnet|Haiku)\b/);
   });
 
+  it("orchestrator-mode.md recognizes Codex subagents as callable background-agent tooling", async () => {
+    const content = await readFile(join(PROJECT_ROOT, "src", "skill", "orchestrator-mode.md"), "utf-8");
+    expect(content).toContain("Codex with callable subagent tooling");
+    expect(content).toContain("`multi_agent_v1.spawn_agent`");
+    expect(content).toContain("`multi_agent_v1__spawn_agent`");
+    expect(content).toContain("exact `spawn_agent` tool");
+    expect(content).toContain("No dynamic-workflow script determinism and no cache-resume");
+    expect(content).toContain("record it as an explicit equal-tier decision");
+    expect(content).toContain("The JavaScript above is a logical pipeline, not a script to execute in Codex");
+    expect(content).toContain("matching send-input tool rather than spawning a duplicate worker");
+    expect(content).toContain("main task remains the pen");
+  });
+
   it("SKILL.md ticket-and-issue discipline points orchestrator filings at the enrichment template", async () => {
     const content = await readFile(join(PROJECT_ROOT, "src", "skill", "SKILL.md"), "utf-8");
     expect(content).toContain("ticket or issue");
     expect(content).toContain("lowest permitted execution tier");
+  });
+
+  it("SKILL.md defines a plain-text fallback when AskUserQuestion is unavailable", async () => {
+    const content = await readFile(join(PROJECT_ROOT, "src", "skill", "SKILL.md"), "utf-8");
+    expect(content).toContain("Question tool compatibility");
+    expect(content).toContain("Codex Default mode");
+    expect(content).toContain("ask one concise free-form question");
+    expect(content).toContain("do not render a numbered or bulleted option list");
+    expect(content).toContain("A same-owner COMPACT continuation is automatic");
+    expect(content).toContain("never call or offer `resume`");
+  });
+
+  it("SKILL.md defines task-aware continuation and foreign-task relay", async () => {
+    const content = await readFile(join(PROJECT_ROOT, "src", "skill", "SKILL.md"), "utf-8");
+    expect(content).toContain('`storybloq_status` with `{ "format": "json" }`');
+    expect(content).toContain("Same owner, non-COMPACT");
+    expect(content).toContain("Same owner, COMPACT");
+    expect(content).toContain("Different live owner");
+    expect(content).toContain("codex_app__send_message_to_thread");
+    expect(content).toContain("the user's exact message");
+    expect(content).toContain("Sent to T-020's running task.");
+    expect(content).toContain("manual-switch instruction");
+    expect(content).not.toContain("take over (only safe if the owning instance is gone)");
+  });
+
+  it("SKILL.md documents the bounded code-review landing policy", async () => {
+    const content = await readFile(join(PROJECT_ROOT, "src", "skill", "SKILL.md"), "utf-8");
+    const autonomous = await readFile(join(PROJECT_ROOT, "src", "skill", "autonomous-mode.md"), "utf-8");
+    expect(content).toContain('"maxReviewRounds": "number (default: 12');
+    expect(autonomous).toContain("Code-review landing cap");
+    expect(autonomous).toContain("zero unresolved critical findings advances to FINALIZE");
+    expect(autonomous).toContain("PLAN_REVIEW convergence remains separate");
+  });
+
+  it("SKILL.md summary actions are item-neutral because recommendations can be tickets or issues", async () => {
+    const content = await readFile(join(PROJECT_ROOT, "src", "skill", "SKILL.md"), "utf-8");
+    expect(content).toContain("Work on [first recommended item ID + title]");
+    expect(content).toContain("whether ticket or issue");
+    expect(content).toContain("the top item keeps `(Recommended)`");
+    expect(content).not.toContain("first recommended ticket ID");
+  });
+
+  it("bundled skill files do not hard-code client-specific ToolSearch result parameter names", async () => {
+    const skillContent = await readFile(join(PROJECT_ROOT, "src", "skill", "SKILL.md"), "utf-8");
+    const setupFlowContent = await readFile(join(PROJECT_ROOT, "src", "skill", "setup-flow.md"), "utf-8");
+    expect(skillContent).not.toContain("max_results");
+    expect(setupFlowContent).not.toContain("max_results");
+    expect(skillContent).toContain("In Codex, use the `limit` field");
+    expect(setupFlowContent).toContain("In Codex, use the `limit` field");
   });
 
   // -------------------------------------------------------------------------
@@ -420,15 +490,29 @@ describe("setup-skill", () => {
     const postSetup = content.split("1f. Post-Setup")[1]!;
     expect(postSetup).toContain("/story");
     expect(postSetup).toContain("/story auto");
+    expect(postSetup).toContain("$story");
+    expect(postSetup).toContain("$story auto");
   });
 
   it("autonomous-mode.md contains autonomous and tiered mode sections", async () => {
     const content = await readFile(join(PROJECT_ROOT, "src", "skill", "autonomous-mode.md"), "utf-8");
     expect(content).toContain("## Autonomous Mode");
+    expect(content).toContain("$story auto");
     expect(content).toContain("storybloq_autonomous_guide");
     expect(content).toContain("### `/story review T-XXX`");
     expect(content).toContain("### `/story plan T-XXX`");
     expect(content).toContain("### `/story guided T-XXX`");
+  });
+
+  it("autonomous-mode.md carries Codex-specific autonomous setup guidance", async () => {
+    const content = await readFile(join(PROJECT_ROOT, "src", "skill", "autonomous-mode.md"), "utf-8");
+    expect(content).toContain("**Codex:**");
+    expect(content).toContain("STORYBLOQ_CLIENT=codex");
+    expect(content).toContain("restart Codex or start a new session");
+    expect(content).toContain("Check `/hooks` after setup");
+    expect(content).toContain("`$story auto` does not require Codex subagents");
+    expect(content).toContain("Do NOT use client-native plan mode");
+    expect(content).toContain("Codex automations");
   });
 
   it("SKILL.md no longer contains extracted sections inline", async () => {
@@ -515,6 +599,7 @@ describe("setup-skill", () => {
     expect(tsContent).toContain('"autonomous-mode.md"');
     expect(tsContent).toContain('"reference.md"');
     expect(tsContent).toContain('"orchestrator-mode.md"');
+    expect(tsContent).toContain('"bus-mode.md"');
   });
 
   it("setup-skill.ts handles subdirectory skills with copyDirRecursive", async () => {
@@ -1552,6 +1637,18 @@ describe("Codex setup helpers", () => {
     expect(content).not.toContain('STORYBLOQ_CLIENT = "claude"');
   });
 
+  it("creates a missing Codex home directory before MCP registration", async () => {
+    const codexHome = join(tempDir, "fresh-codex-home", "nested");
+    const { ensureCodexHomeDir } = await import("../../../src/cli/commands/setup-skill.js");
+
+    const first = await ensureCodexHomeDir(codexHome);
+    const second = await ensureCodexHomeDir(codexHome);
+
+    expect(first).toBe("created");
+    expect(second).toBe("exists");
+    expect(existsSync(codexHome)).toBe(true);
+  });
+
   it("migrates stale Codex hook variants before registering the JSON hook", async () => {
     const hooksPath = join(tempDir, "hooks.json");
     await writeFile(hooksPath, JSON.stringify({
@@ -1566,7 +1663,12 @@ describe("Codex setup helpers", () => {
       },
     }, null, 2), "utf-8");
 
-    const { formatCodexSessionStartCommand, migrateCodexHookVariants, registerCodexHook } = await import("../../../src/cli/commands/setup-skill.js");
+    const {
+      CODEX_SESSION_START_MATCHER,
+      formatCodexSessionStartCommand,
+      migrateCodexHookVariants,
+      registerCodexHook,
+    } = await import("../../../src/cli/commands/setup-skill.js");
     const command = formatCodexSessionStartCommand("/usr/local/bin/storybloq");
     const removed = await migrateCodexHookVariants(
       "SessionStart",
@@ -1578,21 +1680,25 @@ describe("Codex setup helpers", () => {
       "SessionStart",
       { type: "command", command, statusMessage: "Loading Storybloq session" },
       hooksPath,
-      "startup|resume|clear",
+      CODEX_SESSION_START_MATCHER,
     );
 
     const settings = JSON.parse(await readFile(hooksPath, "utf-8")) as {
-      hooks: { SessionStart: Array<{ hooks: Array<{ command: string }> }> };
+      hooks: { SessionStart: Array<{ matcher?: string; hooks: Array<{ command: string }> }> };
     };
+    const oldGroup = settings.hooks.SessionStart.find((g) => g.matcher === "startup|resume|clear");
+    const currentGroup = settings.hooks.SessionStart.find((g) => g.matcher === CODEX_SESSION_START_MATCHER);
     expect(removed).toBe(1);
-    expect(registered).toBe("exists");
-    expect(settings.hooks.SessionStart[0]!.hooks).toHaveLength(1);
-    expect(settings.hooks.SessionStart[0]!.hooks[0]!.command).toBe(command);
+    expect(registered).toBe("registered");
+    expect(oldGroup).toBeUndefined();
+    expect(currentGroup?.hooks).toHaveLength(1);
+    expect(currentGroup?.hooks[0]!.command).toBe(command);
   });
 
   it("registers Codex SessionStart hooks with JSON resume output", async () => {
     const hooksPath = join(tempDir, "hooks.json");
     const {
+      CODEX_SESSION_START_MATCHER,
       formatCodexSessionStartCommand,
       registerCodexHook,
     } = await import("../../../src/cli/commands/setup-skill.js");
@@ -1602,13 +1708,13 @@ describe("Codex setup helpers", () => {
       "SessionStart",
       { type: "command", command, statusMessage: "Loading Storybloq session" },
       hooksPath,
-      "startup|resume|clear",
+      CODEX_SESSION_START_MATCHER,
     );
     const second = await registerCodexHook(
       "SessionStart",
       { type: "command", command, statusMessage: "Loading Storybloq session" },
       hooksPath,
-      "startup|resume|clear",
+      CODEX_SESSION_START_MATCHER,
     );
 
     const settings = JSON.parse(await readFile(hooksPath, "utf-8")) as {
@@ -1616,8 +1722,207 @@ describe("Codex setup helpers", () => {
     };
     expect(first).toBe("registered");
     expect(second).toBe("exists");
-    expect(settings.hooks.SessionStart[0]!.matcher).toBe("startup|resume|clear");
+    expect(settings.hooks.SessionStart[0]!.matcher).toBe(CODEX_SESSION_START_MATCHER);
     expect(settings.hooks.SessionStart[0]!.hooks[0]!.command).toContain("--codex-hook-json");
+  });
+
+  it("registers identity-aware Codex PreCompact hooks with manual and auto compact sources", async () => {
+    const hooksPath = join(tempDir, "hooks.json");
+    const {
+      CODEX_PRECOMPACT_MATCHER,
+      formatCodexPreCompactCommand,
+      registerCodexHook,
+    } = await import("../../../src/cli/commands/setup-skill.js");
+    const command = formatCodexPreCompactCommand("/usr/local/bin/storybloq");
+
+    const first = await registerCodexHook(
+      "PreCompact",
+      { type: "command", command, statusMessage: "Preparing Storybloq session" },
+      hooksPath,
+      CODEX_PRECOMPACT_MATCHER,
+    );
+    const second = await registerCodexHook(
+      "PreCompact",
+      { type: "command", command, statusMessage: "Preparing Storybloq session" },
+      hooksPath,
+      CODEX_PRECOMPACT_MATCHER,
+    );
+
+    const settings = JSON.parse(await readFile(hooksPath, "utf-8")) as {
+      hooks: { PreCompact: Array<{ matcher?: string; hooks: Array<{ command: string; statusMessage?: string }> }> };
+    };
+    expect(first).toBe("registered");
+    expect(second).toBe("exists");
+    expect(settings.hooks.PreCompact[0]!.matcher).toBe(CODEX_PRECOMPACT_MATCHER);
+    expect(settings.hooks.PreCompact[0]!.hooks[0]!.command).toBe(command);
+    expect(command).toContain("--client codex");
+    expect(settings.hooks.PreCompact[0]!.hooks[0]!.statusMessage).toBe("Preparing Storybloq session");
+  });
+
+  it("refreshes a legacy Codex PreCompact command to include client identity", async () => {
+    const hooksPath = join(tempDir, "hooks.json");
+    await writeFile(hooksPath, JSON.stringify({
+      hooks: {
+        PreCompact: [{
+          matcher: "manual|auto",
+          hooks: [{ type: "command", command: "storybloq session compact-prepare" }],
+        }],
+      },
+    }, null, 2), "utf-8");
+
+    const { refreshExistingCodexHooks } = await import("../../../src/cli/commands/setup-skill.js");
+    const result = await refreshExistingCodexHooks("/usr/local/bin/storybloq", hooksPath);
+    const settings = JSON.parse(await readFile(hooksPath, "utf-8")) as {
+      hooks: { PreCompact: Array<{ hooks: Array<{ command: string }> }> };
+    };
+
+    expect(result.detected).toBe(1);
+    expect(settings.hooks.PreCompact.flatMap((group) => group.hooks.map((hook) => hook.command))).toEqual([
+      "/usr/local/bin/storybloq session compact-prepare --client codex",
+    ]);
+  });
+
+  it("moves an existing Codex SessionStart command from the old matcher to the compact-aware matcher", async () => {
+    const hooksPath = join(tempDir, "hooks.json");
+    const {
+      CODEX_SESSION_START_MATCHER,
+      formatCodexSessionStartCommand,
+      registerCodexHook,
+    } = await import("../../../src/cli/commands/setup-skill.js");
+    const command = formatCodexSessionStartCommand("/usr/local/bin/storybloq");
+    await writeFile(hooksPath, JSON.stringify({
+      hooks: {
+        SessionStart: [{
+          matcher: "startup|resume|clear",
+          hooks: [{ type: "command", command, statusMessage: "Loading Storybloq session" }],
+        }],
+      },
+    }, null, 2), "utf-8");
+
+    const result = await registerCodexHook(
+      "SessionStart",
+      { type: "command", command, statusMessage: "Loading Storybloq session" },
+      hooksPath,
+      CODEX_SESSION_START_MATCHER,
+    );
+
+    const settings = JSON.parse(await readFile(hooksPath, "utf-8")) as {
+      hooks: { SessionStart: Array<{ matcher?: string; hooks: Array<{ command: string }> }> };
+    };
+    const oldGroup = settings.hooks.SessionStart.find((g) => g.matcher === "startup|resume|clear");
+    const currentGroup = settings.hooks.SessionStart.find((g) => g.matcher === CODEX_SESSION_START_MATCHER);
+    expect(result).toBe("registered");
+    expect(oldGroup).toBeUndefined();
+    expect(currentGroup?.hooks.map((h) => h.command)).toEqual([command]);
+  });
+
+  it("preserves a user-owned empty Codex matcher group when the target hook already exists", async () => {
+    const hooksPath = join(tempDir, "hooks.json");
+    const {
+      CODEX_SESSION_START_MATCHER,
+      formatCodexSessionStartCommand,
+      registerCodexHook,
+    } = await import("../../../src/cli/commands/setup-skill.js");
+    const command = formatCodexSessionStartCommand("/usr/local/bin/storybloq");
+    await writeFile(hooksPath, JSON.stringify({
+      hooks: {
+        SessionStart: [
+          { matcher: "startup|resume|clear", hooks: [] },
+          {
+            matcher: CODEX_SESSION_START_MATCHER,
+            hooks: [{ type: "command", command, statusMessage: "Loading Storybloq session" }],
+          },
+        ],
+      },
+    }, null, 2), "utf-8");
+
+    const result = await registerCodexHook(
+      "SessionStart",
+      { type: "command", command, statusMessage: "Loading Storybloq session" },
+      hooksPath,
+      CODEX_SESSION_START_MATCHER,
+    );
+
+    const settings = JSON.parse(await readFile(hooksPath, "utf-8")) as {
+      hooks: { SessionStart: Array<{ matcher?: string; hooks: Array<{ command: string }> }> };
+    };
+    expect(result).toBe("exists");
+    expect(settings.hooks.SessionStart.map((g) => g.matcher)).toEqual([
+      "startup|resume|clear",
+      CODEX_SESSION_START_MATCHER,
+    ]);
+    expect(settings.hooks.SessionStart[1]!.hooks.map((h) => h.command)).toEqual([command]);
+  });
+
+  it("prunes a stale-only Codex matcher group after migration removes its hooks", async () => {
+    const hooksPath = join(tempDir, "hooks.json");
+    await writeFile(hooksPath, JSON.stringify({
+      hooks: {
+        SessionStart: [{
+          matcher: "startup|resume|clear",
+          hooks: [{ type: "command", command: "storybloq session resume-prompt" }],
+        }],
+      },
+    }, null, 2), "utf-8");
+
+    const { migrateCodexHookVariants } = await import("../../../src/cli/commands/setup-skill.js");
+    const removed = await migrateCodexHookVariants(
+      "SessionStart",
+      ["session resume-prompt", "session resume-prompt --codex-hook-json"],
+      "/usr/local/bin/storybloq session resume-prompt --codex-hook-json",
+      hooksPath,
+    );
+
+    const settings = JSON.parse(await readFile(hooksPath, "utf-8")) as {
+      hooks: { SessionStart: unknown[] };
+    };
+    expect(removed).toBe(1);
+    expect(settings.hooks.SessionStart).toEqual([]);
+  });
+
+  it("refreshExistingCodexHooks migrates only existing Codex Storybloq hook types", async () => {
+    const hooksPath = join(tempDir, "hooks.json");
+    await writeFile(hooksPath, JSON.stringify({
+      hooks: {
+        SessionStart: [{
+          matcher: "startup|resume|clear",
+          hooks: [
+            { type: "command", command: "storybloq session resume-prompt" },
+            { type: "command", command: "/usr/local/bin/storybloq session resume-prompt --codex-hook-json" },
+          ],
+        }],
+        Stop: [{
+          hooks: [{ type: "command", command: "storybloq hook-status" }],
+        }],
+      },
+    }, null, 2), "utf-8");
+
+    const {
+      CODEX_SESSION_START_MATCHER,
+      refreshExistingCodexHooks,
+    } = await import("../../../src/cli/commands/setup-skill.js");
+    const result = await refreshExistingCodexHooks("/usr/local/bin/storybloq", hooksPath);
+
+    const settings = JSON.parse(await readFile(hooksPath, "utf-8")) as {
+      hooks: {
+        PreCompact?: unknown;
+        SessionStart: Array<{ matcher?: string; hooks: Array<{ command: string }> }>;
+        Stop: Array<{ matcher?: string; hooks: Array<{ command: string; statusMessage?: string }> }>;
+      };
+    };
+    const startCurrent = settings.hooks.SessionStart.find((g) => g.matcher === CODEX_SESSION_START_MATCHER);
+    const startOld = settings.hooks.SessionStart.find((g) => g.matcher === "startup|resume|clear");
+    const stopCommands = settings.hooks.Stop.flatMap((g) => g.hooks.map((h) => h.command));
+
+    expect(result.detected).toBe(3);
+    expect(result.changed).toBeGreaterThan(0);
+    expect(result.skipped).toBe(false);
+    expect(startOld).toBeUndefined();
+    expect(startCurrent?.hooks.map((h) => h.command)).toEqual([
+      "/usr/local/bin/storybloq session resume-prompt --codex-hook-json",
+    ]);
+    expect(stopCommands).toEqual(["/usr/local/bin/storybloq hook-status --client codex"]);
+    expect(settings.hooks.PreCompact).toBeUndefined();
   });
 });
 
@@ -1649,12 +1954,16 @@ describe("T-414: orchestrate discoverability", () => {
 
   it("SKILL.md Gate A uses an exact-name allowlist that fails closed", async () => {
     const content = await readFile(join(PROJECT_ROOT, "src", "skill", "SKILL.md"), "utf-8");
-    expect(content).toContain("exact tool name");
+    expect(content).toContain("EXACT callable tool name or namespace-qualified identifier");
     expect(content).toContain("fails closed");
     // The allowlist names.
     expect(content).toContain("`Workflow`");
     expect(content).toContain("`Agent`");
     expect(content).toContain("`Task`");
+    expect(content).toContain("`multi_agent_v1.spawn_agent`");
+    expect(content).toContain("`multi_agent_v1__spawn_agent`");
+    expect(content).toContain("`spawn_agent`");
+    expect(content).toContain("merely mentions agents does not pass");
   });
 
   it("SKILL.md pins storybloq_node_list as the federation-bypass source for Gate B", async () => {

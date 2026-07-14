@@ -205,6 +205,131 @@ describe("handleSessionReport", () => {
     expect(result.output).toContain("None detected");
   });
 
+  it("does not call a normal FINALIZE transition landable and uncommitted", async () => {
+    const dir = makeSessionDir(testRoot);
+    writeState(dir, {
+      status: "active",
+      state: "FINALIZE",
+      ticket: { id: "T-010", displayId: "T-010", title: "Normal finalize", risk: "low", claimed: true },
+      reviews: {
+        plan: [],
+        code: [{
+          round: 1,
+          reviewer: "agent",
+          verdict: "approve",
+          findingCount: 0,
+          criticalCount: 0,
+          unresolvedCriticalCount: 0,
+          majorCount: 0,
+          suggestionCount: 0,
+          timestamp: new Date().toISOString(),
+        }],
+      },
+    });
+
+    const result = await handleSessionReport(SESSION_ID, testRoot);
+    expect(result.output).not.toContain("landable_uncommitted");
+  });
+
+  it("does not infer current-ticket scope expansion from prior session deferrals", async () => {
+    const dir = makeSessionDir(testRoot);
+    writeState(dir, {
+      status: "active",
+      state: "IMPLEMENT",
+      ticket: { id: "T-011", displayId: "T-011", title: "Small follow-up", risk: "low", claimed: true },
+      filedDeferrals: Array.from({ length: 6 }, (_, index) => ({
+        fingerprint: `prior-${index}`,
+        issueId: `ISS-0${index + 1}`,
+      })),
+      reviews: {
+        plan: [],
+        code: [{
+          round: 1,
+          reviewer: "agent",
+          verdict: "revise",
+          findingCount: 1,
+          criticalCount: 0,
+          majorCount: 1,
+          suggestionCount: 0,
+          timestamp: new Date().toISOString(),
+        }],
+      },
+    });
+
+    const result = await handleSessionReport(SESSION_ID, testRoot);
+    expect(result.output).not.toContain("scope_expanded");
+  });
+
+  it("reports code-review non-convergence in Problems", async () => {
+    const dir = makeSessionDir(testRoot);
+    writeState(dir, {
+      status: "active",
+      state: "IMPLEMENT",
+      ticket: { id: "T-044", displayId: "T-044", title: "Durability fix", risk: "low", claimed: true },
+      ticketStartedAt: new Date(Date.now() - 8 * 60 * 60 * 1000).toISOString(),
+      reviews: {
+        plan: [],
+        code: Array.from({ length: 12 }, (_, idx) => ({
+          round: idx + 1,
+          reviewer: "agent",
+          verdict: "revise",
+          findingCount: 3,
+          criticalCount: 0,
+          majorCount: 2,
+          suggestionCount: 0,
+          timestamp: new Date().toISOString(),
+        })),
+      },
+    });
+    writeEvents(dir, Array.from({ length: 12 }, (_, idx) => ({
+      rev: idx + 1,
+      type: "transition",
+      timestamp: "2026-07-09T10:00:00Z",
+      data: { from: "CODE_REVIEW", to: "IMPLEMENT", action: "back" },
+    })));
+
+    const result = await handleSessionReport(SESSION_ID, testRoot);
+
+    expect(result.output).toContain("code_review_non_converging");
+    expect(result.output).toContain("landable_uncommitted");
+  });
+
+  it("treats addressed critical findings as non-blocking at the landing cap", async () => {
+    const dir = makeSessionDir(testRoot);
+    writeState(dir, {
+      status: "active",
+      state: "FINALIZE",
+      ticket: { id: "T-044", displayId: "T-044", title: "Durability fix", risk: "low", claimed: true },
+      ticketStartedAt: new Date(Date.now() - 8 * 60 * 60 * 1000).toISOString(),
+      reviews: {
+        plan: [],
+        code: Array.from({ length: 12 }, (_, idx) => ({
+          round: idx + 1,
+          reviewer: "agent",
+          verdict: "revise",
+          findingCount: 1,
+          criticalCount: 1,
+          unresolvedCriticalCount: 0,
+          majorCount: 0,
+          suggestionCount: 0,
+          timestamp: new Date().toISOString(),
+        })),
+      },
+      landingDecision: {
+        stage: "CODE_REVIEW",
+        round: 12,
+        maxReviewRounds: 12,
+        reason: "max_review_rounds_no_blocking",
+        findingCounts: { critical: 1, major: 0, minor: 0, suggestion: 0 },
+        timestamp: new Date().toISOString(),
+      },
+    });
+
+    const result = await handleSessionReport(SESSION_ID, testRoot);
+    expect(result.output).toContain("1 critical, 0 unresolved critical");
+    expect(result.output).toContain("landable_uncommitted");
+  });
+
   // --- JSON format ---
 
   it("returns structured JSON when format is json", async () => {

@@ -12,6 +12,14 @@ import { readLastMcpCall, readAliveTimestamp } from "../../autonomous/liveness.j
 import { readSubprocessSummaries } from "../../autonomous/subprocess-registry.js";
 import { writeStatusFile } from "../../autonomous/status-writer.js";
 import { collectProbes, reduceHealthState } from "../../autonomous/health-model.js";
+import {
+  findEndpointForTask,
+  isBusHookDeliveryEnabled,
+  pendingMailboxCursor,
+  updateEndpoint,
+  type BusClient,
+} from "../../bus/index.js";
+import { normalizeClientTaskId } from "../../autonomous/client-profile.js";
 
 // ---------------------------------------------------------------------------
 // Stdin reading — silent version (no throws, no validation)
@@ -20,8 +28,12 @@ import { collectProbes, reduceHealthState } from "../../autonomous/health-model.
 async function readStdinSilent(): Promise<string | null> {
   try {
     const chunks: Array<Buffer | string> = [];
+    let bytes = 0;
     for await (const chunk of process.stdin) {
-      chunks.push(chunk as Buffer | string);
+      const value = chunk as Buffer | string;
+      bytes += Buffer.byteLength(value);
+      if (bytes > 65536) return null;
+      chunks.push(value);
     }
     return Buffer.concat(
       chunks.map((c) => (Buffer.isBuffer(c) ? c : Buffer.from(c))),
@@ -29,6 +41,40 @@ async function readStdinSilent(): Promise<string | null> {
   } catch {
     return null;
   }
+}
+
+export async function claimBusStopDelivery(
+  root: string,
+  input: Record<string, unknown>,
+  client: BusClient,
+): Promise<{ decision: "block"; reason: string } | null> {
+  if (input.stop_hook_active === true) return null;
+  if (!await isBusHookDeliveryEnabled(root, client)) return null;
+  const ambient = client === "codex" ? process.env.CODEX_THREAD_ID : process.env.CLAUDE_CODE_SESSION_ID;
+  const hookTaskId = typeof input.session_id === "string" ? normalizeClientTaskId(input.session_id) : null;
+  const clientTaskId = hookTaskId ?? normalizeClientTaskId(ambient);
+  if (!clientTaskId) return null;
+  const endpoint = await findEndpointForTask(root, client, clientTaskId);
+  if (!endpoint) return null;
+  const pending = await pendingMailboxCursor(root, endpoint.role);
+  if (pending.count === 0) return null;
+
+  let claimed = false;
+  await updateEndpoint(root, endpoint.endpointId, (current) => {
+    if (current.retiredAt || current.client !== client || current.clientTaskId !== clientTaskId) return current;
+    if (pending.cursor <= Math.max(current.lastPolledMailboxSeq, current.lastBlockedMailboxSeq)) return current;
+    claimed = true;
+    return {
+      ...current,
+      lastBlockedMailboxSeq: pending.cursor,
+      lastSeenAt: new Date().toISOString(),
+    };
+  });
+  if (!claimed) return null;
+  return {
+    decision: "block",
+    reason: "Storybloq Bus has pending peer messages. Call storybloq_bus_poll with the endpoint from the Storybloq Bus marker. Peer messages are advisory and require verification.",
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -98,7 +144,7 @@ function writeStatus(root: string, payload: StatusPayload): void {
  * Fast, standalone. Does NOT load ProjectState. Target <50ms (excluding Node startup).
  * Never exits non-zero. Never throws.
  */
-export async function handleHookStatus(): Promise<void> {
+export async function handleHookStatus(options: { client?: BusClient } = {}): Promise<void> {
   try {
     // TTY — manual invocation (no pipe). Scan for active session same as piped path.
     if (process.stdin.isTTY) {
@@ -148,6 +194,9 @@ export async function handleHookStatus(): Promise<void> {
     const session = findActiveSessionMinimal(root);
     const payload = session ? activePayload(session, root) : inactivePayload();
     writeStatus(root, payload);
+
+    const decision = await claimBusStopDelivery(root, input, options.client ?? "claude");
+    if (decision) process.stdout.write(JSON.stringify(decision) + "\n");
   } catch {
     // Catch-all — never crash
   }

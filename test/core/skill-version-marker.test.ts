@@ -11,7 +11,8 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { writeFile, mkdir, rm, chmod } from "node:fs/promises";
+import { readFile, writeFile, mkdir, rm, chmod } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
@@ -20,12 +21,14 @@ describe("autoRefreshSkillIfStale with legacy hook sweep", () => {
   let tempDir: string;
   let originalHome: string | undefined;
   let originalPath: string | undefined;
+  let originalCodexHome: string | undefined;
 
   beforeEach(async () => {
     tempDir = join(tmpdir(), `storybloq-marker-${randomUUID()}`);
     await mkdir(tempDir, { recursive: true });
     originalHome = process.env.HOME;
     originalPath = process.env.PATH;
+    originalCodexHome = process.env.CODEX_HOME;
     process.env.HOME = tempDir;
     // Pre-create the skill dir + an out-of-date marker so isSkillStale
     // returns true. SKILL.md presence is required for isSkillStale to
@@ -43,6 +46,8 @@ describe("autoRefreshSkillIfStale with legacy hook sweep", () => {
     else process.env.HOME = originalHome;
     if (originalPath === undefined) delete process.env.PATH;
     else process.env.PATH = originalPath;
+    if (originalCodexHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = originalCodexHome;
     await rm(tempDir, { recursive: true, force: true });
     // Clear Vitest's module cache so dynamic imports inside the tested
     // function re-resolve against the real modules for the next test.
@@ -134,6 +139,151 @@ describe("autoRefreshSkillIfStale with legacy hook sweep", () => {
     expect(settings.model).toBe("opus");
     // No hooks were injected.
     expect(settings.hooks).toBeUndefined();
+  });
+
+  it("autoRefreshSkillIfStale refreshes a stale Codex ~/.agents skill install", async () => {
+    await rm(join(tempDir, ".claude", "skills", "story"), { recursive: true, force: true });
+    const codexSkillDir = join(tempDir, ".agents", "skills", "story");
+    await mkdir(codexSkillDir, { recursive: true });
+    await writeFile(join(codexSkillDir, "SKILL.md"), "# stale codex stub\n", "utf-8");
+    await writeFile(join(codexSkillDir, ".storybloq-version"), "1.1.0\n", "utf-8");
+
+    const { autoRefreshSkillIfStale } = await import("../../src/core/skill-version-marker.js");
+    const refreshed = await autoRefreshSkillIfStale("1.1.6");
+
+    expect(refreshed).toBe(true);
+    const marker = (await readFile(join(codexSkillDir, ".storybloq-version"), "utf-8")).trim();
+    const skill = await readFile(join(codexSkillDir, "SKILL.md"), "utf-8");
+    expect(marker).toBe("1.1.6");
+    expect(skill).toContain("Storybloq - Project Context");
+  });
+
+  it("autoRefreshSkillIfStale adds client identity without changing Codex approval choices", async () => {
+    await rm(join(tempDir, ".claude", "skills", "story"), { recursive: true, force: true });
+    const codexSkillDir = join(tempDir, ".agents", "skills", "story");
+    await mkdir(codexSkillDir, { recursive: true });
+    await writeFile(join(codexSkillDir, "SKILL.md"), "# stale codex stub\n", "utf-8");
+    await writeFile(join(codexSkillDir, ".storybloq-version"), "1.1.0\n", "utf-8");
+    const codexHome = join(tempDir, ".codex");
+    await mkdir(codexHome, { recursive: true });
+    const configPath = join(codexHome, "config.toml");
+    await writeFile(configPath, [
+      "[mcp_servers.storybloq]",
+      'command = "storybloq"',
+      'args = ["--mcp"]',
+      "",
+      "[mcp_servers.storybloq.tools.storybloq_status]",
+      'approval_mode = "ask"',
+      "",
+    ].join("\n"), "utf-8");
+    process.env.CODEX_HOME = codexHome;
+
+    const { autoRefreshSkillIfStale } = await import("../../src/core/skill-version-marker.js");
+    const refreshed = await autoRefreshSkillIfStale("1.1.6");
+
+    expect(refreshed).toBe(true);
+    const config = await readFile(configPath, "utf-8");
+    expect(config).toContain('STORYBLOQ_CLIENT = "codex"');
+    expect(config).toContain("[mcp_servers.storybloq.tools.storybloq_status]\napproval_mode = \"ask\"");
+    expect(config).not.toContain("[mcp_servers.storybloq.tools.storybloq_node_list]");
+  });
+
+  it("autoRefreshSkillIfStale does not create orphan Codex MCP config when the server is absent", async () => {
+    await rm(join(tempDir, ".claude", "skills", "story"), { recursive: true, force: true });
+    const codexSkillDir = join(tempDir, ".agents", "skills", "story");
+    await mkdir(codexSkillDir, { recursive: true });
+    await writeFile(join(codexSkillDir, "SKILL.md"), "# stale codex stub\n", "utf-8");
+    await writeFile(join(codexSkillDir, ".storybloq-version"), "1.1.0\n", "utf-8");
+    const codexHome = join(tempDir, ".codex");
+    await mkdir(codexHome, { recursive: true });
+    const configPath = join(codexHome, "config.toml");
+    const original = [
+      "[features]",
+      "hooks = true",
+      "",
+      "[mcp_servers.other]",
+      'command = "other"',
+      "",
+    ].join("\n");
+    await writeFile(configPath, original, "utf-8");
+    process.env.CODEX_HOME = codexHome;
+
+    const { autoRefreshSkillIfStale } = await import("../../src/core/skill-version-marker.js");
+    const refreshed = await autoRefreshSkillIfStale("1.1.6");
+
+    expect(refreshed).toBe(true);
+    const config = await readFile(configPath, "utf-8");
+    expect(config).toBe(original);
+  });
+
+  it("autoRefreshSkillIfStale migrates existing Codex hooks to compact-aware matchers", async () => {
+    await rm(join(tempDir, ".claude", "skills", "story"), { recursive: true, force: true });
+    const codexSkillDir = join(tempDir, ".agents", "skills", "story");
+    await mkdir(codexSkillDir, { recursive: true });
+    await writeFile(join(codexSkillDir, "SKILL.md"), "# stale codex stub\n", "utf-8");
+    await writeFile(join(codexSkillDir, ".storybloq-version"), "1.1.0\n", "utf-8");
+
+    const binDir = join(tempDir, "bin");
+    await mkdir(binDir, { recursive: true });
+    const binPath = join(binDir, "storybloq");
+    await writeFile(binPath, "#!/bin/sh\n", "utf-8");
+    await chmod(binPath, 0o755);
+    process.env.PATH = binDir;
+
+    const codexHome = join(tempDir, ".codex");
+    await mkdir(codexHome, { recursive: true });
+    process.env.CODEX_HOME = codexHome;
+    const hooksPath = join(codexHome, "hooks.json");
+    await writeFile(hooksPath, JSON.stringify({
+      hooks: {
+        SessionStart: [{
+          matcher: "startup|resume|clear",
+          hooks: [
+            { type: "command", command: `${binPath} session resume-prompt --codex-hook-json` },
+          ],
+        }],
+      },
+    }, null, 2), "utf-8");
+
+    const { autoRefreshSkillIfStale } = await import("../../src/core/skill-version-marker.js");
+    const refreshed = await autoRefreshSkillIfStale("1.1.6");
+
+    expect(refreshed).toBe(true);
+    const settings = JSON.parse(await readFile(hooksPath, "utf-8")) as {
+      hooks: { SessionStart: Array<{ matcher?: string; hooks: Array<{ command: string }> }> };
+    };
+    const oldGroup = settings.hooks.SessionStart.find((g) => g.matcher === "startup|resume|clear");
+    const currentGroup = settings.hooks.SessionStart.find((g) => g.matcher === "startup|resume|clear|compact");
+    expect(oldGroup).toBeUndefined();
+    expect(currentGroup?.hooks.map((h) => h.command)).toEqual([
+      `${binPath} session resume-prompt --codex-hook-json`,
+    ]);
+  });
+
+  it("autoRefreshSkillIfStale does not create Codex hooks when none existed", async () => {
+    await rm(join(tempDir, ".claude", "skills", "story"), { recursive: true, force: true });
+    const codexSkillDir = join(tempDir, ".agents", "skills", "story");
+    await mkdir(codexSkillDir, { recursive: true });
+    await writeFile(join(codexSkillDir, "SKILL.md"), "# stale codex stub\n", "utf-8");
+    await writeFile(join(codexSkillDir, ".storybloq-version"), "1.1.0\n", "utf-8");
+
+    const binDir = join(tempDir, "bin");
+    await mkdir(binDir, { recursive: true });
+    const binPath = join(binDir, "storybloq");
+    await writeFile(binPath, "#!/bin/sh\n", "utf-8");
+    await chmod(binPath, 0o755);
+    process.env.PATH = binDir;
+
+    const codexHome = join(tempDir, ".codex");
+    await mkdir(codexHome, { recursive: true });
+    process.env.CODEX_HOME = codexHome;
+    const hooksPath = join(codexHome, "hooks.json");
+
+    const { autoRefreshSkillIfStale } = await import("../../src/core/skill-version-marker.js");
+    const refreshed = await autoRefreshSkillIfStale("1.1.6");
+
+    expect(refreshed).toBe(true);
+    expect(existsSync(hooksPath)).toBe(false);
   });
 
   it("autoRefreshSkillIfStale heals fully when all three legacy hook types are present", async () => {
@@ -310,12 +460,20 @@ describe("autoRefreshSkillIfStale with legacy hook sweep", () => {
     await chmod(binPath, 0o755);
     process.env.PATH = binDir;
 
-    // Mock hook-migration's sweepLegacyHooks to throw.
+    // Mock hook-migration's sweepLegacyHooks to throw while preserving the
+    // constants that setup-skill imports during the refresh path.
     const { vi } = await import("vitest");
     vi.resetModules();
-    vi.doMock("../../src/core/hook-migration.js", () => ({
-      sweepLegacyHooks: async () => { throw new Error("boom"); },
-    }));
+    vi.doMock("../../src/core/hook-migration.js", async () => {
+      const actual = await vi.importActual<typeof import("../../src/core/hook-migration.js")>(
+        "../../src/core/hook-migration.js",
+      );
+      return {
+        ...actual,
+        countLegacyHooks: async () => ({ PreCompact: 1, SessionStart: 0, Stop: 0 }),
+        sweepLegacyHooks: async () => { throw new Error("boom"); },
+      };
+    });
 
     const { autoRefreshSkillIfStale } = await import("../../src/core/skill-version-marker.js");
     // Must not throw.

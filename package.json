@@ -1,8 +1,8 @@
 {
   "name": "@storybloq/storybloq",
-  "version": "1.5.2",
+  "version": "1.7.0",
   "license": "PolyForm-Shield-1.0.0",
-  "description": "Project memory for Claude Code. Storybloq stores tickets, issues, handovers, and lessons in a .story/ folder inside your repo so every session starts where the last one left off. Pairs with the Storybloq Mac app on the App Store.",
+  "description": "Project memory for Claude Code and Codex. Storybloq stores tickets, issues, handovers, and lessons in a .story/ folder inside your repo so every session starts where the last one left off. Pairs with the Storybloq Mac app on the App Store.",
   "homepage": "https://storybloq.com",
   "repository": {
     "type": "git",
@@ -11,6 +11,8 @@
   "keywords": [
     "storybloq",
     "claude-code",
+    "codex",
+    "openai-codex",
     "ai-development",
     "session-continuity",
     "project-management",
@@ -31,7 +33,8 @@
   "files": [
     "dist",
     "src/skill",
-    "README.md"
+    "README.md",
+    "NOTICE"
   ],
   "engines": {
     "node": ">=20"
@@ -46,6 +49,7 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.27.1",
     "@storybloq/lenses": "^0.3.0",
+    "canonicalize": "^3.0.0",
     "proper-lockfile": "^4.1.2",
     "yargs": "^17",
     "zod": "^3"

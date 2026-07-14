@@ -198,4 +198,11 @@ describe("buildMismatchHandoverInstruction", () => {
     expect(result).toContain("/story auto T-456");
     expect(result).toContain("branchStrategy");
   });
+
+  it("renders the Codex story command when selected by the client adapter", () => {
+    const affinity = { status: "matched" as const, matchedIds: ["T-123"], branch: "story/T-123-foo" };
+    const result = buildMismatchHandoverInstruction(affinity, "T-456", "sid", "$story");
+    expect(result).toContain("$story auto T-456");
+    expect(result).not.toContain("/story auto");
+  });
 });

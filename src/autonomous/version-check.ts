@@ -9,6 +9,7 @@
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { storybloqClientProfile } from "./client-profile.js";
 
 /**
  * Compare running version against installed version.
@@ -22,7 +23,7 @@ export function checkVersionMismatch(
   if (runningVersion === "0.0.0-dev") return null;
   if (runningVersion === installedVersion) return null;
 
-  return `storybloq MCP server is running v${runningVersion} but v${installedVersion} is installed. Restart Claude Code to load the updated version.`;
+  return `storybloq MCP server is running v${runningVersion} but v${installedVersion} is installed. Restart ${storybloqClientProfile().displayName} to load the updated version.`;
 }
 
 /**

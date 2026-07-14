@@ -3,6 +3,7 @@ import { displayIdOf } from "./resolver.js";
  * Session report formatter — renders 7-section structured analysis.
  * All sections always present; missing data uses "Not available" placeholders.
  */
+import { analyzeSessionDiagnostics } from "../autonomous/session-diagnostics.js";
 import type { FullSessionState, EventEntry } from "../autonomous/session-types.js";
 import type { OutputFormat } from "../models/types.js";
 
@@ -138,14 +139,16 @@ function buildReviewSection(state: FullSessionState): string {
   if (plan.length > 0) {
     lines.push(`**Plan reviews:** ${plan.length} round(s)`);
     for (const r of plan) {
-      lines.push(`  - Round ${r.round}: ${r.verdict} (${r.findingCount} findings, ${r.criticalCount} critical, ${r.majorCount} major) — ${r.reviewer}`);
+      const unresolved = r.unresolvedCriticalCount === undefined ? "" : `, ${r.unresolvedCriticalCount} unresolved critical`;
+      lines.push(`  - Round ${r.round}: ${r.verdict} (${r.findingCount} findings, ${r.criticalCount} critical${unresolved}, ${r.majorCount} major) -- ${r.reviewer}`);
     }
   }
 
   if (code.length > 0) {
     lines.push(`**Code reviews:** ${code.length} round(s)`);
     for (const r of code) {
-      lines.push(`  - Round ${r.round}: ${r.verdict} (${r.findingCount} findings, ${r.criticalCount} critical, ${r.majorCount} major) — ${r.reviewer}`);
+      const unresolved = r.unresolvedCriticalCount === undefined ? "" : `, ${r.unresolvedCriticalCount} unresolved critical`;
+      lines.push(`  - Round ${r.round}: ${r.verdict} (${r.findingCount} findings, ${r.criticalCount} critical${unresolved}, ${r.majorCount} major) -- ${r.reviewer}`);
     }
   }
 
@@ -235,6 +238,11 @@ function buildProblems(
 
   if (state.deferralsUnfiled) {
     problems.push("Session has unfiled deferrals");
+  }
+
+  const diagnostics = analyzeSessionDiagnostics(state, events);
+  for (const diagnostic of diagnostics.diagnostics) {
+    problems.push(`[${diagnostic.code}] ${diagnostic.message}`);
   }
 
   return problems;

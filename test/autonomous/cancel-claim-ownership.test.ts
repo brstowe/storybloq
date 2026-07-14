@@ -120,6 +120,28 @@ afterEach(() => {
 });
 
 describe("session cancel claim-release ownership (ISS-778, guide site)", () => {
+  it("rejects cancellation from a known foreign live task", async () => {
+    process.env.STORYBLOQ_CLIENT = "codex";
+    writeTicket(root, {});
+    const { sessionId, sessDir } = plantSession(root);
+    const state = JSON.parse(readFileSync(join(sessDir, "state.json"), "utf-8")) as FullSessionState;
+    writeSessionSync(sessDir, {
+      ...state,
+      ownerTask: { client: "codex", id: "owner-task", boundAt: "2026-07-09T00:00:00Z" },
+    });
+
+    const result = await handleAutonomousGuide(root, {
+      action: "cancel",
+      sessionId,
+      clientTaskId: "foreign-task",
+    });
+
+    expect(result.isError).toBe(true);
+    const after = JSON.parse(readFileSync(join(sessDir, "state.json"), "utf-8")) as FullSessionState;
+    expect(after.state).toBe("IMPLEMENT");
+    expect(readTicket(root).status).toBe("inprogress");
+  });
+
   it("(a) preserves a FOREIGN CLI claim (claimedBySession absent): no release", async () => {
     const foreignClaim = { user: "teammate@example.com", branch: "main", since: NOW };
     writeTicket(root, { claim: foreignClaim });

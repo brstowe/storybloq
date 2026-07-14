@@ -272,6 +272,35 @@ describe("ReviewVerdict (T-263)", () => {
       expect(tier1.suggestionCount).toBe(4);
     });
 
+    it("keeps raw critical count and projects unresolved critical count", () => {
+      const tier1 = buildTier1Verdict(makeArtifact({
+        unresolvedCriticalCount: 0,
+        severityCounts: { critical: 2, major: 0, minor: 0, suggestion: 0 },
+      }));
+      expect(tier1.criticalCount).toBe(2);
+      expect(tier1.unresolvedCriticalCount).toBe(0);
+    });
+
+    it("derives unresolved critical count from legacy artifact findings", () => {
+      const tier1 = buildTier1Verdict(makeArtifact({
+        severityCounts: { critical: 2, major: 0, minor: 0, suggestion: 0 },
+        findings: [
+          { severity: "critical", disposition: "addressed" },
+          { severity: "critical", disposition: "open" },
+        ],
+      }));
+      expect(tier1.criticalCount).toBe(2);
+      expect(tier1.unresolvedCriticalCount).toBe(1);
+    });
+
+    it("falls back conservatively when legacy critical findings lack disposition", () => {
+      const tier1 = buildTier1Verdict(makeArtifact({
+        severityCounts: { critical: 2, major: 0, minor: 0, suggestion: 0 },
+        findings: [{ severity: "critical" }],
+      }));
+      expect(tier1.unresolvedCriticalCount).toBe(2);
+    });
+
     it("does not include minorCount (lossy projection)", () => {
       const tier1 = buildTier1Verdict(makeArtifact({
         severityCounts: { critical: 0, major: 0, minor: 5, suggestion: 0 },
@@ -343,7 +372,7 @@ describe("ReviewVerdict (T-263)", () => {
   describe("Tier 1 shape", () => {
     it("matches SessionState lastReviewVerdict type shape exactly", () => {
       const tier1 = buildTier1Verdict(makeArtifact());
-      const expectedKeys = ["stage", "round", "verdict", "findingCount", "criticalCount", "majorCount", "suggestionCount", "durationMs", "summary"];
+      const expectedKeys = ["stage", "round", "verdict", "findingCount", "criticalCount", "unresolvedCriticalCount", "majorCount", "suggestionCount", "durationMs", "summary"];
       const actualKeys = Object.keys(tier1).sort();
       expect(actualKeys).toEqual(expectedKeys.sort());
     });

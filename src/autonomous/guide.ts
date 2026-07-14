@@ -8,6 +8,7 @@ import {
   type GuideOutput,
   type FullSessionState,
   type SessionSummary,
+  type ContextAdvice,
   type WorkflowState,
 } from "./session-types.js";
 import {
@@ -25,6 +26,7 @@ import {
   withSessionLock,
   type SessionConfig,
   prepareForCompact,
+  wasCompactionObserved,
   findResumableSession,
   readEvents,
   readSession,
@@ -33,8 +35,8 @@ import {
 } from "./session.js";
 import { isFinishedOrphan, isOrphanCandidate, type OrphanCheckContext } from "./orphan-detector.js";
 import { assertTransition } from "./state-machine.js";
-import { evaluatePressure } from "./context-pressure.js";
-import { assessRisk, requiredRounds, nextReviewer } from "./review-depth.js";
+import { evaluatePressure, pressureAfterCompaction } from "./context-pressure.js";
+import { reviewRiskForTicket } from "./review-depth.js";
 import {
   spawnAliveSidecar,
   killSidecar,
@@ -66,6 +68,11 @@ import { resolveWorkId } from "./id-resolution.js";
 import { checkAutonomousConflicts } from "./conflicts-guard.js";
 import { detectBranchAffinity, buildAffinityAnnotation } from "./branch-affinity.js";
 import {
+  isSameOwnerTask,
+  legacyClaudeSessionIdForOwner,
+  ownerTaskForCurrentClient,
+} from "./client-profile.js";
+import {
   handleHandoverLatest,
   handleHandoverCreate,
 } from "../cli/commands/handover.js";
@@ -88,6 +95,69 @@ function writeSessionAndRefresh(
   if (mode === "if-active" && !isSessionActiveForStatus(written)) return written;
   try { refreshStatusForSession(root, dir, written, "guide"); } catch { /* best-effort */ }
   return written;
+}
+
+function liveOwnershipConflict(
+  state: FullSessionState,
+  clientTaskId?: string,
+  enforceAfterExpiry = false,
+): string | null {
+  const callerTask = ownerTaskForCurrentClient(clientTaskId);
+  if (!callerTask || (!enforceAfterExpiry && isLeaseExpired(state))) return null;
+  if (state.ownerTask) {
+    return isSameOwnerTask(state.ownerTask, callerTask)
+      ? null
+      : `session is owned by another live ${state.ownerTask.client} task`;
+  }
+  if (state.claudeCodeSessionId) {
+    return callerTask.client === "claude" && state.claudeCodeSessionId === callerTask.id
+      ? null
+      : "session is owned by another live legacy Claude Code task";
+  }
+  return null;
+}
+
+function adoptExpiredLease(
+  root: string,
+  dir: string,
+  state: FullSessionState,
+  clientTaskId: string | undefined,
+  action: "report" | "pre_compact",
+): { state: FullSessionState; adopted: boolean } {
+  const callerTask = ownerTaskForCurrentClient(clientTaskId);
+  const actionCanAdopt = state.status === "active" &&
+    state.state !== "COMPACT" &&
+    state.state !== "SESSION_END" &&
+    !(action === "pre_compact" && state.state === "FINALIZE");
+  if (
+    !actionCanAdopt ||
+    !callerTask ||
+    !isLeaseExpired(state) ||
+    isSameOwnerTask(state.ownerTask, callerTask)
+  ) {
+    return { state, adopted: false };
+  }
+
+  const previousOwnerTask = state.ownerTask ?? (state.claudeCodeSessionId
+    ? { client: "claude", id: state.claudeCodeSessionId }
+    : null);
+  const written = writeSessionAndRefresh(root, dir, refreshLease({
+    ...state,
+    ownerTask: callerTask,
+    claudeCodeSessionId: legacyClaudeSessionIdForOwner(callerTask, state.claudeCodeSessionId),
+  } as FullSessionState), "always");
+  appendEvent(dir, {
+    rev: written.revision,
+    type: "owner_task_rebound",
+    timestamp: new Date().toISOString(),
+    data: {
+      reason: "expired_lease",
+      action,
+      previousOwnerTask,
+      ownerTask: callerTask,
+    },
+  });
+  return { state: written, adopted: true };
 }
 
 // ---------------------------------------------------------------------------
@@ -485,6 +555,9 @@ async function handleGuideInner(root: string, args: GuideInput): Promise<McpTool
   if (args.targetWork?.length && args.action !== "start") {
     return guideError(new Error(`targetWork is only valid with action "start". Got action "${args.action}".`));
   }
+  if (args.takeover && args.action !== "resume") {
+    return guideError(new Error(`takeover is only valid with action "resume". Got action "${args.action}".`));
+  }
   switch (args.action) {
     case "start":
       return handleStart(root, args);
@@ -588,23 +661,34 @@ async function handleStart(root: string, args: GuideInput): Promise<McpToolResul
       const preparedAt = existing.state.compactPreparedAt ? new Date(existing.state.compactPreparedAt).getTime() : 0;
       const staleThreshold = 60 * 60 * 1000; // 1 hour
       const isStale = Date.now() - preparedAt > staleThreshold;
+      const ownershipConflict = liveOwnershipConflict(existing.state, args.clientTaskId);
+      const callerTask = ownerTaskForCurrentClient(args.clientTaskId);
+      const taskArg = callerTask ? `, "clientTaskId": "${callerTask.id}"` : "";
+      if (ownershipConflict) {
+        return guideError(new Error(
+          `Compacted session ${existing.state.sessionId} is owned by another live task. ` +
+          "Open or message its owner first. Recovery from another task requires the " +
+          "explicit owner-gone confirmation flow.",
+        ));
+      }
       if (isStale) {
         return guideError(new Error(
           `Stale compacted session ${existing.state.sessionId} found (prepared ${Math.round((Date.now() - preparedAt) / 60000)} minutes ago, never resumed). ` +
           `SessionStart hook is no longer prompting for this session.\n` +
-          `- To resume anyway: call action "resume" with sessionId "${existing.state.sessionId}"\n` +
+          `- To resume anyway: {"sessionId":"${existing.state.sessionId}","action":"resume"${taskArg}}\n` +
           `- To abandon and start fresh: run "storybloq session stop ${existing.state.sessionId}"`,
         ));
       }
       return guideError(new Error(
         `Active session ${existing.state.sessionId} is awaiting compaction resume.\n` +
-        `- To continue: call action "resume" with sessionId "${existing.state.sessionId}"\n` +
-        `- To abandon: run "storybloq session clear-compact ${existing.state.sessionId}"`,
+        `- To continue: {"sessionId":"${existing.state.sessionId}","action":"resume"${taskArg}}\n` +
+        `- To abandon: run "storybloq session stop ${existing.state.sessionId}"`,
       ));
     }
     return guideError(new Error(
       `Active session ${existing.state.sessionId} already exists for this workspace. ` +
-      `Use action: "resume" to continue or "cancel" to end it.`,
+      `Continue from its owning client task. Action "resume" is only valid after the session enters COMPACT; ` +
+      `use "cancel" only when the running task should be ended.`,
     ));
   }
 
@@ -822,6 +906,7 @@ async function handleStart(root: string, args: GuideInput): Promise<McpToolResul
   // Create session — wrapped in try/finally for cleanup on failure
   const session = createSession(root, recipe, wsId, sessionConfig);
   const dir = sessionDir(root, session.sessionId);
+  const ownerTask = ownerTaskForCurrentClient(args.clientTaskId, session.startedAt);
   let sidecarPid: number | undefined;
 
   // ISS-412: Cleanup helper for early-exit error paths.
@@ -940,6 +1025,7 @@ async function handleStart(root: string, args: GuideInput): Promise<McpToolResul
           ? [...resolvedRecipe.defaults.codexReviewBackends]
           : undefined,
       },
+      ownerTask,
     };
 
     // T-124/T-139: Capture test baseline if TEST or WRITE_TESTS stage is enabled
@@ -1038,7 +1124,9 @@ async function handleStart(root: string, args: GuideInput): Promise<McpToolResul
 
     // T-260: Liveness infrastructure
     const fp = computeBinaryFingerprint();
-    const ccSessionId = captureClaudeCodeSessionId();
+    const ccSessionId = ownerTask
+      ? legacyClaudeSessionIdForOwner(ownerTask, null)
+      : captureClaudeCodeSessionId();
     try {
       sidecarPid = spawnAliveSidecar(telemetryDirPath(dir));
     } catch { /* best-effort */ }
@@ -1152,7 +1240,7 @@ async function handleStart(root: string, args: GuideInput): Promise<McpToolResul
           id: ticket.id,
           displayId: ticketResolution.displayId,
           title: ticket.title,
-          risk: assessRisk(ticket).risk,
+          risk: reviewRiskForTicket(ticket),
           claimed: true,
         },
       };
@@ -1212,7 +1300,7 @@ async function handleStart(root: string, args: GuideInput): Promise<McpToolResul
           ticket.description ? `\n**Description:**\n${ticket.description}` : "",
           "",
           `Write the plan as a markdown file at \`.story/sessions/${updated.sessionId}/plan.md\`.`,
-          "Do NOT use Claude Code's plan mode.",
+          "Do NOT use client-native plan mode.",
           "",
           "When done, call `storybloq_autonomous_guide`:",
           '```json',
@@ -1223,7 +1311,7 @@ async function handleStart(root: string, args: GuideInput): Promise<McpToolResul
 
       const reminders = mode === "guided"
         ? [
-            "Do NOT use Claude Code's plan mode — write plans as markdown files.",
+            "Do NOT use client-native plan mode -- write plans as markdown files.",
             "This is guided mode — single ticket, full pipeline.",
           ]
         : [
@@ -1277,7 +1365,7 @@ async function handleStart(root: string, args: GuideInput): Promise<McpToolResul
         "# Targeted Autonomous Session Started",
         "",
         `You are in targeted auto mode. Working on ${validatedTargetWork.length} specific item(s) in order, then ending the session.${checkpointDesc}${skippedNote}`,
-        "Do NOT stop to summarize. Do NOT ask the user. Do NOT cancel for context management -- compaction is automatic.",
+        "Do NOT stop to summarize. Do NOT ask the user. Do NOT cancel for context management; Storybloq rotates at a clean boundary when pressure reaches the configured threshold.",
         "",
         targetedInstruction,
       ].join("\n");
@@ -1285,7 +1373,7 @@ async function handleStart(root: string, args: GuideInput): Promise<McpToolResul
       return guideResult(updated, "PICK_TICKET", {
         instruction,
         reminders: [
-          "Do NOT use Claude Code's plan mode -- write plans as markdown files.",
+          "Do NOT use client-native plan mode -- write plans as markdown files.",
           "Do NOT ask the user for confirmation or approval.",
           "Do NOT stop or summarize between items -- call autonomous_guide IMMEDIATELY.",
           "You are in targeted auto mode -- work ONLY on the listed items.",
@@ -1356,7 +1444,7 @@ async function handleStart(root: string, args: GuideInput): Promise<McpToolResul
       "# Autonomous Session Started",
       "",
       `You are now in autonomous mode. ${sessionDesc}${checkpointDesc}`,
-      "Do NOT stop to summarize. Do NOT ask the user. Do NOT cancel for context management — compaction is automatic. Pick a ticket or issue and start working immediately.",
+      "Do NOT stop to summarize. Do NOT ask the user. Do NOT cancel for context management; Storybloq rotates at a clean boundary when pressure reaches the configured threshold. Pick a ticket or issue and start working immediately.",
       "",
       "## Ticket Candidates",
       "",
@@ -1386,7 +1474,7 @@ async function handleStart(root: string, args: GuideInput): Promise<McpToolResul
     return guideResult(updated, "PICK_TICKET", {
       instruction,
       reminders: [
-        "Do NOT use Claude Code's plan mode — write plans as markdown files.",
+        "Do NOT use client-native plan mode -- write plans as markdown files.",
         "Do NOT ask the user for confirmation or approval.",
         "Do NOT stop or summarize between tickets — call autonomous_guide IMMEDIATELY.",
         "You are in autonomous mode — continue working until done.",
@@ -1594,7 +1682,22 @@ async function handleReport(root: string, args: GuideInput): Promise<McpToolResu
   const info = findSessionById(root, args.sessionId);
   if (!info) return guideError(new Error(`Session ${args.sessionId} not found`));
 
-  let state = refreshLease(info.state);
+  const ownershipConflict = liveOwnershipConflict(info.state, args.clientTaskId);
+  if (ownershipConflict) {
+    return guideError(new Error(
+      `Cannot report progress for session ${args.sessionId}: ${ownershipConflict}. ` +
+      "Continue from its owning task.",
+    ));
+  }
+
+  const adoption = adoptExpiredLease(
+    root,
+    info.dir,
+    info.state,
+    args.clientTaskId,
+    "report",
+  );
+  let state = adoption.adopted ? adoption.state : refreshLease(adoption.state);
 
   // ISS-024: recover any pending mutation before processing
   state = await recoverPendingMutation(info.dir, state, root);
@@ -1670,6 +1773,70 @@ async function handleResume(root: string, args: GuideInput): Promise<McpToolResu
   let info = findSessionById(root, args.sessionId);
   if (!info) return guideError(new Error(`Session ${args.sessionId} not found`));
 
+  // Recovery and takeover are valid only at the explicit COMPACT boundary.
+  // Check before any mutation so a foreign caller cannot refresh the lease or
+  // drain pending project writes on a live non-COMPACT session.
+  if (info.state.state !== "COMPACT") {
+    return guideError(new Error(
+      `Session ${args.sessionId} is not in COMPACT state (current: ${info.state.state}). Use action: "report" to continue.`,
+    ));
+  }
+  if (!info.state.compactPending) {
+    return guideError(new Error(
+      `Session ${args.sessionId} is in COMPACT state but compactPending is false (stale compact). ` +
+      `Run "storybloq session clear-compact ${args.sessionId}" to recover.`,
+    ));
+  }
+
+  const callerTask = ownerTaskForCurrentClient(args.clientTaskId);
+  const leaseWasExpired = isLeaseExpired(info.state);
+  const hasLegacyClaudeOwner = !info.state.ownerTask && !!info.state.claudeCodeSessionId;
+  const legacySameOwner = !info.state.ownerTask &&
+    callerTask?.client === "claude" &&
+    info.state.claudeCodeSessionId === callerTask.id;
+  const unownedLegacy = !info.state.ownerTask && !info.state.claudeCodeSessionId;
+  const knownForeignOwner = !!callerTask && !isSameOwnerTask(info.state.ownerTask, callerTask) &&
+    !legacySameOwner && !unownedLegacy;
+
+  if (args.takeover && !callerTask) {
+    return guideError(new Error(
+      `Recovering session ${args.sessionId} requires a valid clientTaskId so ownership can be rebound.`,
+    ));
+  }
+  if (
+    knownForeignOwner &&
+    !leaseWasExpired &&
+    !args.takeover
+  ) {
+    const ownerDescription = info.state.ownerTask
+      ? `another live ${info.state.ownerTask.client} task`
+      : hasLegacyClaudeOwner
+        ? "another live legacy Claude Code task"
+        : "another live task";
+    return guideError(new Error(
+      `Session ${args.sessionId} is owned by ${ownerDescription}. ` +
+      "Open or message that task first. Recovery from another task requires the " +
+      "explicit owner-gone confirmation flow.",
+    ));
+  }
+  const shouldRebindOwner = !!callerTask && (
+    leaseWasExpired || legacySameOwner || unownedLegacy || (knownForeignOwner && args.takeover === true)
+  );
+  const reboundOwnerTask = shouldRebindOwner ? callerTask : info.state.ownerTask;
+  const reboundClaudeCodeSessionId = legacyClaudeSessionIdForOwner(
+    reboundOwnerTask,
+    info.state.claudeCodeSessionId,
+  );
+  const ownerTaskRebindReason = shouldRebindOwner
+    ? leaseWasExpired
+      ? "expired_lease"
+      : unownedLegacy
+        ? "legacy_unowned"
+        : legacySameOwner
+          ? "legacy_claude_match"
+          : "explicit_takeover"
+    : null;
+
   // ISS-024: recover any pending mutation before processing
   const recoveredState = await recoverPendingMutation(info.dir, info.state, root);
   if (recoveredState !== info.state) {
@@ -1681,7 +1848,7 @@ async function handleResume(root: string, args: GuideInput): Promise<McpToolResu
   // Must capture return value — subsequent writes spread info.state as base
   info = { ...info, state: await drainPendingDeferrals(root, info.dir, info.state) };
 
-  // Guard: only resume from COMPACT state
+  // Revalidate after pending-mutation recovery in case it repaired state.
   if (info.state.state !== "COMPACT") {
     return guideError(new Error(
       `Session ${args.sessionId} is not in COMPACT state (current: ${info.state.state}). Use action: "report" to continue.`,
@@ -1705,6 +1872,19 @@ async function handleResume(root: string, args: GuideInput): Promise<McpToolResu
     ));
   }
 
+  const compactionObserved = wasCompactionObserved(info.state);
+  const refreshedResumeState = refreshLease(info.state);
+  const resumedGuideCallCount = compactionObserved ? 0 : refreshedResumeState.guideCallCount;
+  const resumedContextPressure = compactionObserved
+    ? pressureAfterCompaction(refreshedResumeState)
+    : refreshedResumeState.contextPressure;
+  const compactionNotice = compactionObserved
+    ? ""
+    : "Client compaction was not confirmed by SessionStart. Pressure counters were preserved, and the session will rotate through HANDOVER at the next clean COMPLETE boundary.";
+  const resumeHeading = compactionObserved
+    ? "Resumed After Client Compaction"
+    : "Recovered From COMPACT State";
+
   // ISS-032: 3-branch HEAD validation
   const headResult = await gitHead(root);
   const expectedHead = info.state.git.expectedHead;
@@ -1714,8 +1894,10 @@ async function handleResume(root: string, args: GuideInput): Promise<McpToolResu
   if (!headResult.ok) {
     // Keep compactPending — session must remain discoverable
     const blockedState = writeSessionAndRefresh(root, info.dir, {
-      ...refreshLease(info.state),
+      ...refreshedResumeState,
       resumeBlocked: true,
+      ownerTask: reboundOwnerTask,
+      claudeCodeSessionId: reboundClaudeCodeSessionId,
     } as FullSessionState, "always");
     appendEvent(info.dir, {
       rev: blockedState.revision,
@@ -1766,21 +1948,25 @@ async function handleResume(root: string, args: GuideInput): Promise<McpToolResu
       : undefined;
 
     const driftWritten = writeSessionAndRefresh(root, info.dir, {
-      ...refreshLease(info.state),
+      ...refreshedResumeState,
       state: mapping.state,
       previousState: "COMPACT",
       preCompactState: null,
       resumeFromRevision: null,
       compactPending: false,
       compactPreparedAt: null,
+      compactObservedAt: null,
       resumeBlocked: false,
       finalizeCheckpoint: null,
+      landingDecision: null,
       reviews: recoveryReviews,
       ticket: recoveryTicket,
-      guideCallCount: 0,
-      contextPressure: { ...info.state.contextPressure, guideCallCount: 0, compactionCount: (info.state.contextPressure?.compactionCount ?? 0) + 1 },
+      guideCallCount: resumedGuideCallCount,
+      contextPressure: resumedContextPressure,
       git: { ...info.state.git, expectedHead: headResult.data.hash, mergeBase: headResult.data.hash },
       sidecarPid: resumeSidecarPid,
+      ownerTask: reboundOwnerTask,
+      claudeCodeSessionId: reboundClaudeCodeSessionId,
     } as FullSessionState, "always");
 
     appendEvent(info.dir, {
@@ -1799,18 +1985,25 @@ async function handleResume(root: string, args: GuideInput): Promise<McpToolResu
         ticketId: info.state.ticket?.id ?? null,
         headMatch: false,
         recoveryState: mapping.state,
+        compactionObserved,
+        ownerTaskRebound: shouldRebindOwner,
+        ownerTaskRebindReason,
       },
     });
     removeResumeMarker(root);
 
     // State-specific actionable instructions after drift recovery
-    const driftPreamble = `**HEAD changed during compaction** (expected ${expectedHead.slice(0, 8)}, got ${headResult.data.hash.slice(0, 8)}). Review state invalidated.\n\n`;
+    const driftPreamble = [
+      `**HEAD changed while COMPACT was pending** (expected ${expectedHead.slice(0, 8)}, got ${headResult.data.hash.slice(0, 8)}). Review state invalidated.`,
+      compactionNotice,
+      "",
+    ].filter(Boolean).join("\n\n");
 
     if (mapping.state === "PICK_TICKET") {
       // T-188: Targeted mode -- show only remaining targets (with stuck check)
       if (isTargetedMode(driftWritten)) {
         const dispatched = await dispatchTargetedResume(root, driftWritten, info.dir, [
-          `# Resumed After Compact -- HEAD Mismatch (Targeted Mode)`,
+          `# ${resumeHeading} -- HEAD Mismatch (Targeted Mode)`,
           "",
           driftPreamble + "Pick the next target item.",
         ]);
@@ -1842,7 +2035,7 @@ async function handleResume(root: string, args: GuideInput): Promise<McpToolResu
 
       return guideResult(driftWritten, "PICK_TICKET", {
         instruction: [
-          `# Resumed After Compact — HEAD Mismatch`,
+          `# ${resumeHeading} -- HEAD Mismatch`,
           "",
           driftPreamble + "Pick the next ticket.",
           candidatesText,
@@ -1864,7 +2057,7 @@ async function handleResume(root: string, args: GuideInput): Promise<McpToolResu
       const ticketInfo = driftWritten.ticket ? `for ${displaySessionTicket(driftWritten.ticket)}: ${driftWritten.ticket.title}` : "";
       return guideResult(driftWritten, "PLAN", {
         instruction: [
-          `# Resumed After Compact — HEAD Mismatch`,
+          `# ${resumeHeading} -- HEAD Mismatch`,
           "",
           `${driftPreamble}Write a new implementation plan ${ticketInfo}. Save to \`.story/sessions/${driftWritten.sessionId}/plan.md\`.`,
           "",
@@ -1881,7 +2074,7 @@ async function handleResume(root: string, args: GuideInput): Promise<McpToolResu
       const ticketInfo = driftWritten.ticket ? `for ${displaySessionTicket(driftWritten.ticket)}: ${driftWritten.ticket.title}` : "";
       return guideResult(driftWritten, "IMPLEMENT", {
         instruction: [
-          `# Resumed After Compact — HEAD Mismatch`,
+          `# ${resumeHeading} -- HEAD Mismatch`,
           "",
           `${driftPreamble}Re-implement ${ticketInfo}. Previous commit state was invalidated.`,
           "",
@@ -1906,7 +2099,7 @@ async function handleResume(root: string, args: GuideInput): Promise<McpToolResu
         }
         return guideResult(ctx.state, "ISSUE_FIX", {
           instruction: [
-            "# Resumed After Compact — HEAD Mismatch",
+            `# ${resumeHeading} -- HEAD Mismatch`,
             "",
             `${driftPreamble}Recovered to **ISSUE_FIX**. Re-fix the issue and mark resolved.`,
             "",
@@ -1921,31 +2114,29 @@ async function handleResume(root: string, args: GuideInput): Promise<McpToolResu
 
     // Fallback for unmapped states
     return guideResult(driftWritten, mapping.state, {
-      instruction: `# Resumed After Compact — HEAD Mismatch\n\n${driftPreamble}Recovered to state: **${mapping.state}**. Continue from here.`,
+      instruction: `# ${resumeHeading} -- HEAD Mismatch\n\n${driftPreamble}Recovered to state: **${mapping.state}**. Continue from here.`,
       reminders: [],
     });
   }
 
   // Branch A: HEAD matches — normal resume (or own-commit drift from T-184)
-  // ISS-036c: reset guideCallCount after compact to prevent false critical pressure
-  const resumePressure = {
-    ...info.state.contextPressure,
-    guideCallCount: 0,
-    compactionCount: (info.state.contextPressure?.compactionCount ?? 0) + 1,
-  };
+  // Reset pressure only when SessionStart confirmed that client compaction occurred.
   const written = writeSessionAndRefresh(root, info.dir, {
-    ...refreshLease(info.state),
+    ...refreshedResumeState,
     state: resumeState,
     preCompactState: null,
     resumeFromRevision: null,
     compactPending: false,
     compactPreparedAt: null,
+    compactObservedAt: null,
     resumeBlocked: false,
-    guideCallCount: 0,
-    contextPressure: { ...resumePressure, level: evaluatePressure({ ...info.state, guideCallCount: 0, contextPressure: resumePressure } as FullSessionState) },
+    guideCallCount: resumedGuideCallCount,
+    contextPressure: resumedContextPressure,
     // T-184: Update expectedHead on own-commit drift (mergeBase stays at branch-off point)
     ...(ownCommitDrift ? { git: { ...info.state.git, expectedHead: headResult.data.hash } } : {}),
     sidecarPid: resumeSidecarPid,
+    ownerTask: reboundOwnerTask,
+    claudeCodeSessionId: reboundClaudeCodeSessionId,
   } as FullSessionState, "always");
   appendEvent(info.dir, {
     rev: written.revision,
@@ -1957,11 +2148,15 @@ async function handleResume(root: string, args: GuideInput): Promise<McpToolResu
       ticketId: info.state.ticket?.id ?? null,
       headMatch: !ownCommitDrift,
       ownCommit: ownCommitDrift || undefined,
+      compactionObserved,
+      ownerTaskRebound: shouldRebindOwner,
+      ownerTaskRebindReason,
     },
   });
   emitTelemetry(info.dir, "session_resumed", "guide", {
     preCompactState: resumeState,
     compactionCount: written.contextPressure?.compactionCount ?? 0,
+    compactionObserved,
   });
   removeResumeMarker(root);
 
@@ -1969,11 +2164,13 @@ async function handleResume(root: string, args: GuideInput): Promise<McpToolResu
   if (resumeState === "PICK_TICKET") {
     // T-188: Targeted mode -- show only remaining targets (with stuck check)
     if (isTargetedMode(written)) {
-      const dispatched = await dispatchTargetedResume(root, written, info.dir, [
-        "# Resumed After Compact -- Continue Targeted Session",
-        "",
-        `${written.completedTickets.length} ticket(s) and ${(written.resolvedIssues ?? []).length} issue(s) done so far. Context compacted. Pick the next target item immediately.`,
-      ]);
+        const dispatched = await dispatchTargetedResume(root, written, info.dir, [
+          `# ${resumeHeading} -- Continue Targeted Session`,
+          "",
+          compactionNotice,
+          "",
+          `${written.completedTickets.length} ticket(s) and ${(written.resolvedIssues ?? []).length} issue(s) done so far. ${compactionObserved ? "Client compaction confirmed." : "Compaction remains unverified."} Pick the next target item immediately.`,
+        ].filter(Boolean));
       return dispatched;
     }
 
@@ -2002,9 +2199,11 @@ async function handleResume(root: string, args: GuideInput): Promise<McpToolResu
 
     return guideResult(written, "PICK_TICKET", {
       instruction: [
-        "# Resumed After Compact — Continue Working",
+        `# ${resumeHeading} -- Continue Working`,
         "",
-        `${written.completedTickets.length} ticket(s) and ${(written.resolvedIssues ?? []).length} issue(s) done so far. Context compacted. Pick the next ticket or issue immediately.`,
+        compactionNotice,
+        "",
+        `${written.completedTickets.length} ticket(s) and ${(written.resolvedIssues ?? []).length} issue(s) done so far. ${compactionObserved ? "Client compaction confirmed." : "Compaction remains unverified."} Pick the next ticket or issue immediately.`,
         "",
         candidatesText,
         "",
@@ -2021,19 +2220,22 @@ async function handleResume(root: string, args: GuideInput): Promise<McpToolResu
         "Do NOT stop or summarize. Pick the next ticket IMMEDIATELY.",
         "Do NOT ask the user for confirmation.",
         "You are in autonomous mode — continue working.",
-        "Context compacted successfully — all session state preserved. Continue working.",
+        compactionObserved
+          ? "Client compaction confirmed; all session state was preserved. Continue working."
+          : "Compaction was not confirmed; pressure counters remain unchanged.",
       ],
     });
   }
 
   const resumeMode = written.mode ?? "auto";
-  const modeContext = resumeMode === "auto"
-    ? "You are in autonomous mode — continue working."
+  const baseModeContext = resumeMode === "auto"
+    ? "You are in autonomous mode; continue working."
     : resumeMode === "review"
-      ? "You are in review mode — session ends after code review approval."
+      ? "You are in review mode; the session ends after code review approval."
       : resumeMode === "plan"
-        ? "You are in plan mode — session ends after plan review approval."
-        : "You are in guided mode — single ticket, full pipeline.";
+        ? "You are in plan mode; the session ends after plan review approval."
+        : "You are in guided mode with a single ticket and the full pipeline.";
+  const modeContext = [baseModeContext, compactionNotice].filter(Boolean).join("\n\n");
 
   // ISS-057: Call stage's enter() for stage-specific instruction instead of generic fallback
   const resumeStage = getStage(resumeState);
@@ -2049,7 +2251,7 @@ async function handleResume(root: string, args: GuideInput): Promise<McpToolResu
 
     return guideResult(ctx.state, resumeState, {
       instruction: [
-        "# Resumed After Compact",
+        `# ${resumeHeading}`,
         "",
         `Session restored at state: **${resumeState}**.`,
         written.ticket ? `Working on: **${displaySessionTicket(written.ticket)}: ${written.ticket.title}**` : "",
@@ -2073,7 +2275,7 @@ async function handleResume(root: string, args: GuideInput): Promise<McpToolResu
   // Stage not registered — fall back to generic instruction
   return guideResult(written, resumeState, {
     instruction: [
-      "# Resumed After Compact",
+      `# ${resumeHeading}`,
       "",
       `Session restored at state: **${resumeState}**.`,
       written.ticket ? `Working on: **${displaySessionTicket(written.ticket)}: ${written.ticket.title}**` : "No ticket in progress.",
@@ -2111,12 +2313,28 @@ async function handlePreCompact(root: string, args: GuideInput): Promise<McpTool
   const info = findSessionById(root, args.sessionId);
   if (!info) return guideError(new Error(`Session ${args.sessionId} not found`));
 
+  const adoption = adoptExpiredLease(
+    root,
+    info.dir,
+    info.state,
+    args.clientTaskId,
+    "pre_compact",
+  );
+  const state = adoption.adopted ? adoption.state : refreshLease(adoption.state);
+  const ownershipConflict = liveOwnershipConflict(state, args.clientTaskId, true);
+  if (ownershipConflict) {
+    return guideError(new Error(
+      `Cannot prepare session ${args.sessionId} for compaction: ${ownershipConflict}. ` +
+      "Continue from its owning task.",
+    ));
+  }
+
   // ISS-032: delegate to shared helper
   const headResult = await gitHead(root);
 
   let result;
   try {
-    result = prepareForCompact(info.dir, refreshLease(info.state), {
+    result = prepareForCompact(info.dir, state, {
       expectedHead: headResult.ok ? headResult.data.hash : undefined,
     });
   } catch (err) {
@@ -2132,29 +2350,29 @@ async function handlePreCompact(root: string, args: GuideInput): Promise<McpTool
 
   // T-183: Write resume marker for 100% compaction survival
   writeResumeMarker(root, result.sessionId, {
-    ticket: info.state.ticket,
-    completedTickets: info.state.completedTickets,
-    resolvedIssues: info.state.resolvedIssues,
+    ticket: state.ticket,
+    completedTickets: state.completedTickets,
+    resolvedIssues: state.resolvedIssues,
     preCompactState: result.preCompactState,
   });
 
   // Read back actual written state (revision and timestamps must match disk)
   const reread = findSessionById(root, args.sessionId);
-  const written = reread?.state ?? info.state;
+  const written = reread?.state ?? state;
 
   return guideResult(written, "COMPACT", {
     instruction: [
       "# Ready for Compact",
       "",
-      "State flushed. Context compaction will happen automatically via hooks.",
-      "If you need to compact manually, run `/compact` now.",
+      "Storybloq state is flushed, but client context has not been compacted.",
+      "Run the client's user-level compaction command now. The post-compaction SessionStart hook records confirmation.",
       "",
-      "After compact, call `storybloq_autonomous_guide` with:",
+      "Only after SessionStart runs, call `storybloq_autonomous_guide` with:",
       '```json',
       `{ "sessionId": "${result.sessionId}", "action": "resume" }`,
       '```',
     ].join("\n"),
-    reminders: [],
+    reminders: ["Do not call resume before client compaction completes."],
   });
 }
 
@@ -2172,6 +2390,14 @@ async function handleCancel(root: string, args: GuideInput): Promise<McpToolResu
 
   const info = findSessionById(root, args.sessionId!);
   if (!info) return guideError(new Error(`Session ${args.sessionId} not found`));
+
+  const ownershipConflict = liveOwnershipConflict(info.state, args.clientTaskId);
+  if (ownershipConflict) {
+    return guideError(new Error(
+      `Cannot cancel session ${args.sessionId}: ${ownershipConflict}. ` +
+      "Open the owning task or use the administrative CLI after confirming it is gone.",
+    ));
+  }
 
   // ISS-052 + ISS-066: Allow cancel from any state. Already-ended sessions are rejected.
   if (info.state.state === "SESSION_END" || info.state.status === "completed") {
@@ -2196,7 +2422,7 @@ async function handleCancel(root: string, args: GuideInput): Promise<McpToolResu
           "",
           `You have completed ${info.state.completedTickets.length} ticket(s) and ${(info.state.resolvedIssues ?? []).length} issue(s) with more work remaining.`,
           "Do NOT cancel an autonomous session due to context size.",
-          "If you need to manage context, Claude Code handles compaction automatically.",
+          "If you need to manage context, the client handles compaction automatically.",
           "",
           "Continue working by calling `storybloq_autonomous_guide` with:",
           '```json',
@@ -2264,6 +2490,7 @@ async function handleCancel(root: string, args: GuideInput): Promise<McpToolResu
     terminationReason: "cancelled",
     compactPending: false,
     compactPreparedAt: null,
+    compactObservedAt: null,
     resumeBlocked: false,
     ticket: undefined,
   } as FullSessionState, "always");
@@ -2367,6 +2594,7 @@ function guideResult(
     instruction: string;
     reminders?: readonly string[];
     transitionedFrom?: string;
+    contextAdvice?: ContextAdvice;
   },
 ): McpToolResult {
   const summary: SessionSummary = {
@@ -2385,7 +2613,7 @@ function guideResult(
   const allReminders = [...(opts.reminders ?? [])];
   if ((state.mode === "auto" || !state.mode) && currentState !== "SESSION_END") {
     allReminders.push(
-      "NEVER cancel this session due to context size. Compaction is automatic — Storybloq preserves all session state across compactions via hooks.",
+      "NEVER cancel this session due to context size. Client compaction hooks preserve Storybloq state when compaction occurs; threshold pressure rotates through HANDOVER at a clean boundary.",
     );
   }
 
@@ -2395,7 +2623,7 @@ function guideResult(
     transitionedFrom: opts.transitionedFrom,
     instruction: opts.instruction,
     reminders: allReminders,
-    contextAdvice: "ok",
+    contextAdvice: opts.contextAdvice ?? "ok",
     sessionSummary: summary,
   };
 
@@ -2410,6 +2638,7 @@ function guideResult(
     `**Risk:** ${summary.risk}`,
     `**Completed:** ${summary.completed.length > 0 ? summary.completed.join(", ") : "none"}`,
     `**Tickets done:** ${summary.completed.length}`,
+    output.contextAdvice !== "ok" ? `**Context advice:** ${output.contextAdvice}` : "",
     summary.branch ? `**Branch:** ${summary.branch}` : "",
     state.verificationCounters
       ? `**Verification:** ${state.verificationCounters.proposed} proposed, ${state.verificationCounters.verified} verified, ${state.verificationCounters.rejected} rejected, ${state.verificationCounters.filed} filed`
@@ -2450,4 +2679,3 @@ function readFileSafe(path: string): string {
     return "";
   }
 }
-

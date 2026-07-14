@@ -24,7 +24,15 @@ import {
   type IssueStatus,
   type IssueSeverity,
 } from "../../models/types.js";
-import type { Issue } from "../../models/issue.js";
+import {
+  IssueDedupeKeySchema,
+  type Issue,
+  type IssueSourceRefInput,
+} from "../../models/issue.js";
+import {
+  IssueSourceRefError,
+  normalizeIssueSourceRefs,
+} from "../../core/issue-source-ref.js";
 import {
   todayISO,
   normalizeArrayOption,
@@ -50,6 +58,8 @@ const ISSUE_CORE_METADATA_KEYS = new Set([
   "impact",
   "resolution",
   "location",
+  "sourceRefs",
+  "dedupeKey",
   "discoveredDate",
   "resolvedDate",
   "relatedTickets",
@@ -257,6 +267,9 @@ export async function handleIssueCreate(
     components: string[];
     relatedTickets: string[];
     location: string[];
+    sourceRefs?: IssueSourceRefInput[];
+    dedupeKey?: string;
+    createdBy?: string;
     phase?: string;
     project?: string | null;
   },
@@ -270,9 +283,41 @@ export async function handleIssueCreate(
     );
   }
 
+  const dedupeResult = args.dedupeKey === undefined
+    ? null
+    : IssueDedupeKeySchema.safeParse(args.dedupeKey);
+  if (dedupeResult && !dedupeResult.success) {
+    throw new CliValidationError(
+      "invalid_input",
+      dedupeResult.error.issues.map((issue) => issue.message).join("; "),
+    );
+  }
+
   let createdIssue: Issue | undefined;
+  let deduplicated = false;
 
   await withProjectLock(root, { strict: true }, async ({ state }) => {
+    if (args.dedupeKey) {
+      const existing = state.activeIssues.find((issue) => issue.dedupeKey === args.dedupeKey);
+      if (existing) {
+        createdIssue = existing;
+        deduplicated = true;
+        return;
+      }
+    }
+
+    let sourceRefs;
+    try {
+      sourceRefs = args.sourceRefs
+        ? await normalizeIssueSourceRefs(root, args.sourceRefs)
+        : undefined;
+    } catch (err) {
+      if (err instanceof IssueSourceRefError) {
+        throw new CliValidationError("invalid_input", err.message);
+      }
+      throw err;
+    }
+
     // Fork: default to the current working phase when none is given so
     // review-raised issues never land unphased and hidden from phase-filtered
     // views. Falls back to null only when no phase is active.
@@ -311,8 +356,11 @@ export async function handleIssueCreate(
       impact: args.impact,
       resolution: null,
       location: args.location,
+      ...(sourceRefs && sourceRefs.length > 0 ? { sourceRefs } : {}),
+      ...(args.dedupeKey ? { dedupeKey: args.dedupeKey } : {}),
       discoveredDate: createdAt.slice(0, 10),
       ...(isTeam && { createdAt }),
+      ...(args.createdBy ? { createdBy: args.createdBy } : {}),
       resolvedDate: null,
       relatedTickets: resolvedRelated,
       phase,
@@ -326,7 +374,17 @@ export async function handleIssueCreate(
 
   if (!createdIssue) throw new Error("Issue not created");
   if (format === "json") {
-    return { output: JSON.stringify(successEnvelope(createdIssue), null, 2) };
+    const envelope = successEnvelope(createdIssue) as unknown as Record<string, unknown>;
+    return {
+      output: JSON.stringify(
+        deduplicated ? { ...envelope, meta: { deduplicated: true } } : envelope,
+        null,
+        2,
+      ),
+    };
+  }
+  if (deduplicated) {
+    return { output: `Issue ${displayIdOf(createdIssue)} already exists for dedupe key ${args.dedupeKey}.` };
   }
   return { output: `Created issue ${displayIdOf(createdIssue)}: ${createdIssue.title}` };
 }
@@ -342,6 +400,7 @@ export async function handleIssueUpdate(
     components?: string[];
     relatedTickets?: string[];
     location?: string[];
+    sourceRefs?: IssueSourceRefInput[];
     order?: number;
     phase?: string | null;
     project?: string | null;
@@ -374,6 +433,18 @@ export async function handleIssueUpdate(
     const existing = state.issueByID(resolvedId);
     if (!existing) {
       throw new CliValidationError("not_found", `Issue ${id} not found`);
+    }
+
+    let sourceRefs;
+    try {
+      sourceRefs = updates.sourceRefs
+        ? await normalizeIssueSourceRefs(root, updates.sourceRefs)
+        : undefined;
+    } catch (err) {
+      if (err instanceof IssueSourceRefError) {
+        throw new CliValidationError("invalid_input", err.message);
+      }
+      throw err;
     }
 
     if (updates.phase !== undefined && updates.phase !== null) {
@@ -415,6 +486,7 @@ export async function handleIssueUpdate(
       ...(updates.components !== undefined && { components: updates.components }),
       ...(resolvedRelated !== undefined && { relatedTickets: resolvedRelated }),
       ...(updates.location !== undefined && { location: updates.location }),
+      ...(sourceRefs !== undefined && { sourceRefs }),
       ...(updates.order !== undefined && { order: updates.order }),
       ...(updates.phase !== undefined && { phase: updates.phase }),
       ...projectChange,

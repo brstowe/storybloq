@@ -30,6 +30,7 @@ import {
   createSession,
   writeSessionSync,
   prepareForCompact,
+  markCompactionObserved,
   readEvents,
 } from "../../src/autonomous/session.js";
 import type { FullSessionState } from "../../src/autonomous/session-types.js";
@@ -53,10 +54,12 @@ function setupProject(dir: string): void {
   mkdirSync(join(storyDir, "handovers"), { recursive: true });
   mkdirSync(join(storyDir, "sessions"), { recursive: true });
   writeFileSync(join(storyDir, "config.json"), JSON.stringify({
+    version: 1,
     schemaVersion: 1,
     project: "test",
     type: "npm",
     language: "typescript",
+    features: { tickets: true, issues: true, handovers: true, roadmap: true, reviews: true },
   }));
   writeFileSync(join(storyDir, "roadmap.json"), JSON.stringify({
     title: "test",
@@ -151,6 +154,299 @@ describe("handleResume integration (ISS-039)", () => {
     });
     expect(result.isError).toBe(true);
     expect((result.content[0] as { text: string }).text).toContain("compactPending is false");
+  });
+
+  it("allows the same owning Codex task to resume a live COMPACT lease", async () => {
+    const oldClient = process.env.STORYBLOQ_CLIENT;
+    process.env.STORYBLOQ_CLIENT = "codex";
+    try {
+      const session = createCompactSession(root, { preCompactState: "IMPLEMENT" });
+      const dir = join(sessionsDir, session.sessionId);
+      const ownerTask = { client: "codex" as const, id: "task-a", boundAt: "2026-07-09T00:00:00Z" };
+      writeSessionSync(dir, { ...session, ownerTask, claudeCodeSessionId: "stale-claude-task" });
+
+      const result = await handleAutonomousGuide(root, {
+        action: "resume",
+        sessionId: session.sessionId,
+        clientTaskId: "task-a",
+      });
+
+      expect(result.isError).toBeFalsy();
+      const state = JSON.parse(readFileSync(join(dir, "state.json"), "utf-8")) as FullSessionState;
+      expect(state.state).toBe("IMPLEMENT");
+      expect(state.ownerTask).toEqual(ownerTask);
+      expect(state.claudeCodeSessionId).toBeNull();
+    } finally {
+      if (oldClient === undefined) delete process.env.STORYBLOQ_CLIENT;
+      else process.env.STORYBLOQ_CLIENT = oldClient;
+    }
+  });
+
+  it("rejects a known foreign task while the COMPACT lease is live", async () => {
+    const oldClient = process.env.STORYBLOQ_CLIENT;
+    process.env.STORYBLOQ_CLIENT = "codex";
+    try {
+      const session = createCompactSession(root);
+      const dir = join(sessionsDir, session.sessionId);
+      writeSessionSync(dir, {
+        ...session,
+        ownerTask: { client: "codex", id: "task-a", boundAt: "2026-07-09T00:00:00Z" },
+      });
+
+      const result = await handleAutonomousGuide(root, {
+        action: "resume",
+        sessionId: session.sessionId,
+        clientTaskId: "task-b",
+      });
+
+      expect(result.isError).toBe(true);
+      const text = (result.content[0] as { text: string }).text;
+      expect(text).toContain("owned by another live codex task");
+      expect(text).not.toContain("takeover");
+    } finally {
+      if (oldClient === undefined) delete process.env.STORYBLOQ_CLIENT;
+      else process.env.STORYBLOQ_CLIENT = oldClient;
+    }
+  });
+
+  it("binds a live unowned legacy COMPACT session to the current Codex task", async () => {
+    process.env.STORYBLOQ_CLIENT = "codex";
+    const session = createCompactSession(root, { preCompactState: "IMPLEMENT" });
+    const dir = join(sessionsDir, session.sessionId);
+    writeSessionSync(dir, { ...session, ownerTask: null, claudeCodeSessionId: null });
+
+    const result = await handleAutonomousGuide(root, {
+      action: "resume",
+      sessionId: session.sessionId,
+      clientTaskId: "current-codex-task",
+    });
+
+    expect(result.isError).toBeFalsy();
+    const state = JSON.parse(readFileSync(join(dir, "state.json"), "utf-8")) as FullSessionState;
+    expect(state.state).toBe("IMPLEMENT");
+    expect(state.ownerTask).toMatchObject({ client: "codex", id: "current-codex-task" });
+    expect(state.claudeCodeSessionId).toBeNull();
+    const resumed = readEvents(dir).events.find((event) => event.type === "resumed");
+    expect(resumed?.data).toMatchObject({
+      ownerTaskRebound: true,
+      ownerTaskRebindReason: "legacy_unowned",
+    });
+  });
+
+  it("binds a matching legacy Claude session during COMPACT recovery", async () => {
+    process.env.STORYBLOQ_CLIENT = "claude";
+    const session = createCompactSession(root, { preCompactState: "IMPLEMENT" });
+    const dir = join(sessionsDir, session.sessionId);
+    writeSessionSync(dir, {
+      ...session,
+      ownerTask: null,
+      claudeCodeSessionId: "legacy-claude-task",
+    });
+
+    const result = await handleAutonomousGuide(root, {
+      action: "resume",
+      sessionId: session.sessionId,
+      clientTaskId: "legacy-claude-task",
+    });
+
+    expect(result.isError).toBeFalsy();
+    const state = JSON.parse(readFileSync(join(dir, "state.json"), "utf-8")) as FullSessionState;
+    expect(state.ownerTask).toMatchObject({ client: "claude", id: "legacy-claude-task" });
+    expect(state.claudeCodeSessionId).toBe("legacy-claude-task");
+  });
+
+  it("allows explicit recovery of a live COMPACT lease after its owner is confirmed gone", async () => {
+    process.env.STORYBLOQ_CLIENT = "codex";
+    const session = createCompactSession(root, { preCompactState: "IMPLEMENT" });
+    const dir = join(sessionsDir, session.sessionId);
+    writeSessionSync(dir, {
+      ...session,
+      ownerTask: { client: "codex", id: "dead-task", boundAt: "2026-07-09T00:00:00Z" },
+    });
+
+    const result = await handleAutonomousGuide(root, {
+      action: "resume",
+      sessionId: session.sessionId,
+      clientTaskId: "replacement-task",
+      takeover: true,
+    });
+
+    expect(result.isError).toBeFalsy();
+    const state = JSON.parse(readFileSync(join(dir, "state.json"), "utf-8")) as FullSessionState;
+    expect(state.ownerTask).toMatchObject({ client: "codex", id: "replacement-task" });
+  });
+
+  it("never permits takeover outside the COMPACT recovery boundary", async () => {
+    process.env.STORYBLOQ_CLIENT = "codex";
+    const session = createSession(root, "coding", "test-workspace");
+    const dir = join(sessionsDir, session.sessionId);
+    writeSessionSync(dir, {
+      ...session,
+      state: "IMPLEMENT",
+      ownerTask: { client: "codex", id: "owner-task", boundAt: "2026-07-09T00:00:00Z" },
+    });
+
+    const result = await handleAutonomousGuide(root, {
+      action: "resume",
+      sessionId: session.sessionId,
+      clientTaskId: "replacement-task",
+      takeover: true,
+    });
+
+    expect(result.isError).toBe(true);
+    expect((result.content[0] as { text: string }).text).toContain("not in COMPACT state");
+    const state = JSON.parse(readFileSync(join(dir, "state.json"), "utf-8")) as FullSessionState;
+    expect(state.ownerTask?.id).toBe("owner-task");
+  });
+
+  it("rebinds ownership only when an expired COMPACT lease is recovered", async () => {
+    const oldClient = process.env.STORYBLOQ_CLIENT;
+    process.env.STORYBLOQ_CLIENT = "codex";
+    try {
+      const session = createCompactSession(root);
+      const dir = join(sessionsDir, session.sessionId);
+      writeSessionSync(dir, {
+        ...session,
+        ownerTask: { client: "codex", id: "task-a", boundAt: "2026-07-09T00:00:00Z" },
+        lease: {
+          ...session.lease,
+          expiresAt: new Date(Date.now() - 60_000).toISOString(),
+        },
+      });
+
+      const result = await handleAutonomousGuide(root, {
+        action: "resume",
+        sessionId: session.sessionId,
+        clientTaskId: "task-b",
+      });
+
+      expect(result.isError).toBeFalsy();
+      const state = JSON.parse(readFileSync(join(dir, "state.json"), "utf-8")) as FullSessionState;
+      expect(state.ownerTask).toMatchObject({ client: "codex", id: "task-b" });
+      expect(state.ownerTask?.boundAt).not.toBe("2026-07-09T00:00:00Z");
+    } finally {
+      if (oldClient === undefined) delete process.env.STORYBLOQ_CLIENT;
+      else process.env.STORYBLOQ_CLIENT = oldClient;
+    }
+  });
+
+  it("refreshes legacy Claude telemetry from the validated expired-lease rebind", async () => {
+    const oldClient = process.env.STORYBLOQ_CLIENT;
+    const oldClaudeTask = process.env.CLAUDE_CODE_SESSION_ID;
+    process.env.STORYBLOQ_CLIENT = "claude";
+    process.env.CLAUDE_CODE_SESSION_ID = "ambient-stale-task";
+    try {
+      const session = createCompactSession(root, { preCompactState: "IMPLEMENT" });
+      const dir = join(sessionsDir, session.sessionId);
+      writeSessionSync(dir, {
+        ...session,
+        ownerTask: { client: "claude", id: "old-claude-task", boundAt: "2026-07-09T00:00:00Z" },
+        claudeCodeSessionId: "old-claude-task",
+        lease: {
+          ...session.lease,
+          expiresAt: new Date(Date.now() - 60_000).toISOString(),
+        },
+      });
+
+      const result = await handleAutonomousGuide(root, {
+        action: "resume",
+        sessionId: session.sessionId,
+        clientTaskId: "new-claude-task",
+      });
+
+      expect(result.isError).toBeFalsy();
+      const state = JSON.parse(readFileSync(join(dir, "state.json"), "utf-8")) as FullSessionState;
+      expect(state.ownerTask).toMatchObject({ client: "claude", id: "new-claude-task" });
+      expect(state.claudeCodeSessionId).toBe("new-claude-task");
+    } finally {
+      if (oldClient === undefined) delete process.env.STORYBLOQ_CLIENT;
+      else process.env.STORYBLOQ_CLIENT = oldClient;
+      if (oldClaudeTask === undefined) delete process.env.CLAUDE_CODE_SESSION_ID;
+      else process.env.CLAUDE_CODE_SESSION_ID = oldClaudeTask;
+    }
+  });
+
+  it("resets pressure baselines before routing resumed COMPLETE work", async () => {
+    writeFileSync(join(root, ".story", "tickets", "T-002.json"), JSON.stringify({
+      id: "T-002", title: "Remaining ticket", type: "task", status: "open",
+      phase: "p1", order: 20, description: "", createdDate: "2026-03-30",
+      completedDate: null, blockedBy: [], parentTicket: null,
+    }));
+    const session = createSession(root, "coding", "test-workspace");
+    const dir = join(sessionsDir, session.sessionId);
+    const completedTickets = Array.from({ length: 5 }, (_, index) => ({ id: `T-${index}` }));
+    const working = writeSessionSync(dir, {
+      ...session,
+      state: "COMPLETE",
+      completedTickets,
+      contextPressure: {
+        ...session.contextPressure,
+        level: "high",
+        guideCallCount: 60,
+        ticketsCompleted: 5,
+      },
+      guideCallCount: 60,
+      git: { branch: "main", mergeBase: "abc123", expectedHead: "abc123", initHead: "abc123" },
+    });
+    prepareForCompact(dir, working, { expectedHead: "abc123" });
+    const compactState = JSON.parse(readFileSync(join(dir, "state.json"), "utf-8")) as FullSessionState;
+    markCompactionObserved(dir, compactState);
+
+    const result = await handleAutonomousGuide(root, {
+      action: "resume",
+      sessionId: session.sessionId,
+    });
+
+    expect(result.isError).toBeFalsy();
+    const state = JSON.parse(readFileSync(join(dir, "state.json"), "utf-8")) as FullSessionState;
+    expect(state.state).not.toBe("COMPACT");
+    expect(state.contextPressure.level).toBe("low");
+    expect(state.contextPressure.workItemsAtLastCompaction).toBe(5);
+    expect(state.contextPressure.compactionCount).toBe(1);
+    expect(state.compactObservedAt).toBeNull();
+    expect(readEvents(dir).events.find((event) => event.type === "resumed")?.data).toMatchObject({
+      compactionObserved: true,
+      compactionCount: 1,
+    });
+    expect((result.content[0] as { text: string }).text).not.toContain("Context Rotation Required");
+  });
+
+  it("preserves pressure and rotates at COMPLETE when resume lacks compaction proof", async () => {
+    writeFileSync(join(root, ".story", "tickets", "T-002.json"), JSON.stringify({
+      id: "T-002", title: "Remaining ticket", type: "task", status: "open",
+      phase: "p1", order: 20, description: "", createdDate: "2026-03-30",
+      completedDate: null, blockedBy: [], parentTicket: null,
+    }));
+    const session = createSession(root, "coding", "test-workspace");
+    const dir = join(sessionsDir, session.sessionId);
+    const working = writeSessionSync(dir, {
+      ...session,
+      state: "COMPLETE",
+      completedTickets: Array.from({ length: 5 }, (_, index) => ({ id: `T-${index}` })),
+      contextPressure: {
+        ...session.contextPressure,
+        level: "high",
+        guideCallCount: 60,
+        ticketsCompleted: 5,
+      },
+      guideCallCount: 60,
+      git: { branch: "main", mergeBase: "abc123", expectedHead: "abc123", initHead: "abc123" },
+    });
+    prepareForCompact(dir, working, { expectedHead: "abc123" });
+
+    const result = await handleAutonomousGuide(root, {
+      action: "resume",
+      sessionId: session.sessionId,
+    });
+
+    expect(result.isError).toBeFalsy();
+    const state = JSON.parse(readFileSync(join(dir, "state.json"), "utf-8")) as FullSessionState;
+    expect(state.state).toBe("HANDOVER");
+    expect(state.guideCallCount).toBeGreaterThan(0);
+    expect(state.contextPressure.guideCallCount).toBeGreaterThan(0);
+    expect(state.contextPressure.compactionCount).toBe(0);
+    expect((result.content[0] as { text: string }).text).toContain("Context Rotation Required");
+    expect((result.content[0] as { text: string }).text).toContain("Compaction was not confirmed");
   });
 
   // --- Branch A: HEAD match ---
@@ -277,6 +573,211 @@ describe("handleResume integration (ISS-039)", () => {
     const expires = new Date(state.lease!.expiresAt!).getTime();
     expect(expires).toBeGreaterThan(Date.now() - 5000); // refreshed recently
   });
+
+  it("Branch C: preserves a legacy owner rebind when git validation fails", async () => {
+    process.env.STORYBLOQ_CLIENT = "codex";
+    const session = createCompactSession(root, { preCompactState: "PLAN" });
+    const dir = join(sessionsDir, session.sessionId);
+    writeSessionSync(dir, { ...session, ownerTask: null, claudeCodeSessionId: null });
+    mockedGitHead.mockResolvedValue({ ok: false, error: "git not available" } as any);
+
+    const result = await handleAutonomousGuide(root, {
+      action: "resume",
+      sessionId: session.sessionId,
+      clientTaskId: "replacement-task",
+    });
+
+    expect(result.isError).toBe(true);
+    const state = JSON.parse(readFileSync(join(dir, "state.json"), "utf-8")) as FullSessionState;
+    expect(state.resumeBlocked).toBe(true);
+    expect(state.ownerTask).toMatchObject({ client: "codex", id: "replacement-task" });
+    expect(state.claudeCodeSessionId).toBeNull();
+  });
+});
+
+describe("direct guide ownership guards", () => {
+  it("rejects a foreign report without refreshing or advancing the live session", async () => {
+    process.env.STORYBLOQ_CLIENT = "codex";
+    const session = createSession(root, "coding", "test-workspace");
+    const dir = join(sessionsDir, session.sessionId);
+    const written = writeSessionSync(dir, {
+      ...session,
+      state: "IMPLEMENT",
+      ownerTask: { client: "codex", id: "owner-task", boundAt: "2026-07-09T00:00:00Z" },
+    });
+
+    const result = await handleAutonomousGuide(root, {
+      action: "report",
+      sessionId: session.sessionId,
+      clientTaskId: "foreign-task",
+      report: { completedAction: "implementation_done" },
+    });
+
+    expect(result.isError).toBe(true);
+    const state = JSON.parse(readFileSync(join(dir, "state.json"), "utf-8")) as FullSessionState;
+    expect(state.state).toBe("IMPLEMENT");
+    expect(state.revision).toBe(written.revision);
+  });
+
+  it("rejects foreign pre_compact without mutating the live session", async () => {
+    process.env.STORYBLOQ_CLIENT = "codex";
+    const session = createSession(root, "coding", "test-workspace");
+    const dir = join(sessionsDir, session.sessionId);
+    writeSessionSync(dir, {
+      ...session,
+      state: "IMPLEMENT",
+      ownerTask: { client: "codex", id: "owner-task", boundAt: "2026-07-09T00:00:00Z" },
+    });
+
+    const result = await handleAutonomousGuide(root, {
+      action: "pre_compact",
+      sessionId: session.sessionId,
+      clientTaskId: "foreign-task",
+    });
+
+    expect(result.isError).toBe(true);
+    const state = JSON.parse(readFileSync(join(dir, "state.json"), "utf-8")) as FullSessionState;
+    expect(state.state).toBe("IMPLEMENT");
+    expect(state.compactPending).toBe(false);
+  });
+
+  it("atomically rebinds an expired lease before a report refreshes it", async () => {
+    process.env.STORYBLOQ_CLIENT = "codex";
+    const session = createSession(root, "coding", "test-workspace");
+    const dir = join(sessionsDir, session.sessionId);
+    writeSessionSync(dir, {
+      ...session,
+      state: "IMPLEMENT",
+      ticket: { id: "T-001", title: "Test ticket", risk: "low", claimed: true },
+      ownerTask: { client: "codex", id: "expired-owner", boundAt: "2026-07-09T00:00:00Z" },
+      claudeCodeSessionId: "stale-claude-task",
+      lease: {
+        ...session.lease,
+        expiresAt: new Date(Date.now() - 60_000).toISOString(),
+      },
+    });
+
+    const report = await handleAutonomousGuide(root, {
+      action: "report",
+      sessionId: session.sessionId,
+      clientTaskId: "adopting-task",
+      report: { completedAction: "implementation_done" },
+    });
+
+    const reportText = (report.content[0] as { text: string }).text;
+    expect(report.isError).toBeFalsy();
+    expect(reportText).not.toContain("owned by another");
+    let state = JSON.parse(readFileSync(join(dir, "state.json"), "utf-8")) as FullSessionState;
+    expect(state.ownerTask).toMatchObject({ client: "codex", id: "adopting-task" });
+    expect(state.claudeCodeSessionId).toBeNull();
+    expect(new Date(state.lease.expiresAt).getTime()).toBeGreaterThan(Date.now());
+    expect(readEvents(dir).events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: "owner_task_rebound",
+        data: expect.objectContaining({ reason: "expired_lease", action: "report" }),
+      }),
+    ]));
+
+    const nextCall = await handleAutonomousGuide(root, {
+      action: "pre_compact",
+      sessionId: session.sessionId,
+      clientTaskId: "adopting-task",
+    });
+
+    expect(nextCall.isError).toBeFalsy();
+    state = JSON.parse(readFileSync(join(dir, "state.json"), "utf-8")) as FullSessionState;
+    expect(state.state).toBe("COMPACT");
+    expect(state.ownerTask).toMatchObject({ client: "codex", id: "adopting-task" });
+  });
+
+  it("rebinds an expired lease when pre_compact is the adopting call", async () => {
+    process.env.STORYBLOQ_CLIENT = "codex";
+    const session = createSession(root, "coding", "test-workspace");
+    const dir = join(sessionsDir, session.sessionId);
+    writeSessionSync(dir, {
+      ...session,
+      state: "IMPLEMENT",
+      ownerTask: { client: "claude", id: "expired-claude-task", boundAt: "2026-07-09T00:00:00Z" },
+      claudeCodeSessionId: "expired-claude-task",
+      lease: {
+        ...session.lease,
+        expiresAt: new Date(Date.now() - 60_000).toISOString(),
+      },
+    });
+
+    const result = await handleAutonomousGuide(root, {
+      action: "pre_compact",
+      sessionId: session.sessionId,
+      clientTaskId: "adopting-codex-task",
+    });
+
+    expect(result.isError).toBeFalsy();
+    const state = JSON.parse(readFileSync(join(dir, "state.json"), "utf-8")) as FullSessionState;
+    expect(state.state).toBe("COMPACT");
+    expect(state.ownerTask).toMatchObject({ client: "codex", id: "adopting-codex-task" });
+    expect(state.claudeCodeSessionId).toBeNull();
+    expect(readEvents(dir).events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: "owner_task_rebound",
+        data: expect.objectContaining({ reason: "expired_lease", action: "pre_compact" }),
+      }),
+    ]));
+  });
+
+  it("refreshes legacy Claude telemetry when report adopts an expired lease", async () => {
+    process.env.STORYBLOQ_CLIENT = "claude";
+    const session = createSession(root, "coding", "test-workspace");
+    const dir = join(sessionsDir, session.sessionId);
+    writeSessionSync(dir, {
+      ...session,
+      state: "IMPLEMENT",
+      ticket: { id: "T-001", title: "Test ticket", risk: "low", claimed: true },
+      ownerTask: { client: "claude", id: "expired-claude-task", boundAt: "2026-07-09T00:00:00Z" },
+      claudeCodeSessionId: "expired-claude-task",
+      lease: {
+        ...session.lease,
+        expiresAt: new Date(Date.now() - 60_000).toISOString(),
+      },
+    });
+
+    await handleAutonomousGuide(root, {
+      action: "report",
+      sessionId: session.sessionId,
+      clientTaskId: "adopting-claude-task",
+      report: { completedAction: "implementation_done" },
+    });
+
+    const state = JSON.parse(readFileSync(join(dir, "state.json"), "utf-8")) as FullSessionState;
+    expect(state.ownerTask).toMatchObject({ client: "claude", id: "adopting-claude-task" });
+    expect(state.claudeCodeSessionId).toBe("adopting-claude-task");
+  });
+
+  it("does not adopt an expired COMPACT session through report", async () => {
+    process.env.STORYBLOQ_CLIENT = "codex";
+    const session = createCompactSession(root, { preCompactState: "IMPLEMENT" });
+    const dir = join(sessionsDir, session.sessionId);
+    const written = writeSessionSync(dir, {
+      ...session,
+      ownerTask: { client: "codex", id: "compacted-owner", boundAt: "2026-07-09T00:00:00Z" },
+      lease: {
+        ...session.lease,
+        expiresAt: new Date(Date.now() - 60_000).toISOString(),
+      },
+    });
+
+    const result = await handleAutonomousGuide(root, {
+      action: "report",
+      sessionId: session.sessionId,
+      clientTaskId: "wrong-action-caller",
+      report: { completedAction: "implementation_done" },
+    });
+
+    expect(result.isError).toBe(true);
+    expect((result.content[0] as { text: string }).text).toContain("COMPACT state");
+    const state = JSON.parse(readFileSync(join(dir, "state.json"), "utf-8")) as FullSessionState;
+    expect(state.ownerTask).toMatchObject({ client: "codex", id: "compacted-owner" });
+    expect(state.revision).toBe(written.revision);
+  });
 });
 
 describe("T-187: resumed event logging", () => {
@@ -296,7 +797,8 @@ describe("T-187: resumed event logging", () => {
     expect(resumed[0].data.headMatch).toBe(true);
     expect(resumed[0].data.preCompactState).toBe("PLAN");
     expect(resumed[0].data.ticketId).toBe("T-001");
-    expect(resumed[0].data.compactionCount).toBeGreaterThanOrEqual(1);
+    expect(resumed[0].data.compactionCount).toBe(0);
+    expect(resumed[0].data.compactionObserved).toBe(false);
   });
 
   it("Branch B: appends both 'resume_conflict' and 'resumed' events", async () => {

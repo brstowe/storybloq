@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { WorkflowStage, StageResult, StageAdvance, StageContext } from "./types.js";
 import type { GuideReportInput } from "../session-types.js";
-import { assessRisk, requiredRounds, nextReviewer } from "../review-depth.js";
+import { normalizeRiskLevel, requiredRounds, nextReviewer } from "../review-depth.js";
 import {
   currentStorybloqClient,
   nativeCodexReportInstruction,
@@ -48,7 +48,7 @@ export class PlanStage implements WorkflowStage {
         '```',
       ].join("\n"),
       reminders: [
-        "Write the plan as a markdown file — do NOT use Claude Code's plan mode.",
+        "Write the plan as a markdown file -- do NOT use client-native plan mode.",
         "Do NOT ask the user for approval.",
       ],
       transitionedFrom: ctx.state.previousState ?? undefined,
@@ -113,8 +113,10 @@ export class PlanStage implements WorkflowStage {
       return { action: "retry", instruction: "Plan has not changed since the last review. Address the review findings, then revise the plan and call me again." };
     }
 
-    // Compute initial risk
-    const risk = assessRisk(undefined, undefined);
+    // Preserve the ticket's plan-time risk seed. Legacy sessions without a
+    // seed stay low; malformed persisted values fail closed to high.
+    const storedRisk = ctx.state.ticket?.risk;
+    const risk = storedRisk == null ? "low" : normalizeRiskLevel(storedRisk, "high");
 
     // Update ticket to inprogress in .story/ with session ownership (ISS-024/ISS-027)
     let claimFailed = false;

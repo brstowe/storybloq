@@ -2,7 +2,7 @@ import type { WorkflowStage, StageResult, StageAdvance, StageContext } from "./t
 import { buildLensHistoryUpdate } from "./types.js";
 import type { GuideReportInput } from "../session-types.js";
 import { REVIEW_VERDICTS, REVIEW_VERDICTS_PROSE, normalizeSeverity } from "../session-types.js";
-import { requiredRounds, nextReviewer } from "../review-depth.js";
+import { normalizeRiskLevel, requiredRounds, nextReviewer } from "../review-depth.js";
 import { accumulateVerificationCounters } from "../lens-harness/verification-log.js";
 import { writeReviewVerdict, readReviewVerdict, buildTier1Verdict, classifyLensReviewPath, type ReviewVerdictArtifact } from "../review-verdict.js";
 import {
@@ -28,8 +28,9 @@ export class PlanReviewStage implements WorkflowStage {
     const existingReviews = ctx.state.reviews.plan;
     const roundNum = existingReviews.length + 1;
     const reviewer = nextReviewer(existingReviews, backends, ctx.state.codexUnavailable, ctx.state.codexUnavailableSince);
-    const risk = ctx.state.ticket?.risk ?? "low";
-    const minRounds = requiredRounds(risk as "low" | "medium" | "high");
+    const storedRisk = ctx.state.ticket?.risk;
+    const risk = storedRisk == null ? "low" : normalizeRiskLevel(storedRisk, "high");
+    const minRounds = requiredRounds(risk);
 
     if (!ctx.state.currentReviewStartedAt) {
       ctx.writeState({ currentReviewStartedAt: new Date().toISOString() });
@@ -170,12 +171,17 @@ export class PlanReviewStage implements WorkflowStage {
     const reviewerBackend = report.reviewer
       ?? (computedReviewer === "codex" && report.notes && /codex\b.*\b(unavail|limit|failed|down|error|usage)/i.test(report.notes) ? "agent" : null)
       ?? computedReviewer;
+    const unresolvedCriticalCount = findings.filter(
+      (f) => f.severity === "critical" &&
+        f.disposition !== "addressed" && f.disposition !== "deferred",
+    ).length;
     planReviews.push({
       round: roundNum,
       reviewer: reviewerBackend,
       verdict,
       findingCount: findings.length,
       criticalCount: findings.filter((f) => f.severity === "critical").length,
+      unresolvedCriticalCount,
       majorCount: findings.filter((f) => f.severity === "major").length,
       suggestionCount: findings.filter((f) => f.severity === "suggestion").length,
       codexSessionId: report.reviewerSessionId,
@@ -188,8 +194,9 @@ export class PlanReviewStage implements WorkflowStage {
       ctx.writeState({ codexUnavailable: true, codexUnavailableSince: new Date().toISOString() });
     }
 
-    const risk = ctx.state.ticket?.risk ?? "low";
-    const minRounds = requiredRounds(risk as "low" | "medium" | "high");
+    const storedRisk = ctx.state.ticket?.risk;
+    const risk = storedRisk == null ? "low" : normalizeRiskLevel(storedRisk, "high");
+    const minRounds = requiredRounds(risk);
     // ISS-073: Only count unresolved findings (open/contested) as contradictory with approve
     const hasCriticalOrMajor = findings.some(
       (f) => (f.severity === "critical" || f.severity === "major") &&
@@ -225,6 +232,7 @@ export class PlanReviewStage implements WorkflowStage {
       verdict,
       findingsCount: findings.length,
       severityCounts: { critical: criticalCount, major: majorCount, minor: minorCount, suggestion: suggestionCount },
+      unresolvedCriticalCount,
       startedAt: startedAt ?? new Date().toISOString(),
       durationMs,
       summary,

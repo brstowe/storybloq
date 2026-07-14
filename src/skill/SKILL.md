@@ -9,29 +9,39 @@ storybloq tracks tickets, issues, roadmap, and handovers in a `.story/` director
 
 Invocation differs by client: use `/story` in Claude Code, `$story` in Codex, or ask naturally to use the Storybloq skill.
 
+**Client profile.** Resolve the profile once per invocation. `STORYBLOQ_CLIENT=codex` selects `{ id: "codex", displayName: "Codex", storyCommand: "$story" }`; unset, `claude`, or an unknown value selects `{ id: "claude", displayName: "Claude Code", storyCommand: "/story" }`. Render the resolved `storyCommand` in user-facing instructions. Capabilities such as structured questions, task navigation, exact-message relay, and subagents are separate exact-name runtime gates, not profile fields.
+
+**Client task identity.** A Codex SessionStart hook may inject `[storybloq-client-task]` with `client=codex` and an opaque `id`. Use that validated id. If the marker is absent, probe only the corresponding variable with the read-only command `printenv CODEX_THREAD_ID` or `printenv CLAUDE_CODE_SESSION_ID`; never dump the environment. IDs must match `[A-Za-z0-9][A-Za-z0-9._:-]{0,127}`. Missing or malformed identity never blocks the legacy workflow, but it cannot prove same-task ownership. Task identity is accidental-concurrency protection, not a security boundary; when identity is unavailable, guide ownership checks preserve the legacy fail-open behavior. Pass a known identity as `clientTaskId` on every autonomous guide call; Claude's inherited session id remains supported when the field is omitted.
+
+**Question tool compatibility.** Whenever this skill says `AskUserQuestion`, use the client's structured question tool if it is available. If the client does not expose that tool, follow the client's higher-priority plain-text rules instead. In Codex Default mode, ask one concise free-form question, name the valid reply shapes in prose when needed, and STOP to wait for the user's reply; do not render a numbered or bulleted option list. Do not infer a default selection or auto-start autonomous/orchestrate mode. A same-owner COMPACT continuation is automatic; unowned-legacy COMPACT continuation is also automatic at the migration boundary. Foreign takeover, expired-session recovery, and destructive cancellation follow the explicit gates below. This fallback is allowed everywhere this file requires `AskUserQuestion`, including settings and active-session guards.
+
 ## Step 0.5: Active session guard (runs BEFORE argument routing)
 
-This guard runs on EVERY `/story` invocation regardless of subcommand (`/story`, `/story auto`, `/story review`, `/story plan`, `/story guided`, `/story orchestrate`, `/story handover`, `/story snapshot`, `/story export`, `/story design`, `/story review-lenses`, `/story settings`, `/story help`, `/story status`, etc.). It MUST complete before ANY other action in this invocation.
+This guard runs on EVERY Storybloq invocation regardless of subcommand. It MUST complete before argument routing.
 
-**Guard prelude: force-surface deferred MCP tools.** Before running step 1 of this guard, make a `ToolSearch` call with `query: "storybloq"` and `max_results: 80` (high enough to surface the full `storybloq_*` tool set, currently ~53 tools, in one call; a smaller cap truncates alphabetically and can drop `storybloq_status`). On Claude Code desktop/web, `storybloq_*` tool schemas are deferred, so without this prelude the subsequent `storybloq_status` call in step 1 is not dispatchable. If `storybloq_status` is still not available after that call (some clients clamp or ignore `max_results`), make a second targeted `ToolSearch` with `query: "storybloq_status"` and `max_results: 5`, which ranks that exact tool to the top, before concluding anything about MCP availability. The prelude is explicitly part of the guard, not a separate pre-guard step; it satisfies the whitelist below.
+**Guard prelude: force-surface deferred MCP tools.** Before running step 1 of this guard, call the client's tool discovery/search tool (`ToolSearch`, `tool_search`, or equivalent) with `query: "storybloq"` and a result limit high enough to surface the full `storybloq_*` tool set (currently ~53 tools) in one call. In Codex, use the `limit` field for that result limit. A smaller cap can truncate alphabetically and drop `storybloq_status`. On clients with deferred MCP schemas, this prelude makes the subsequent `storybloq_status` call in step 1 dispatchable. If `storybloq_status` is still not available after that call, make a second targeted tool discovery call with `query: "storybloq_status"` and a small result limit, which ranks that exact tool to the top, before concluding anything about MCP availability. The prelude is explicitly part of the guard, not a separate pre-guard step; it satisfies the whitelist below.
 
 - If `ToolSearch` itself is not available or returns an error on this harness, SKIP the prelude and continue to step 1. Do NOT treat a missing `ToolSearch` tool as evidence that MCP is unavailable — step 1's `storybloq_status` call will either succeed (MCP already surfaced) or its failure will route the skill to the Step 0 setup/CLI-fallback path below.
 - The prelude is idempotent: on terminal CLI sessions where `storybloq_*` tools are already in the base list, it simply returns the same tool set.
 
-**Whitelist semantics (not blacklist).** While the guard is unresolved, the ONLY actions permitted are: (a) the guard's `ToolSearch` prelude described above, (b) the guard's own `storybloq_status` call as defined in step 1 below, (c) reading the surfaced session metadata, and (d) the guard's `AskUserQuestion` flow. NO other MCP call, file write, file read, or skill-file dispatch is permitted -- this includes `storybloq_handover_create`, `storybloq_snapshot`, `storybloq_export`, `storybloq_ticket_create`, `storybloq_ticket_update`, `storybloq_issue_*`, `storybloq_note_*`, `storybloq_autonomous_guide` with any action other than the user-authorized `resume` / `cancel`, and any read or write inside `.story/sessions/<active-sessionId>/`. Subcommand-specific dispatch (to `autonomous-mode.md`, `orchestrator-mode.md`, `design/design.md`, `review-lenses/review-lenses.md`, `setup-flow.md`, `reference.md`, etc.) is also blocked. The guard is a hard gate, not a soft warning.
+**Whitelist semantics (not blacklist).** While ownership is unresolved, the ONLY permitted actions are the tool-discovery prelude, the exact identity probe above, `storybloq_status` with `{ "format": "json" }`, `storybloq_session_report`, structured/plain-text questioning, and the exact Codex task tools named below. `storybloq_autonomous_guide` is allowed only for automatic same-owner or unowned-legacy COMPACT continuation, explicit expired-COMPACT recovery, confirmed-owner-gone COMPACT takeover, or typed cancellation. The five `storybloq_bus_*` tools are a narrow exception only for an explicit bus invocation or an injected endpoint marker with pending work; they require the current task-bound endpoint and never authorize autonomous-session mutation. A confirmed Bus review finding may also use one idempotent `storybloq_issue_create` call with `dedupeKey`, `sourceRefs`, and reviewer attribution before sending its issue notice. No other file read/write, ledger mutation, subcommand dispatch, or direct access to `.story/sessions/` is permitted. Monitoring is read-only and ends after the report; it never opens a nested Resume/Cancel prompt.
 
-1. Call `storybloq_status` once. If the output contains a `## Active Sessions` heading, OR any subsequent guide call in this invocation fails with an "existing session" / "resumable session" error, you must STOP and surface the situation to the user:
-   - Extract for each surfaced session: the **full `sessionId`** (required for every guide call), plus state, mode, and ticket (if any). Derive the displayed token `<T>` from the full `sessionId` per the Step 3 definition. If `storybloq_status` exposes only a truncated/rendered ID and no way to recover the full `sessionId` for a surfaced session (and the guide-error fallback in Step 3 also does not name a full `sessionId`), STOP. Do NOT offer Resume or Cancel. Tell the user: "A session appears to be active but its full `sessionId` cannot be recovered from the skill's tools. Please inspect `.story/sessions/` or run `storybloq session list` before retrying."
-   - Render one **Active Autonomous Session** block per session (format defined in Step 3).
-   - End with the session-aware `AskUserQuestion` defined in Step 3.
-   - Until the user chooses, no other action is permitted (see whitelist semantics above).
-   - Do NOT write any file under `.story/sessions/<active-sessionId>/`. That directory is owned by the running instance and any cross-instance write races with the owner.
+1. Call `storybloq_status` once with `{ "format": "json" }`. Read both `activeSessions` and `resumableSessions`; deduplicate by full `sessionId`. Each record may include `ownerTask`, `leaseState`, `leaseExpiresAt`, and `compactPending`. If JSON format is unavailable from an older server, call Markdown status once and treat a live non-COMPACT session as unverifiable legacy (Monitor or other work only). For a COMPACT session, follow a SessionStart resume instruction only after the user asks to continue; the guide remains authoritative. Reuse this status result during context loading.
 
-2. If there are no active sessions AND no subsequent "existing/resumable session" errors from any MCP call in this invocation, proceed to the "How to Handle Arguments" routing table and the rest of the normal flow. Reuse the `storybloq_status` response from this step when Step 2 asks for it; do NOT call `storybloq_status` again in the same invocation **except** in the Step 3 guide-error augmentation path explicitly described there.
+2. Compare each session's `ownerTask` with the resolved client profile and current task id:
+   - **Same owner, non-COMPACT:** this is the current autonomous task, not a foreign session. Do not show an Active Autonomous Session banner and do not ask for Resume. Process owner replies such as `Ratify T-020` directly. On a normal context load, one concise line such as `Continuing T-020 in IMPLEMENT` is enough.
+   - **Same owner, COMPACT:** call `storybloq_autonomous_guide` automatically with the full `sessionId`, `action: "resume"`, and `clientTaskId`, then continue the pipeline. Do not ask for another confirmation.
+   - **Different live owner, non-COMPACT:** never call or offer `resume`. Follow the foreign-task UX in Step 3.
+   - **Different live owner, COMPACT:** do not resume automatically. Prefer Open task or Monitor. If the user explicitly asks to recover here, confirm that the recorded owner task is gone, then call `resume` once with the full `sessionId`, current `clientTaskId`, and `takeover: true`.
+   - **Live legacy session without `ownerTask`, non-COMPACT:** ownership cannot be verified. Offer only Monitor or work here on something else.
+   - **Live legacy session without `ownerTask`, COMPACT:** call `resume` with the full `sessionId` and current `clientTaskId`; this migration recovery binds the current task. If task identity is unavailable, the guide preserves legacy resume behavior without binding.
+   - **Expired COMPACT session:** offer Resume here, End session, or Back. Resume only after explicit selection, passing the full `sessionId` and current `clientTaskId`; successful recovery rebinds ownership. End session enters the typed cancellation flow.
 
-3. **Re-trigger rule for `start`.** Any later `storybloq_autonomous_guide` call with `action: "start"` in the SAME `/story` invocation MUST re-run Step 0.5 from the top first, regardless of any prior user choices in this invocation. The guard's prior resolution authorizes only the specific Resume/Cancel/Other branch chosen at that moment; it never authorizes starting a new autonomous session later.
+3. **Codex owner-response relay.** When the current user message is an explicit response for a different live Codex task, relay it automatically if it names that task's active ticket/session or answers a prior guard prompt that identified exactly one session. Use only the exact callable tool `send_message_to_thread` or its namespace-qualified `codex_app__send_message_to_thread`, with the owner's task id and the user's exact message. Send it once, perform no Storybloq call or write, then respond exactly: `Sent to T-020's running task.` (substitute the ticket). If multiple sessions could match, ask the user to name the ticket/session first. If relay is unavailable or fails, use only `navigate_to_codex_page` or `codex_app__navigate_to_codex_page` to open the owner task and tell the user to repeat the response there; otherwise give one concise manual-switch instruction.
 
-This guard has precedence over every "do not ask the user" rule elsewhere in this skill file and in `autonomous-mode.md`. Foreign-session resume or cancel ALWAYS requires explicit user confirmation through `AskUserQuestion`.
+4. **Re-trigger rule for start.** Any later `storybloq_autonomous_guide` call with `action: "start"` must rerun this guard. Choosing Monitor or other work never authorizes a second autonomous session.
+
+This guard overrides every no-confirmation rule elsewhere. A non-COMPACT live lease is never taken over; a foreign COMPACT lease requires explicit confirmation that its recorded owner is gone. Cancellation is absent from the primary picker and is exposed only after an explicit cancel request, followed by exact typed confirmation `cancel <token>`.
 
 ## How to Handle Arguments
 
@@ -54,6 +64,7 @@ This guard has precedence over every "do not ask the user" rule elsewhere in thi
 - `/story review-lenses` -> run multi-lens review on current diff (read `review-lenses/review-lenses.md` in the same directory as this skill file; if not found, tell user to run `storybloq setup --client all`). Note: the autonomous guide invokes lenses automatically when `reviewBackends` includes `"lenses"` -- this command is for manual/debug use.
 - `/story federation` -> set up multi-repo orchestrator (read `federation-setup.md` in the same directory as this skill file; if not found, tell user to run `storybloq setup --client all`)
 - `/story orchestrate` -> drive the backlog as orchestrator/pen with tiered background agents (read `orchestrator-mode.md` in the same directory as this skill file; if not found, tell user to run `storybloq setup --client all`)
+- `/story bus` -> poll or coordinate with the current task-bound Storybloq Bus endpoint (read `bus-mode.md` in the same directory as this skill file; if not found, tell user to run `storybloq setup --client all`)
 - `/story help` -> show all capabilities (read `reference.md` in the same directory as this skill file; if not found, tell user to run `storybloq setup --client all`)
 
 If the user's intent doesn't match any of these, use the full context load.
@@ -62,11 +73,11 @@ If the user's intent doesn't match any of these, use the full context load.
 
 Check if the storybloq MCP tools are available.
 
-**Deferred tools note (Claude Code app).** Claude Code desktop/web may register MCP tools at session start but defer exposing their full schemas to your tool list until you explicitly request them. A naive "look for `storybloq_status` in available tools" check fails on a cold session even when the MCP server is healthy and connected, routing the skill to the CLI fallback unnecessarily. The Step 0.5 guard prelude above (the `ToolSearch` call) has already force-surfaced any deferred tools by this point, so this step only needs to check the current tool list:
+**Deferred tools note.** Some clients may register MCP tools at session start but defer exposing their full schemas to your tool list until you explicitly request them. A naive "look for `storybloq_status` in available tools" check fails on a cold session even when the MCP server is healthy and connected, routing the skill to the CLI fallback unnecessarily. The Step 0.5 guard prelude above has already force-surfaced any deferred tools by this point, so this step only needs to check the current tool list:
 
 1. **Check for storybloq MCP tools in your tool list.** If any `storybloq_*` tools (for example `storybloq_status`) are present, MCP is available -- proceed to Step 1.
-2. **If no `storybloq_*` tools are present**, try a `ToolSearch` call with `query: "storybloq"` and `max_results: 80` (and, if `storybloq_status` is still not listed, a targeted `query: "storybloq_status"`, `max_results: 5`) as a safety net in case the guard prelude was skipped or failed silently. If the response lists any `storybloq_*` tools, proceed to Step 1.
-3. **If `ToolSearch` is unavailable on this harness OR returned no matches**, MCP is genuinely unavailable -- continue with the setup/fallback path below. Missing `ToolSearch` is never by itself evidence that MCP is broken; it just means the harness exposes tools differently.
+2. **If no `storybloq_*` tools are present**, try a tool discovery call with `query: "storybloq"` and a high result limit (and, if `storybloq_status` is still not listed, a targeted `query: "storybloq_status"` with a small result limit) as a safety net in case the guard prelude was skipped or failed silently. If the response lists any `storybloq_*` tools, proceed to Step 1.
+3. **If tool discovery is unavailable on this harness OR returned no matches**, MCP is genuinely unavailable -- continue with the setup/fallback path below. Missing tool discovery is never by itself evidence that MCP is broken; it just means the harness exposes tools differently.
 
 **If MCP tools are NOT available:**
 
@@ -121,23 +132,17 @@ After `storybloq_status` returns, check in order:
 
 After loading context, present a summary with two parts: a conversational intro (2-3 sentences catching the user up), then structured tables showing actionable data.
 
-**IF Step 0.5 surfaced any active session, see the "Active session variant" at the end of this section -- it REPLACES the normal summary. Do NOT render Ready to Work, Decisions Pending, Open Issues, Key Rules, or the First session guide in that case.**
+**If Step 0.5 surfaces a foreign live, legacy live, or expired COMPACT session, use the session variant at the end of this section; it replaces the normal summary. A same-owner session does not use that variant.**
 
-**Session token definition.** Throughout this section and in `autonomous-mode.md`, the symbol `<T>` (or `<T1>`, `<T2>`, ...) refers to the **session token**: the shortest prefix of a session's full `sessionId` that is unique among all sessions surfaced by the current guard invocation. Start with `min(8, len(sessionId))` characters; if any two surfaced sessions share that same prefix, extend the displayed prefix for ALL sessions in this invocation until every token is distinct. The full `sessionId` always satisfies uniqueness and is the ultimate fallback.
+**Recovery token definition.** Use a raw Storybloq session token only for ambiguous COMPACT recovery or explicit administrative cancellation. `<T>` is the shortest unique prefix of the full `sessionId`, starting at eight characters and extending until unique. Guide calls always use the full `sessionId`; the token is only for typed confirmation.
 
-All guide calls (`action: "resume"`, `action: "cancel"`) MUST pass the full `sessionId`, not `<T>`. The token exists so the user can type a short readable confirmation; the agent resolves the token back to the full `sessionId` by matching it against the surfaced session list before calling the guide.
-
-If the guard fired via a guide error path, apply these rules in order:
-
-1. If the error names exactly ONE blocking full `sessionId`, use that full `sessionId` directly as the sole session token and render `Resume <full-sessionId>` / `Cancel <full-sessionId>` from the error. Do NOT depend on `storybloq_status` for this path -- the blocking session may be stale or resumable and absent from the status scan while still being what the guide error refers to.
-2. Optionally, re-call `storybloq_status` to augment the banner with state/ticket/mode details. If the status response includes the same sessionId, use the enriched info for the banner; if not, render the banner with only the sessionId and the error's description.
-3. If the error does NOT name a resolvable full `sessionId` AND `storybloq_status` returns no matching session, STOP. Do NOT offer any Resume or Cancel action in that state. Tell the user: "A session appears to block this action but cannot be safely identified. Please inspect `.story/sessions/` or run `storybloq session list` before retrying."
+If a guide call reports an existing/resumable session that was absent from status JSON, rerun the guard once. A named session may be inspected with `storybloq_session_report`, but a live session is never offered Resume. If state, lease, or full identity still cannot be determined, stop and tell the user to run `storybloq session list`; do not guess.
 
 **Orchestrate gates (compute BEFORE composing Part 1).**
 
 Execution order is fixed: first obtain the Part 2 `storybloq_recommend` result (with `count: 10`) and evaluate BOTH gates below; only then compose Part 1, and render Part 1, Part 2, Part 3 in that order. The gates decide whether the `/story orchestrate` working style is surfaced at all -- this is a recommendation, never an auto-start; selecting it still routes through the explicit opt-in in `orchestrator-mode.md` Step 1.
 
-- **Gate A -- capability (exact-name allowlist, fails closed).** Probe your own harness for background-orchestration tools by EXACT tool name only. No fuzzy or keyword matching. The allowlist of names that signal capability is exactly `Workflow`, `Agent`, and `Task` -- the documented multi-agent tool names across supported clients (`Workflow` for dynamic-workflow clients; `Agent` and `Task` for subagent clients). Gate A passes only when at least one of those exact tool names is available to you in this session. Any other or ambiguous tool surface fails closed: Gate A does not pass and the orchestrate option is simply not surfaced.
+- **Gate A -- capability (exact-name allowlist, fails closed).** Probe your own harness for background-orchestration tools by EXACT callable tool name or namespace-qualified identifier only. No fuzzy or keyword matching. The allowlist of names that signal capability is exactly `Workflow`, `Agent`, `Task`, `multi_agent_v1.spawn_agent`, `multi_agent_v1__spawn_agent`, and `spawn_agent` -- the documented multi-agent tool names across supported clients (`Workflow` for dynamic-workflow clients, `Agent` / `Task` for subagent clients, and the dotted or normalized `multi_agent_v1` spelling / exact `spawn_agent` for Codex subagent clients). Gate A passes only when at least one of those exact tool names is available to you in this session. A description, namespace, plugin, or skill that merely mentions agents does not pass. Any other or ambiguous tool surface fails closed: Gate A does not pass and the orchestrate option is simply not surfaced.
 
 - **Gate B -- backlog size (deterministic).** Compute over the loaded `storybloq_recommend` result (`count: 10`): count every row whose `kind` is `"ticket"`; for every row whose `kind` is `"issue"`, call `storybloq_issue_get` and count it ONLY when its status is `open` or `inprogress` AND no explicit blocker or owner-gated marker appears in its `impact` or `resolution` fields; never count a row whose `kind` is `"action"`. Gate B passes when that count is 5 or more. Federation bypass: on an orchestrator project, Gate B ALSO passes when storybloq_node_list returns at least one configured node (storybloq_node_list is the source of truth for the node count).
 
@@ -205,7 +210,7 @@ Default state (the orchestrate gates did NOT both pass):
 - question: "What would you like to do?"
 - header: "Next"
 - options:
-  - "Work on [first recommended ticket ID + title] (Recommended)" -- the top ticket from the Ready table
+  - "Work on [first recommended item ID + title] (Recommended)" -- the top item from the Ready table, whether ticket or issue
   - "Something else" -- I'll ask what you have in mind
   - "Autonomous mode" -- I'll pick tickets, plan, review, build, commit, and loop until done
 - (Other always available for free-text input)
@@ -213,65 +218,31 @@ Default state (the orchestrate gates did NOT both pass):
 Autonomous mode is last -- most users want to collaborate, not hand off control.
 
 Orchestrate variant (ONLY when Gate A and Gate B BOTH passed): render exactly THREE explicit options and DROP "Something else" (the question tool's built-in free-text Other path covers it):
-- "Work on [first recommended ticket ID + title]" -- the top ticket from the Ready table
+- "Work on [first recommended item ID + title]" -- the top item from the Ready table, whether ticket or issue
 - "Orchestrate the backlog" -- drive the backlog with tiered background agents: enrichment pass, review gates, batched ships
 - "Autonomous mode" -- I'll pick tickets, plan, review, build, commit, and loop until done
 
-Note (agent-facing meta-rules, do NOT render as option text): "Orchestrate the backlog" sits directly above "Autonomous mode". Mark exactly one option `(Recommended)`: give it to "Orchestrate the backlog" ONLY when the backlog is large AND there is no single obvious in-progress thread; otherwise the top ticket keeps `(Recommended)` and orchestrate is offered without the marker. Never exceed three explicit options in this state. Selecting "Orchestrate the backlog" routes to `orchestrator-mode.md` with Step 1 unchanged (node guard + blast-radius confirmation), so the recommendation never bypasses the explicit opt-in.
+Note (agent-facing meta-rules, do NOT render as option text): "Orchestrate the backlog" sits directly above "Autonomous mode". Mark exactly one option `(Recommended)`: give it to "Orchestrate the backlog" ONLY when the backlog is large AND there is no single obvious in-progress thread; otherwise the top item keeps `(Recommended)` and orchestrate is offered without the marker. Never exceed three explicit options in this state. Selecting "Orchestrate the backlog" routes to `orchestrator-mode.md` with Step 1 unchanged (node guard + blast-radius confirmation), so the recommendation never bypasses the explicit opt-in.
 
-**Active session variant (REPLACES the normal summary when Step 0.5 surfaced any active session):**
+**Foreign/legacy/resumable session variant:**
 
-Render ONLY:
+Render only a short intro, one compact session line, and the relevant question. Do not render Ready to Work, Decisions Pending, Open Issues, Key Rules, or the first-session guide.
 
-1. The conversational intro (2-3 sentences). Do NOT reference Ready to Work or recommend a ticket.
-2. One Active Autonomous Session banner per surfaced session, in this format:
+**Different live task with verified owner:**
 
 ```
-## Active Autonomous Session
-Session `<T>` is running in <state> state, ticket <ticketId>: <title> (or "no ticket").
+T-020 is already running in another Codex task (IMPLEMENT).
 ```
 
-   (Where `<T>` is the session token defined at the top of Step 3.)
+When structured interaction is available, offer at most three choices: `Open task` (recommended when exact task navigation is callable), `Monitor`, and `Work here on something else`. Without a picker ask one free-form question naming those reply shapes in prose. `Open task` calls only `navigate_to_codex_page` or `codex_app__navigate_to_codex_page` with `ownerTask.id`. `Monitor` calls `storybloq_session_report`, summarizes once, and stops. `Work here on something else` asks for the item and permits a collaborative flow, but never starts a second autonomous session or writes inside the live session directory. Never display or offer routine live Resume. For COMPACT only, an explicit request to recover here starts a separate confirmation that the recorded owner is gone; after confirmation call guide `resume` with `clientTaskId` and `takeover: true`.
 
-3. The session-aware `AskUserQuestion` described below.
+**Live legacy session without ownerTask:** for a non-COMPACT session, say that the ticket is running but task ownership cannot be verified and offer Monitor or other work. For COMPACT, recover the existing session with the current `clientTaskId`; this binds ownership and avoids waiting for lease expiry. Do not expose a raw session token unless recovery is ambiguous.
 
-Do NOT render Ready to Work, Decisions Pending, Open Issues, Key Rules, or the First session guide in this variant. If the user wants a specific non-session ticket, they will name it via the free-form "Other" option.
+**Expired COMPACT recovery:** show the ticket/state and offer `Resume here`, `End session`, or `Back`. `Resume here` calls the guide with the full `sessionId`, `action: "resume"`, and current `clientTaskId`; continue directly after success. `End session` requires typed `cancel <T>` confirmation before calling `action: "cancel"` with the matching full `sessionId`. Any nonmatching input aborts without a guide call. Raw tokens are allowed here because recovery is administrative and ambiguous without them.
 
-**AskUserQuestion -- single active session** (let `<T>` = that session's token, typically 8 characters since the single-session case is always unique):
+**Explicit cancellation of a live session:** cancellation is never in the primary live-session choices. Only after the user explicitly asks to cancel, display `<T>` and require the exact lowercase text `cancel <T>` after trimming outer whitespace. On a match call `action: "cancel"` with the full session id; otherwise do nothing. Rerun the guard after successful cancellation.
 
-- "Monitor -- read-only, don't interfere (Recommended)"
-  -> READ-ONLY PAUSE (no guide calls unless the nested follow-up question below selects Resume or Cancel). Re-render the Active Autonomous Session banner only. Do NOT show Ready to Work. Do NOT call the guide. Do NOT write to the session's directory. End with a follow-up `AskUserQuestion` whose options are exactly: "Resume `<T>`", "Cancel `<T>`", and "Back" (returns to the previous question without action). The guard remains in force on any subsequent `/story` invocation.
-- "Resume `<T>` -- take over (only safe if the owning instance is gone)"
-  -> call `storybloq_autonomous_guide` with `action: "resume"` and the full `sessionId` that `<T>` resolves to. The guide arbitrates the lease and will fail if another instance still holds it. This selection IS the explicit user authorization that `autonomous-mode.md`'s recovery instructions require FOR THAT SPECIFIC `sessionId` ONLY.
-- "Cancel `<T>` -- destructive"
-  -> Ask the user to type `cancel <T>` to confirm. **Match rules:** trim leading/trailing whitespace, then require an exact lowercase match of the literal string `cancel <T>` where `<T>` matches the displayed token character-for-character (case-sensitive). Any other input -- including `Cancel <T>`, `cancel  <T>` (extra whitespace inside), `cancel <full-sessionId>` when the displayed token was a prefix, or `back` -- aborts the cancel flow and returns to the guard's top-level question without calling the guide. On a matching confirmation, call the guide with `action: "cancel"` and the full `sessionId` that `<T>` resolves to. Only after the cancel succeeds may the agent proceed to normal `/story` flow.
-- (Other always available) -- user may type a specific ticket ID to work on. If they do:
-  - Treat the named ticket as explicitly user-chosen.
-  - Proceed with a **collaborative single-ticket flow**: read the ticket via `storybloq_ticket_get`, discuss, and work on it directly with the user in this session.
-  - Do NOT call `storybloq_autonomous_guide` with `action: "start"` as part of accepting this branch. Starting a new autonomous session while another is live defeats the guard. If the user later asks to "go autonomous on this ticket" mid-flow, the re-trigger rule in Step 0.5 item 3 applies: re-run Step 0.5 from the top before any `action: "start"` call.
-  - Do NOT write to any `.story/sessions/<active-sessionId>/` directory. Normal project-level writes (tickets, issues, code) are fine.
-  - Do NOT auto-pick or auto-suggest a ticket; act only on the name the user typed.
-
-**AskUserQuestion -- multiple active sessions** (tokens `<T1>`, `<T2>`, ... -- each token is the shortest prefix unique across this guard invocation):
-
-Render one banner per session, then ask a single `AskUserQuestion` with one Resume option and one Cancel option per session:
-
-- "Monitor -- read-only, don't interfere (Recommended)"
-  -> Same READ-ONLY PAUSE as the single-session case, but the nested follow-up question offers "Resume `<T1>`", "Cancel `<T1>`", "Resume `<T2>`", "Cancel `<T2>`", ..., "Back".
-- "Resume `<T1>`" / "Resume `<T2>`" / ...
-  -> Each targets exactly the named session; call the guide with `action: "resume"` and the full `sessionId` that the token resolves to. Authorization is scoped to that `sessionId` ONLY.
-- "Cancel `<T1>`" / "Cancel `<T2>`" / ...
-  -> Each targets exactly the named session. Require typed `cancel <Ti>` confirmation before calling `action: "cancel"` with the matching full `sessionId`. The same match rules apply as single-session Cancel (trim outer whitespace, exact lowercase match of `cancel <Ti>` with `<Ti>` matching its displayed token character-for-character; any deviation aborts without a guide call).
-- (Other) -- free-form. User may type a non-session ticket ID to work on. Same rules as the single-session "Other" branch: collaborative single-ticket flow, no new autonomous-session start as part of accepting this branch, no writes to any active-session directory. Any later `action: "start"` request triggers the Step 0.5 re-trigger rule (item 3).
-
-**Post-action behavior depends on the action type (Resume vs Cancel):**
-
-- After a successful `Resume <Ti>`: do NOT re-run Step 0.5 as a prerequisite to continuing INTO that resumed session. The user's selection authorizes that specific full `sessionId` **only for the duration of driving that resumed session**. Hand off to `autonomous-mode.md` and drive the resumed session through its normal pipeline. **Deterministic re-entry rules (apply in either branch):**
-  1. If a later guide call in the resumed flow surfaces a DIFFERENT blocking `sessionId` via the guide-error path, Step 0.5 re-fires immediately for that new session.
-  2. If the resumed session ends, completes, errors out, or otherwise yields control back to general `/story` flow in the same invocation -- AND/OR if the agent is asked to perform any non-resume action against this project (other tickets, snapshots, handovers, exports, settings, design, lenses, help, status, or starting a new autonomous session) -- re-run Step 0.5 from the top BEFORE acting. This is unconditional in BOTH the single-session and multi-session branches; do not guess whether other sessions still exist. Authorization for the just-resumed `sessionId` does not extend to anything else.
-- After a successful `Cancel <Ti>`: re-run Step 0.5 from the top before returning to normal `/story` flow. If other active or resumable sessions remain, stay in the Active session variant and render it again with the updated session list. Only proceed to the normal summary once Step 0.5 surfaces zero active sessions and zero guide-error paths.
-
-Never auto-select. Never skip the question. Never write to any active session's directory until one of these choices is made.
+**Multiple possible sessions:** do not relay, open, resume, or cancel until the user identifies the ticket/session. Monitoring remains read-only. Never write to an owning session directory from the observing task.
 
 ## Session Lifecycle
 
@@ -281,7 +252,7 @@ Never auto-select. Never skip the question. Never write to any active session's 
 
 **Never modify or overwrite existing handover files.** Handovers are append-only historical records. Always create new handover files -- never edit, replace, or write to an existing one. If you need to correct something from a previous session, create a new handover that references the correction. This prevents accidental data loss during sessions.
 
-Before writing a handover at the end of a session, run `storybloq snapshot` first. This ensures the next session's recap can show what changed. If Claude setup has been run, a PreCompact hook auto-takes snapshots before context compaction.
+Before writing a handover at the end of a session, run `storybloq snapshot` first. This ensures the next session's recap can show what changed. When client setup has installed hooks, a PreCompact hook prepares Storybloq state before context compaction.
 
 **Lessons** capture non-obvious process learnings that should carry forward across sessions. At the end of a significant session, review what you learned and create lessons via `storybloq_lesson_create` for:
 - Patterns that worked (or failed) and why
@@ -304,6 +275,8 @@ Don't duplicate what's already in the handover -- lessons are structured, tagged
 
 When working on a task and you encounter a bug, inconsistency, or improvement opportunity that is out of scope for the current ticket, create an issue using `storybloq issue create` (CLI) with a clear title, severity, and impact description. Don't fix it in the current task, don't ignore it -- log it. This keeps the issue tracker growing organically and ensures nothing discovered during work is lost. When orchestrating (`/story orchestrate`), anything the orchestrator files for later execution must be portable enough for the lowest permitted execution tier, so every ticket or issue you file is born in the enrichment template documented in `orchestrator-mode.md`, not a bare paragraph.
 
+**External and manual review filing:** Confirmed findings belong in the ledger directly, without a human copy/paste relay. Search for an existing issue first, then call `storybloq_issue_create` with reviewer attribution in `createdBy`, a stable retry identity in `dedupeKey`, and structured `sourceRefs` containing the review ID plus the reviewed path, line range, and revision when known. A good cross-agent key is `<review-id>:<finding-id>`; retries with the same key return the existing issue. Keep the new issue `open`. The implementing agent owns status and resolution. File uncertain design questions as notes or ask the owner instead of presenting them as confirmed defects. Never store source excerpts in custom metadata; Storybloq captures a line-range hash.
+
 When starting work on a ticket, update its status to `inprogress`. When done, update to `complete` in the same commit as the code change.
 
 **Frontend design guidance:** When working on UI or frontend tickets, read `design/design.md` in the same directory as this skill file for design principles and platform-specific best practices. Follow its priority order (clarity > hierarchy > platform correctness > accessibility > state completeness) and load the relevant platform reference. This applies to any ticket involving components, layouts, styling, or visual design.
@@ -317,15 +290,15 @@ Ticket and issue create/update operations are available via both CLI and MCP too
 CLI examples:
 - `storybloq ticket create --title "..." --type task --phase p0`
 - `storybloq ticket update T-001 --status complete`
-- `storybloq issue create --title "..." --severity high --impact "..."`
+- `storybloq issue create --title "..." --severity high --impact "..." --created-by "reviewer" --dedupe-key "review-42:finding-3" --source-ref '{"path":"src/file.ts","startLine":42,"revision":"<commit-sha>","reviewId":"review-42"}'`
 
 Phase defaulting: if `phase` is omitted on ticket/issue create, it defaults to the current working phase (first non-complete phase with tickets), so items never land unphased. Pass `--phase` / `phase` explicitly to file into a different phase.
 
 MCP examples:
 - `storybloq_ticket_create` with `title`, `type`, and optional `phase`, `description`, `blockedBy`, `parentTicket`
 - `storybloq_ticket_update` with `id` and optional `status`, `title`, `order`, `description`, `phase`, `parentTicket`
-- `storybloq_issue_create` with `title`, `severity`, `impact`, and optional `components`, `relatedTickets`, `location`, `phase`
-- `storybloq_issue_update` with `id` and optional `status`, `title`, `severity`, `impact`, `resolution`, `components`, `relatedTickets`, `location`
+- `storybloq_issue_create` with `title`, `severity`, `impact`, and optional `components`, `relatedTickets`, `location`, `sourceRefs`, `dedupeKey`, `createdBy`, `phase`
+- `storybloq_issue_update` with `id` and optional `status`, `title`, `severity`, `impact`, `resolution`, `components`, `relatedTickets`, `location`, `sourceRefs`
 
 Read operations (list, get, next, blocked) are available via both CLI and MCP.
 
@@ -356,6 +329,7 @@ When the user runs `/story settings` or asks about project config, show current 
 |---------|-------|
 | Max tickets per session | 5 |
 | Review backends | codex, agent |
+| Code review round cap | 12 (minimum still follows ticket risk) |
 | Handover interval | every 3 tickets |
 | Compact threshold | high (default) |
 | TDD (WRITE_TESTS) | enabled |
@@ -406,7 +380,7 @@ options:
 - "None" -- skip automated review
 ```
 
-Note: this sets the top-level `reviewBackends`. If the config has per-stage overrides in `stages.PLAN_REVIEW.backends` or `stages.CODE_REVIEW.backends`, those take precedence. When displaying settings, check for per-stage overrides and show them if present.
+Note: this sets the top-level `reviewBackends`. If the config has per-stage overrides in `stages.PLAN_REVIEW.backends` or `stages.CODE_REVIEW.backends`, those take precedence. `stages.CODE_REVIEW.maxReviewRounds` defaults to 12 and is clamped upward to the ticket-risk minimum; `0` explicitly disables the cap. When displaying settings, show both per-stage backends and this cap when present.
 
 **Handover frequency:**
 ```
@@ -452,7 +426,7 @@ Do NOT search source code for this. The full config.json schema is shown below. 
   "recipe": "string (default: coding)",
   "recipeOverrides": {
     "maxTicketsPerSession": "number (0 = unlimited, default: 0)",
-    "compactThreshold": "string (high/medium/low, default: high)",
+    "compactThreshold": "string (medium/high/critical; selects pressure limits and rotation trigger; default: high)",
     "reviewBackends": ["codex", "agent"],
     "handoverInterval": "number (default: 3)",
     "stages": {
@@ -479,7 +453,8 @@ Do NOT search source code for this. The full config.json schema is shown below. 
         "backends": ["codex", "agent"]
       },
       "CODE_REVIEW": {
-        "backends": ["codex", "agent"]
+        "backends": ["codex", "agent"],
+        "maxReviewRounds": "number (default: 12; 0 disables; otherwise effective cap is max(value, required risk rounds))"
       },
       "LESSON_CAPTURE": { "enabled": "boolean" },
       "ISSUE_SWEEP": { "enabled": "boolean" }

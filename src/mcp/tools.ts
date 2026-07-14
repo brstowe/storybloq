@@ -14,8 +14,11 @@ import { initProject } from "../core/init.js";
 import { handleNodeList } from "../cli/commands/node.js";
 import { resolveNodePath } from "../federation/resolver.js";
 import { TARGET_WORK_INPUT_REGEX, LENS_FINDING_DISPOSITIONS } from "../autonomous/session-types.js";
+import { CLIENT_TASK_ID_PATTERN } from "../autonomous/client-profile.js";
 import { findActiveSessionMinimal, readSessionResilient, sessionDir, isLeaseExpired } from "../autonomous/session.js";
 import { touchLastMcpCallFile } from "../autonomous/liveness.js";
+import { ConfigSchema } from "../models/config.js";
+import { registerBusTools } from "./bus-tools.js";
 
 // ISS-407: Cache active session dir to avoid O(n) directory scan on every MCP call.
 // Expires after 30s -- long enough to amortize hot-path calls, short enough
@@ -24,7 +27,7 @@ const _SESSION_CACHE_TTL_MS = 30_000;
 let _cachedSessionDir: string | null = null;
 let _cachedSessionAt = 0;
 
-function touchMcpLiveness(pinnedRoot: string): void {
+export function touchMcpLiveness(pinnedRoot: string): void {
   const now = Date.now();
   if (_cachedSessionDir && now - _cachedSessionAt < _SESSION_CACHE_TTL_MS) {
     touchLastMcpCallFile(_cachedSessionDir);
@@ -45,11 +48,13 @@ import {
   registerSubprocess,
   unregisterSubprocess,
 } from "../autonomous/subprocess-registry.js";
-import { handlePrepare, handleSynthesize, handleJudge, generateIssueKey } from "../autonomous/lens-harness/index.js";
+import { handlePrepare, handleSynthesize, handleJudge, generateIssueKey, generateReviewFilingKey } from "../autonomous/lens-harness/index.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 
 import { loadProject } from "../core/project-loader.js";
 import { ProjectLoaderError, INTEGRITY_WARNING_TYPES } from "../core/errors.js";
+import { scanLedgerIntegrity } from "../core/ledger-integrity.js";
+import { formatLedgerIntegrity } from "../core/output-formatter.js";
 import { CliValidationError } from "../cli/helpers.js";
 import {
   TICKET_ID_REGEX,
@@ -67,14 +72,19 @@ import {
   NOTE_STATUSES,
   LESSON_STATUSES,
   LESSON_SOURCES,
+  type OutputFormat,
 } from "../models/types.js";
 import type { CommandContext, CommandResult } from "../cli/types.js";
+import {
+  IssueDedupeKeySchema,
+  IssueSourceRefInputSchema,
+} from "../models/issue.js";
 
 import { withProjectLock } from "../core/project-loader.js";
 
 // Handler imports — pure functions, no run.ts side effects
 import { handleStatus } from "../cli/commands/status.js";
-import { handleValidate } from "../cli/commands/validate.js";
+import { handleValidateWithSourceRefs } from "../cli/commands/validate.js";
 import {
   handleHandoverList,
   handleHandoverLatest,
@@ -146,8 +156,11 @@ const INFRASTRUCTURE_ERROR_CODES: readonly string[] = [
 ];
 
 
-/** Consistent error text format for all isError: true MCP responses. */
-function formatMcpError(code: string, message: string): string {
+/** Consistent error format for all isError: true MCP read responses. */
+function formatMcpError(code: string, message: string, format: OutputFormat = "md"): string {
+  if (format === "json") {
+    return JSON.stringify({ version: 1, error: { code, message } }, null, 2);
+  }
   return `[${code}] ${message}`;
 }
 
@@ -155,7 +168,7 @@ function formatMcpError(code: string, message: string): string {
  * Shared pipeline for all MCP read tools.
  *
  * 1. Load project (permissive mode)
- * 2. Build CommandContext with format: "md"
+ * 2. Build CommandContext with the requested format (default: "md")
  * 3. Call handler
  * 4. Classify result via errorCode + INFRASTRUCTURE_ERROR_CODES
  * 5. Prepend integrity warning notice if warnings present
@@ -164,6 +177,7 @@ export async function runMcpReadTool(
   pinnedRoot: string,
   handler: (ctx: CommandContext) => Promise<CommandResult> | CommandResult,
   effectiveRoot?: string,
+  format: OutputFormat = "md",
 ): Promise<McpToolResult> {
   // Liveness is always anchored to pinnedRoot (the orchestrator), not the effective node root.
   try { touchMcpLiveness(pinnedRoot); } catch { /* best-effort */ }
@@ -171,14 +185,14 @@ export async function runMcpReadTool(
   try {
     const { state, warnings } = await loadProject(loadRoot);
     const handoversDir = join(loadRoot, ".story", "handovers");
-    const ctx: CommandContext = { state, warnings, root: loadRoot, handoversDir, format: "md" };
+    const ctx: CommandContext = { state, warnings, root: loadRoot, handoversDir, format };
 
     const result = await handler(ctx);
 
     // Classify: infrastructure errorCode → isError: true
     if (result.errorCode && INFRASTRUCTURE_ERROR_CODES.includes(result.errorCode)) {
       return {
-        content: [{ type: "text", text: formatMcpError(result.errorCode, result.output) }],
+        content: [{ type: "text", text: formatMcpError(result.errorCode, result.output, format) }],
         isError: true,
       };
     }
@@ -193,26 +207,39 @@ export async function runMcpReadTool(
       (INTEGRITY_WARNING_TYPES as readonly string[]).includes(w.type),
     );
     if (integrityWarnings.length > 0) {
-      const details = integrityWarnings
-        .slice(0, 5)
-        .map((w) => `  - ${w.file}: ${w.message}`)
-        .join("\n");
-      const more = integrityWarnings.length > 5
-        ? `\n  ... and ${integrityWarnings.length - 5} more. Run storybloq_validate for the full list.`
-        : "";
-      text = `Warning: ${integrityWarnings.length} item(s) skipped due to data integrity issues:\n${details}${more}\n\n${text}`;
+      if (format === "json") {
+        const parsed = JSON.parse(text) as Record<string, unknown>;
+        text = JSON.stringify({
+          ...parsed,
+          warnings: integrityWarnings.map((warning) => ({
+            type: warning.type,
+            file: warning.file,
+            message: warning.message,
+          })),
+          partial: true,
+        }, null, 2);
+      } else {
+        const details = integrityWarnings
+          .slice(0, 5)
+          .map((w) => `  - ${w.file}: ${w.message}`)
+          .join("\n");
+        const more = integrityWarnings.length > 5
+          ? `\n  ... and ${integrityWarnings.length - 5} more. Run storybloq_validate for the full list.`
+          : "";
+        text = `Warning: ${integrityWarnings.length} item(s) skipped due to data integrity issues:\n${details}${more}\n\n${text}`;
+      }
     }
 
     return { content: [{ type: "text", text }] };
   } catch (err: unknown) {
     if (err instanceof ProjectLoaderError) {
-      return { content: [{ type: "text", text: formatMcpError(err.code, err.message) }], isError: true };
+      return { content: [{ type: "text", text: formatMcpError(err.code, err.message, format) }], isError: true };
     }
     if (err instanceof CliValidationError) {
-      return { content: [{ type: "text", text: formatMcpError(err.code, err.message) }], isError: true };
+      return { content: [{ type: "text", text: formatMcpError(err.code, err.message, format) }], isError: true };
     }
     const message = err instanceof Error ? err.message : String(err);
-    return { content: [{ type: "text", text: formatMcpError("io_error", message) }], isError: true };
+    return { content: [{ type: "text", text: formatMcpError("io_error", message, format) }], isError: true };
   }
 }
 
@@ -284,12 +311,25 @@ function resolveEffectiveRootForWrite(pinnedRoot: string, nodeName?: string): { 
 }
 
 export function registerAllTools(server: McpServer, pinnedRoot: string): void {
+  try {
+    const parsed = ConfigSchema.safeParse(JSON.parse(readFileSync(join(pinnedRoot, ".story", "config.json"), "utf-8")));
+    if (parsed.success && parsed.data.features.bus === true) {
+      registerBusTools(server, pinnedRoot, () => touchMcpLiveness(pinnedRoot));
+    }
+  } catch {
+    // Normal tools still register. Project loading reports config damage.
+  }
+
   // --- No-arg tools ---
 
   server.registerTool("storybloq_status", {
     description: "Project summary: phase statuses, ticket/issue counts, blockers, current phase",
-  }, async () => {
-    const result = await runMcpReadTool(pinnedRoot, handleStatus);
+    inputSchema: {
+      format: z.enum(["md", "json"]).optional().describe("Output format (default: md)"),
+    },
+  }, async (args) => {
+    const format = args.format ?? "md";
+    const result = await runMcpReadTool(pinnedRoot, handleStatus, undefined, format);
     // ISS-570 G2: prepend update-available notice so /story's first MCP
     // call surfaces 'newer storybloq available' proactively. Synchronous
     // cache read; a background refresh is kicked off so the NEXT status
@@ -299,7 +339,7 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
       const running = process.env.STORYBLOQ_VERSION ?? "0.0.0-dev";
       const info = readUpdateCacheSync(running);
       refreshUpdateCacheInBackground();
-      if (info?.updateAvailable && result.content[0]?.type === "text") {
+      if (format === "md" && info?.updateAvailable && result.content[0]?.type === "text") {
         const banner = `A newer storybloq is available (v${info.latestVersion}). Run \`npm install -g @storybloq/storybloq@latest\` -- the CLI will auto-refresh the /story skill on next invocation.\n\n`;
         return {
           ...result,
@@ -354,8 +394,25 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
   }, () => runMcpReadTool(pinnedRoot, handleBlockerList));
 
   server.registerTool("storybloq_validate", {
-    description: "Reference integrity + schema checks on all .story/ files",
-  }, () => runMcpReadTool(pinnedRoot, handleValidate));
+    description: "Reference integrity + schema checks. The integrity preflight works even when critical JSON prevents normal project loading.",
+    inputSchema: {
+      format: z.enum(["md", "json"]).optional().describe("Output format (default: md)"),
+      integrityOnly: z.boolean().optional().describe("Scan all .story JSON without loading project state"),
+    },
+  }, async (args) => {
+    const format = args.format ?? "md";
+    const integrity = await scanLedgerIntegrity(pinnedRoot, {
+      includeAuxiliary: args.integrityOnly === true,
+    });
+    if (args.integrityOnly || !integrity.valid) {
+      try { touchMcpLiveness(pinnedRoot); } catch { /* best-effort */ }
+      return {
+        content: [{ type: "text" as const, text: formatLedgerIntegrity(integrity, format) }],
+        ...(integrity.criticalErrorCount > 0 ? { isError: true } : {}),
+      };
+    }
+    return runMcpReadTool(pinnedRoot, handleValidateWithSourceRefs, undefined, format);
+  });
 
   // --- Parameterized tools ---
 
@@ -654,6 +711,9 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
       components: z.array(z.string()).optional().describe("Affected components"),
       relatedTickets: z.array(TicketRefSchema).optional().describe("Related ticket IDs"),
       location: z.array(z.string()).optional().describe("File locations"),
+      sourceRefs: z.array(IssueSourceRefInputSchema).optional().describe("Structured source provenance. Missing hashes are captured from the reviewed revision or working tree."),
+      dedupeKey: IssueDedupeKeySchema.optional().describe("Idempotency key. A repeated create returns the existing issue."),
+      createdBy: z.string().min(1).max(256).optional().describe("Reviewer or agent attribution"),
       phase: z.string().optional().describe("Phase ID (defaults to the current working phase if omitted)"),
       project: z.string().optional().describe("Project ID to assign (must belong to the issue's phase)"),
       node: nodeParam,
@@ -670,6 +730,9 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
           components: args.components ?? [],
           relatedTickets: args.relatedTickets ?? [],
           location: args.location ?? [],
+          sourceRefs: args.sourceRefs,
+          dedupeKey: args.dedupeKey,
+          createdBy: args.createdBy,
           phase: args.phase,
           project: args.project ?? null,
         },
@@ -691,6 +754,7 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
       components: z.array(z.string()).optional().describe("Affected components"),
       relatedTickets: z.array(TicketRefSchema).optional().describe("Related ticket IDs"),
       location: z.array(z.string()).optional().describe("File locations"),
+      sourceRefs: z.array(IssueSourceRefInputSchema).optional().describe("Replacement structured source provenance"),
       order: z.number().int().optional().describe("New sort order"),
       phase: z.string().nullable().optional().describe("New phase ID (null to clear)"),
       project: z.string().nullable().optional().describe("Project ID to assign (must belong to the issue's phase; null to clear)"),
@@ -711,6 +775,7 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
           components: args.components,
           relatedTickets: args.relatedTickets,
           location: args.location,
+          sourceRefs: args.sourceRefs,
           order: args.order,
           phase: args.phase,
           project: args.project,
@@ -1226,6 +1291,10 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
     inputSchema: {
       sessionId: z.string().uuid().nullable().describe("Session ID (null for start action)"),
       action: z.enum(["start", "report", "resume", "pre_compact", "cancel"]).describe("Action to perform"),
+      clientTaskId: z.string().min(1).max(128).regex(CLIENT_TASK_ID_PATTERN).optional()
+        .describe("Current AI-client task/thread id. Codex passes CODEX_THREAD_ID; Claude is detected automatically."),
+      takeover: z.boolean().optional()
+        .describe("Resume only: recover a COMPACT session after explicitly confirming its recorded owner task is gone."),
       mode: z.enum(["auto", "review", "plan", "guided"]).optional().describe("Execution tier (start action only): auto=full autonomous, review=code review only, plan=plan+review, guided=single ticket"),
       ticketId: z.string().optional().describe("Ticket ID for tiered modes (review, plan, guided). Required for non-auto modes."),
       targetWork: z.array(z.string().regex(TARGET_WORK_INPUT_REGEX)).max(150).optional().describe("For start action only: array of T-XXX / ISS-XXX IDs and/or project ids (from roadmap.projects) to work on in order — a project id expands to its remaining tickets and issues. Empty or omitted = standard auto mode."),
@@ -1363,6 +1432,8 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
 
       // T-192: Auto-file pre-existing findings as issues
       const filedIssues: { issueKey: string; issueId: string }[] = [];
+      const filingWarnings: { issueKey: string; code: string; message: string }[] = [];
+      const filingErrors: { issueKey: string; code: string; message: string }[] = [];
       if (result.preExistingFindings.length > 0) {
         const sessionDir = args.sessionId
           ? join(pinnedRoot, ".story", "sessions", args.sessionId)
@@ -1371,25 +1442,56 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
         const sizeBeforeLoop = alreadyFiled.size;
 
         for (const f of result.preExistingFindings) {
-          const dedupKey = generateIssueKey(f);
-          if (alreadyFiled.has(dedupKey)) continue;
+          const issueKey = generateIssueKey(f);
+          if (alreadyFiled.has(issueKey)) continue;
 
           try {
             const { handleIssueCreate } = await import("../cli/commands/issue.js");
             const severityMap: Record<string, string> = { blocking: "critical", major: "high", minor: "medium" };
             const severity = severityMap[f.severity] ?? "medium";
-            const issueResult = await handleIssueCreate(
-              {
-                title: `[pre-existing] [${f.category}] ${f.description.slice(0, 60)}`,
-                severity,
-                impact: f.description,
-                components: ["review-lenses"],
-                relatedTickets: [],
-                location: f.file && f.line != null ? [`${f.file}:${f.line}`] : [],
-              },
-              "json",
-              pinnedRoot,
-            );
+            const quote = f.snippet?.quote.replace(/\r\n?/g, "\n");
+            const quoteLines = quote
+              ? quote.endsWith("\n") ? quote.slice(0, -1).split("\n").length : quote.split("\n").length
+              : 1;
+            const sourceRefs = f.file && f.line != null
+              ? [{
+                  path: f.file,
+                  startLine: f.line,
+                  ...(quoteLines > 1
+                    ? { endLine: f.line + quoteLines - 1 }
+                    : {}),
+                  reviewId: args.reviewId ?? "unknown",
+                }]
+              : undefined;
+            const createArgs = {
+              title: `[pre-existing] [${f.category}] ${f.description.slice(0, 60)}`,
+              severity,
+              impact: f.description,
+              components: ["review-lenses"],
+              relatedTickets: [],
+              location: f.file && f.line != null ? [`${f.file}:${f.line}`] : [],
+              sourceRefs,
+              dedupeKey: generateReviewFilingKey(args.reviewId ?? "unknown", f),
+              createdBy: `review-lenses:${f.contributingLenses.join(",")}`,
+            };
+            let issueResult;
+            try {
+              issueResult = await handleIssueCreate(createArgs, "json", pinnedRoot);
+            } catch (err) {
+              if (!(sourceRefs && err instanceof CliValidationError && err.code === "invalid_input")) {
+                throw err;
+              }
+              filingWarnings.push({
+                issueKey,
+                code: "source_provenance_omitted",
+                message: "The finding was filed without structured source provenance because the source reference could not be normalized.",
+              });
+              issueResult = await handleIssueCreate(
+                { ...createArgs, sourceRefs: undefined },
+                "json",
+                pinnedRoot,
+              );
+            }
 
             let issueId: string | undefined;
             try {
@@ -1401,11 +1503,14 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
             }
 
             if (issueId) {
-              filedIssues.push({ issueKey: dedupKey, issueId });
-              alreadyFiled.add(dedupKey);
+              filedIssues.push({ issueKey, issueId });
+              alreadyFiled.add(issueKey);
             }
-          } catch {
-            // Best-effort filing; finding still goes through review pipeline
+          } catch (err) {
+            const message = err instanceof Error
+              ? err.message.replace(/\/[^\s]+/g, "<path>")
+              : "unknown error";
+            filingErrors.push({ issueKey, code: "issue_filing_failed", message });
           }
         }
 
@@ -1414,7 +1519,7 @@ export function registerAllTools(server: McpServer, pinnedRoot: string): void {
         }
       }
 
-      const output = { ...result, filedIssues };
+      const output = { ...result, filedIssues, filingWarnings, filingErrors };
       return { content: [{ type: "text" as const, text: JSON.stringify(output, null, 2) }] };
     } catch (err) {
       const msg = err instanceof Error ? err.message.replace(/\/[^\s]+/g, "<path>") : "unknown error";

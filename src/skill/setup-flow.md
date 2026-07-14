@@ -2,7 +2,7 @@
 
 This file is referenced from SKILL.md when no `.story/` directory exists but project indicators are present. SKILL.md has already determined that setup is needed before routing here.
 
-**Skill command name:** When this file references `/story` in user-facing output, use the actual command that invoked you (e.g., `/story` for standalone install, `/story:go` for plugin install). Same for `/story auto` -- use `/story:go auto` if invoked as a plugin.
+**Skill command name:** When this file references `/story` in user-facing output, use the actual command that invoked you (e.g., `/story` for Claude Code, `$story` for Codex, `/story:go` for plugin install). Same for `/story auto` -- use `$story auto` in Codex or `/story:go auto` if invoked as a plugin.
 
 **If arriving from Step 2b (scaffold detection):** The project already has an empty `.story/` scaffold but no tickets. Skip 1a and start at **1b. Existing Project -- Analyze**.
 
@@ -21,7 +21,7 @@ These rules govern the entire setup flow. Follow them at every gate.
 
 ## AI-Assisted Setup Flow
 
-This flow creates a meaningful `.story/` project instead of empty scaffolding. Claude analyzes the project, proposes structure, and creates everything via MCP tools.
+This flow creates a meaningful `.story/` project instead of empty scaffolding. Your AI client analyzes the project, proposes structure, and creates everything via MCP tools.
 
 #### 1a. Detect Project Type
 
@@ -46,7 +46,7 @@ If none found (empty or near-empty directory) -> skip to **1c. New Project -- In
 
 Before diving into analysis, briefly introduce storybloq to the user:
 
-"Storybloq tracks your project's roadmap, tickets, issues, and session handovers in a `.story/` directory. Every Claude Code session starts by reading this context, so you never re-explain your project from scratch. Sessions build on each other: decisions, blockers, and lessons carry forward automatically. I'll analyze your project and propose a structure. You can adjust everything before I create anything."
+"Storybloq tracks your project's roadmap, tickets, issues, and session handovers in a `.story/` directory. Every Storybloq session starts by reading this context, so you never re-explain your project from scratch. Sessions build on each other: decisions, blockers, and lessons carry forward automatically. I'll analyze your project and propose a structure. You can adjust everything before I create anything."
 
 Keep it to 3-4 sentences. Not a sales pitch, just enough that the user knows what they're opting into and that they're in control.
 
@@ -377,7 +377,7 @@ Show the user a structured proposal (table format, not raw JSON):
 
 Before asking for approval, briefly explain what they're looking at:
 
-"**How this works:** Phases are milestones in your project's development. They track progress from setup to shipping. Tickets are specific work items within each phase. After setup, typing `/story` at the start of any Claude Code session loads this context automatically. Claude will know your project's state, what was done last session, and what to work on next."
+"**How this works:** Phases are milestones in your project's development. They track progress from setup to shipping. Tickets are specific work items within each phase. After setup, invoking Storybloq at the start of any supported AI coding session loads this context automatically. Your AI client will know your project's state, what was done last session, and what to work on next."
 
 Then use ONE `AskUserQuestion` that combines approval and refinement depth (do not ask two separate questions):
 - question: "How should I proceed with this proposal?"
@@ -502,7 +502,7 @@ Only proceed to **1e. Execute on Approval** after the user selects "Create every
     Skip VERIFY when: static site, CLI, library, package, mobile-only, BaaS (no custom server).
     Skip BUILD when: Python, Go (compiled at test time).
 
-**Force-surface post-init MCP tools (Claude Code app).** Right after `storybloq_init` returns, call `ToolSearch(query: "storybloq", max_results: 20)`. The MCP server registers all 47 remaining tools when init completes, but some clients (notably Claude Code desktop/web) cache the pre-init tool list and only refresh when explicitly prompted. This one call makes `storybloq_phase_create`, `storybloq_ticket_create`, etc. dispatchable without a client restart. If `ToolSearch` returns only 2 tools (init + status), the full tool set didn't register server-side -- fall back to CLI via `Bash` (`storybloq phase create ...`, `storybloq ticket create ...`) and note in the summary that a client restart may be needed.
+**Force-surface post-init MCP tools.** Right after `storybloq_init` returns, call the client's tool discovery/search tool (`ToolSearch`, `tool_search`, or equivalent) with `query: "storybloq"` and a result limit high enough to surface the full tool set. In Codex, use the `limit` field for that result limit. The MCP server registers the remaining tools when init completes, but some clients cache the pre-init tool list and only refresh when explicitly prompted. This one call makes `storybloq_phase_create`, `storybloq_ticket_create`, etc. dispatchable without a client restart. If tool discovery returns only 2 tools (init + status), the full tool set didn't register server-side -- fall back to CLI via `Bash` (`storybloq phase create ...`, `storybloq ticket create ...`) and note in the summary that a client restart may be needed.
 
 2. Call `storybloq_phase_create` for each phase -- first phase with `atStart: true`, subsequent with `after: <previous-phase-id>`
 3. **Pass 1:** Call `storybloq_ticket_create` for each ticket WITHOUT `blockedBy` (ticket IDs don't exist until after creation)
@@ -599,7 +599,7 @@ If the repo already exists, just verify `.gitignore` contains `.story/snapshots/
 
 Present a brief completion message and tell the user how to start:
 
-"Your project is set up -- [X] phases, [Y] tickets, CLAUDE.md, and RULES.md created. Type **`/story`** at the start of any session to load context and see what to work on. Or type **`/story auto`** to let me work through the tickets autonomously."
+"Your project is set up -- [X] phases, [Y] tickets, AGENTS.md/CLAUDE.md, and RULES.md created. Type **`/story`** in Claude Code or **`$story`** in Codex at the start of any session to load context and see what to work on. Or use **`/story auto`** / **`$story auto`** to work through the tickets autonomously."
 
 Keep it to 2-3 sentences. The system teaches itself through use -- `/story` loads context, shows status, and suggests next work. No need for a manual.
 

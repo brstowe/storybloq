@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
-import { handleValidate } from "../../../src/cli/commands/validate.js";
+import { handleValidate, handleValidateWithSourceRefs } from "../../../src/cli/commands/validate.js";
 import { ExitCode } from "../../../src/core/output-formatter.js";
-import { makeState, makeTicket, makeRoadmap, makePhase } from "../../core/test-factories.js";
+import { makeIssue, makeState, makeTicket, makeRoadmap, makePhase } from "../../core/test-factories.js";
 import type { CommandContext } from "../../../src/cli/run.js";
 
 function makeCtx(overrides: Partial<CommandContext> = {}): CommandContext {
@@ -65,5 +65,31 @@ describe("handleValidate", () => {
     const result = handleValidate(ctx);
     // naming_convention is info level in mergeValidation, valid stays true
     expect(result.exitCode).toBe(ExitCode.OK);
+  });
+
+  it("does not validate source provenance on deleted issues", async () => {
+    const ctx = makeCtx({
+      format: "json",
+      state: makeState({
+        issues: [makeIssue({
+          id: "ISS-001",
+          lifecycle: "deleted",
+          sourceRefs: [{
+            path: "missing.ts",
+            startLine: 1,
+            revision: "deadbeef",
+            contentHash: "a".repeat(64),
+          }],
+        })],
+      }),
+    });
+
+    const result = await handleValidateWithSourceRefs(ctx);
+    const parsed = JSON.parse(result.output);
+
+    expect(result.exitCode).toBe(ExitCode.OK);
+    expect(parsed.data.findings).not.toContainEqual(
+      expect.objectContaining({ code: expect.stringMatching(/^source_ref_/) }),
+    );
   });
 });

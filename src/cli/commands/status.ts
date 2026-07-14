@@ -1,5 +1,5 @@
 import { formatStatus, formatFederatedStatus } from "../../core/output-formatter.js";
-import { scanActiveSessions } from "../../core/session-scan.js";
+import { scanSessionSummaries } from "../../core/session-scan.js";
 import { resolveAllNodes } from "../../federation/resolver.js";
 import { scanAllSummaries } from "../../federation/scanner.js";
 import { buildFederationState } from "../../federation/state.js";
@@ -7,10 +7,27 @@ import { writeFederationCache } from "../../federation/cache.js";
 import { CrossNodeBlockingResolver } from "../../federation/cross-node-resolver.js";
 import { join } from "node:path";
 import type { CommandContext, CommandResult } from "../types.js";
+import { busSummary } from "../../bus/store.js";
+import { BusError } from "../../bus/errors.js";
+import { isBusEnabled } from "../../bus/config.js";
 
 export async function handleStatus(ctx: CommandContext): Promise<CommandResult> {
-  const sessions = scanActiveSessions(ctx.root);
+  const { activeSessions, resumableSessions } = scanSessionSummaries(ctx.root);
   const config = ctx.state.config;
+  let bus;
+  if (isBusEnabled(config)) {
+    try {
+      bus = await busSummary(ctx.root, ctx.state);
+    } catch (err) {
+      bus = {
+        enabled: true as const,
+        error: {
+          code: err instanceof BusError ? err.code : "io_error",
+          message: err instanceof Error ? err.message : String(err),
+        },
+      };
+    }
+  }
 
   const isOrchestrator = config.type === "orchestrator";
   const nodes = config.nodes as Record<string, Record<string, unknown>> | undefined;
@@ -34,8 +51,8 @@ export async function handleStatus(ctx: CommandContext): Promise<CommandResult> 
       // best-effort cache write
     }
 
-    return { output: formatFederatedStatus(fedState, config, ctx.format, sessions) };
+    return { output: formatFederatedStatus(fedState, config, ctx.format, activeSessions, resumableSessions, bus) };
   }
 
-  return { output: formatStatus(ctx.state, ctx.format, sessions) };
+  return { output: formatStatus(ctx.state, ctx.format, activeSessions, resumableSessions, bus) };
 }

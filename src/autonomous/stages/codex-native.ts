@@ -1,14 +1,11 @@
 import { execFileSync } from "node:child_process";
+import { currentStorybloqClient } from "../client-profile.js";
 
-export type StorybloqClient = "claude" | "codex";
+export { currentStorybloqClient } from "../client-profile.js";
 
 export interface ReviewBackendConfig {
   readonly reviewBackends: readonly string[];
   readonly codexReviewBackends?: readonly string[];
-}
-
-export function currentStorybloqClient(): StorybloqClient {
-  return process.env.STORYBLOQ_CLIENT === "codex" ? "codex" : "claude";
 }
 
 export function reviewBackendsForClient(config: ReviewBackendConfig): readonly string[] {

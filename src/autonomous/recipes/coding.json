@@ -5,7 +5,7 @@
   "postComplete": ["LESSON_CAPTURE", "ISSUE_SWEEP"],
   "stages": {
     "PLAN_REVIEW": { "backends": ["lenses", "codex", "agent"] },
-    "CODE_REVIEW": { "backends": ["lenses", "codex", "agent"] },
+    "CODE_REVIEW": { "backends": ["lenses", "codex", "agent"], "maxReviewRounds": 12 },
     "WRITE_TESTS": { "enabled": true, "command": "npm test", "onExhaustion": "plan" },
     "TEST": { "enabled": true, "command": "npm test" },
     "BUILD": { "enabled": false, "command": "npm run build" },

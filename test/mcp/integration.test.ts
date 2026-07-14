@@ -39,6 +39,15 @@ describe("MCP integration — real filesystem", () => {
     expect(result.content[0].text).toContain("Phase");
   });
 
+  it("storybloq_status supports parseable JSON through the MCP read pipeline", async () => {
+    const root = await setupProject();
+    const result = await runMcpReadTool(root, handleStatus, undefined, "json");
+    expect(result.isError).toBeUndefined();
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.version).toBe(1);
+    expect(parsed.data.project).toBeDefined();
+  });
+
   it("storybloq_ticket_get — valid ticket", async () => {
     const root = await setupProject();
     const result = await runMcpReadTool(root, (ctx) => handleTicketGet("T-001", ctx));
@@ -104,6 +113,18 @@ describe("MCP integration — real filesystem", () => {
     expect(result.content[0].text).toMatch(/^\[.+\]/); // plain text with [code] prefix
   });
 
+  it("keeps status infrastructure errors parseable in JSON format", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "mcp-noproject-json-"));
+    tmpDirs.push(dir);
+    const result = await runMcpReadTool(dir, handleStatus, undefined, "json");
+    const parsed = JSON.parse(result.content[0].text);
+    expect(result.isError).toBe(true);
+    expect(parsed).toMatchObject({
+      version: 1,
+      error: { code: expect.any(String), message: expect.any(String) },
+    });
+  });
+
   it("corrupt ticket JSON → permissive load, warning prefix", async () => {
     const root = await setupProject();
     // Write a corrupt ticket file
@@ -118,6 +139,18 @@ describe("MCP integration — real filesystem", () => {
     expect(result.content[0].text).toContain("data integrity issues");
   });
 
+  it("keeps integrity warnings structured in MCP status JSON", async () => {
+    const root = await setupProject();
+    await writeFile(join(root, ".story", "tickets", "T-BAD.json"), "{ not valid json }}");
+    const result = await runMcpReadTool(root, handleStatus, undefined, "json");
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.partial).toBe(true);
+    expect(parsed.warnings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ file: expect.stringContaining("T-BAD.json") }),
+    ]));
+    expect(parsed.data.project).toBeDefined();
+  });
+
   it("corrupt config.json → ProjectLoaderError (isError: true)", async () => {
     const root = await setupProject();
     // Overwrite config with invalid JSON
@@ -127,6 +160,16 @@ describe("MCP integration — real filesystem", () => {
     );
     const result = await runMcpReadTool(root, handleStatus);
     expect(result.isError).toBe(true);
+  });
+
+  it("keeps corrupt-project status errors parseable in JSON format", async () => {
+    const root = await setupProject();
+    await writeFile(join(root, ".story", "config.json"), "not json at all");
+    const result = await runMcpReadTool(root, handleStatus, undefined, "json");
+    const parsed = JSON.parse(result.content[0].text);
+    expect(result.isError).toBe(true);
+    expect(parsed.error.code).toBeDefined();
+    expect(parsed.error.message).toContain("config.json");
   });
 
   it("handover_latest with handovers present", async () => {

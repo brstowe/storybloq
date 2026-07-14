@@ -37,7 +37,10 @@ describe("writeResumeMarker", () => {
     expect(content).toContain("2 tickets completed");
     expect(content).toContain("1 issues resolved");
     expect(content).toContain("IMPLEMENT");
-    expect(content).toContain('"action": "resume"');
+    expect(content).toContain("run `/story`");
+    expect(content).toContain("verify task ownership");
+    expect(content).not.toContain('"action": "resume"');
+    expect(content).not.toContain("takeover");
   });
 
   it("creates intermediate directories if missing", () => {

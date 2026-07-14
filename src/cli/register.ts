@@ -24,11 +24,13 @@ import {
   CliValidationError,
 } from "./helpers.js";
 import { parseMetadataValue } from "./commands/metadata.js";
-import { formatError, ExitCode, type OutputFormat } from "../core/output-formatter.js";
+import { formatError, formatLedgerIntegrity, ExitCode, type OutputFormat } from "../core/output-formatter.js";
+import { discoverIntegrityRoot, scanLedgerIntegrity } from "../core/ledger-integrity.js";
+import type { IssueSourceRefInput } from "../models/issue.js";
 
 // Handler imports — read handlers
 import { handleStatus } from "./commands/status.js";
-import { handleValidate } from "./commands/validate.js";
+import { handleValidateWithSourceRefs } from "./commands/validate.js";
 import { handleRepair, computeRepairs } from "./commands/repair.js";
 import { handleReconcile } from "./commands/reconcile.js";
 import { handleTeamDoctor } from "./commands/team-doctor.js";
@@ -109,6 +111,7 @@ import {
 
 // Re-export init's register (init has no handler separation)
 export { registerInitCommand } from "./commands/init.js";
+export { registerBusCommand } from "./commands/bus.js";
 
 // New T-084 handler imports
 import { handleRecap } from "./commands/recap.js";
@@ -120,6 +123,24 @@ import { handleReference } from "./commands/reference.js";
 
 // Selftest command
 import { handleSelftest } from "./commands/selftest.js";
+
+function parseIssueSourceRefs(values: string[] | undefined): IssueSourceRefInput[] | undefined {
+  if (!values) return undefined;
+  return values.map((value, index) => {
+    try {
+      const parsed = JSON.parse(value) as unknown;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error("expected a JSON object");
+      }
+      return parsed as IssueSourceRefInput;
+    } catch (err) {
+      throw new CliValidationError(
+        "invalid_input",
+        `Invalid --source-ref value ${index + 1}: ${(err as Error).message}`,
+      );
+    }
+  });
+}
 
 function addNodeOption<T>(y: Argv<T>): Argv<T & { node: string | undefined }> {
   return y.option("node", {
@@ -166,10 +187,34 @@ export function registerValidateCommand(yargs: Argv): Argv {
   return yargs.command(
     "validate",
     "Reference integrity + schema checks",
-    (y) => addFormatOption(y),
+    (y) => addFormatOption(y.option("integrity-only", {
+      type: "boolean",
+      default: false,
+      describe: "Scan JSON and known schemas without loading project state",
+    })),
     async (argv) => {
       const format = parseOutputFormat(argv.format);
-      await runReadCommand(format, handleValidate);
+      const discovered = (
+        await import("../core/project-root-discovery.js")
+      ).discoverProjectRoot();
+      const root = discovered ?? await discoverIntegrityRoot();
+      if (!root) {
+        writeOutput(formatError("not_found", "No .story/ project found.", format));
+        process.exitCode = ExitCode.USER_ERROR;
+        return;
+      }
+
+      const integrityOnly = argv["integrity-only"] as boolean;
+      const integrity = await scanLedgerIntegrity(root, {
+        includeAuxiliary: integrityOnly,
+      });
+      if (integrityOnly || !integrity.valid) {
+        writeOutput(formatLedgerIntegrity(integrity, format));
+        process.exitCode = integrity.valid ? ExitCode.OK : ExitCode.VALIDATION_ERROR;
+        return;
+      }
+
+      await runReadCommandWithRoot(format, root, handleValidateWithSourceRefs);
     },
   );
 }
@@ -1848,6 +1893,19 @@ export function registerIssueCommand(yargs: Argv): Argv {
                   type: "string",
                   describe: "Project to assign (must belong to the issue's phase)",
                 })
+                .option("source-ref", {
+                  type: "string",
+                  array: true,
+                  describe: "Structured source reference as a JSON object",
+                })
+                .option("dedupe-key", {
+                  type: "string",
+                  describe: "Idempotency key for reviewer or automation retries",
+                })
+                .option("created-by", {
+                  type: "string",
+                  describe: "Reviewer or agent that created the issue",
+                })
                 .conflicts("impact", "stdin")
                 .check((a) => {
                   if (!a.impact && !a.stdin) {
@@ -1891,6 +1949,9 @@ export function registerIssueCommand(yargs: Argv): Argv {
                   location: normalizeArrayOption(
                     argv.location as string[] | undefined,
                   ),
+                  sourceRefs: parseIssueSourceRefs(argv["source-ref"] as string[] | undefined),
+                  dedupeKey: argv["dedupe-key"] as string | undefined,
+                  createdBy: argv["created-by"] as string | undefined,
                   phase: argv.phase === "" ? undefined : (argv.phase as string | undefined),
                   project: argv.project === "" ? null : (argv.project as string | undefined) ?? null,
                 },
@@ -1970,6 +2031,11 @@ export function registerIssueCommand(yargs: Argv): Argv {
                   array: true,
                   describe: "File locations",
                 })
+                .option("source-ref", {
+                  type: "string",
+                  array: true,
+                  describe: "Replacement structured source reference as a JSON object",
+                })
                 .option("order", {
                   type: "number",
                   describe: "New sort order",
@@ -2026,6 +2092,7 @@ export function registerIssueCommand(yargs: Argv): Argv {
                   location: argv.location
                     ? normalizeArrayOption(argv.location as string[])
                     : undefined,
+                  sourceRefs: parseIssueSourceRefs(argv["source-ref"] as string[] | undefined),
                   order: argv.order as number | undefined,
                   phase: argv.phase === "" ? null : argv.phase as string | undefined,
                   project: argv.project === "" ? null : argv.project as string | undefined,
@@ -3907,10 +3974,14 @@ export function registerHookStatusCommand(yargs: Argv): Argv {
   return yargs.command(
     "hook-status",
     false as unknown as string, // hidden — machine-facing, not shown in --help
-    (y) => y,
-    async () => {
+    (y) => y.option("client", {
+      type: "string",
+      choices: ["claude", "codex"] as const,
+      default: "claude" as const,
+    }),
+    async (argv) => {
       const { handleHookStatus } = await import("./commands/hook-status.js");
-      await handleHookStatus();
+      await handleHookStatus({ client: argv.client as "claude" | "codex" });
     },
   );
 }
@@ -4028,10 +4099,22 @@ export function registerSessionCommand(yargs: Argv): Argv {
         .command(
           "compact-prepare",
           "Prepare session for compaction (PreCompact hook)",
-          () => {},
-          async () => {
-            const { handleSessionCompactPrepare } = await import("./commands/session-compact.js");
-            await handleSessionCompactPrepare();
+          (y2) =>
+            y2.option("client", {
+              type: "string",
+              choices: ["claude", "codex"] as const,
+              default: "claude" as const,
+              describe: "AI client invoking the PreCompact hook",
+            }),
+          async (argv) => {
+            const { handleSessionCompactPrepare, readHookStdinContext } = await import("./commands/session-compact.js");
+            const hookContext = await readHookStdinContext(process.stdin);
+            await handleSessionCompactPrepare({
+              client: argv.client as "claude" | "codex",
+              clientTaskId: hookContext.sessionId,
+              cwd: hookContext.cwd,
+              transcriptPath: hookContext.transcriptPath,
+            });
           },
         )
         .command(
@@ -4045,9 +4128,15 @@ export function registerSessionCommand(yargs: Argv): Argv {
             }),
           async (argv) => {
             try {
-              const { handleSessionResumePrompt, readHookStdinSource } = await import("./commands/session-compact.js");
-              const source = await readHookStdinSource(process.stdin);
-              await handleSessionResumePrompt({ codexHookJson: argv["codex-hook-json"] === true, source });
+              const { handleSessionResumePrompt, readHookStdinContext } = await import("./commands/session-compact.js");
+              const hookContext = await readHookStdinContext(process.stdin);
+              await handleSessionResumePrompt({
+                codexHookJson: argv["codex-hook-json"] === true,
+                source: hookContext.source,
+                clientTaskId: hookContext.sessionId,
+                cwd: hookContext.cwd,
+                transcriptPath: hookContext.transcriptPath,
+              });
             } catch (err) {
               process.stderr.write(
                 `[storybloq] resume-prompt failed: ${err instanceof Error ? err.message : String(err)}\n`,

@@ -9,7 +9,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { execSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -167,6 +167,54 @@ afterEach(() => {
 });
 
 describe("ISS-654: handleStart targetWork canonicalization (end-to-end)", () => {
+  it("persists the resolved client task owner without removing Claude compatibility fields", async () => {
+    const oldClient = process.env.STORYBLOQ_CLIENT;
+    const oldClaudeTask = process.env.CLAUDE_CODE_SESSION_ID;
+    process.env.STORYBLOQ_CLIENT = "codex";
+    process.env.CLAUDE_CODE_SESSION_ID = "poisoned-ambient-claude-task";
+    try {
+      const root = track(buildProject());
+      const result = await handleAutonomousGuide(root, {
+        action: "start",
+        sessionId: null,
+        mode: "auto",
+        clientTaskId: "codex-task-123",
+      });
+      expect(result.isError).toBeFalsy();
+      const session = startedSession(root);
+      expect(session.ownerTask).toMatchObject({ client: "codex", id: "codex-task-123" });
+      expect(typeof session.ownerTask?.boundAt).toBe("string");
+      expect("claudeCodeSessionId" in session).toBe(true);
+      expect(session.claudeCodeSessionId).toBeNull();
+    } finally {
+      if (oldClient === undefined) delete process.env.STORYBLOQ_CLIENT;
+      else process.env.STORYBLOQ_CLIENT = oldClient;
+      if (oldClaudeTask === undefined) delete process.env.CLAUDE_CODE_SESSION_ID;
+      else process.env.CLAUDE_CODE_SESSION_ID = oldClaudeTask;
+    }
+  });
+
+  it("persists ticket reviewRisk for tiered plan mode", async () => {
+    const root = track(buildProject());
+    const ticketPath = join(root, ".story", "tickets", "T-001.json");
+    const ticket = JSON.parse(readFileSync(ticketPath, "utf-8"));
+    writeFileSync(ticketPath, JSON.stringify({ ...ticket, reviewRisk: "high" }));
+    run("git add .", root);
+    run('git commit -q -m "add review risk"', root);
+
+    const result = await handleAutonomousGuide(root, {
+      action: "start",
+      sessionId: null,
+      mode: "plan",
+      ticketId: "T-001",
+    });
+
+    expect(result.isError).toBeFalsy();
+    const session = startedSession(root);
+    expect(session.state).toBe("PLAN");
+    expect(session.ticket?.risk).toBe("high");
+  });
+
   it("display-id input is persisted as canonical ids with a display map", async () => {
     const root = track(buildProject());
     const result = await handleAutonomousGuide(root, {

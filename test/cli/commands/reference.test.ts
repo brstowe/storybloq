@@ -66,6 +66,9 @@ describe("reference command", () => {
     expect(names).toContain("blocker list");
     expect(names).toContain("blocker add");
     expect(names).toContain("blocker clear");
+    expect(names).toContain("bus init");
+    expect(names).toContain("bus send");
+    expect(names).toContain("bus check");
   });
 
   it("MCP_TOOLS registry covers all expected tools", () => {
@@ -95,6 +98,11 @@ describe("reference command", () => {
     expect(names).toContain("storybloq_lesson_create");
     expect(names).toContain("storybloq_lesson_update");
     expect(names).toContain("storybloq_lesson_reinforce");
+    expect(names).toContain("storybloq_bus_send");
+    expect(names).toContain("storybloq_bus_poll");
+    expect(names).toContain("storybloq_bus_ack");
+    expect(names).toContain("storybloq_bus_thread_get");
+    expect(names).toContain("storybloq_bus_thread_update");
   });
 
   it("reference.md matches handleReference output (drift detection)", () => {

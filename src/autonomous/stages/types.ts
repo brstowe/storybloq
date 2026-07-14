@@ -3,6 +3,7 @@ import {
   normalizeSeverity,
   type FullSessionState,
   type GuideReportInput,
+  type ContextAdvice,
   type LensFindingDisposition,
 } from "../session-types.js";
 import { writeSessionSync, appendEvent } from "../session.js";
@@ -19,7 +20,7 @@ import type { ProjectState } from "../../core/project-state.js";
 export interface StageResult {
   readonly instruction: string;
   readonly reminders?: readonly string[];
-  readonly contextAdvice?: string;
+  readonly contextAdvice?: ContextAdvice;
   readonly transitionedFrom?: string;
 }
 

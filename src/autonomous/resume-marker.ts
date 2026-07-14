@@ -47,10 +47,10 @@ export function writeResumeMarker(root: string, sessionId: string, state: {
     }
     lines.push(
       "",
-      "You MUST call `storybloq_autonomous_guide` with:",
-      `{"sessionId": "${sessionId}", "action": "resume"}`,
+      "You MUST run `/story` before any other work.",
+      "Its active-session guard will verify task ownership and resume this session only when safe.",
       "",
-      "Do NOT do any other work until you have called this.",
+      "Do NOT do any other work until you have run `/story`.",
       "Do NOT manually create tickets, issues, or handovers.",
       "The guide manages your workflow.",
     );

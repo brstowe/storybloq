@@ -42,6 +42,9 @@ function makeFullSessionState(): SessionState {
     pendingInstruction: "Run multi-lens review round 2",
     pendingInstructionSetAt: "2026-04-11T09:55:01Z",
     claudeCodeSessionId: "5567fb78-277f-4443-b8f4-f121fec357ce",
+    ownerTask: { client: "codex", id: "codex-task", boundAt: "2026-04-11T09:00:00Z" },
+    lease: { workspaceId: "test", expiresAt: "2099-04-11T10:05:00Z" },
+    compactPending: false,
     binaryFingerprint: { mtime: "2026-04-11T08:00:00Z", sha256: "abc123def456" },
     runningSubprocesses: [
       { pid: 12345, category: "build", startedAt: "2026-04-11T09:50:00Z", stage: "CODE_REVIEW" },
@@ -75,6 +78,10 @@ describe("StatusPayload schema foundation (T-259)", () => {
       expect(payload.pendingInstruction).toBe("Run multi-lens review round 2");
       expect(payload.pendingInstructionSetAt).toBe("2026-04-11T09:55:01Z");
       expect(payload.claudeCodeSessionId).toBe("5567fb78-277f-4443-b8f4-f121fec357ce");
+      expect(payload.ownerTask).toEqual({ client: "codex", id: "codex-task", boundAt: "2026-04-11T09:00:00Z" });
+      expect(payload.leaseExpiresAt).toBe("2099-04-11T10:05:00Z");
+      expect(payload.leaseState).toBe("live");
+      expect(payload.compactPending).toBe(false);
       expect(payload.binaryFingerprint).toEqual({
         mtime: "2026-04-11T08:00:00Z",
         sha256: "abc123def456",
@@ -113,6 +120,10 @@ describe("StatusPayload schema foundation (T-259)", () => {
       expect(payload.pendingInstruction).toBeNull();
       expect(payload.pendingInstructionSetAt).toBeNull();
       expect(payload.claudeCodeSessionId).toBeNull();
+      expect(payload.ownerTask).toBeNull();
+      expect(payload.leaseExpiresAt).toBeNull();
+      expect(payload.leaseState).toBe("missing");
+      expect(payload.compactPending).toBe(false);
       expect(payload.binaryFingerprint).toBeNull();
       expect(payload.runningSubprocesses).toBeNull();
       expect(payload.lastReviewVerdict).toBeNull();

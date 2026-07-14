@@ -7,10 +7,19 @@ export const FeaturesSchema = z
     handovers: z.boolean(),
     roadmap: z.boolean(),
     reviews: z.boolean(),
+    bus: z.boolean().optional(),
   })
   .passthrough();
 
 export type Features = z.infer<typeof FeaturesSchema>;
+
+export const BusConfigSchema = z.object({
+  maxBodyBytes: z.number().int().min(1024).max(65536).optional(),
+  maxHops: z.number().int().min(2).max(32).optional(),
+  requireIssueForCritical: z.boolean().optional(),
+}).strict();
+
+export type BusConfig = z.infer<typeof BusConfigSchema>;
 
 export const ConfigSchema = z
   .object({
@@ -20,6 +29,7 @@ export const ConfigSchema = z
     type: z.string(),
     language: z.string(),
     features: FeaturesSchema,
+    bus: BusConfigSchema.optional(),
     recipe: z.string().optional(),  // default "coding" applied in guide.ts handleStart
     // ISS-730: opt-in continuous cross-reference integrity check. When true,
     // loadProject runs a full validateProject pass and surfaces ERROR-level

@@ -72,7 +72,7 @@ describe("formatStatus with active sessions (ISS-023)", () => {
     }];
     const output = formatStatus(state, "md", sessions);
     expect(output).toContain("## Active Sessions");
-    expect(output).toContain("abcdef12");
+    expect(output).not.toContain("abcdef12");
     expect(output).toContain("IMPLEMENT");
     expect(output).toContain("T-042");
     expect(output).toContain("auto mode");
@@ -91,8 +91,10 @@ describe("formatStatus with active sessions (ISS-023)", () => {
       { sessionId: "sess-bbb", state: "CODE_REVIEW", mode: "review", ticketId: "T-002", ticketTitle: "Second" },
     ];
     const output = formatStatus(state, "md", sessions);
-    expect(output).toContain("sess-aaa");
-    expect(output).toContain("sess-bbb");
+    expect(output).toContain("T-001: First");
+    expect(output).toContain("T-002: Second");
+    expect(output).not.toContain("sess-aaa");
+    expect(output).not.toContain("sess-bbb");
     expect(output).toContain("guided mode");
     expect(output).toContain("review mode");
   });
@@ -110,6 +112,58 @@ describe("formatStatus with active sessions (ISS-023)", () => {
     const parsed = JSON.parse(output);
     expect(parsed.data.activeSessions).toHaveLength(1);
     expect(parsed.data.activeSessions[0].sessionId).toBe("sess-json");
+  });
+
+  it("keeps Markdown concise and exposes full ownership metadata in JSON", () => {
+    const state = makeState();
+    const sessions: ActiveSessionSummary[] = [{
+      sessionId: "full-storybloq-session-id",
+      state: "IMPLEMENT",
+      mode: "auto",
+      ticketId: "T-020",
+      ticketTitle: "Native task ownership",
+      ownerTask: { client: "codex", id: "codex-thread-id", boundAt: "2026-07-09T00:00:00Z" },
+      leaseExpiresAt: "2026-07-09T01:00:00Z",
+      leaseState: "live",
+      compactPending: false,
+    }];
+
+    const markdown = formatStatus(state, "md", sessions);
+    expect(markdown).toContain("T-020: Native task ownership -- IMPLEMENT in a Codex task");
+    expect(markdown).not.toContain("codex-thread-id");
+    expect(markdown).not.toContain("full-storybloq-session-id");
+
+    const parsed = JSON.parse(formatStatus(state, "json", sessions));
+    expect(parsed.data.activeSessions[0]).toMatchObject({
+      sessionId: "full-storybloq-session-id",
+      ownerTask: { client: "codex", id: "codex-thread-id" },
+      leaseState: "live",
+      compactPending: false,
+    });
+  });
+
+  it("reports expired compact recovery separately from activeSessions", () => {
+    const state = makeState();
+    const compact: ActiveSessionSummary = {
+      sessionId: "compact-session-id",
+      state: "COMPACT",
+      mode: "auto",
+      ticketId: "T-021",
+      ticketTitle: "Recover task",
+      ownerTask: null,
+      leaseExpiresAt: "2026-07-09T00:00:00Z",
+      leaseState: "expired",
+      compactPending: true,
+    };
+    const parsed = JSON.parse(formatStatus(state, "json", [], [compact]));
+    expect(parsed.data.activeSessions).toBeUndefined();
+    expect(parsed.data.resumableSessions).toHaveLength(1);
+    expect(parsed.data.resumableSessions[0].sessionId).toBe("compact-session-id");
+
+    const markdown = formatStatus(state, "md", [], [compact]);
+    expect(markdown).toContain("## Resumable Sessions");
+    expect(markdown).toContain("T-021: Recover task -- COMPACT recovery available (expired lease)");
+    expect(markdown).not.toContain("compact-session-id");
   });
 
   it("omits activeSessions key from JSON when no sessions", () => {

@@ -1,6 +1,8 @@
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join, basename } from "node:path";
 import { telemetryDirPath, readAliveTimestamp, readLastMcpCall, computeBinaryFingerprint } from "./liveness.js";
+import { analyzeSessionDiagnostics } from "./session-diagnostics.js";
+import type { EventEntry, FullSessionState } from "./session-types.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -124,6 +126,37 @@ function readSessionState(sessionDir: string): Record<string, unknown> | null {
   }
 }
 
+function readDiagnosticEvents(sessionDir: string): { events: EventEntry[]; malformedCount: number } {
+  try {
+    const raw = readFileSync(join(sessionDir, "events.log"), "utf-8");
+    const events: EventEntry[] = [];
+    let malformedCount = 0;
+    for (const line of raw.split("\n")) {
+      if (!line.trim()) continue;
+      try {
+        const parsed = JSON.parse(line) as Partial<EventEntry>;
+        if (
+          typeof parsed.rev === "number" &&
+          typeof parsed.type === "string" &&
+          typeof parsed.timestamp === "string" &&
+          parsed.data &&
+          typeof parsed.data === "object" &&
+          !Array.isArray(parsed.data)
+        ) {
+          events.push(parsed as EventEntry);
+        } else {
+          malformedCount++;
+        }
+      } catch {
+        malformedCount++;
+      }
+    }
+    return { events, malformedCount };
+  } catch {
+    return { events: [], malformedCount: 0 };
+  }
+}
+
 function probeAlive(sessionDir: string, now: number): { value: ProbeValue; age: number | null } {
   const ts = readAliveTimestamp(sessionDir);
   if (ts === null) return { value: null, age: null };
@@ -241,12 +274,38 @@ export function deriveHealthState(sessionDir: string): HealthResult {
   const sessionId = (state?.sessionId as string) ?? basename(sessionDir);
   const probes = collectProbes(sessionDir, undefined, state);
   const healthState = reduceHealthState(probes);
+  let diagnosticSummary: ReturnType<typeof analyzeSessionDiagnostics> | null = null;
+  if (state) {
+    try {
+      diagnosticSummary = analyzeSessionDiagnostics(
+        state as FullSessionState,
+        readDiagnosticEvents(sessionDir),
+      );
+    } catch {
+      // Health remains available for corrupt or partially written legacy state.
+    }
+  }
 
   return {
     sessionId,
     healthState,
     probes,
     derivedAt: new Date().toISOString(),
-    details: {},
+    details: diagnosticSummary && diagnosticSummary.diagnostics.length > 0
+      ? {
+          diagnostics: diagnosticSummary.diagnostics,
+          codeReview: {
+            rounds: diagnosticSummary.codeReviewRounds,
+            backtracks: diagnosticSummary.codeReviewBacktracks,
+            maxReviewRounds: diagnosticSummary.maxReviewRounds,
+            lastVerdict: diagnosticSummary.lastVerdict,
+            lastCriticalCount: diagnosticSummary.lastCriticalCount,
+            lastUnresolvedCriticalCount: diagnosticSummary.lastUnresolvedCriticalCount,
+            lastMajorCount: diagnosticSummary.lastMajorCount,
+            ticketAgeMs: diagnosticSummary.ticketAgeMs,
+            filedDeferralCount: diagnosticSummary.filedDeferralCount,
+          },
+        }
+      : {},
   };
 }

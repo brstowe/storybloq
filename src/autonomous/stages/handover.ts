@@ -10,8 +10,8 @@ import { loadProject } from "../../core/project-loader.js";
 import { nextTickets } from "../../core/queries.js";
 
 /**
- * HANDOVER stage — Claude writes a session handover document.
- * Terminal stage — always transitions to SESSION_END.
+ * HANDOVER stage - the agent writes a session handover document.
+ * Terminal stage - always transitions to SESSION_END.
  *
  * enter(): Instruction to write handover.
  * report(): Create handover, drain deferrals, end session.
@@ -22,9 +22,33 @@ export class HandoverStage implements WorkflowStage {
   async enter(ctx: StageContext): Promise<StageResult> {
     const ticketsDone = ctx.state.completedTickets.length;
     const issuesDone = (ctx.state.resolvedIssues ?? []).length;
+    const rotation = ctx.state.contextRotation;
+    if (rotation) {
+      const remaining = rotation.remainingTargets
+        .map((id) => ctx.state.targetWorkDisplayIds[id] ?? id)
+        .join(", ");
+      return {
+        instruction: [
+          "# Context Rotation Required",
+          "",
+          `Context pressure is **${rotation.level}**, which reached the configured \`compactThreshold\` (**${rotation.compactThreshold}**).`,
+          `${rotation.ticketsDone} ticket(s) and ${rotation.issuesDone} issue(s) are complete. The current item is finalized, and more work remains.`,
+          ...(remaining ? [`Remaining targeted work: ${remaining}.`] : []),
+          "",
+          "Compaction was not confirmed, and Storybloq cannot invoke the client's compaction command. End this bounded session at the clean item boundary and write a handover for the next task.",
+          "",
+          'Call me with completedAction: "handover_written" and include the content in handoverContent.',
+        ].join("\n"),
+        reminders: [
+          "Do not select another item in this session.",
+          "Write the context-rotation handover now.",
+        ],
+        transitionedFrom: ctx.state.previousState ?? undefined,
+      };
+    }
     return {
       instruction: [
-        `# Session Complete — ${ticketsDone} ticket(s) and ${issuesDone} issue(s) done`,
+        `# Session Complete - ${ticketsDone} ticket(s) and ${issuesDone} issue(s) done`,
         "",
         "Write a session handover summarizing what was accomplished, decisions made, and what's next.",
         "",

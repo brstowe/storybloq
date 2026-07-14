@@ -3,7 +3,8 @@ import type { WorkflowStage, StageResult, StageAdvance, StageContext } from "./t
 import { buildLensHistoryUpdate } from "./types.js";
 import type { GuideReportInput } from "../session-types.js";
 import { REVIEW_VERDICTS, REVIEW_VERDICTS_PROSE, normalizeSeverity } from "../session-types.js";
-import { requiredRounds, nextReviewer } from "../review-depth.js";
+import { normalizeRiskLevel, requiredRounds, nextReviewer } from "../review-depth.js";
+import { effectiveCodeReviewMaxRounds } from "../session-diagnostics.js";
 import { clearCache } from "../lens-harness/cache.js";
 import { accumulateVerificationCounters } from "../lens-harness/verification-log.js";
 import { writeReviewVerdict, readReviewVerdict, buildTier1Verdict, classifyLensReviewPath, type ReviewVerdictArtifact } from "../review-verdict.js";
@@ -32,8 +33,9 @@ export class CodeReviewStage implements WorkflowStage {
     const codeReviews = ctx.state.reviews.code;
     const roundNum = codeReviews.length + 1;
     const reviewer = nextReviewer(codeReviews, backends, ctx.state.codexUnavailable, ctx.state.codexUnavailableSince);
-    const risk = ctx.state.ticket?.realizedRisk ?? ctx.state.ticket?.risk ?? "low";
-    const rounds = requiredRounds(risk as "low" | "medium" | "high");
+    const storedRisk = ctx.state.ticket?.realizedRisk ?? ctx.state.ticket?.risk;
+    const risk = storedRisk == null ? "low" : normalizeRiskLevel(storedRisk, "high");
+    const rounds = requiredRounds(risk);
     const mergeBase = ctx.state.git.mergeBase;
     const isIssueFix = !!ctx.state.currentIssue;
     const issueHeader = isIssueFix
@@ -189,12 +191,17 @@ export class CodeReviewStage implements WorkflowStage {
     const reviewerBackend = report.reviewer
       ?? (computedReviewer === "codex" && report.notes && /codex\b.*\b(unavail|limit|failed|down|error|usage)/i.test(report.notes) ? "agent" : null)
       ?? computedReviewer;
+    const unresolvedCriticalCount = findings.filter(
+      (f) => f.severity === "critical" &&
+        f.disposition !== "addressed" && f.disposition !== "deferred",
+    ).length;
     codeReviews.push({
       round: roundNum,
       reviewer: reviewerBackend,
       verdict,
       findingCount: findings.length,
       criticalCount: findings.filter((f) => f.severity === "critical").length,
+      unresolvedCriticalCount,
       majorCount: findings.filter((f) => f.severity === "major").length,
       suggestionCount: findings.filter((f) => f.severity === "suggestion").length,
       codexSessionId: report.reviewerSessionId,
@@ -207,13 +214,20 @@ export class CodeReviewStage implements WorkflowStage {
       ctx.writeState({ codexUnavailable: true, codexUnavailableSince: new Date().toISOString() });
     }
 
-    const risk = ctx.state.ticket?.realizedRisk ?? ctx.state.ticket?.risk ?? "low";
-    const minRounds = requiredRounds(risk as "low" | "medium" | "high");
+    const storedRisk = ctx.state.ticket?.realizedRisk ?? ctx.state.ticket?.risk;
+    const risk = storedRisk == null ? "low" : normalizeRiskLevel(storedRisk, "high");
+    const minRounds = requiredRounds(risk);
+    const maxReviewRounds = effectiveCodeReviewMaxRounds(risk, ctx.recipe.stages);
     // ISS-073: Only count unresolved findings (open/contested) as contradictory with approve
     const hasCriticalOrMajor = findings.some(
       (f) => (f.severity === "critical" || f.severity === "major") &&
         f.disposition !== "addressed" && f.disposition !== "deferred",
     );
+    const hasUnresolvedCritical = unresolvedCriticalCount > 0;
+    const criticalCount = findings.filter((f) => f.severity === "critical").length;
+    const majorCount = findings.filter((f) => f.severity === "major").length;
+    const minorCount = findings.filter((f) => f.severity === "minor").length;
+    const suggestionCount = findings.filter((f) => f.severity === "suggestion").length;
 
     // Check for PLAN redirect
     const planRedirect = findings.some((f) => f.recommendedNextState === "PLAN");
@@ -226,10 +240,18 @@ export class CodeReviewStage implements WorkflowStage {
       return { action: "retry", instruction: "Contradictory review payload: verdict is 'approve' but findings recommend replanning. Re-run the review or correct the verdict." };
     }
 
+    const isChangeRequest = verdict === "revise" || verdict === "request_changes";
+    const forcedLanding = maxReviewRounds > 0 && isChangeRequest &&
+      !hasUnresolvedCritical && roundNum >= maxReviewRounds && !planRedirect;
+
     let nextAction: "PLAN" | "IMPLEMENT" | "FINALIZE" | "CODE_REVIEW";
     if (planRedirect && verdict !== "approve") {
       nextAction = "PLAN";
-    } else if (verdict === "reject" || verdict === "revise" || verdict === "request_changes") {
+    } else if (verdict === "reject" || (isChangeRequest && hasUnresolvedCritical)) {
+      nextAction = "IMPLEMENT";
+    } else if (forcedLanding) {
+      nextAction = "FINALIZE";
+    } else if (isChangeRequest) {
       nextAction = "IMPLEMENT";
     } else if (verdict === "approve" || (!hasCriticalOrMajor && roundNum >= minRounds)) {
       nextAction = "FINALIZE";
@@ -241,10 +263,6 @@ export class CodeReviewStage implements WorkflowStage {
 
     // T-263: Build and write review verdict artifact
     const target = ctx.state.ticket?.id ?? ctx.state.currentIssue?.id ?? "unknown";
-    const criticalCount = findings.filter((f) => f.severity === "critical").length;
-    const majorCount = findings.filter((f) => f.severity === "major").length;
-    const minorCount = findings.filter((f) => f.severity === "minor").length;
-    const suggestionCount = findings.filter((f) => f.severity === "suggestion").length;
     const startedAt = ctx.state.currentReviewStartedAt;
     const startedMs = startedAt ? new Date(startedAt).getTime() : NaN;
     const durationMs = Number.isFinite(startedMs) ? Math.max(0, Date.now() - startedMs) : 0;
@@ -263,6 +281,7 @@ export class CodeReviewStage implements WorkflowStage {
       verdict,
       findingsCount: findings.length,
       severityCounts: { critical: criticalCount, major: majorCount, minor: minorCount, suggestion: suggestionCount },
+      unresolvedCriticalCount,
       startedAt: startedAt ?? new Date().toISOString(),
       durationMs,
       summary,
@@ -298,6 +317,7 @@ export class CodeReviewStage implements WorkflowStage {
         ticket: ctx.state.ticket ? { ...ctx.state.ticket, realizedRisk: undefined } : ctx.state.ticket,
         lastReviewVerdict: tier1Verdict,
         currentReviewStartedAt: null,
+        landingDecision: null,
       });
 
       ctx.appendEvent("code_review", {
@@ -316,11 +336,27 @@ export class CodeReviewStage implements WorkflowStage {
     }
 
     // Normal transitions + T-181 lens history (single atomic write)
+    const landingDecision = forcedLanding
+      ? {
+          stage: "CODE_REVIEW",
+          round: roundNum,
+          maxReviewRounds,
+          reason: "max_review_rounds_no_blocking",
+          findingCounts: {
+            critical: criticalCount,
+            major: majorCount,
+            minor: minorCount,
+            suggestion: suggestionCount,
+          },
+          timestamp: new Date().toISOString(),
+        }
+      : null;
     const stateUpdate: Record<string, unknown> = {
       reviews: { ...ctx.state.reviews, code: codeReviews },
       lastReviewVerdict: tier1Verdict,
       currentReviewStartedAt: null,
     };
+    if (landingDecision) stateUpdate.landingDecision = landingDecision;
     if (reviewerBackend === "lenses" && findings.length > 0) {
       const updated = buildLensHistoryUpdate(
         findings,
@@ -340,7 +376,21 @@ export class CodeReviewStage implements WorkflowStage {
       findingCount: findings.length,
     });
 
-    await ctx.fileDeferredFindings(findings, "code");
+    if (landingDecision) {
+      ctx.appendEvent("landing_decision", landingDecision);
+    }
+
+    const forcedDeferredFindings = forcedLanding
+      ? findings
+          .filter((f) =>
+            (f.severity === "major" || f.severity === "minor") &&
+            f.disposition !== "addressed" &&
+            f.disposition !== "deferred"
+          )
+          .map((f) => ({ ...f, disposition: "deferred" }))
+      : [];
+
+    await ctx.fileDeferredFindings([...findings, ...forcedDeferredFindings], "code");
 
     if (nextAction === "IMPLEMENT") {
       // T-208: Issue fixes route back to ISSUE_FIX instead of IMPLEMENT

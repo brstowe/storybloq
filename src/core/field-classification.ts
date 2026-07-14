@@ -60,7 +60,10 @@ const ISSUE_RULES: Record<string, MergeRule> = {
   relatedTickets: { kind: "commutative" },
   components: { kind: "commutative" },
   location: { kind: "commutative" },
+  sourceRefs: { kind: "commutative" },
   previousDisplayIds: { kind: "commutative" },
+
+  dedupeKey: { kind: "identity" },
 
   title: { kind: "hard-conflict" },
   severity: { kind: "hard-conflict" },
