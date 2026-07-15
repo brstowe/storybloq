@@ -145,11 +145,17 @@ Use `/story auto T-XXX` instead. A single-ticket targeted auto session is equiva
 
 `recipeOverrides.stages.CODE_REVIEW.maxReviewRounds` defaults to 12. The effective cap is the larger of that value and the ticket risk's required review rounds; `0` explicitly disables the cap. `reject`, plan redirects, and unresolved critical findings remain blocking at any round. At the cap, `revise` or `request_changes` with zero unresolved critical findings advances to FINALIZE and converts unresolved major/minor findings into deduplicated follow-up issues. A `landingDecision.reason` of `max_review_rounds_no_blocking` is an instruction to land the ticket, not reopen implementation. PLAN_REVIEW convergence remains separate.
 
-### Plan-review landing cap and review proportionality
+### Plan-review landing cap and review depth
 
 `recipeOverrides.stages.PLAN_REVIEW.maxReviewRounds` (default `0` = disabled) applies the same landing-cap semantics to PLAN_REVIEW: at the cap, `revise`/`request_changes` with zero unresolved critical findings advances to IMPLEMENT and defers remaining major/minor findings as follow-up issues. `reject` and unresolved criticals remain blocking at any round.
 
-Review effort must stay proportional to ticket risk: run ONE reviewer subagent per round (a focused pass for low risk). Do NOT spawn multiple independent reviewers, adversarial panels, or primary-source verification sweeps unless the ticket's risk is high. If a configured reviewer backend (e.g. codex) is unavailable, substitute a single agent review — not a heavier process.
+`recipeOverrides.reviewDepth` controls how much machinery an agent-backend review round may use (the guide embeds it in every review instruction):
+
+- `light` — the main agent reviews inline; NO reviewer subagents at all.
+- `standard` (default) — exactly ONE reviewer subagent per round; no panels, no parallel reviewers, no primary-source verification sweeps.
+- `thorough` — deep review; multiple reviewer perspectives allowed where risk justifies them.
+
+Per-ticket override: set `reviewDepth` ticket metadata (`storybloq ticket meta set T-001 reviewDepth '"thorough"'`) to escalate or reduce one ticket without changing the session default. Depth governs the plain agent backend only; the `lenses` backend has its own bounded fan-out. If a configured reviewer backend (e.g. codex) is unavailable, substitute a review at the stated depth — never a heavier process.
 
 ## Review findings and dispositions
 

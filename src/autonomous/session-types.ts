@@ -614,6 +614,10 @@ export const SessionStateSchema = z.object({
     compactThreshold: z.string().default("high"),
     reviewBackends: z.array(z.string()).default(["codex", "agent"]),
     codexReviewBackends: z.array(z.string()).optional(),
+    // Fork: how much machinery a review round may use (agent backend only).
+    // light = inline, no subagents; standard = exactly ONE reviewer subagent;
+    // thorough = deep review, multiple perspectives allowed.
+    reviewDepth: z.enum(["light", "standard", "thorough"]).default("standard"),
     // T-181: Multi-lens review config
     lensConfig: z.object({
       lenses: z.union([z.literal("auto"), z.array(z.string())]).default("auto"),

@@ -60,6 +60,7 @@ export interface SessionConfig {
   compactThreshold?: string;
   reviewBackends?: string[];
   codexReviewBackends?: string[];
+  reviewDepth?: "light" | "standard" | "thorough";
   mode?: "auto" | "review" | "plan" | "guided";
   handoverInterval?: number;
   stageOverrides?: Record<string, Record<string, unknown>>;
@@ -123,6 +124,7 @@ export function createSession(
       compactThreshold: configOverrides?.compactThreshold ?? "high",
       reviewBackends: configOverrides?.reviewBackends ?? ["codex", "agent"],
       codexReviewBackends: configOverrides?.codexReviewBackends,
+      reviewDepth: configOverrides?.reviewDepth ?? "standard",
       handoverInterval: configOverrides?.handoverInterval ?? 3,
     },
   };

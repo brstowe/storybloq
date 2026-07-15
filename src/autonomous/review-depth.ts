@@ -74,6 +74,54 @@ export function assessRisk(
   return level;
 }
 
+// ---------------------------------------------------------------------------
+// Fork: review depth — how much machinery a review round may use
+// ---------------------------------------------------------------------------
+
+export type ReviewDepth = "light" | "standard" | "thorough";
+
+export function normalizeReviewDepth(value: unknown): ReviewDepth | undefined {
+  return value === "light" || value === "standard" || value === "thorough"
+    ? value
+    : undefined;
+}
+
+/**
+ * Resolve the effective review depth: explicit ticket metadata (`reviewDepth`)
+ * overrides the session config; default is "standard".
+ */
+export function effectiveReviewDepth(
+  ticket: Record<string, unknown> | null | undefined,
+  config: Record<string, unknown> | null | undefined,
+): ReviewDepth {
+  return normalizeReviewDepth(ticket?.reviewDepth)
+    ?? normalizeReviewDepth(config?.reviewDepth)
+    ?? "standard";
+}
+
+/** Instruction line for the plain agent backend at a given depth. */
+export function reviewDepthInstruction(depth: ReviewDepth, subject: "plan" | "code"): string {
+  switch (depth) {
+    case "light":
+      return subject === "plan"
+        ? "**Review depth: LIGHT.** Review the plan yourself, inline — do NOT spawn any reviewer subagents. One focused pass: scope, acceptance criteria, pitfalls, obvious gaps."
+        : "**Review depth: LIGHT.** Review the diff yourself, inline — do NOT spawn any reviewer subagents. One focused pass for correctness and obvious regressions.";
+    case "standard":
+      return "**Review depth: STANDARD.** Launch exactly ONE reviewer subagent — no panels, no parallel reviewers, no primary-source verification sweeps.";
+    case "thorough":
+      return "**Review depth: THOROUGH.** A deep review is warranted; multiple reviewer perspectives are allowed where the risk justifies them.";
+  }
+}
+
+/** Short reminder line matching the depth instruction. */
+export function reviewDepthReminder(depth: ReviewDepth): string {
+  switch (depth) {
+    case "light": return "Inline review only — do NOT spawn subagents.";
+    case "standard": return "Exactly ONE reviewer subagent — nothing more.";
+    case "thorough": return "Deep review permitted — keep effort proportional to risk.";
+  }
+}
+
 /**
  * Minimum review rounds required for a risk level.
  */

@@ -872,6 +872,7 @@ async function handleStart(root: string, args: GuideInput): Promise<McpToolResul
       if (typeof overrides.compactThreshold === "string") sessionConfig.compactThreshold = overrides.compactThreshold;
       if (Array.isArray(overrides.reviewBackends)) sessionConfig.reviewBackends = overrides.reviewBackends as string[];
       if (Array.isArray(overrides.codexReviewBackends)) sessionConfig.codexReviewBackends = overrides.codexReviewBackends as string[];
+      if (overrides.reviewDepth === "light" || overrides.reviewDepth === "standard" || overrides.reviewDepth === "thorough") sessionConfig.reviewDepth = overrides.reviewDepth;
       if (typeof overrides.handoverInterval === "number") sessionConfig.handoverInterval = overrides.handoverInterval;
       if (overrides.branchStrategy === "none" || overrides.branchStrategy === "per-ticket") sessionConfig.branchStrategy = overrides.branchStrategy;
       if (overrides.stages && typeof overrides.stages === "object") {

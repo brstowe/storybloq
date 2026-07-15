@@ -2,7 +2,7 @@ import type { WorkflowStage, StageResult, StageAdvance, StageContext } from "./t
 import { buildLensHistoryUpdate } from "./types.js";
 import type { GuideReportInput } from "../session-types.js";
 import { REVIEW_VERDICTS, REVIEW_VERDICTS_PROSE, normalizeSeverity } from "../session-types.js";
-import { normalizeRiskLevel, requiredRounds, nextReviewer } from "../review-depth.js";
+import { normalizeRiskLevel, requiredRounds, nextReviewer, effectiveReviewDepth, reviewDepthInstruction, reviewDepthReminder } from "../review-depth.js";
 import { effectivePlanReviewMaxRounds } from "../session-diagnostics.js";
 import { accumulateVerificationCounters } from "../lens-harness/verification-log.js";
 import { writeReviewVerdict, readReviewVerdict, buildTier1Verdict, classifyLensReviewPath, type ReviewVerdictArtifact } from "../review-verdict.js";
@@ -88,6 +88,7 @@ export class PlanReviewStage implements WorkflowStage {
     }
 
     const bridgeCodex = currentStorybloqClient() === "claude" && reviewer === "codex";
+    const depth = effectiveReviewDepth(ctx.state.ticket, ctx.state.config as Record<string, unknown>);
     return {
       instruction: [
         `# Plan Review — Round ${roundNum} of ${Math.max(minRounds, roundNum)} minimum`,
@@ -96,7 +97,7 @@ export class PlanReviewStage implements WorkflowStage {
         "",
         bridgeCodex
           ? `Call \`review_plan\` MCP tool with the plan content.`
-          : `Launch a code review agent to review the plan.`,
+          : reviewDepthInstruction(depth, "plan"),
         "",
         "When done, call `storybloq_autonomous_guide` with:",
         '```json',
@@ -105,9 +106,9 @@ export class PlanReviewStage implements WorkflowStage {
       ].join("\n"),
       reminders: [
         "Report the exact verdict and findings from the reviewer.",
-        `Use ONE reviewer subagent with depth proportional to ticket risk (${risk}). Do NOT spawn multiple independent reviewers or adversarial review panels.`,
+        reviewDepthReminder(depth),
         "IMPORTANT: After the review, file ANY pre-existing issues discovered using storybloq_issue_create with severity and impact. Do NOT skip this step.",
-        ...(reviewer === "codex" ? ["If codex is unavailable (usage limit, error, etc.), fall back to a single agent review and include 'codex unavailable' in your report notes."] : []),
+        ...(reviewer === "codex" ? ["If codex is unavailable (usage limit, error, etc.), fall back to a review at the stated depth and include 'codex unavailable' in your report notes."] : []),
       ],
       transitionedFrom: ctx.state.previousState ?? undefined,
     };
