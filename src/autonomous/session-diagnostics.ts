@@ -50,6 +50,23 @@ export function effectiveCodeReviewMaxRounds(
   return configured === 0 ? 0 : Math.max(configured, requiredRounds(riskLevel(risk)));
 }
 
+// Fork: optional PLAN_REVIEW landing cap. Unlike CODE_REVIEW (default 12),
+// this defaults to 0 (disabled) so base behavior is unchanged unless a project
+// opts in via recipeOverrides.stages.PLAN_REVIEW.maxReviewRounds.
+export function configuredPlanReviewMaxRounds(stages: StageConfigMap): number {
+  const raw = stages?.PLAN_REVIEW?.maxReviewRounds;
+  if (typeof raw !== "number" || !Number.isFinite(raw) || raw <= 0) return 0;
+  return Math.max(1, Math.floor(raw));
+}
+
+export function effectivePlanReviewMaxRounds(
+  risk: string | null | undefined,
+  stages: StageConfigMap,
+): number {
+  const configured = configuredPlanReviewMaxRounds(stages);
+  return configured === 0 ? 0 : Math.max(configured, requiredRounds(riskLevel(risk)));
+}
+
 function isActiveSession(state: FullSessionState): boolean {
   return state.status === "active" && state.state !== "SESSION_END";
 }

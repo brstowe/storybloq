@@ -3,6 +3,7 @@ import { buildLensHistoryUpdate } from "./types.js";
 import type { GuideReportInput } from "../session-types.js";
 import { REVIEW_VERDICTS, REVIEW_VERDICTS_PROSE, normalizeSeverity } from "../session-types.js";
 import { normalizeRiskLevel, requiredRounds, nextReviewer } from "../review-depth.js";
+import { effectivePlanReviewMaxRounds } from "../session-diagnostics.js";
 import { accumulateVerificationCounters } from "../lens-harness/verification-log.js";
 import { writeReviewVerdict, readReviewVerdict, buildTier1Verdict, classifyLensReviewPath, type ReviewVerdictArtifact } from "../review-verdict.js";
 import {
@@ -104,8 +105,9 @@ export class PlanReviewStage implements WorkflowStage {
       ].join("\n"),
       reminders: [
         "Report the exact verdict and findings from the reviewer.",
+        `Use ONE reviewer subagent with depth proportional to ticket risk (${risk}). Do NOT spawn multiple independent reviewers or adversarial review panels.`,
         "IMPORTANT: After the review, file ANY pre-existing issues discovered using storybloq_issue_create with severity and impact. Do NOT skip this step.",
-        ...(reviewer === "codex" ? ["If codex is unavailable (usage limit, error, etc.), fall back to agent review and include 'codex unavailable' in your report notes."] : []),
+        ...(reviewer === "codex" ? ["If codex is unavailable (usage limit, error, etc.), fall back to a single agent review and include 'codex unavailable' in your report notes."] : []),
       ],
       transitionedFrom: ctx.state.previousState ?? undefined,
     };
@@ -260,9 +262,19 @@ export class PlanReviewStage implements WorkflowStage {
     const isRevise = verdict === "revise" || verdict === "request_changes";
     const isReject = verdict === "reject";
 
+    // Fork: optional PLAN_REVIEW landing cap (mirrors CODE_REVIEW's
+    // maxReviewRounds). At the cap, a revise with zero unresolved critical
+    // findings lands the plan; unresolved criticals and reject stay blocking.
+    const maxPlanReviewRounds = effectivePlanReviewMaxRounds(storedRisk == null ? null : risk, ctx.recipe.stages);
+    const hasUnresolvedCritical = unresolvedCriticalCount > 0;
+    const forcedLanding = maxPlanReviewRounds > 0 && isRevise &&
+      !hasUnresolvedCritical && roundNum >= maxPlanReviewRounds;
+
     let nextAction: "PLAN" | "IMPLEMENT" | "PLAN_REVIEW";
     if (isReject) {
       nextAction = "PLAN";
+    } else if (forcedLanding) {
+      nextAction = "IMPLEMENT";
     } else if (isRevise) {
       // ISS-048: Revise stays in PLAN_REVIEW -- agent already fixed inline, just re-review
       nextAction = "PLAN_REVIEW";
@@ -304,8 +316,30 @@ export class PlanReviewStage implements WorkflowStage {
       findingCount: findings.length,
     });
 
+    if (forcedLanding) {
+      ctx.appendEvent("landing_decision", {
+        stage: "PLAN_REVIEW",
+        round: roundNum,
+        maxReviewRounds: maxPlanReviewRounds,
+        reason: "max_review_rounds_no_blocking",
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    // Fork: at the landing cap, unresolved major/minor findings are deferred
+    // (filed as follow-up issues) rather than looping another revision round.
+    const forcedDeferredFindings = forcedLanding
+      ? findings
+          .filter((f) =>
+            (f.severity === "major" || f.severity === "minor") &&
+            f.disposition !== "addressed" &&
+            f.disposition !== "deferred"
+          )
+          .map((f) => ({ ...f, disposition: "deferred" }))
+      : [];
+
     // ISS-037: file deferred findings
-    await ctx.fileDeferredFindings(findings, "plan");
+    await ctx.fileDeferredFindings([...findings, ...forcedDeferredFindings], "plan");
 
     if (nextAction === "PLAN") {
       return {
@@ -316,7 +350,7 @@ export class PlanReviewStage implements WorkflowStage {
     }
 
     // ISS-048: Revise stays in PLAN_REVIEW — retry with findings summary
-    if (isRevise) {
+    if (isRevise && !forcedLanding) {
       const findingSummary = findings.length > 0
         ? findings.slice(0, 5).map((f) => `- [${f.severity}] ${f.description}`).join("\n")
         : "Address the reviewer's concerns.";
@@ -347,7 +381,9 @@ export class PlanReviewStage implements WorkflowStage {
             instruction: [
               "# Plan Review Complete",
               "",
-              `Plan for **${ctx.state.ticket?.id}** has been approved after ${roundNum} review round(s).`,
+              forcedLanding
+              ? `Plan for **${ctx.state.ticket?.id}** landed at the ${maxPlanReviewRounds}-round review cap; remaining major/minor findings were deferred as follow-up issues.`
+              : `Plan for **${ctx.state.ticket?.id}** has been approved after ${roundNum} review round(s).`,
               "",
               "Session ending — plan mode is complete.",
             ].join("\n"),

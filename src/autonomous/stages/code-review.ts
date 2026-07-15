@@ -119,8 +119,9 @@ export class CodeReviewStage implements WorkflowStage {
       reminders: [
         diffReminder,
         "Do NOT compress or summarize the diff.",
+        `Use ONE reviewer subagent with depth proportional to ticket risk (${risk}). Do NOT spawn multiple independent reviewers or adversarial review panels.`,
         "If the reviewer flags pre-existing issues unrelated to your changes, file them as issues using storybloq_issue_create with severity and impact. Do not fix them in this ticket.",
-        ...(reviewer === "codex" ? ["If codex is unavailable (usage limit, error, etc.), fall back to agent review and include 'codex unavailable' in your report notes."] : []),
+        ...(reviewer === "codex" ? ["If codex is unavailable (usage limit, error, etc.), fall back to a single agent review and include 'codex unavailable' in your report notes."] : []),
       ],
       transitionedFrom: ctx.state.previousState ?? undefined,
     };

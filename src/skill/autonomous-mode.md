@@ -145,6 +145,12 @@ Use `/story auto T-XXX` instead. A single-ticket targeted auto session is equiva
 
 `recipeOverrides.stages.CODE_REVIEW.maxReviewRounds` defaults to 12. The effective cap is the larger of that value and the ticket risk's required review rounds; `0` explicitly disables the cap. `reject`, plan redirects, and unresolved critical findings remain blocking at any round. At the cap, `revise` or `request_changes` with zero unresolved critical findings advances to FINALIZE and converts unresolved major/minor findings into deduplicated follow-up issues. A `landingDecision.reason` of `max_review_rounds_no_blocking` is an instruction to land the ticket, not reopen implementation. PLAN_REVIEW convergence remains separate.
 
+### Plan-review landing cap and review proportionality
+
+`recipeOverrides.stages.PLAN_REVIEW.maxReviewRounds` (default `0` = disabled) applies the same landing-cap semantics to PLAN_REVIEW: at the cap, `revise`/`request_changes` with zero unresolved critical findings advances to IMPLEMENT and defers remaining major/minor findings as follow-up issues. `reject` and unresolved criticals remain blocking at any round.
+
+Review effort must stay proportional to ticket risk: run ONE reviewer subagent per round (a focused pass for low risk). Do NOT spawn multiple independent reviewers, adversarial panels, or primary-source verification sweeps unless the ticket's risk is high. If a configured reviewer backend (e.g. codex) is unavailable, substitute a single agent review — not a heavier process.
+
 ## Review findings and dispositions
 
 When you report a review round (`action: "report"` with `findings`), each finding
