@@ -8,6 +8,7 @@ import { nextLessonID, allocateTeamLessonId } from "../../core/id-allocation.js"
 import { reserveDisplayId } from "../../core/remote-refs.js";
 import { resolveAndNormalizeLessonRef, RefResolutionError } from "../../core/ref-normalization.js";
 import { buildLessonDigest } from "../../core/lessons.js";
+import { inheritedLessonsFor } from "../../federation/inherit.js";
 import { isTeamModeConfig } from "../../core/team-capabilities.js";
 import {
   formatLessonList,
@@ -145,7 +146,10 @@ export function handleLessonGet(
 export function handleLessonDigest(
   ctx: CommandContext,
 ): CommandResult {
-  const digest = buildLessonDigest(ctx.state.activeLessons);
+  // Fork: federation nodes absorb the orchestrator root's active lessons
+  // (marked "[root] ...") so shared knowledge reaches every node session.
+  const inherited = inheritedLessonsFor(ctx.root, ctx.state.config as Record<string, unknown>);
+  const digest = buildLessonDigest([...ctx.state.activeLessons, ...inherited]);
   return { output: formatLessonDigest(digest, ctx.format) };
 }
 

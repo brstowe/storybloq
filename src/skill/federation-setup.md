@@ -14,6 +14,7 @@ Federation lets one **orchestrator** project coordinate across multiple **node**
 - **`links`**: Runtime integration points between nodes (informational, not enforced).
 - **`crossNodeBlockedBy`**: Ticket field on orchestrator tickets referencing work in node projects (e.g., `["engine:T-010", "client:T-005"]`). Used to block coordination milestones until node work completes.
 - **`federation.allowNodeWrites`**: When true, orchestrator MCP tools can write to node `.story/` directories.
+- **Lesson/note inheritance** (fork): nodes absorb the orchestrator root's lessons and notes at read time (marked `[root] `, read-only from the node). Automatic for nodes nested under the orchestrator directory; nodes elsewhere set `federationRoot: "<orchestrator path>"` in their config (`false` opts out). Keep shared knowledge at the root; node-specific knowledge in the node.
 
 The orchestrator does NOT duplicate per-node work. It tracks only cross-node coordination points (milestones). Each node manages its own tickets, phases, issues, and handovers independently.
 

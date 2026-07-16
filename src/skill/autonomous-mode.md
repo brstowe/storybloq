@@ -157,6 +157,14 @@ Use `/story auto T-XXX` instead. A single-ticket targeted auto session is equiva
 
 Per-ticket override: set `reviewDepth` ticket metadata (`storybloq ticket meta set T-001 reviewDepth '"thorough"'`) to escalate or reduce one ticket without changing the session default. Depth governs the plain agent backend only; the `lenses` backend has its own bounded fan-out. If a configured reviewer backend (e.g. codex) is unavailable, substitute a review at the stated depth — never a heavier process.
 
+### Federation inheritance (lessons + notes)
+
+A federation **node** absorbs the orchestrator root's lessons and notes at read time. The node's lesson digest (CLI, MCP, and the autonomous context digest) merges the root's ACTIVE lessons, and `note list`/`note get` include the root's notes — all marked with a `[root] ` title prefix. Inherited items are read-only from the node: reinforce or edit them at the orchestrator. Local ids always win a collision.
+
+Discovery is automatic when the node lives inside the orchestrator's directory tree (the orchestrator's `nodes` map must claim the node's path). For nodes outside the tree, set `federationRoot: "<path to orchestrator root>"` in the node's `.story/config.json`; set `federationRoot: false` to opt out entirely. Standalone projects are unaffected.
+
+Curation rule of thumb: knowledge that applies to more than one node (platform behavior, shared stack patterns, process lessons) belongs at the orchestrator root; only node-specific implementation knowledge lives in the node.
+
 ## Review findings and dispositions
 
 When you report a review round (`action: "report"` with `findings`), each finding

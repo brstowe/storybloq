@@ -21,3 +21,13 @@ export { findLatestHandover } from "./handover-utils.js";
 
 export type { NodeRecommendationLoadWarning, NodeRecommendationsLoadResult } from "./node-recommend.js";
 export { loadNodeRecommendations } from "./node-recommend.js";
+
+export type { OrchestratorLink } from "./inherit.js";
+export {
+  findOrchestratorLink,
+  loadInheritedLessons,
+  loadInheritedNotes,
+  inheritedLessonsFor,
+  inheritedNotesFor,
+  markInheritedTitle,
+} from "./inherit.js";

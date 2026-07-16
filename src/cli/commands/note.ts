@@ -27,6 +27,7 @@ import {
   CliValidationError,
 } from "../helpers.js";
 import type { CommandContext, CommandResult } from "../types.js";
+import { inheritedNotesFor } from "../../federation/inherit.js";
 
 export const NOTE_CORE_METADATA_KEYS = new Set([
   "id",
@@ -55,7 +56,10 @@ export function handleNoteList(
   filters: { status?: string; tag?: string },
   ctx: CommandContext,
 ): CommandResult {
-  let notes = [...ctx.state.activeNotes];
+  // Fork: federation nodes list the orchestrator root's notes too, titles
+  // marked "[root] ..." — read-only here; edit them at the orchestrator.
+  const inherited = inheritedNotesFor(ctx.root, ctx.state.config as Record<string, unknown>);
+  let notes = [...ctx.state.activeNotes, ...inherited];
 
   if (filters.status) {
     if (!NOTE_STATUSES.includes(filters.status as NoteStatus)) {
@@ -104,21 +108,31 @@ export function handleNoteGet(
         errorCode: "invalid_input",
       };
     }
-    return {
-      output: formatError("not_found", `Note ${id} not found`, ctx.format),
-      exitCode: ExitCode.USER_ERROR,
-      errorCode: "not_found",
-    };
+    return inheritedNoteResult(id, ctx);
   }
   const note = ctx.state.noteByID(resolvedId);
   if (!note) {
-    return {
-      output: formatError("not_found", `Note ${id} not found`, ctx.format),
-      exitCode: ExitCode.USER_ERROR,
-      errorCode: "not_found",
-    };
+    return inheritedNoteResult(id, ctx);
   }
   return { output: formatNote(note, ctx.format) };
+}
+
+/**
+ * Fork: when a note id doesn't resolve locally, fall back to the federation
+ * orchestrator's notes (read-only; local ids always win).
+ */
+function inheritedNoteResult(id: string, ctx: CommandContext): CommandResult {
+  const upper = id.toUpperCase();
+  const inherited = inheritedNotesFor(ctx.root, ctx.state.config as Record<string, unknown>)
+    .find((n) => n.id.toUpperCase() === upper || n.displayId?.toUpperCase() === upper);
+  if (inherited) {
+    return { output: formatNote(inherited, ctx.format) };
+  }
+  return {
+    output: formatError("not_found", `Note ${id} not found`, ctx.format),
+    exitCode: ExitCode.USER_ERROR,
+    errorCode: "not_found",
+  };
 }
 
 // --- Write Handlers ---
