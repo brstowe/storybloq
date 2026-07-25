@@ -165,6 +165,14 @@ Discovery is automatic when the node lives inside the orchestrator's directory t
 
 Curation rule of thumb: knowledge that applies to more than one node (platform behavior, shared stack patterns, process lessons) belongs at the orchestrator root; only node-specific implementation knowledge lives in the node.
 
+### Storyknow knowledge packs (attached knowledge)
+
+Above the federation root sits an optional third layer: **storyknow packs** — standalone knowledge-only repos holding `K-NNN` entries shared across clients/projects (e.g. a `shopify` pack). A project attaches packs via the config key `knowledge: ["<name-or-path>"]` (bare names resolve under `$STORYKNOW_HOME`, default `~/dev/storyknow`). Federation nodes also absorb the packs attached at their orchestrator root, so a federation attaches once at the root.
+
+Attached knowledge appears in every lesson digest marked `[<pack>] ` and is read-only from the consumer. The digest layers are: local lessons → `[root]` inherited → `[<pack>]` attached. Curation ladder: node-specific → node; client-wide → federation root; stack/platform-generic → pack.
+
+To move a proven local lesson into a pack, use `storybloq lesson promote L-NNN --to <pack>` (the pack gains a K-entry carrying the reinforcement count and an origin stamp; the local lesson is superseded with a pointer). Promotion is a deliberate curation act — during LESSON_CAPTURE keep creating lessons locally, and if a lesson is clearly stack-generic rather than project-specific, note it as a promotion candidate in the handover instead of promoting mid-session. Pack entries themselves are managed inside the pack directory with the `storybloq knowledge` command family.
+
 ## Review findings and dispositions
 
 When you report a review round (`action: "report"` with `findings`), each finding

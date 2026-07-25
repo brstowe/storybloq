@@ -289,11 +289,31 @@ Reinforce a lesson: increment count and update lastValidated
 storybloq lesson reinforce <id> [--format json|md]
 ```
 
+### lesson promote
+Promote a lesson into an attached storyknow knowledge pack (fork). The pack gains a K-entry (reinforcement count carried, origin stamped); the local lesson is superseded with a pointer.
+
+```
+storybloq lesson promote <id> --to <pack-name-or-path> [--force] [--format json|md]
+```
+
 ### lesson delete
 Delete a lesson
 
 ```
 storybloq lesson delete <id> [--hard] [--format json|md]
+```
+
+### knowledge (storyknow packs, fork)
+Manage shared K-NNN knowledge entries inside a knowledge pack (a project created with `storybloq init --type knowledge`). Consumer projects attach packs via the `knowledge: ["<name-or-path>"]` config key (bare names resolve under `$STORYKNOW_HOME`, default `~/dev/storyknow`); attached entries appear in `lesson digest` marked `[<pack>]`. `knowledge digest` is dual-mode: inside a pack it digests the pack's own entries; inside a consumer project it digests all attached knowledge.
+
+```
+storybloq knowledge list [--status <s>] [--tag <t>] [--source <src>] [--format json|md]
+storybloq knowledge get <id> [--format json|md]
+storybloq knowledge digest [--format json|md]
+storybloq knowledge create --title <t> --content <c> --context <ctx> --source <src> [--tags <tags>] [--supersedes <id>]
+storybloq knowledge update <id> [--title <t>] [--content <c>] [--context <ctx>] [--tags <tags>] [--status <s>]
+storybloq knowledge reinforce <id>
+storybloq knowledge delete <id>
 ```
 
 ### validate

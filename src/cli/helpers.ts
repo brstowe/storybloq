@@ -6,6 +6,7 @@ import {
   IssueIdSchema,
   NoteIdSchema,
   LessonIdSchema,
+  KnowledgeIdSchema,
   DateSchema,
   OUTPUT_FORMATS,
   type OutputFormat,
@@ -173,6 +174,17 @@ export function parseLessonId(raw: string): string {
     throw new CliValidationError(
       "invalid_input",
       `Invalid lesson ID "${raw}": ${formatZodError(result.error)}`,
+    );
+  }
+  return result.data;
+}
+
+export function parseKnowledgeId(raw: string): string {
+  const result = KnowledgeIdSchema.safeParse(raw);
+  if (!result.success) {
+    throw new CliValidationError(
+      "invalid_input",
+      `Invalid knowledge ID "${raw}": ${formatZodError(result.error)}`,
     );
   }
   return result.data;

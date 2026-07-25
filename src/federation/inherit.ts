@@ -26,7 +26,7 @@ export interface OrchestratorLink {
 
 const MAX_UPWARD_LEVELS = 5;
 
-function readJsonSafe(path: string): Record<string, unknown> | null {
+export function readJsonSafe(path: string): Record<string, unknown> | null {
   try {
     const parsed: unknown = JSON.parse(readFileSync(path, "utf-8"));
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
@@ -38,7 +38,7 @@ function readJsonSafe(path: string): Record<string, unknown> | null {
   return null;
 }
 
-function realpathSafe(p: string): string | null {
+export function realpathSafe(p: string): string | null {
   try {
     return realpathSync(p);
   } catch {
@@ -110,7 +110,7 @@ export function findOrchestratorLink(
   return null;
 }
 
-function loadDirSafe<T>(
+export function loadDirSafe<T>(
   dir: string,
   parse: (raw: unknown) => T | null,
 ): T[] {

@@ -122,6 +122,7 @@ export class LessonCaptureStage implements WorkflowStage {
       reminders: [
         "Check existing lessons first — reinforce before creating duplicates.",
         "Only capture patterns worth remembering across sessions.",
+        "Create lessons locally even when stack-generic — but flag those as storyknow promotion candidates (`lesson promote`) in the handover rather than promoting mid-session.",
         ...(falsePositivePatterns.length > 0
           ? ["Lens false positive patterns MUST be captured as lessons — they improve future reviews."]
           : []),

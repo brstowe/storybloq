@@ -53,27 +53,33 @@ export async function initProject(
     );
   }
 
-  // Create directories
-  await mkdir(join(wrapDir, "tickets"), { recursive: true });
-  await mkdir(join(wrapDir, "issues"), { recursive: true });
-  await mkdir(join(wrapDir, "handovers"), { recursive: true });
-  await mkdir(join(wrapDir, "notes"), { recursive: true });
-  await mkdir(join(wrapDir, "lessons"), { recursive: true });
+  const isOrchestrator = (options.type ?? "generic") === "orchestrator";
+  // Fork: a storyknow pack is a knowledge-only project — K-entries, no
+  // tickets/issues/handovers. The stub roadmap keeps loader invariants.
+  const isKnowledgePack = options.type === "knowledge";
 
-  const created: string[] = [
-    ".story/config.json",
-    ".story/roadmap.json",
-    ".story/tickets/",
-    ".story/issues/",
-    ".story/handovers/",
-    ".story/notes/",
-    ".story/lessons/",
-  ];
+  // Create directories
+  const created: string[] = [".story/config.json", ".story/roadmap.json"];
+  if (isKnowledgePack) {
+    await mkdir(join(wrapDir, "knowledge"), { recursive: true });
+    created.push(".story/knowledge/");
+  } else {
+    await mkdir(join(wrapDir, "tickets"), { recursive: true });
+    await mkdir(join(wrapDir, "issues"), { recursive: true });
+    await mkdir(join(wrapDir, "handovers"), { recursive: true });
+    await mkdir(join(wrapDir, "notes"), { recursive: true });
+    await mkdir(join(wrapDir, "lessons"), { recursive: true });
+    created.push(
+      ".story/tickets/",
+      ".story/issues/",
+      ".story/handovers/",
+      ".story/notes/",
+      ".story/lessons/",
+    );
+  }
 
   // Today's date
   const today = new Date().toISOString().slice(0, 10);
-
-  const isOrchestrator = (options.type ?? "generic") === "orchestrator";
 
   const config: Config = {
     version: 2,
@@ -81,13 +87,21 @@ export async function initProject(
     project: options.name,
     type: options.type ?? "generic",
     language: options.language ?? "unknown",
-    features: {
-      tickets: true,
-      issues: true,
-      handovers: true,
-      roadmap: true,
-      reviews: true,
-    },
+    features: isKnowledgePack
+      ? {
+          tickets: false,
+          issues: false,
+          handovers: false,
+          roadmap: false,
+          reviews: false,
+        }
+      : {
+          tickets: true,
+          issues: true,
+          handovers: true,
+          roadmap: true,
+          reviews: true,
+        },
     ...(isOrchestrator && {
       nodes: {},
       federation: { allowNodeWrites: false },
@@ -102,11 +116,19 @@ export async function initProject(
         description:
           "Cross-node coordination milestones. Each milestone uses crossNodeBlockedBy to track dependencies across the federation.",
       }
-    : {
-        id: "p0",
-        label: "PHASE 0",
-        name: "Setup",
-        description: "Initial project setup.",
+    : isKnowledgePack
+      ? {
+          id: "pack",
+          label: "PACK",
+          name: "Knowledge Pack",
+          description:
+            "Storyknow knowledge pack — shared K-entries consumed by attached projects. No tickets live here.",
+        }
+      : {
+          id: "p0",
+          label: "PHASE 0",
+          name: "Setup",
+          description: "Initial project setup.",
       };
 
   const roadmap: Roadmap = {

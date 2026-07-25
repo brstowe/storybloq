@@ -17,6 +17,7 @@ import {
   parseIssueId,
   parseNoteId,
   parseLessonId,
+  parseKnowledgeId,
   normalizeArrayOption,
   normalizeTags,
   readStdinContent,
@@ -87,9 +88,19 @@ import {
   handleLessonUpdate,
   handleLessonReinforce,
   handleLessonDelete,
+  handleLessonPromote,
   LESSON_STATUSES,
   LESSON_SOURCES,
 } from "./commands/lesson.js";
+import {
+  handleKnowledgeList,
+  handleKnowledgeGet,
+  handleKnowledgeDigest,
+  handleKnowledgeCreate,
+  handleKnowledgeUpdate,
+  handleKnowledgeReinforce,
+  handleKnowledgeDelete,
+} from "./commands/knowledge.js";
 import { handleRecommend } from "./commands/recommend.js";
 import { handleDispatchRecommend, handleDispatch } from "./commands/dispatch.js";
 import {
@@ -3462,6 +3473,68 @@ export function registerLessonCommand(yargs: Argv): Argv {
           },
         )
         .command(
+          "promote <id>",
+          "Promote a lesson into an attached storyknow knowledge pack",
+          (y2) =>
+            addFormatOption(
+              y2
+                .positional("id", {
+                  type: "string",
+                  demandOption: true,
+                  describe: "Lesson ID (e.g. L-001)",
+                })
+                .option("to", {
+                  type: "string",
+                  demandOption: true,
+                  describe: "Target pack: an attached pack name, or a path to a pack",
+                })
+                .option("force", {
+                  type: "boolean",
+                  default: false,
+                  describe: "Promote even if the pack already has an active entry with the same title",
+                }),
+            ),
+          async (argv) => {
+            const format = parseOutputFormat(argv.format);
+            const id = parseLessonId(argv.id as string);
+            const root = (
+              await import("../core/project-root-discovery.js")
+            ).discoverProjectRoot();
+            if (!root) {
+              writeOutput(
+                formatError("not_found", "No .story/ project found.", format),
+              );
+              process.exitCode = ExitCode.USER_ERROR;
+              return;
+            }
+            try {
+              const result = await handleLessonPromote(
+                id,
+                { to: argv.to as string, force: argv.force as boolean },
+                format,
+                root,
+              );
+              writeOutput(result.output);
+              process.exitCode = result.exitCode ?? ExitCode.OK;
+            } catch (err: unknown) {
+              if (err instanceof CliValidationError) {
+                writeOutput(formatError(err.code, err.message, format));
+                process.exitCode = ExitCode.USER_ERROR;
+                return;
+              }
+              const { ProjectLoaderError } = await import("../core/errors.js");
+              if (err instanceof ProjectLoaderError) {
+                writeOutput(formatError(err.code, err.message, format));
+                process.exitCode = ExitCode.USER_ERROR;
+                return;
+              }
+              const message = err instanceof Error ? err.message : String(err);
+              writeOutput(formatError("io_error", message, format));
+              process.exitCode = ExitCode.USER_ERROR;
+            }
+          },
+        )
+        .command(
           "delete <id>",
           "Delete a lesson",
           (y2) =>
@@ -3528,7 +3601,274 @@ export function registerLessonCommand(yargs: Argv): Argv {
             }
           },
         )
-        .demandCommand(1, "Specify a lesson subcommand: list, get, digest, create, update, reinforce, delete"),
+        .demandCommand(1, "Specify a lesson subcommand: list, get, digest, create, update, reinforce, promote, delete"),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// knowledge (storyknow packs, fork feature)
+// ---------------------------------------------------------------------------
+
+export function registerKnowledgeCommand(yargs: Argv): Argv {
+  const runWrite = async (
+    format: OutputFormat,
+    fn: (root: string) => Promise<{ output: string; exitCode?: number }>,
+  ) => {
+    const root = (
+      await import("../core/project-root-discovery.js")
+    ).discoverProjectRoot();
+    if (!root) {
+      writeOutput(formatError("not_found", "No .story/ project found.", format));
+      process.exitCode = ExitCode.USER_ERROR;
+      return;
+    }
+    try {
+      const result = await fn(root);
+      writeOutput(result.output);
+      process.exitCode = result.exitCode ?? ExitCode.OK;
+    } catch (err: unknown) {
+      if (err instanceof CliValidationError) {
+        writeOutput(formatError(err.code, err.message, format));
+        process.exitCode = ExitCode.USER_ERROR;
+        return;
+      }
+      const { ProjectLoaderError } = await import("../core/errors.js");
+      if (err instanceof ProjectLoaderError) {
+        writeOutput(formatError(err.code, err.message, format));
+        process.exitCode = ExitCode.USER_ERROR;
+        return;
+      }
+      const message = err instanceof Error ? err.message : String(err);
+      writeOutput(formatError("io_error", message, format));
+      process.exitCode = ExitCode.USER_ERROR;
+    }
+  };
+
+  return yargs.command(
+    "knowledge",
+    "Manage storyknow knowledge entries (inside a knowledge pack)",
+    (y) =>
+      y
+        .command(
+          "list",
+          "List knowledge entries",
+          (y2) =>
+            addFormatOption(
+              y2
+                .option("status", {
+                  type: "string",
+                  choices: [...LESSON_STATUSES],
+                  describe: "Filter by status",
+                })
+                .option("tag", {
+                  type: "string",
+                  describe: "Filter by tag",
+                })
+                .option("source", {
+                  type: "string",
+                  choices: [...LESSON_SOURCES],
+                  describe: "Filter by source",
+                }),
+            ),
+          async (argv) => {
+            const format = parseOutputFormat(argv.format);
+            await runReadCommand(format, (ctx) =>
+              handleKnowledgeList(
+                {
+                  status: argv.status as string | undefined,
+                  tag: argv.tag as string | undefined,
+                  source: argv.source as string | undefined,
+                },
+                ctx,
+              ),
+            );
+          },
+        )
+        .command(
+          "get <id>",
+          "Get a knowledge entry",
+          (y2) =>
+            addFormatOption(
+              y2.positional("id", {
+                type: "string",
+                demandOption: true,
+                describe: "Knowledge ID (e.g. K-001)",
+              }),
+            ),
+          async (argv) => {
+            const format = parseOutputFormat(argv.format);
+            const id = parseKnowledgeId(argv.id as string);
+            await runReadCommand(format, (ctx) => handleKnowledgeGet(id, ctx));
+          },
+        )
+        .command(
+          "digest",
+          "Ranked digest of knowledge — the pack's own entries, or (in a consumer project) all attached knowledge",
+          (y2) => addFormatOption(y2),
+          async (argv) => {
+            const format = parseOutputFormat(argv.format);
+            await runReadCommand(format, (ctx) => handleKnowledgeDigest(ctx));
+          },
+        )
+        .command(
+          "create",
+          "Create a knowledge entry",
+          (y2) =>
+            addFormatOption(
+              y2
+                .option("title", {
+                  type: "string",
+                  demandOption: true,
+                  describe: "Knowledge title",
+                })
+                .option("content", {
+                  type: "string",
+                  describe: "Knowledge content (the actionable rule)",
+                })
+                .option("context", {
+                  type: "string",
+                  demandOption: true,
+                  describe: "What produced this knowledge",
+                })
+                .option("source", {
+                  type: "string",
+                  demandOption: true,
+                  choices: [...LESSON_SOURCES],
+                  describe: "Knowledge source",
+                })
+                .option("tags", {
+                  type: "array",
+                  describe: "Tags for the entry",
+                })
+                .option("supersedes", {
+                  type: "string",
+                  describe: "ID of entry this supersedes",
+                })
+                .option("stdin", {
+                  type: "boolean",
+                  describe: "Read content from stdin",
+                })
+                .conflicts("content", "stdin")
+                .check((argv) => {
+                  if (!argv.content && !argv.stdin) {
+                    throw new Error("Specify either --content or --stdin");
+                  }
+                  return true;
+                }),
+            ),
+          async (argv) => {
+            const format = parseOutputFormat(argv.format);
+            const content = argv.stdin
+              ? await readStdinContent()
+              : (argv.content as string);
+            await runWrite(format, (root) =>
+              handleKnowledgeCreate(
+                {
+                  title: argv.title as string,
+                  content,
+                  context: argv.context as string,
+                  source: argv.source as string,
+                  tags: argv.tags as string[] | undefined,
+                  supersedes: (argv.supersedes as string | undefined) ?? null,
+                },
+                format,
+                root,
+              ),
+            );
+          },
+        )
+        .command(
+          "update <id>",
+          "Update a knowledge entry",
+          (y2) =>
+            addFormatOption(
+              y2
+                .positional("id", {
+                  type: "string",
+                  demandOption: true,
+                  describe: "Knowledge ID (e.g. K-001)",
+                })
+                .option("title", { type: "string", describe: "New title" })
+                .option("content", { type: "string", describe: "New content" })
+                .option("context", { type: "string", describe: "New context" })
+                .option("tags", {
+                  type: "array",
+                  describe: "New tags (replaces existing)",
+                })
+                .option("clear-tags", {
+                  type: "boolean",
+                  describe: "Clear all tags",
+                })
+                .option("status", {
+                  type: "string",
+                  choices: [...LESSON_STATUSES],
+                  describe: "New status",
+                })
+                .option("stdin", {
+                  type: "boolean",
+                  describe: "Read content from stdin",
+                })
+                .conflicts("content", "stdin")
+                .conflicts("tags", "clear-tags"),
+            ),
+          async (argv) => {
+            const format = parseOutputFormat(argv.format);
+            const id = parseKnowledgeId(argv.id as string);
+            const content = argv.stdin
+              ? await readStdinContent()
+              : (argv.content as string | undefined);
+            await runWrite(format, (root) =>
+              handleKnowledgeUpdate(
+                id,
+                {
+                  title: argv.title as string | undefined,
+                  content,
+                  context: argv.context as string | undefined,
+                  tags: argv.tags as string[] | undefined,
+                  clearTags: argv["clear-tags"] as boolean | undefined,
+                  status: argv.status as string | undefined,
+                },
+                format,
+                root,
+              ),
+            );
+          },
+        )
+        .command(
+          "reinforce <id>",
+          "Reinforce a knowledge entry — increment reinforcement count and update lastValidated",
+          (y2) =>
+            addFormatOption(
+              y2.positional("id", {
+                type: "string",
+                demandOption: true,
+                describe: "Knowledge ID (e.g. K-001)",
+              }),
+            ),
+          async (argv) => {
+            const format = parseOutputFormat(argv.format);
+            const id = parseKnowledgeId(argv.id as string);
+            await runWrite(format, (root) => handleKnowledgeReinforce(id, format, root));
+          },
+        )
+        .command(
+          "delete <id>",
+          "Delete a knowledge entry",
+          (y2) =>
+            addFormatOption(
+              y2.positional("id", {
+                type: "string",
+                demandOption: true,
+                describe: "Knowledge ID (e.g. K-001)",
+              }),
+            ),
+          async (argv) => {
+            const format = parseOutputFormat(argv.format);
+            const id = parseKnowledgeId(argv.id as string);
+            await runWrite(format, (root) => handleKnowledgeDelete(id, format, root));
+          },
+        )
+        .demandCommand(1, "Specify a knowledge subcommand: list, get, digest, create, update, reinforce, delete"),
   );
 }
 

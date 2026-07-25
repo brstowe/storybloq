@@ -73,6 +73,19 @@ export const LessonIdSchema = z
     "Lesson ID must match L-NNN or l-[canonical]",
   );
 
+// --- Knowledge enums (storyknow packs, fork feature) ---
+
+// Knowledge entries live in storyknow packs (shared cross-project knowledge
+// bases) and reuse the lesson statuses/sources. No canonical/team-mode id
+// variant: packs are single-writer local repos.
+export const KNOWLEDGE_ID_REGEX = /^K-\d+$/;
+export const KnowledgeIdSchema = z
+  .string()
+  .refine(
+    (v) => KNOWLEDGE_ID_REGEX.test(v),
+    "Knowledge ID must match K-NNN",
+  );
+
 // --- Team-mode enums ---
 
 export const LIFECYCLE_VALUES = ["active", "archived", "deleted"] as const;

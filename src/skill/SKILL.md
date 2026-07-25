@@ -262,6 +262,8 @@ Before writing a handover at the end of a session, run `storybloq snapshot` firs
 
 Don't duplicate what's already in the handover -- lessons are structured, tagged, and ranked. Handovers are narrative. Use `storybloq_lesson_digest` to check existing lessons before creating duplicates. Use `storybloq_lesson_reinforce` when an existing lesson proves true again.
 
+**Storyknow packs (fork):** projects can attach shared knowledge packs via the `knowledge: ["<name-or-path>"]` config key (bare names resolve under `$STORYKNOW_HOME`, default `~/dev/storyknow`). Attached `K-NNN` entries appear in the lesson digest marked `[<pack>] ` and are read-only here — they are the cross-client layer above any federation root's `[root]` lessons. Promote a proven, stack-generic local lesson into a pack with `storybloq lesson promote L-NNN --to <pack>`; manage pack entries inside the pack directory with `storybloq knowledge list|get|digest|create|update|reinforce|delete`. Create a new pack with `storybloq init --type knowledge`.
+
 ## Ticket and Issue Discipline
 
 **Tickets** are planned work -- features, tasks, refactors. They represent intentional, scoped commitments.

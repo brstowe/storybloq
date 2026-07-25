@@ -1428,7 +1428,7 @@ export async function guardPath(
 }
 
 /** Acquires a project lock, executes fn, releases in finally. */
-async function withLock<T>(
+export async function withLock<T>(
   wrapDir: string,
   fn: () => Promise<T>,
 ): Promise<T> {

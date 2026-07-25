@@ -55,6 +55,7 @@ import { writeEvent, writeCheckpoint, markEnded, type TelemetryLayer } from "./t
 import { loadProject } from "../core/project-loader.js";
 import { buildLessonDigest } from "../core/lessons.js";
 import { inheritedLessonsFor } from "../federation/inherit.js";
+import { attachedKnowledgeFor } from "../knowledge/attach.js";
 import { loadLatestSnapshot } from "../core/snapshot.js";
 import { buildRecap } from "../core/snapshot.js";
 import { nextTickets } from "../core/queries.js";
@@ -1172,9 +1173,11 @@ async function handleStart(root: string, args: GuideInput): Promise<McpToolResul
     const rulesText = readFileSafe(join(root, "RULES.md"));
     // T-134: Lessons are the product feature for process knowledge.
     // Project-specific files (like WORK_STRATEGIES.md) are handled by CLAUDE.md.
-    // Fork: federation nodes absorb the orchestrator root's lessons ("[root] ...").
+    // Fork: federation nodes absorb the orchestrator root's lessons ("[root] ...")
+    // and attached storyknow packs contribute shared knowledge ("[<pack>] ...").
     const inheritedLessons = inheritedLessonsFor(root, projectState.config as Record<string, unknown>);
-    const lessonDigest = buildLessonDigest([...projectState.lessons, ...inheritedLessons]);
+    const attachedKnowledge = attachedKnowledgeFor(root, projectState.config as Record<string, unknown>);
+    const lessonDigest = buildLessonDigest([...projectState.lessons, ...inheritedLessons, ...attachedKnowledge]);
 
     // Write context digest
     const digestParts = [

@@ -9,6 +9,18 @@ import { reserveDisplayId } from "../../core/remote-refs.js";
 import { resolveAndNormalizeLessonRef, RefResolutionError } from "../../core/ref-normalization.js";
 import { buildLessonDigest } from "../../core/lessons.js";
 import { inheritedLessonsFor } from "../../federation/inherit.js";
+import {
+  attachedKnowledgeFor,
+  attachedPacksFor,
+  resolvePack,
+  loadKnowledgeEntries,
+  nextKnowledgeID,
+  writeKnowledgeUnlocked,
+  type AttachedPack,
+} from "../../knowledge/index.js";
+import { withLock } from "../../core/project-loader.js";
+import { join } from "node:path";
+import type { Knowledge } from "../../models/knowledge.js";
 import { isTeamModeConfig } from "../../core/team-capabilities.js";
 import {
   formatLessonList,
@@ -19,6 +31,7 @@ import {
   formatLessonReinforceResult,
   formatLessonDeleteResult,
   formatError,
+  successEnvelope,
   ExitCode,
 } from "../../core/output-formatter.js";
 import {
@@ -148,8 +161,11 @@ export function handleLessonDigest(
 ): CommandResult {
   // Fork: federation nodes absorb the orchestrator root's active lessons
   // (marked "[root] ...") so shared knowledge reaches every node session.
-  const inherited = inheritedLessonsFor(ctx.root, ctx.state.config as Record<string, unknown>);
-  const digest = buildLessonDigest([...ctx.state.activeLessons, ...inherited]);
+  // Attached storyknow packs contribute a third layer (marked "[<pack>] ...").
+  const config = ctx.state.config as Record<string, unknown>;
+  const inherited = inheritedLessonsFor(ctx.root, config);
+  const attached = attachedKnowledgeFor(ctx.root, config);
+  const digest = buildLessonDigest([...ctx.state.activeLessons, ...inherited, ...attached]);
   return { output: formatLessonDigest(digest, ctx.format) };
 }
 
@@ -340,6 +356,122 @@ export async function handleLessonReinforce(
 
   if (!reinforcedLesson) throw new Error("Lesson not reinforced");
   return { output: formatLessonReinforceResult(reinforcedLesson, format) };
+}
+
+/**
+ * Fork: promotes a local lesson into an attached storyknow pack. The pack
+ * gains a new K-entry (reinforcement count carried over, origin stamped);
+ * the local lesson is marked superseded with a pointer in its context.
+ */
+export async function handleLessonPromote(
+  id: string,
+  opts: { to: string; force?: boolean },
+  format: OutputFormat,
+  root: string,
+): Promise<CommandResult> {
+  let promoted: { lesson: Lesson; entry: Knowledge; pack: AttachedPack } | undefined;
+
+  await withProjectLock(root, { strict: true }, async ({ state }) => {
+    const resolvedId = resolveAndNormalizeLessonRef(state, id);
+    const lesson = state.lessonByID(resolvedId);
+    if (!lesson) {
+      throw new CliValidationError("not_found", `Lesson ${id} not found`);
+    }
+    if (lesson.status !== "active") {
+      throw new CliValidationError(
+        "invalid_input",
+        `Lesson ${displayIdOf(lesson)} is ${lesson.status} — only active lessons can be promoted`,
+      );
+    }
+
+    const config = state.config as Record<string, unknown>;
+    const attachedPacks = attachedPacksFor(root, config);
+    const pack =
+      attachedPacks.find((p) => p.name === opts.to || p.ref === opts.to) ??
+      // A path-like ref may target a pack that isn't attached (explicit override).
+      (/[/~.]/.test(opts.to) ? resolvePack(opts.to, root) : null);
+    if (!pack) {
+      throw new CliValidationError(
+        "not_found",
+        `Knowledge pack "${opts.to}" is not attached to this project (config key "knowledge") and does not resolve to a pack path`,
+      );
+    }
+
+    const today = todayISO();
+    let entry: Knowledge | undefined;
+
+    await withLock(join(pack.root, ".story"), async () => {
+      const entries = loadKnowledgeEntries(pack.root);
+      const titleKey = lesson.title.trim().toLowerCase();
+      const duplicate = entries.find(
+        (e) => e.status === "active" && e.title.trim().toLowerCase() === titleKey,
+      );
+      if (duplicate && !opts.force) {
+        throw new CliValidationError(
+          "conflict",
+          `Pack "${pack.name}" already has an active entry with this title (${duplicate.id}). Reinforce it instead (storybloq knowledge reinforce ${duplicate.id} in the pack), or pass --force to create anyway.`,
+        );
+      }
+      const newId = nextKnowledgeID(pack.root, entries);
+      entry = {
+        id: newId,
+        title: lesson.title,
+        content: lesson.content,
+        context: lesson.context,
+        source: lesson.source,
+        tags: [...lesson.tags],
+        // Carry the count: it's earned evidence, and pack counts aggregate
+        // into "times proven anywhere" across consumers.
+        reinforcements: lesson.reinforcements,
+        lastValidated: lesson.lastValidated,
+        createdDate: today,
+        updatedDate: today,
+        supersedes: null,
+        status: "active",
+        origin: {
+          project: String(config.project ?? "unknown"),
+          sourceId: displayIdOf(lesson),
+          date: today,
+        },
+      };
+      await writeKnowledgeUnlocked(entry, pack.root, { createOnly: true });
+    });
+
+    if (!entry) throw new Error("Knowledge entry not created");
+
+    const pointer = `Promoted → ${pack.name}:${entry.id} (${today}).`;
+    const updatedLesson: Lesson = {
+      ...lesson,
+      status: "superseded",
+      context: lesson.context ? `${lesson.context}\n\n${pointer}` : pointer,
+      updatedDate: today,
+    };
+    await writeLessonUnlocked(updatedLesson, root);
+
+    promoted = { lesson: updatedLesson, entry, pack };
+  });
+
+  if (!promoted) throw new Error("Lesson not promoted");
+  if (format === "json") {
+    return {
+      output: JSON.stringify(
+        successEnvelope({
+          promoted: {
+            from: displayIdOf(promoted.lesson),
+            to: `${promoted.pack.name}:${promoted.entry.id}`,
+            packRoot: promoted.pack.root,
+          },
+          knowledge: promoted.entry,
+          lesson: promoted.lesson,
+        }),
+        null,
+        2,
+      ),
+    };
+  }
+  return {
+    output: `Promoted ${displayIdOf(promoted.lesson)} → ${promoted.pack.name}:${promoted.entry.id}; local lesson superseded.`,
+  };
 }
 
 export async function handleLessonDelete(
