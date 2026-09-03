@@ -1,15 +1,40 @@
 import { existsSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import type { WorkflowStage, StageResult, StageAdvance, StageContext } from "./types.js";
-import type { GuideReportInput } from "../session-types.js";
+import type { GuideReportInput, PendingProjectMutation } from "../session-types.js";
 import { isDeleted } from "../../core/project-state.js";
 import { isTargetedMode, getRemainingTargets, buildTargetedCandidatesText, buildTargetedPickInstruction, buildTargetedStuckHandover } from "../target-work.js";
-import { detectBranchAffinity, checkAffinityMismatch, buildAffinityAnnotation, buildMismatchHandoverInstruction, createTicketBranch, refreshGitWorkingState } from "../branch-affinity.js";
+import {
+  detectBranchAffinity, checkAffinityMismatch, buildAffinityAnnotation,
+  buildMismatchHandoverInstruction, buildMismatchOfferInstruction,
+  applyBranchStrategy, performNewBranchFromMain, MAX_MISMATCH_CONTROL_FAILURES,
+  type BranchAffinity, type BranchTarget, type PendingMismatch,
+} from "../branch-affinity.js";
 import { canClaim, buildClaim } from "../../core/claims.js";
-import { gitUserEmail } from "../git-inspector.js";
+import { gitUserEmail, gitHead } from "../git-inspector.js";
 import { displayIdOf } from "../../core/resolver.js";
 import { storybloqClientProfile } from "../client-profile.js";
 import { reviewRiskForTicket } from "../review-depth.js";
+import { reviewEffortForIssue, reviewEffortForTicket, sessionEffortFromState } from "../review-effort.js";
+import { entityFingerprint } from "../pending-artifacts.js";
+import { resolveGateStatus } from "./gate-enforcement.js";
+import { tryAcquireEarmark, describeEarmarkHolder, isEarmarkVisible } from "../../core/earmarks.js";
+import type { Ticket } from "../../models/ticket.js";
+import type { Issue } from "../../models/issue.js";
+import { loadCitationContext } from "../../core/ruling-loader.js";
+import { resolveEntityCitations } from "../../core/ruling.js";
+import { formatCitedRulingsSection } from "../../core/output-formatter.js";
+
+/**
+ * T-328: revalidating a pending target has three outcomes, not two. Folding a
+ * transient read failure into "rejected" would clear the episode and reset its
+ * failure budget, so repeated ledger-read failures could only ever be stopped
+ * by the generic retry counter.
+ */
+type RevalidationResult<T> =
+  | { kind: "ok"; item: T }
+  | { kind: "rejected"; advance: StageAdvance }
+  | { kind: "transient"; message: string };
 
 /**
  * PICK_TICKET stage -- Claude selects the next ticket to work on.
@@ -19,6 +44,28 @@ import { reviewRiskForTicket } from "../review-depth.js";
  *
  * T-188: When targetWork is non-empty, candidates are constrained to remaining targets.
  */
+/**
+ * Resolve the finalization baseline for an item about to be picked (ISS-922).
+ *
+ * Must be a FRESH head, never the cached expectedHead: that field records the
+ * last OBSERVED head and has no updater for ordinary active-session drift, so
+ * HEAD can move between COMPLETE and the next pick while branch strategy
+ * "current", "main" already on main, and "per-ticket" already on its branch
+ * all refresh nothing. A stale baseline makes a pre-existing commit read as
+ * this item's work.
+ *
+ * Fails closed rather than falling back: a cached value is exactly what cannot
+ * establish the baseline. That costs no supported configuration, because
+ * session start already refuses a project without git.
+ */
+async function resolveItemBaseHead(ctx: StageContext): Promise<string | null> {
+  const head = await gitHead(ctx.root);
+  return head?.ok ? head.data.hash : null;
+}
+
+const GIT_UNAVAILABLE_AT_PICK =
+  "Cannot resolve HEAD, so the item was NOT picked: without it there is no baseline to detect this item's commit against, and finalization would later refuse work that exists. Restore git access (check `git status` in the project root), then report the pick again.";
+
 export class PickTicketStage implements WorkflowStage {
   readonly id = "PICK_TICKET";
 
@@ -75,7 +122,9 @@ export class PickTicketStage implements WorkflowStage {
 
     // Standard auto mode -- browse full roadmap
     const { nextTickets } = await import("../../core/queries.js");
-    const candidates = nextTickets(projectState, 5);
+    // T-328: a skipped item must not come straight back on the next pass.
+    const skipped = new Set(ctx.state.skippedTargets ?? []);
+    const candidates = nextTickets(projectState, 5, skipped);
 
     let candidatesText = "";
     if (candidates.kind === "found") {
@@ -92,7 +141,9 @@ export class PickTicketStage implements WorkflowStage {
     }
 
     // ISS-084: Surface ALL open issues (severity affects display order, not work-remaining check)
-    const allOpenIssues = projectState.activeIssues.filter(i => i.status === "open");
+    const allOpenIssues = projectState.activeIssues.filter(
+      i => i.status === "open" && !skipped.has(i.id) && !(i.displayId && skipped.has(i.displayId)) && isEarmarkVisible(i),
+    );
     const highIssues = allOpenIssues.filter(i => i.severity === "critical" || i.severity === "high");
     const otherIssues = allOpenIssues.filter(i => i.severity !== "critical" && i.severity !== "high");
     let issuesText = "";
@@ -150,6 +201,13 @@ export class PickTicketStage implements WorkflowStage {
   }
 
   async report(ctx: StageContext, report: GuideReportInput): Promise<StageAdvance> {
+    // T-328: pending control actions dispatch FIRST, so an open mismatch
+    // episode can always be closed. If they ran after the ordinary pick path an
+    // episode could become a trap: the only way out would be the generic retry
+    // exhaustion, which is not a decision anyone made.
+    const control = await this.handlePendingMismatchAction(ctx, report);
+    if (control) return control;
+
     // T-153: Accept issueId for issue-fix flow
     const issueId = report.issueId;
     if (issueId) {
@@ -194,30 +252,6 @@ export class PickTicketStage implements WorkflowStage {
     const targetReject = this.enforceTargetMembership(ctx, ticket.id, ticketLabel);
     if (targetReject) return targetReject;
 
-    // T-328 + ISS-752: Branch affinity mismatch blocking against the resolved item's full id set
-    // Skip when: targeted mode (already handled above), or per-ticket branching (Part 2)
-    if (!isTargetedMode(ctx.state) && ctx.state.resolvedBranchStrategy !== "per-ticket") {
-      const affinity = detectBranchAffinity(ctx.state.git?.branch ?? null);
-      const pickedIds = [ticket.id, ticket.displayId, ...(ticket.previousDisplayIds ?? [])].filter((v): v is string => Boolean(v));
-      const mismatch = checkAffinityMismatch(affinity, pickedIds, ticketLabel);
-      if (mismatch.blocked) {
-        return {
-          action: "goto",
-          target: "HANDOVER",
-          result: {
-            instruction: buildMismatchHandoverInstruction(
-              affinity,
-              ticketLabel,
-              ctx.state.sessionId,
-              storybloqClientProfile().storyCommand,
-            ),
-            reminders: [],
-            transitionedFrom: "PICK_TICKET",
-          },
-        };
-      }
-    }
-
     if (projectState.isBlocked(ticket)) {
       return { action: "retry", instruction: `Ticket ${ticketLabel} is blocked. Pick an unblocked ticket.` };
     }
@@ -241,60 +275,131 @@ export class PickTicketStage implements WorkflowStage {
       }
     }
 
-    // T-328 Part 2: Per-ticket branch creation
-    if (ctx.state.resolvedBranchStrategy === "per-ticket") {
-      const headResult = await import("../git-inspector.js").then(m => m.gitHead(ctx.root));
-      if (!headResult.ok || headResult.data.branch === null) {
-        return { action: "retry", instruction: `branchStrategy is "per-ticket" but ${!headResult.ok ? "git is unavailable" : "HEAD is detached"}. Switch to a branch or set branchStrategy to "none".` };
-      }
-      const result = await createTicketBranch(
-        ctx.root,
-        ctx.state.git ?? { branch: null, mergeBase: null },
-        { id: ticket.id, displayId: ticket.displayId, title: ticket.title },
-        "story",
-      );
-      if (!result.ok) {
-        return { action: "retry", instruction: `Branch creation failed: ${result.message}. Fix the issue and retry.` };
-      }
-      if (result.data.created || result.data.branchName !== ctx.state.git?.branch) {
-        const refreshed = await refreshGitWorkingState(ctx.root);
-        if (!refreshed) {
-          return { action: "retry", instruction: `Branch "${result.data.branchName}" was checked out but git state refresh failed. Run \`git status\` and retry.` };
-        }
-        ctx.updateDraft({
-          git: {
-            ...ctx.state.git,
-            branch: refreshed.branch,
-            expectedHead: refreshed.expectedHead,
-            baseline: refreshed.baseline,
-          },
-        });
-      }
-    }
+    // T-328: affinity runs AFTER the eligibility gates above. It opens a
+    // persisted episode and offers a branch-creating escape, so an ineligible
+    // pick must not be able to start one.
+    const mismatch = this.checkMismatch(ctx, {
+      canonicalId: ticket.id,
+      displayId: ticket.displayId,
+      title: ticket.title,
+      kind: "ticket",
+      allIds: [ticket.id, ticket.displayId, ...(ticket.previousDisplayIds ?? [])]
+        .filter((v): v is string => Boolean(v)),
+      label: ticketLabel,
+    });
+    if (mismatch) return mismatch;
+
+    // T-328: branch strategy is the last thing that touches git.
+    const applied = await this.applyStrategy(ctx, {
+      canonicalId: ticket.id,
+      displayId: ticket.displayId,
+      title: ticket.title,
+      kind: "ticket",
+    });
+    if (applied) return applied;
+
+    // ISS-922: establish this item's finalization baseline from a FRESH head,
+    // after branch strategy (the last thing that moves the repository).
+    const ticketBaseHead = await resolveItemBaseHead(ctx);
+    if (!ticketBaseHead) return { action: "retry", instruction: GIT_UNAVAILABLE_AT_PICK };
 
     // Clean up stale plan from previous ticket (ISS-029)
     const planPath = join(ctx.dir, "plan.md");
     try { if (existsSync(planPath)) unlinkSync(planPath); } catch { /* best-effort */ }
+
+    // T-475 Layer 1 (binding choke point): resolve the earmark CAS before
+    // this stage ever commits to handing out the PLAN instruction. R5 (the
+    // gate-1 acceptor's ruling): CONVERT a matching reservation into an
+    // assignment, never CLEAR one -- an assignment persists through the
+    // item's whole active life so a rival's concurrent reserve/pick has
+    // nothing to race against. An autonomous PICK_TICKET session is always
+    // acting as "worker" in this architecture -- a "pen" never runs its own
+    // autonomous walker through this stage. Fail-closed: any lock, reload,
+    // or write error refuses the pick rather than falling through as
+    // success -- the exact failure mode ISS-1051 named in the pre-existing,
+    // unrelated claim-acquisition path, deliberately not repeated here.
+    let earmarkRefusal: string | null = null;
+    try {
+      const { withProjectLock, writeTicketUnlocked } = await import("../../core/project-loader.js");
+      let refusal: string | null = null;
+      await withProjectLock(ctx.root, { strict: false }, async ({ state: freshState }) => {
+        const freshTicket = freshState.ticketByID(ticket.id);
+        if (!freshTicket) {
+          refusal = `Ticket ${ticketLabel} no longer exists. Pick a different ticket.`;
+          return;
+        }
+        const decision = tryAcquireEarmark(freshTicket.earmark, ctx.state.sessionId, "worker");
+        if (!decision.ok) {
+          refusal = `Ticket ${ticketLabel} is earmarked for ${describeEarmarkHolder(decision.holder)}. Pick a different ticket.`;
+          return;
+        }
+        if (decision.write) {
+          await writeTicketUnlocked({ ...freshTicket, earmark: decision.write }, ctx.root);
+        }
+      });
+      earmarkRefusal = refusal;
+    } catch {
+      earmarkRefusal = `Could not verify earmark status for ${ticketLabel} due to a lock or read error. Try again.`;
+    }
+    if (earmarkRefusal) {
+      return { action: "retry", instruction: earmarkRefusal };
+    }
 
     // T-375: Build claim using final branch (after per-ticket branch creation)
     const finalBranch = ctx.state.git?.branch ?? "unknown";
     const claimObj = email ? buildClaim(email, finalBranch, new Date().toISOString()) : undefined;
 
     // Stage field updates (persisted atomically with state transition by processAdvance)
+    // T-461: resolve this item's review effort once, here, and record where it
+    // came from. skip() must stay pure (the walker may call it repeatedly), so
+    // the disclosure has to be written at pick time rather than at skip time.
+    const ticketEffort = reviewEffortForTicket(
+      ticket as unknown as Record<string, unknown>,
+      sessionEffortFromState(ctx.state),
+    );
+    ctx.appendEvent("review_effort_resolved", {
+      item: ticket.displayId ?? ticket.id,
+      level: ticketEffort.level,
+      source: ticketEffort.source,
+      basis: { type: ticket.type ?? null, risk: reviewRiskForTicket(ticket) },
+    });
+
     ctx.updateDraft({
       ticket: {
         id: ticket.id,
         displayId: ticket.displayId,
         title: ticket.title,
         risk: reviewRiskForTicket(ticket),
+        type: ticket.type ?? undefined,
         claimed: true,
       },
+      currentReviewEffort: ticketEffort.level,
+      currentReviewEffortSource: ticketEffort.source,
       reviews: { plan: [], code: [] },
+      git: { ...ctx.state.git, itemBaseHead: ticketBaseHead },
+      // ISS-904: per-ticket, so a fresh pick never inherits the previous item's
+      // plan-gate history and mis-trigger the park hint on round one.
+      planGateNonApprovals: 0,
       finalizeCheckpoint: null,
+      finalizedItem: null,
       landingDecision: null,
       ticketStartedAt: new Date().toISOString(),
+      // T-474 section 5: resolved fresh for THIS ticket and reset
+      // unconditionally, along with pendingPlanAck/approvedPlanAckDeltas/
+      // approvedPlanSnapshot (ISS-1050) -- no cross-ticket carryover, ever.
+      frozenGate: resolveGateStatus(ctx.root, { kind: "ticket", id: ticket.id }, projectState),
+      pendingPlanAck: null,
+      approvedPlanAckDeltas: null,
+      approvedPlanSnapshot: null,
       ...(claimObj ? { pendingTicketClaim: claimObj } : {}),
     });
+
+    // T-476 acceptance 4 (T-055 class): resolve citations fresh from disk for
+    // THIS ticket rather than trusting anything cached on the ticket object,
+    // so a superseded ruling never rides into a PLAN instruction as if it
+    // were still current.
+    const citationCtx = loadCitationContext(ctx.root);
+    const citedRulingsSection = formatCitedRulingsSection(resolveEntityCitations(ticket, citationCtx));
 
     // Produce PLAN instruction (advance with result for hybrid dispatch)
     return {
@@ -304,6 +409,7 @@ export class PickTicketStage implements WorkflowStage {
           `# Plan for ${ticketLabel}: ${ticket.title}`,
           "",
           ticket.description ? `## Ticket Description\n\n${ticket.description}` : "",
+          citedRulingsSection,
           "",
           `Write an implementation plan for this ticket. Save it to \`.story/sessions/${ctx.state.sessionId}/plan.md\`.`,
           "",
@@ -354,88 +460,509 @@ export class PickTicketStage implements WorkflowStage {
     const targetReject = this.enforceTargetMembership(ctx, issue.id, issueLabel);
     if (targetReject) return targetReject;
 
-    // T-328 + ISS-752: Branch affinity mismatch blocking against the resolved item's full id set
-    if (!isTargetedMode(ctx.state) && ctx.state.resolvedBranchStrategy !== "per-ticket") {
-      const affinity = detectBranchAffinity(ctx.state.git?.branch ?? null);
-      const pickedIds = [issue.id, issue.displayId, ...(issue.previousDisplayIds ?? [])].filter((v): v is string => Boolean(v));
-      const mismatch = checkAffinityMismatch(affinity, pickedIds, issueLabel);
-      if (mismatch.blocked) {
-        return {
-          action: "goto",
-          target: "HANDOVER",
-          result: {
-            instruction: buildMismatchHandoverInstruction(
-              affinity,
-              issueLabel,
-              ctx.state.sessionId,
-              storybloqClientProfile().storyCommand,
-            ),
-            reminders: [],
-            transitionedFrom: "PICK_TICKET",
-          },
-        };
-      }
-    }
-
     // T-188: Targeted mode allows inprogress issues (resume from prior session)
     const targeted = isTargetedMode(ctx.state);
     if (issue.status !== "open" && !(targeted && issue.status === "inprogress")) {
       return { action: "retry", instruction: `Issue ${issueLabel} is ${issue.status}. Pick an open issue.` };
     }
 
-    // T-328 Part 2: Per-ticket branch creation for issues
-    if (ctx.state.resolvedBranchStrategy === "per-ticket") {
-      const headResult = await import("../git-inspector.js").then(m => m.gitHead(ctx.root));
-      if (!headResult.ok || headResult.data.branch === null) {
-        return { action: "retry", instruction: `branchStrategy is "per-ticket" but ${!headResult.ok ? "git is unavailable" : "HEAD is detached"}. Switch to a branch or set branchStrategy to "none".` };
-      }
-      const result = await createTicketBranch(
-        ctx.root,
-        ctx.state.git ?? { branch: null, mergeBase: null },
-        { id: issue.id, displayId: issue.displayId, title: issue.title },
-        "fix",
-      );
-      if (!result.ok) {
-        return { action: "retry", instruction: `Branch creation failed: ${result.message}. Fix the issue and retry.` };
-      }
-      if (result.data.created || result.data.branchName !== ctx.state.git?.branch) {
-        const refreshed = await refreshGitWorkingState(ctx.root);
-        if (!refreshed) {
-          return { action: "retry", instruction: `Branch "${result.data.branchName}" was checked out but git state refresh failed. Run \`git status\` and retry.` };
+    // T-328: same order as the ticket path -- eligibility, then affinity, then
+    // the strategy that actually moves the repository.
+    const mismatch = this.checkMismatch(ctx, {
+      canonicalId: issue.id,
+      displayId: issue.displayId,
+      title: issue.title,
+      kind: "issue",
+      allIds: [issue.id, issue.displayId, ...(issue.previousDisplayIds ?? [])]
+        .filter((v): v is string => Boolean(v)),
+      label: issueLabel,
+    });
+    if (mismatch) return mismatch;
+
+    const applied = await this.applyStrategy(ctx, {
+      canonicalId: issue.id,
+      displayId: issue.displayId,
+      title: issue.title,
+      kind: "issue",
+    });
+    if (applied) return applied;
+
+    // ISS-922: establish the finalization baseline from a FRESH head. This sits
+    // ahead of the ledger mutation below, so failing closed picks nothing AND
+    // leaves the issue's status untouched.
+    const issueBaseHead = await resolveItemBaseHead(ctx);
+    if (!issueBaseHead) return { action: "retry", instruction: GIT_UNAVAILABLE_AT_PICK };
+
+    // T-475 Layer 1 (binding choke point, issue path): a FRESH read here --
+    // not the snapshot from the top of this method -- is what closes the
+    // TOCTOU window round 2's review found (the mismatch check and
+    // applyStrategy's git work above are real async time; a stale earmark
+    // read across that gap would miss a placement that landed during it).
+    // Same R5 convert-not-clear semantics and fail-closed posture as the
+    // ticket path above. Deliberately its OWN locked transaction rather than
+    // merged into the pendingProjectMutation write below: a rival earmark
+    // PLACEMENT is itself CAS'd against whatever this transaction commits
+    // (core/earmarks.ts's placement CAS, wired in cli/commands/earmark.ts),
+    // so a placement landing in the brief gap between this commit and the
+    // status write below sees the now-converted earmark and refuses --
+    // merging the two writes was not required to close the race this ticket
+    // is scoped to close, and reusing the existing pendingProjectMutation
+    // crash-recovery machinery unmodified was judged lower-risk than folding
+    // an unrelated write path into a new combined transaction.
+    let earmarkRefusal: string | null = null;
+    try {
+      const { withProjectLock, writeIssueUnlocked } = await import("../../core/project-loader.js");
+      let refusal: string | null = null;
+      await withProjectLock(ctx.root, { strict: false }, async ({ state: freshState }) => {
+        const freshIssue = freshState.issues.find(i => i.id === issue.id);
+        if (!freshIssue) {
+          refusal = `Issue ${issueLabel} no longer exists. Pick a different issue.`;
+          return;
         }
-        ctx.updateDraft({
-          git: {
-            ...ctx.state.git,
-            branch: refreshed.branch,
-            expectedHead: refreshed.expectedHead,
-            baseline: refreshed.baseline,
-          },
-        });
-      }
+        const decision = tryAcquireEarmark(freshIssue.earmark, ctx.state.sessionId, "worker");
+        if (!decision.ok) {
+          refusal = `Issue ${issueLabel} is earmarked for ${describeEarmarkHolder(decision.holder)}. Pick a different issue.`;
+          return;
+        }
+        if (decision.write) {
+          await writeIssueUnlocked({ ...freshIssue, earmark: decision.write }, ctx.root);
+        }
+      });
+      earmarkRefusal = refusal;
+    } catch {
+      earmarkRefusal = `Could not verify earmark status for ${issueLabel} due to a lock or read error. Try again.`;
+    }
+    if (earmarkRefusal) {
+      return { action: "retry", instruction: earmarkRefusal };
     }
 
     // ISS-090: Mark issue as inprogress with pendingProjectMutation for crash recovery
     // ISS-112: Include expectedCurrent for 3-way recovery check (matches ticket_update pattern)
     // ISS-759: Use the resolved canonical issue.id -- crash-recovery replay matches on target
+    // T-450 step 4: provenance and presence-preserving snapshots are recorded
+    // where the artifact is PREPARED, because neither can be reconstructed at
+    // recovery time -- by then the preimage is whatever the crash left behind.
+    // `expectedCurrent` stays because the shipped recovery path reads it; the
+    // snapshots are what the three-outcome table reads once it is wired.
     const transitionId = `issue-pick-${issue.id}-${Date.now()}`;
     ctx.writeState({
-      pendingProjectMutation: { type: "issue_update", target: issue.id, field: "status", value: "inprogress", expectedCurrent: issue.status, transitionId },
+      pendingProjectMutation: {
+        type: "issue_update",
+        target: issue.id,
+        field: "status",
+        value: "inprogress",
+        expectedCurrent: issue.status,
+        transitionId,
+        provenance: {
+          ownerTask: ctx.state.ownerTask?.id ?? null,
+          revision: ctx.state.revision,
+          ticket: null,
+        },
+        preimage: { present: true, value: issue.status },
+        postimage: { present: true, value: "inprogress" },
+        // The status field alone cannot corroborate a landed write: anyone can
+        // set an issue to inprogress. These digest the WHOLE issue on either
+        // side of the write, which only matches if the entity as a whole is the
+        // one this transaction intended. Without the postimage digest the
+        // "already applied" row is unreachable for the one variant that is
+        // actually prepared. Without the preimage digest a replay could be
+        // authorized against an issue that had drifted since, producing a
+        // result this record could never afterwards recognize.
+        preimageFingerprint: entityFingerprint(issue),
+        postimageFingerprint: entityFingerprint({ ...issue, status: "inprogress" }),
+      } satisfies PendingProjectMutation,
     });
     try {
       const { handleIssueUpdate } = await import("../../cli/commands/issue.js");
       await handleIssueUpdate(issue.id, { status: "inprogress" }, "json", ctx.root);
-    } catch { /* best-effort -- don't block on status update */ }
-    ctx.writeState({ pendingProjectMutation: null });
+      // ISS-1052: only clear the marker on confirmed success. A thrown error
+      // here (lock/IO failure) must leave the marker SET, not cleared -- the
+      // marker is what lets `recoverPendingMutation` (guide.ts) recognize and
+      // recover this write on the next entry point. Clearing it unconditionally
+      // regardless of outcome is the exact fail-open ISS-1052 exists to close.
+      ctx.writeState({ pendingProjectMutation: null });
+    } catch { /* best-effort -- don't block on status update; marker stays set for recovery */ }
+
+    // T-461: same resolution for issues, by severity instead of type.
+    const issueEffort = reviewEffortForIssue(
+      issue as unknown as Record<string, unknown>,
+      sessionEffortFromState(ctx.state),
+    );
+    ctx.appendEvent("review_effort_resolved", {
+      item: issue.displayId ?? issue.id,
+      level: issueEffort.level,
+      source: issueEffort.source,
+      basis: { severity: issue.severity ?? null },
+    });
 
     ctx.updateDraft({
       currentIssue: { id: issue.id, displayId: issue.displayId, title: issue.title, severity: issue.severity },
       ticket: undefined,
+      currentReviewEffort: issueEffort.level,
+      currentReviewEffortSource: issueEffort.source,
       reviews: { plan: [], code: [] },
+      git: { ...ctx.state.git, itemBaseHead: issueBaseHead },
       finalizeCheckpoint: null,
+      finalizedItem: null,
       landingDecision: null,
+      // T-474 section 7 (ISS-1032-shaped descope) closed by ISS-1049: an
+      // issue-fix session now resolves its OWN gate coverage, same as a
+      // ticket pick -- also clears any stale hold left over from a prior
+      // item in the same session.
+      frozenGate: resolveGateStatus(ctx.root, { kind: "issue", id: issue.id }, projectState),
+      pendingPlanAck: null,
+      approvedPlanAckDeltas: null,
+      approvedPlanSnapshot: null,
     });
 
     return { action: "goto", target: "ISSUE_FIX" };
+  }
+
+  // -------------------------------------------------------------------------
+  // T-328: branch-mismatch episodes
+  // -------------------------------------------------------------------------
+
+  /**
+   * The affinity gate. Returns null when the pick is fine.
+   *
+   * The first unresolved mismatch in an episode offers escapes; while an
+   * episode is already open, any further unresolved mismatch is terminal
+   * regardless of which item or branch produced it. Keying on the (item,
+   * branch) pair instead would let a caller alternate ids or rename the branch
+   * and collect a fresh offer forever.
+   */
+  private checkMismatch(
+    ctx: StageContext,
+    target: BranchTarget & { allIds: string[]; label: string },
+  ): StageAdvance | null {
+    const strategy = ctx.state.resolvedBranchStrategy;
+    // Targeted mode constrains picks already; "main" and "per-ticket" have
+    // decided the branch, so there is nothing for affinity to arbitrate. Any
+    // episode still open is stale here too, for the same reason as below.
+    if (isTargetedMode(ctx.state) || strategy === "per-ticket" || strategy === "main") {
+      if (ctx.state.pendingMismatch) ctx.writeState({ pendingMismatch: null });
+      return null;
+    }
+
+    const affinity = detectBranchAffinity(ctx.state.git?.branch ?? null);
+    const mismatch = checkAffinityMismatch(affinity, target.allIds, target.label);
+    if (!mismatch.blocked) {
+      // An open episode resolved by simply picking a matching item. Clearing it
+      // here matters: a stale record would make the NEXT unrelated mismatch
+      // terminal instead of offering, and would leave control actions pointing
+      // at an item this session already moved past.
+      if (ctx.state.pendingMismatch) ctx.writeState({ pendingMismatch: null });
+      return null;
+    }
+
+    const open = ctx.state.pendingMismatch ?? null;
+    if (open) return this.endEpisode(ctx, affinity, target.label);
+
+    ctx.writeState({
+      pendingMismatch: {
+        targetId: target.canonicalId,
+        targetKind: target.kind,
+        branch: affinity.branch ?? "",
+        controlFailures: 0,
+        attempt: null,
+      },
+    });
+    return {
+      action: "retry",
+      instruction: buildMismatchOfferInstruction(affinity, target.label, ctx.state.sessionId),
+    };
+  }
+
+  /** Terminal route: unchanged from the pre-T-328 behavior. */
+  private endEpisode(ctx: StageContext, affinity: BranchAffinity, label: string): StageAdvance {
+    ctx.writeState({ pendingMismatch: null });
+    return {
+      action: "goto",
+      target: "HANDOVER",
+      result: {
+        instruction: buildMismatchHandoverInstruction(
+          affinity,
+          label,
+          ctx.state.sessionId,
+          storybloqClientProfile().storyCommand,
+        ),
+        reminders: [],
+        transitionedFrom: "PICK_TICKET",
+      },
+    };
+  }
+
+  /**
+   * Handle `new_branch_from_main`, `skip_ticket`, and `end_session` while an
+   * episode is open. Returns null when the report is not one of those, so the
+   * ordinary pick path runs untouched.
+   */
+  private async handlePendingMismatchAction(
+    ctx: StageContext,
+    report: GuideReportInput,
+  ): Promise<StageAdvance | null> {
+    const action = report.completedAction;
+    if (action !== "new_branch_from_main" && action !== "skip_ticket" && action !== "end_session") {
+      return null;
+    }
+
+    const open = ctx.state.pendingMismatch ?? null;
+    if (!open) {
+      return {
+        action: "retry",
+        instruction: `"${action}" is only valid while a branch mismatch is pending. Report a ticket or issue pick instead.`,
+      };
+    }
+
+    const identity = this.validatePendingIdentity(open, report);
+    if (identity) return this.controlFailure(ctx, open, identity);
+
+    if (action === "end_session") {
+      const affinity = detectBranchAffinity(open.branch);
+      return this.endEpisode(ctx, affinity, open.targetId);
+    }
+
+    if (action === "skip_ticket") {
+      const skipped = [...(ctx.state.skippedTargets ?? [])];
+      if (!skipped.includes(open.targetId)) skipped.push(open.targetId);
+      ctx.writeState({ skippedTargets: skipped, pendingMismatch: null });
+      return { action: "goto", target: "PICK_TICKET" };
+    }
+
+    return this.handleNewBranchFromMain(ctx, open);
+  }
+
+  /**
+   * A report may carry no id, or the id matching the pending target. Anything
+   * else is rejected rather than ignored: silently accepting a mismatched id
+   * would let a confused caller believe it had skipped or rebranched something
+   * it had not.
+   */
+  private validatePendingIdentity(open: PendingMismatch, report: GuideReportInput): string | null {
+    const { ticketId, issueId } = report;
+    if (ticketId && issueId) return "Sending both ticketId and issueId is ambiguous. Send at most one, and it must match the pending item.";
+    const supplied = ticketId ?? issueId;
+    if (!supplied) return null;
+    const suppliedKind = ticketId ? "ticket" : "issue";
+    if (suppliedKind !== open.targetKind) {
+      return `The pending mismatch is for a ${open.targetKind} (${open.targetId}); a ${suppliedKind}Id was sent instead.`;
+    }
+    if (supplied !== open.targetId) {
+      return `The pending mismatch is for ${open.targetId}, not ${supplied}.`;
+    }
+    return null;
+  }
+
+  /**
+   * Count a recoverable failure against the episode's own bound.
+   *
+   * Every retry also increments the generic stuckRetryCount, whose threshold of
+   * 5 bypasses the cancel gate. Left unbounded, repeated control failures would
+   * end the episode through that generic path rather than through this one.
+   */
+  private controlFailure(ctx: StageContext, open: PendingMismatch, message: string): StageAdvance {
+    const failures = (open.controlFailures ?? 0) + 1;
+    if (failures >= MAX_MISMATCH_CONTROL_FAILURES) {
+      const affinity = detectBranchAffinity(open.branch);
+      ctx.writeState({ pendingMismatch: null });
+      return {
+        action: "goto",
+        target: "HANDOVER",
+        result: {
+          instruction: [
+            buildMismatchHandoverInstruction(
+              affinity,
+              open.targetId,
+              ctx.state.sessionId,
+              storybloqClientProfile().storyCommand,
+            ),
+            "",
+            `Resolving the mismatch failed ${failures} times. Last failure: ${message}`,
+          ].join("\n"),
+          reminders: [],
+          transitionedFrom: "PICK_TICKET",
+        },
+      };
+    }
+    ctx.writeState({ pendingMismatch: { ...open, controlFailures: failures } });
+    return { action: "retry", instruction: message };
+  }
+
+  /**
+   * Revalidate, then branch fresh from main and proceed with the pending pick.
+   *
+   * Revalidation is not optional: the offer can be a compaction old and the
+   * ledger is shared, so the target may have been completed, blocked, deleted,
+   * or claimed since. A stale pending record must never reach git.
+   */
+  private async handleNewBranchFromMain(ctx: StageContext, open: PendingMismatch): Promise<StageAdvance> {
+    if (open.targetKind === "issue") {
+      const revalidated = await this.revalidateIssue(ctx, open.targetId);
+      if (revalidated.kind === "transient") {
+        return this.controlFailure(ctx, open, revalidated.message);
+      }
+      if (revalidated.kind === "rejected") {
+        ctx.writeState({ pendingMismatch: null });
+        return revalidated.advance;
+      }
+      const branched = await this.branchFromMain(ctx, open, {
+        canonicalId: revalidated.item.id,
+        displayId: revalidated.item.displayId,
+        title: revalidated.item.title,
+        kind: "issue",
+      });
+      if (branched) return branched;
+      return this.handleIssuePick(ctx, open.targetId);
+    }
+
+    const revalidated = await this.revalidateTicket(ctx, open.targetId);
+    if (revalidated.kind === "transient") {
+      return this.controlFailure(ctx, open, revalidated.message);
+    }
+    if (revalidated.kind === "rejected") {
+      ctx.writeState({ pendingMismatch: null });
+      return revalidated.advance;
+    }
+    const branched = await this.branchFromMain(ctx, open, {
+      canonicalId: revalidated.item.id,
+      displayId: revalidated.item.displayId,
+      title: revalidated.item.title,
+      kind: "ticket",
+    });
+    if (branched) return branched;
+    return this.report(ctx, { completedAction: "ticket_picked", ticketId: open.targetId });
+  }
+
+  /** Returns a StageAdvance on failure, or null once the branch is in place. */
+  private async branchFromMain(
+    ctx: StageContext,
+    open: PendingMismatch,
+    target: BranchTarget,
+  ): Promise<StageAdvance | null> {
+    let recorded = open.attempt;
+    const outcome = await performNewBranchFromMain(ctx.root, target, recorded, (attempt) => {
+      recorded = attempt;
+      // Write-ahead: on disk before git runs, so a crash in between leaves a
+      // recoverable record rather than an orphan branch nobody can identify.
+      ctx.writeState({ pendingMismatch: { ...open, attempt } });
+    });
+
+    if (!outcome.ok) {
+      const carried: PendingMismatch = { ...open, attempt: outcome.attempt ?? recorded };
+      // Both retryable and non-retryable outcomes go through the bounded
+      // counter. A non-retryable conflict returned as a bare retry would repeat
+      // forever until the generic stuckRetryCount bypass fired, which is
+      // exactly the escape hatch this episode is supposed to make unnecessary.
+      return this.controlFailure(ctx, carried, outcome.message);
+    }
+
+    ctx.writeState({
+      pendingMismatch: null,
+      git: {
+        ...ctx.state.git,
+        branch: outcome.refreshed.branch,
+        expectedHead: outcome.refreshed.expectedHead,
+        // ISS-922: a checkout relocates HEAD, so the finalization baseline follows it.
+        itemBaseHead: outcome.refreshed.expectedHead,
+        baseline: outcome.refreshed.baseline,
+      },
+    });
+    return null;
+  }
+
+  private async revalidateTicket(
+    ctx: StageContext,
+    canonicalId: string,
+  ): Promise<RevalidationResult<Ticket>> {
+    let projectState;
+    try {
+      ({ state: projectState } = await ctx.loadProject());
+    } catch (err) {
+      // Transient: the ledger could not be READ. That says nothing about the
+      // target's eligibility, so the episode stays open and the failure counts
+      // against its bound instead of resetting it.
+      return { kind: "transient", message: `Failed to load project state: ${err instanceof Error ? err.message : String(err)}.` };
+    }
+    const resolved = projectState.resolveTicketRef(canonicalId);
+    if (resolved.kind !== "found") {
+      return { kind: "rejected", advance: { action: "retry", instruction: `Ticket ${canonicalId} is no longer resolvable. Pick a different item.` } };
+    }
+    const ticket = resolved.item;
+    const label = displayIdOf(ticket);
+    if (isDeleted(ticket)) {
+      return { kind: "rejected", advance: { action: "retry", instruction: `Ticket ${label} was deleted while the branch mismatch was pending. Pick a different item.` } };
+    }
+    const membership = this.enforceTargetMembership(ctx, ticket.id, label);
+    if (membership) return { kind: "rejected", advance: membership };
+    if (projectState.isBlocked(ticket)) {
+      return { kind: "rejected", advance: { action: "retry", instruction: `Ticket ${label} became blocked while the branch mismatch was pending. Pick an unblocked item.` } };
+    }
+    if (ticket.status !== "open") {
+      const claim = (ticket as Record<string, unknown>).claimedBySession;
+      if (!(ticket.status === "inprogress" && claim === ctx.state.sessionId)) {
+        return { kind: "rejected", advance: { action: "retry", instruction: `Ticket ${label} is now ${ticket.status}. Pick an open item.` } };
+      }
+    }
+    const email = await gitUserEmail(ctx.root);
+    if (ticket.claim) {
+      const claimResult = canClaim(ticket, email ?? "", ctx.state.git?.branch ?? "unknown");
+      if (!claimResult.allowed) {
+        return { kind: "rejected", advance: { action: "retry", instruction: `Ticket ${label} was claimed by ${claimResult.claimedBy} while the branch mismatch was pending. Pick a different item.` } };
+      }
+    }
+    return { kind: "ok", item: ticket };
+  }
+
+  private async revalidateIssue(
+    ctx: StageContext,
+    canonicalId: string,
+  ): Promise<RevalidationResult<Issue>> {
+    let projectState;
+    try {
+      ({ state: projectState } = await ctx.loadProject());
+    } catch (err) {
+      return { kind: "transient", message: `Failed to load project state: ${err instanceof Error ? err.message : String(err)}.` };
+    }
+    const resolved = projectState.resolveIssueRef(canonicalId);
+    if (resolved.kind !== "found") {
+      return { kind: "rejected", advance: { action: "retry", instruction: `Issue ${canonicalId} is no longer resolvable. Pick a different item.` } };
+    }
+    const issue = resolved.item;
+    const label = displayIdOf(issue);
+    if (isDeleted(issue)) {
+      return { kind: "rejected", advance: { action: "retry", instruction: `Issue ${label} was deleted while the branch mismatch was pending. Pick a different item.` } };
+    }
+    const membership = this.enforceTargetMembership(ctx, issue.id, label);
+    if (membership) return { kind: "rejected", advance: membership };
+    const targeted = isTargetedMode(ctx.state);
+    if (issue.status !== "open" && !(targeted && issue.status === "inprogress")) {
+      return { kind: "rejected", advance: { action: "retry", instruction: `Issue ${label} is now ${issue.status}. Pick an open item.` } };
+    }
+    return { kind: "ok", item: issue };
+  }
+
+  /** Apply the configured branch strategy. Returns a retry, or null on success. */
+  private async applyStrategy(ctx: StageContext, target: BranchTarget): Promise<StageAdvance | null> {
+    const outcome = await applyBranchStrategy(
+      ctx.root,
+      ctx.state.resolvedBranchStrategy ?? "current",
+      ctx.state.git,
+      target,
+    );
+    if (!outcome.ok) return { action: "retry", instruction: outcome.message };
+    if (outcome.refreshed) {
+      ctx.updateDraft({
+        git: {
+          ...ctx.state.git,
+          branch: outcome.refreshed.branch,
+          expectedHead: outcome.refreshed.expectedHead,
+          // ISS-922: a checkout relocates HEAD, so the finalization baseline follows it.
+          itemBaseHead: outcome.refreshed.expectedHead,
+          baseline: outcome.refreshed.baseline,
+        },
+      });
+    }
+    return null;
   }
 
   // T-188 (split for ISS-759): remaining-empty check runs BEFORE resolution

@@ -2,6 +2,10 @@
 
 ## CLI Commands
 
+### JSON output envelope
+
+Commands accepting `--format json` wrap their payload in a versioned envelope: `{"version": 1, "data": ...}` on success, `{"version": 1, "error": {"code": ..., "message": ...}}` on failure, plus a `warnings` array on partial loads (exit code 3). Pass `--raw` with `--format json` to emit the `data` payload verbatim: errors keep the envelope, partial-load warnings are dropped (the exit code still signals them), and commands whose JSON is not the standard envelope reject `--raw` naming their shape. A few commands predate the envelope and emit their own JSON instead: `gc`, `limit-status`, `conflicts list`, `conflicts show`, `resolve` and `team reserve` return an `{"ok", "data"}` object, and `team init` and `team setup` return a bare result object. `session list` and `session show` use a text/json axis with their own top-level shapes, and the `bus` subcommands speak the versioned Bus wire format. Every one of these names its own shape in its `--help` and does not accept `--raw` at all, so passing it is rejected during argument validation, before the command runs -- which matters because several of them mutate state.
+
 ### init
 Initialize a new .story/ project
 
@@ -55,7 +59,7 @@ storybloq ticket create --title <t> --type <type> [--phase <p>] [--description <
 Update a ticket
 
 ```
-storybloq ticket update <id> [--status <s>] [--title <t>] [--type <type>] [--phase <p>] [--order <n>] [--description <d>] [--blocked-by <ids>] [--parent-ticket <id>] [--format json|md]
+storybloq ticket update <id> [--status <s>] [--title <t>] [--type <type>] [--phase <p>] [--order <n>] [--description <d>] [--blocked-by <ids>] [--parent-ticket <id>] [--force] [--format json|md]
 ```
 
 ### ticket meta
@@ -372,11 +376,18 @@ Run native Codex plan or code review for an autonomous session
 storybloq codex-review plan|code --session <id> --format guide-report
 ```
 
+### limit-status
+Show pending usage-limit auto-resumes (global across projects); cancel or requeue records
+
+```
+storybloq limit-status [--cancel <key>] [--requeue <key>] [--recent] [--format json|md]
+```
+
 ### setup
 Install Storybloq skill, MCP, and hooks for Claude, Codex, or both
 
 ```
-storybloq setup [--client claude|codex|all] [--skip-hooks]
+storybloq setup [--client claude|codex|all] [--skip-hooks] [--skip-skill]
 ```
 
 ### setup-skill
@@ -499,17 +510,31 @@ storybloq dispatch [ids..] [--format json|md]
 ```
 
 ### bus init
-Enable the local Storybloq Bus
+Low-level initializer: enable the local Storybloq Bus v2 for this project (prefer `storybloq bus setup`). Initializes a fresh v2 runtime only; if a v1 runtime is present it refuses with `upgrade_required` and directs you to `storybloq bus setup`, which resolves this task's identity and runs the guided drain/upgrade.
 
 ```
 storybloq bus init [--format json|md]
 ```
 
-### bus join
-Bind the current client task to one exclusive Bus role
+### bus setup
+Connect this task to the Storybloq Bus in one idempotent, resumable command. Initializes or upgrades the runtime, joins this task's endpoint, and (when hook delivery is enabled) enables this client's guarded on-boundary hooks. With one endpoint it ends with a handoff line inviting the other task to connect. --replace <endpoint-id> retires a proven-offline incumbent and takes its place, redelivering that endpoint's undelivered mail to this successor. --force-archive overrides unread noncritical v1 delivery only during a v1->v2 upgrade; it never bypasses ship-gate blockers (unacknowledged critical messages, parked unresolved critical threads, quarantined threads).
 
 ```
-storybloq bus join implementer|reviewer [--client claude|codex] [--task-id <id>] [--surface <surface>] [--replace] [--format json|md]
+storybloq bus setup [--client claude|codex] [--task-id <id>] [--surface claude_cli|codex_cli|codex_desktop] [--delivery live|poll] [--replace <endpoint-id>] [--force-archive] [--format json|md]
+```
+
+### bus auto-attach
+Turn per-session Bus auto-attach on or off for this project (opt-in, default off). `on` runs the full `bus setup` bootstrap once (initializing the runtime, joining this task, and installing the global client hooks) and sets the opt-in flag; thereafter every new session auto-attaches at SessionStart with its on-boundary delivery tiers enabled, no command, and a session that finds a proven-dead peer reclaims its slot and inherits its undelivered mail. `off` clears the flag and leaves the runtime and existing endpoints in place.
+
+```
+storybloq bus auto-attach <on|off> [--client claude|codex] [--task-id <id>] [--surface claude_cli|codex_cli|codex_desktop] [--force-archive] [--format json|md]
+```
+
+### bus join
+Deprecated: roles are now per-message, so the legacy role argument is ignored. Use `storybloq bus setup`.
+
+```
+storybloq bus join [legacy-role] [--client claude|codex] [--task-id <id>] [--surface <surface>] [--replace <endpoint-id>] [--format json|md]
 ```
 
 ### bus leave
@@ -527,17 +552,17 @@ storybloq bus endpoint retire <endpoint-id> --force --reason <text> [--format js
 ```
 
 ### bus send
-Create a Bus thread or send a reply
+Create a Bus thread or send a reply. Routing always targets the sole peer; `--to` is deprecated and ignored.
 
 ```
-storybloq bus send --to <role> --kind <kind> --body <text> --idempotency-key <key> [--thread <id>] [--thread-kind <kind>] [--issue <id>] [--ticket <id>] [--commit <sha>] [--ci-run <id>] [--file <path>] [--format json|md]
+storybloq bus send --kind <kind> --body <text> --idempotency-key <key> [--to <role>] [--thread <id>] [--thread-kind <kind>] [--issue <id>] [--ticket <id>] [--commit <sha>] [--ci-run <id>] [--file <path>] [--format json|md]
 ```
 
 ### bus poll
-Poll unacknowledged messages for the task-bound endpoint
+Poll unacknowledged messages for the task-bound endpoint. --limit bounds how many messages are returned (applies to the wait drain too). With --wait, block until a message arrives or --timeout elapses (v2 only), then exit: 0 = message delivered, 4 = timed out, 5 = another --wait already owns this endpoint.
 
 ```
-storybloq bus poll [--endpoint <id>] [--client claude|codex] [--task-id <id>] [--limit N] [--format json|md]
+storybloq bus poll [--endpoint <id>] [--client claude|codex] [--task-id <id>] [--limit N] [--wait] [--timeout <seconds>] [--format json|md]
 ```
 
 ### bus ack
@@ -555,7 +580,7 @@ storybloq bus thread show|update <thread-id> [options] [--format json|md]
 ```
 
 ### bus hooks
-Enable or disable guarded live Bus delivery for this project
+Enable or disable guarded on-boundary Bus delivery for this project
 
 ```
 storybloq bus hooks enable|disable [--client claude|codex|all] [--format json|md]
@@ -612,9 +637,9 @@ storybloq node remove <name> [--format json|md]
 
 ## MCP Tools
 
-The base tools below are registered in full mode (inside a .story/ project). The five storybloq_bus_* tools are feature-gated and appear only when `features.bus` is enabled at MCP process start.
+The base tools below are registered in full mode (inside a .story/ project). The five storybloq_bus_* tools are always registered in full mode; when the Bus is disabled or uninitialized they return setup guidance pointing at `storybloq bus setup`, with no MCP restart required.
 
-- **storybloq_status** (format?) - Project summary: phase statuses, ticket/issue counts, blockers. Markdown is the default; JSON includes full active/resumable session ownership and lease metadata.
+- **storybloq_status** (format?, clientTaskId?) - Project summary: phase statuses, ticket/issue counts, blockers. Markdown is the default; JSON includes full active/resumable session ownership and lease metadata. clientTaskId (T-477) also enriches this session's own arrangementPresence/ownerIdentity onto its presence record as a side effect; omit to inherit the environment identity, same as storybloq_session_guard.
 - **storybloq_phase_list** - All phases with derived status
 - **storybloq_phase_current** - First non-complete phase
 - **storybloq_phase_tickets** (phaseId) - Leaf tickets for a specific phase
@@ -641,7 +666,7 @@ The base tools below are registered in full mode (inside a .story/ project). The
 - **storybloq_note_create** (content, title?, tags?) - Create note
 - **storybloq_note_update** (id, content?, title?, tags?, status?) - Update note
 - **storybloq_ticket_create** (title, type, phase?, description?, blockedBy?, parentTicket?) - Create ticket
-- **storybloq_ticket_update** (id, status?, title?, type?, order?, description?, phase?, parentTicket?, blockedBy?) - Update ticket
+- **storybloq_ticket_update** (id, status?, title?, type?, order?, description?, phase?, parentTicket?, blockedBy?, force?) - Update ticket
 - **storybloq_ticket_meta_set** (id, path, value) - Set custom passthrough metadata on a ticket
 - **storybloq_ticket_meta_unset** (id, path) - Unset custom passthrough metadata from a ticket
 - **storybloq_issue_create** (title, severity, impact, components?, relatedTickets?, location?, sourceRefs?, dedupeKey?, createdBy?, phase?) - Create issue with optional durable review provenance and retry deduplication
@@ -659,11 +684,14 @@ The base tools below are registered in full mode (inside a .story/ project). The
 - **storybloq_review_lenses_prepare** (stage, diff, changedFiles, ticketDescription?, reviewRound?, priorDeferrals?, sessionId?) - Prepare multi-lens review on @storybloq/lenses: activation, secrets gate, context packaging, complete lens prompts
 - **storybloq_review_lenses_synthesize** (stage?, lensResults, activeLenses, skippedLenses, reviewRound?, reviewId?, diff?, changedFiles?, sessionId?) - Run the @storybloq/lenses merger pipeline programmatically over raw lens outputs; returns the ReviewVerdict envelope (no merger agent)
 - **storybloq_review_lenses_judge** (reviewVerdict, convergenceHistory?) - Deterministic three-value verdict mapping over the synthesize ReviewVerdict plus convergence history (no judge agent)
-- **storybloq_autonomous_guide** (sessionId?, action, mode?, ticketId?, clientTaskId?, takeover?) - Autonomous session orchestrator -- call at every decision point to drive PICK_TICKET through COMPLETE
+- **storybloq_autonomous_guide** (sessionId?, action, mode?, ticketId?, clientTaskId?, takeover?, reviewEffort?) - Autonomous session orchestrator -- call at every decision point to drive PICK_TICKET through COMPLETE
+- **storybloq_session_guard** (clientTaskId?) - Session ownership verdict: is anything running, and may I write? Reads only .story/sessions/, no ledger load. Also registered in degraded mode
+- **storybloq_session_milestone** (kind, gateName?, note?, clientTaskId?) - Report a self-described work milestone (implementing/gate-hold/blocked-external/reviewing) onto this session's own presence record, for duet/arrangement visibility. Self-reported, never a computed verdict. gateName is required when kind is gate-hold. On lock contention or write failure, returns an explicit machine-readable retryable error rather than a false success.
 - **storybloq_session_report** (sessionId) - Structured analysis of an autonomous session (works even if project state is corrupted)
 - **storybloq_register_subprocess** (pid, cmd, category?, sessionId?) - Register a running subprocess so monitors can tell slow builds from hung agents
 - **storybloq_unregister_subprocess** (pid, sessionId?) - Unregister a subprocess after it completes (idempotent)
-- **storybloq_bus_send** (endpointId, clientTaskId, threadId?, threadKind?, predecessorThreadId?, toRole, messageKind, severity, body, refs?, inReplyTo?, idempotencyKey) - Send a task-bound advisory peer message
+- **storybloq_bus_send** (endpointId, clientTaskId, threadId?, threadKind?, predecessorThreadId?, toRole?, messageKind, severity, body, refs?, inReplyTo?, idempotencyKey) - Send a task-bound advisory peer message; routes to the sole peer (toRole is deprecated, optional, and ignored)
+- **storybloq_bus_redeliver** (endpointId, clientTaskId, predecessorThreadId, refusedEntryHash) - Redeliver a hop-cap-parked, never-dropped message onto a fresh successor thread; content is always the resolved refused artifact, never caller-supplied
 - **storybloq_bus_poll** (endpointId, clientTaskId, limit?) - Poll a task-bound endpoint mailbox with peer-authority envelopes
 - **storybloq_bus_ack** (endpointId, clientTaskId, messageId, disposition, reason?) - Record delivery disposition without resolving canonical work
 - **storybloq_bus_thread_get** (endpointId, clientTaskId, threadId) - Read a participant thread's verified prefix and folded state
@@ -677,8 +705,9 @@ The base tools below are registered in full mode (inside a .story/ project). The
 
 With no .story/ project on the path, the MCP server starts degraded and registers only:
 
-- **storybloq_init** — bootstrap a .story/ project, then dynamically register the full tool set
-- **storybloq_status** — returns setup guidance instead of a project summary
+- **storybloq_session_guard** -- the ownership verdict, available here because the no-project case is exactly where the skill runs its Step 0.5 guard first (T-446)
+- **storybloq_init** -- bootstrap a .story/ project, then dynamically register the full tool set
+- **storybloq_status** -- returns setup guidance instead of a project summary
 
 Destructive, admin, and git-integration workflows (delete, reconcile, conflicts, resolve, merge-driver, team, gc, repair, config, feedback) are CLI-only in both modes; see the CLI Commands section above.
 
@@ -708,6 +737,16 @@ Requires explicit opt-in via AskUserQuestion before any agents are dispatched, a
 
 `/story` surfaces this option proactively at context load when the client is capable and the actionable backlog is orchestrate-sized, so you do not have to know the command exists; it stays a recommendation, and selecting it still routes through the explicit opt-in.
 
+## /story triage
+
+Read-only triage of the open issue backlog: verifies each finding against the pinned current HEAD (reusing the same source-reference provenance checks as `storybloq validate`), flags already-fixed and duplicate issues, groups issues that share one verified root cause, and produces a prioritized recommendations report.
+
+```
+/story triage                    # triage all open issues, report only
+```
+
+Mutates no issue and no ticket: classifications and recommendations are report vocabulary, and closing or filing stays with the maintainer. The only optional write is saving the finished report as a handover (snapshot first), offered once and performed only on explicit confirmation. The full procedure -- integrity branching, alias correlation, evidence bars, report format -- is in `triage-mode.md`.
+
 ## /story bus
 
 Poll or coordinate through the current task-bound local Bus endpoint. Peer content is advisory; confirmed review findings become canonical issues before an issue notice is sent.
@@ -721,14 +760,14 @@ Read `bus-mode.md` for setup, endpoint binding, authority boundaries, acknowledg
 ## Common Workflows
 
 ### Session Start
-1. `storybloq status` — project overview
-2. `storybloq recap` — what changed since last snapshot
-3. `storybloq handover latest` — last session context
-4. `storybloq ticket next` — what to work on
+1. `storybloq status` -- project overview
+2. `storybloq recap` -- what changed since last snapshot
+3. `storybloq handover latest` -- last session context
+4. `storybloq ticket next` -- what to work on
 
 ### Session End
-1. `storybloq snapshot` — save state for diffs
-2. `storybloq handover create --content <md>` — write session handover
+1. `storybloq snapshot` -- save state for diffs
+2. `storybloq handover create --content <md>` -- write session handover
 
 ### Project Setup
 1. `npm install -g @storybloq/storybloq` - install CLI

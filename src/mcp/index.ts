@@ -3,7 +3,7 @@
  * storybloq MCP server entry point.
  *
  * Provides MCP tools for querying and modifying .story/ project state.
- * Uses direct handler imports — no subprocess spawning.
+ * Uses direct handler imports -- no subprocess spawning.
  * Stdio transport: reads JSON-RPC from stdin, writes to stdout.
  * All diagnostic output goes to stderr.
  *
@@ -13,13 +13,16 @@
  * - Walk-up from cwd to find .story/config.json
  * - If neither found, server starts in degraded mode with storybloq_init + error status
  */
+import { captureStartupFingerprint } from "../autonomous/binary-staleness.js";
 import { realpathSync, existsSync } from "node:fs";
 import { resolve, join, isAbsolute } from "node:path";
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { serverRegistryBinder } from "../autonomous/mcp-binding.js";
+
 import { discoverProjectRoot } from "../core/project-root-discovery.js";
-import { registerAllTools } from "./tools.js";
+import { registerAllTools, registerSessionGuardTool } from "./tools.js";
+import { withStrictToolSchemas } from "./strict-schemas.js";
 import { initProject } from "../core/init.js";
 import { startInboxWatcher, stopInboxWatcher } from "../channel/inbox-watcher.js";
 
@@ -27,12 +30,27 @@ const ENV_VAR = "STORYBLOQ_PROJECT_ROOT";
 const LEGACY_ENV_VAR = "CLAUDESTORY_PROJECT_ROOT";
 const CONFIG_PATH = ".story/config.json";
 
+/**
+ * Bind this process to a project's server registry (T-450).
+ *
+ * The mechanism lives in `../autonomous/mcp-binding.js` so it can be imported
+ * and tested without executing `main()`. Kept exported here because callers
+ * inside this module bind at two distinct moments: startup, and a
+ * `storybloq_init` that creates the project in a server that began in degraded
+ * mode. Missing the second would leave a server stamping its pid on guide calls
+ * while absent from the registry, so it could never be recognized as a live
+ * successor until the client restarted.
+ */
+export function bindServerRegistry(root: string | null | undefined): void {
+  serverRegistryBinder.bind(root);
+}
+
 // Version injected at build time by tsup define
 const version = process.env.STORYBLOQ_VERSION ?? "0.0.0-dev";
 
 /**
  * Try to discover project root. Returns the root path or null.
- * Never exits — the server stays alive even without a project.
+ * Never exits -- the server stays alive even without a project.
  */
 function tryDiscoverRoot(): string | null {
   const envRoot = process.env[ENV_VAR] ?? process.env[LEGACY_ENV_VAR];
@@ -67,10 +85,18 @@ function tryDiscoverRoot(): string | null {
  * Degraded-mode tools: registered when no .story/ project is found.
  * Provides storybloq_init to bootstrap a project, then dynamically
  * swaps to the full tool set via registerAllTools.
+ *
+ * `root` is injectable for tests only; production always passes nothing and the
+ * handlers resolve the cwd themselves, exactly as before.
  */
-function registerDegradedTools(server: McpServer): void {
+export function registerDegradedTools(rawServer: McpServer, root?: string): void {
+  // ISS-892: the degraded surface gets the same strict-argument shim as the full
+  // one. storybloq_init writes to disk, so a dropped unknown key here has the
+  // same consequence it has anywhere else.
+  const server = withStrictToolSchemas(rawServer);
+
   const degradedStatus = server.registerTool("storybloq_status", {
-    description: "Project summary — returns guidance if no .story/ project found",
+    description: "Project summary -- returns guidance if no .story/ project found",
     inputSchema: {
       format: z.enum(["md", "json"]).optional().describe("Output format (default: md)"),
     },
@@ -89,6 +115,15 @@ function registerDegradedTools(server: McpServer): void {
     }],
     isError: true,
   }));
+
+  // T-446: the session guard is available in degraded mode too. This is the
+  // no-project case, which is exactly where the skill runs Step 0.5 first.
+  //
+  // The handle is captured because `registerAllTools` registers the same name.
+  // Leaving this one in place makes the post-init swap throw on a duplicate
+  // registration, which lands in the catch below and re-registers the degraded
+  // surface -- stranding the user in degraded mode after a SUCCESSFUL init.
+  const degradedGuard = registerSessionGuardTool(server, root ?? process.cwd());
 
   const degradedInit = server.registerTool("storybloq_init", {
     description: "Initialize a new .story/ project in the current directory",
@@ -117,7 +152,13 @@ function registerDegradedTools(server: McpServer): void {
     try {
       degradedStatus.remove();
       degradedInit.remove();
+      degradedGuard.remove();
       registerAllTools(server, result.root);
+      // T-450: this server now serves a project it did not know about at
+      // startup. Without binding here it would stamp its pid on guide calls
+      // while staying absent from that project's registry, so it could never
+      // be seen as a live successor until the client restarted.
+      bindServerRegistry(result.root);
       // Explicit tool-list-changed notification after the full swap. Each
       // underlying registerTool / remove call already emits its own
       // notification, but firing 49 notifications in rapid succession can
@@ -133,7 +174,7 @@ function registerDegradedTools(server: McpServer): void {
     } catch (swapErr: unknown) {
       process.stderr.write(`storybloq: tool-swap failed after init: ${swapErr instanceof Error ? swapErr.message : String(swapErr)}\n`);
       // Re-register degraded tools so the server isn't completely toolless.
-      // The project was created — user can restart for full access.
+      // The project was created -- user can restart for full access.
       try { registerDegradedTools(server); } catch { /* best effort */ }
       return { content: [{ type: "text" as const, text: `Initialized .story/ project "${args.name}" at ${result.root}\n\nWarning: tool registration failed. Restart the MCP server for full tool access.` }] };
     }
@@ -160,6 +201,13 @@ function registerDegradedTools(server: McpServer): void {
 }
 
 async function main(): Promise<void> {
+  // ISS-906: fingerprint the binary this process is actually running, once,
+  // before anything else. Error paths later compare it against the disk to
+  // establish "the server is stale; restart the client" POSITIVELY instead of
+  // misreporting skew as a missing session. Capture happens regardless of
+  // whether a .story/ root exists -- a stale server in degraded mode misleads
+  // identically.
+  captureStartupFingerprint();
   const root = tryDiscoverRoot();
 
   const server = new McpServer(
@@ -183,7 +231,7 @@ async function main(): Promise<void> {
     process.stderr.write(`storybloq MCP server running (root: ${root})\n`);
   } else {
     registerDegradedTools(server);
-    process.stderr.write("storybloq MCP server running (no project — storybloq_init available)\n");
+    process.stderr.write("storybloq MCP server running (no project -- storybloq_init available)\n");
   }
 
   // Graceful shutdown: stop inbox watcher on process exit
@@ -252,6 +300,24 @@ async function main(): Promise<void> {
     process.exit(isEpipe ? 0 : 1);
   });
 
+  // T-450: register as a live server so a death marker left by a PREDECESSOR
+  // can be recognized as an ordinary restart rather than the client going away.
+  // The successor never touches the predecessor's sessions, so this registry is
+  // the only place that relationship is observable. Success here is also what
+  // licenses this process to stamp its pid on sessions at all.
+  bindServerRegistry(root);
+
+  // Imported dynamically, not at module scope: the SDK's stdio.js imports
+  // node:process, and Node's ESM builtin facade eagerly reads every export at
+  // link time -- including the stdin getter, which constructs the TTY. Because
+  // tsup bundles with splitting: false, a static import here gets hoisted to a
+  // top-level import in dist/cli.js, defeating cli/index.ts's lazy --mcp guard
+  // and making EVERY CLI invocation acquire stdin before argv parsing. On a
+  // wedged pty that open() hangs uninterruptibly (ISS-1043). The dynamic form
+  // survives bundling because esbuild preserves dynamic imports of externals.
+  const { StdioServerTransport } = await import(
+    "@modelcontextprotocol/sdk/server/stdio.js"
+  );
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }

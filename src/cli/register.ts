@@ -3,7 +3,7 @@
  *
  * Each register*Command function wires up yargs command definitions with
  * the corresponding handler from the commands/ directory. This file imports
- * from run.ts (EPIPE listener) and is therefore CLI-only — MCP must never
+ * from run.ts (EPIPE listener) and is therefore CLI-only -- MCP must never
  * import this module.
  */
 import type { Argv } from "yargs";
@@ -24,12 +24,34 @@ import {
   resolveCliNodeRoot,
   CliValidationError,
 } from "./helpers.js";
+import { arrayOptions, arrayPositional } from "./array-options.js";
+
+// Shared comma/empty/trim/emptyAfterSplit combinations. See array-options.ts for
+// what each axis means and ISS-886 for why they are declared per registration.
+/** Newly comma-enabled list of atomic values. */
+const SPLIT_LIST = {
+  comma: "split",
+  empty: "drop",
+  trim: "segments",
+  emptyAfterSplit: "reject",
+} as const;
+/** Already split commas before ISS-886: trims every value and clears on a lone separator. */
+const LEGACY_SPLIT_LIST = {
+  comma: "split",
+  empty: "drop",
+  trim: "always",
+  emptyAfterSplit: "drop",
+} as const;
+/** Payload value where a comma is legal; blank entries were already dropped. */
+const LITERAL_DROP_BLANK = { comma: "literal", empty: "drop", trim: "never" } as const;
+/** Payload value where a comma is legal and a blank must still reach validation. */
+const LITERAL_KEEP_BLANK = { comma: "literal", empty: "preserve", trim: "never" } as const;
 import { parseMetadataValue } from "./commands/metadata.js";
-import { formatError, formatLedgerIntegrity, ExitCode, type OutputFormat } from "../core/output-formatter.js";
+import { formatError, formatLedgerIntegrity, noProjectFoundOutput, ExitCode, type OutputFormat } from "../core/output-formatter.js";
 import { discoverIntegrityRoot, scanLedgerIntegrity } from "../core/ledger-integrity.js";
 import type { IssueSourceRefInput } from "../models/issue.js";
 
-// Handler imports — read handlers
+// Handler imports -- read handlers
 import { handleStatus } from "./commands/status.js";
 import { handleValidateWithSourceRefs } from "./commands/validate.js";
 import { handleRepair, computeRepairs } from "./commands/repair.js";
@@ -80,6 +102,34 @@ import {
   handleNoteUpdate,
   handleNoteDelete,
 } from "./commands/note.js";
+import {
+  handleArrangementList,
+  handleArrangementGet,
+  handleArrangementCreate,
+  handleArrangementUpdate,
+} from "./commands/arrangement.js";
+import { ARRANGEMENT_LIFECYCLE, ARRANGEMENT_ROLES, type ArrangementParty } from "../models/arrangement.js";
+import {
+  handleRulingList,
+  handleRulingGet,
+  handleRulingCreate,
+  handleRulingSupersede,
+} from "./commands/ruling.js";
+import { RULING_ATTRIBUTIONS } from "../models/ruling.js";
+import { handleLandings } from "./commands/landings.js";
+import {
+  handleGateAckGet,
+  handleGateAckList,
+  handleGateAckCreate,
+  handleGateAckContest,
+} from "./commands/gate-ack.js";
+import {
+  handleEarmarkGet,
+  handleEarmarkReserve,
+  handleEarmarkAssign,
+  handleEarmarkRelease,
+} from "./commands/earmark.js";
+import { EARMARK_ROLES } from "../models/types.js";
 import {
   handleLessonList,
   handleLessonGet,
@@ -182,10 +232,11 @@ export function registerStatusCommand(yargs: Argv): Argv {
   return yargs.command(
     "status",
     "Project summary",
-    (y) => addFormatOption(y),
+    (y) => addFormatOption(y).option("client-task-id", { type: "string", describe: "Explicit caller identity, if not resolvable from the session" }),
     async (argv) => {
       const format = parseOutputFormat(argv.format);
-      await runReadCommand(format, handleStatus);
+      const clientTaskId = argv["client-task-id"] as string | undefined;
+      await runReadCommand(format, (ctx) => handleStatus(ctx, clientTaskId));
     },
   );
 }
@@ -280,11 +331,10 @@ export function registerReconcileCommand(yargs: Argv): Argv {
     "reconcile",
     "Detect and fix duplicate displayIds across all entity types",
     (y) =>
-      y
+      addFormatOption(y
         .option("dry-run", { type: "boolean", default: false, describe: "Show what would change without writing" })
         .option("ci", { type: "boolean", default: false, describe: "Exit non-zero if duplicates found, no mutations" })
-        .option("rebalance-ranks", { type: "boolean", default: false, describe: "Also rebalance fractional ranks" })
-        .option("format", { type: "string", choices: ["md", "json"], default: "md", describe: "Output format" }),
+        .option("rebalance-ranks", { type: "boolean", default: false, describe: "Also rebalance fractional ranks" })),
     async (argv) => {
       const root = (await import("../core/project-root-discovery.js")).discoverProjectRoot();
       const result = await handleReconcile(root, {
@@ -314,10 +364,10 @@ export function registerConflictsCommand(yargs: Argv): Argv {
         .command(
           "list",
           "List all items with unresolved conflicts",
-          (y2) => y2.option("format", { type: "string", choices: ["md", "json"], default: "md" }),
+          (y2) => addFormatOption(y2, 'an {"ok", "data"} object (or {"ok", "error"} on failure)'),
           async (argv) => {
             const root = (await import("../core/project-root-discovery.js")).discoverProjectRoot();
-            if (!root) { writeOutput("No .story/ project found."); process.exitCode = ExitCode.USER_ERROR; return; }
+            if (!root) { writeOutput(noProjectFoundOutput(argv.format, "ok")); process.exitCode = ExitCode.USER_ERROR; return; }
             const { handleConflictsList } = await import("./commands/conflicts.js");
             const result = await handleConflictsList(root, (argv.format as "md" | "json") ?? "md");
             writeOutput(result.output);
@@ -327,12 +377,11 @@ export function registerConflictsCommand(yargs: Argv): Argv {
           "show <id>",
           "Show field-level conflict detail for an item",
           (y2) =>
-            y2
-              .positional("id", { type: "string", demandOption: true, describe: "Entity ID" })
-              .option("format", { type: "string", choices: ["md", "json"], default: "md" }),
+            addFormatOption(y2
+              .positional("id", { type: "string", demandOption: true, describe: "Entity ID" }), 'an {"ok", "data"} object (or {"ok", "error"} on failure)'),
           async (argv) => {
             const root = (await import("../core/project-root-discovery.js")).discoverProjectRoot();
-            if (!root) { writeOutput("No .story/ project found."); process.exitCode = ExitCode.USER_ERROR; return; }
+            if (!root) { writeOutput(noProjectFoundOutput(argv.format, "ok")); process.exitCode = ExitCode.USER_ERROR; return; }
             const { handleConflictsShow } = await import("./commands/conflicts.js");
             const result = await handleConflictsShow(argv.id as string, root, (argv.format as "md" | "json") ?? "md");
             writeOutput(result.output);
@@ -349,15 +398,14 @@ export function registerResolveCommand(yargs: Argv): Argv {
     "resolve <id>",
     "Resolve merge conflicts on a .story/ item",
     (y) =>
-      y
+      addFormatOption(y
         .positional("id", { type: "string", demandOption: true, describe: "Entity ID" })
         .option("field", { type: "string", describe: "Resolve a specific field" })
         .option("use", { type: "string", choices: ["ours", "theirs"], describe: "Pick a side" })
-        .option("value", { type: "string", describe: "Custom value (JSON)" })
-        .option("format", { type: "string", choices: ["md", "json"], default: "md" }),
+        .option("value", { type: "string", describe: "Custom value (JSON)" }), 'an {"ok", "data"} object (or {"ok", "error"} on failure)'),
     async (argv) => {
       const root = (await import("../core/project-root-discovery.js")).discoverProjectRoot();
-      if (!root) { writeOutput("No .story/ project found."); process.exitCode = ExitCode.USER_ERROR; return; }
+      if (!root) { writeOutput(noProjectFoundOutput(argv.format, "ok")); process.exitCode = ExitCode.USER_ERROR; return; }
       try {
         const { handleResolve } = await import("./commands/conflicts.js");
         let parsedValue: unknown;
@@ -373,8 +421,14 @@ export function registerResolveCommand(yargs: Argv): Argv {
         writeOutput(result.output);
         if (result.exitCode) process.exitCode = result.exitCode;
       } catch (err: unknown) {
+        // ISS-910: same rule the gc and team-reserve adapters already follow
+        // (ISS-805 R3) -- a post-validation handler failure still honors
+        // --format json, emitting one parseable { ok:false, error } object
+        // rather than prose an automated caller cannot read.
         const message = err instanceof Error ? err.message : String(err);
-        writeOutput(message);
+        writeOutput(
+          argv.format === "json" ? JSON.stringify({ ok: false, error: message }, null, 2) : message,
+        );
         process.exitCode = ExitCode.USER_ERROR;
       }
     },
@@ -390,7 +444,7 @@ export function registerGcCommand(yargs: Argv): Argv {
     "gc",
     "Remove tombstoned files past retention period",
     (y) =>
-      y
+      addFormatOption(y
         .option("apply", {
           type: "boolean",
           default: false,
@@ -405,17 +459,11 @@ export function registerGcCommand(yargs: Argv): Argv {
           type: "number",
           default: 30,
           describe: "Retention period in days",
-        })
-        .option("format", {
-          type: "string",
-          choices: ["md", "json"],
-          default: "md",
-          describe: "Output format",
-        }),
+        }), 'an {"ok", "data"} object (or {"ok", "error"} on failure)'),
     async (argv) => {
       const root = (await import("../core/project-root-discovery.js")).discoverProjectRoot();
       if (!root) {
-        writeOutput("No .story/ project found.");
+        writeOutput(noProjectFoundOutput(argv.format, "ok"));
         process.exitCode = ExitCode.USER_ERROR;
         return;
       }
@@ -485,9 +533,8 @@ export function registerTeamCommand(yargs: Argv): Argv {
         "doctor",
         "Run team health checks on the project",
         (y2) =>
-          y2
-            .option("ci", { type: "boolean", default: false, describe: "Exit non-zero on error-level findings" })
-            .option("format", { type: "string", choices: ["md", "json"], default: "md", describe: "Output format" }),
+          addFormatOption(y2
+            .option("ci", { type: "boolean", default: false, describe: "Exit non-zero on error-level findings" })),
         async (argv) => {
           const root = (await import("../core/project-root-discovery.js")).discoverProjectRoot();
           const result = await handleTeamDoctor(root, {
@@ -504,10 +551,9 @@ export function registerTeamCommand(yargs: Argv): Argv {
         "reserve <type>",
         "Reserve display IDs via remote git refs",
         (y2) =>
-          y2
+          addFormatOption(y2
             .positional("type", { type: "string", demandOption: true, choices: ["tickets", "issues", "notes", "lessons"], describe: "Entity type" })
-            .option("count", { type: "number", default: 1, describe: "Number of IDs to reserve (1-100)" })
-            .option("format", { type: "string", choices: ["md", "json"], default: "md" }),
+            .option("count", { type: "number", default: 1, describe: "Number of IDs to reserve (1-100)" }), 'an {"ok", "data"} object (or {"ok", "error"} on failure)'),
         async (argv) => {
           const reserveFormat = (argv.format as "md" | "json") ?? "md";
           // ISS-805 R1: validate --count BEFORE project discovery so the JSON
@@ -522,7 +568,7 @@ export function registerTeamCommand(yargs: Argv): Argv {
             return;
           }
           const root = (await import("../core/project-root-discovery.js")).discoverProjectRoot();
-          if (!root) { writeOutput("No .story/ project found."); process.exitCode = ExitCode.USER_ERROR; return; }
+          if (!root) { writeOutput(noProjectFoundOutput(argv.format, "ok")); process.exitCode = ExitCode.USER_ERROR; return; }
           try {
             const result = await handleReserve(root, argv.type as "tickets" | "issues" | "notes" | "lessons", argv.count as number, reserveFormat);
             writeOutput(result.output);
@@ -544,13 +590,12 @@ export function registerTeamCommand(yargs: Argv): Argv {
         "init",
         "Enable team mode on this project",
         (y2) =>
-          y2
+          addFormatOption(y2
             .option("claim-staleness-hours", { type: "number", describe: "Hours before a claim is considered stale (default 48)" })
-            .option("id-allocator", { type: "string", choices: ["local", "git-refs"], describe: "ID allocation strategy: local (default) needs no remote but divergent branches can mint duplicate display ids (run `storybloq reconcile` after merges); git-refs reserves ids via remote refs, preventing collisions at the source" })
-            .option("format", { type: "string", choices: ["md", "json"], default: "md", describe: "Output format" }),
+            .option("id-allocator", { type: "string", choices: ["local", "git-refs"], describe: "ID allocation strategy: local (default) needs no remote but divergent branches can mint duplicate display ids (run `storybloq reconcile` after merges); git-refs reserves ids via remote refs, preventing collisions at the source" }), "its own top-level result object with no envelope"),
         async (argv) => {
           const root = (await import("../core/project-root-discovery.js")).discoverProjectRoot();
-          if (!root) { writeOutput("No .story/ project found."); process.exitCode = ExitCode.USER_ERROR; return; }
+          if (!root) { writeOutput(noProjectFoundOutput(argv.format, "ok")); process.exitCode = ExitCode.USER_ERROR; return; }
           const { handleTeamInit } = await import("./commands/team-init.js");
           const result = await handleTeamInit(root, {
             claimStalenessHours: argv["claim-staleness-hours"] as number | undefined,
@@ -564,12 +609,10 @@ export function registerTeamCommand(yargs: Argv): Argv {
       .command(
         "setup",
         "Install git merge driver and .gitattributes for team mode",
-        (y2) =>
-          y2
-            .option("format", { type: "string", choices: ["md", "json"], default: "md", describe: "Output format" }),
+        (y2) => addFormatOption(y2, "its own top-level result object with no envelope"),
         async (argv) => {
           const root = (await import("../core/project-root-discovery.js")).discoverProjectRoot();
-          if (!root) { writeOutput("No .story/ project found."); process.exitCode = ExitCode.USER_ERROR; return; }
+          if (!root) { writeOutput(noProjectFoundOutput(argv.format, "ok")); process.exitCode = ExitCode.USER_ERROR; return; }
           const { handleTeamSetup } = await import("./commands/team-setup.js");
           const result = await handleTeamSetup(root, { format: (argv.format as "md" | "json") ?? "md" });
           writeOutput(result.output);
@@ -587,7 +630,7 @@ export function registerTeamCommand(yargs: Argv): Argv {
               (y2) => addFormatOption(y2),
               async (argv) => {
                 const root = (await import("../core/project-root-discovery.js")).discoverProjectRoot();
-                if (!root) { writeOutput("No .story/ project found."); process.exitCode = ExitCode.USER_ERROR; return; }
+                if (!root) { writeOutput(noProjectFoundOutput(argv.format, "envelope")); process.exitCode = ExitCode.USER_ERROR; return; }
                 const { handleTeamConfigShow } = await import("./commands/team-config.js");
                 const result = handleTeamConfigShow(root, parseOutputFormat(argv.format));
                 writeOutput(result.output);
@@ -604,7 +647,7 @@ export function registerTeamCommand(yargs: Argv): Argv {
                 ),
               async (argv) => {
                 const root = (await import("../core/project-root-discovery.js")).discoverProjectRoot();
-                if (!root) { writeOutput("No .story/ project found."); process.exitCode = ExitCode.USER_ERROR; return; }
+                if (!root) { writeOutput(noProjectFoundOutput(argv.format, "envelope")); process.exitCode = ExitCode.USER_ERROR; return; }
                 const { handleTeamConfigSet } = await import("./commands/team-config.js");
                 const result = await handleTeamConfigSet(root, argv.key as string, argv.value as string, parseOutputFormat(argv.format));
                 writeOutput(result.output);
@@ -627,17 +670,12 @@ export function registerMigrateCommand(yargs: Argv): Argv {
     "migrate",
     "Migrate config schema to latest version",
     (y) =>
-      y
+      addFormatOption(y
         .option("dry-run", {
           type: "boolean",
           default: false,
           describe: "Show proposed changes without writing",
-        })
-        .option("format", {
-          choices: ["md", "json"] as const,
-          default: "md",
-          describe: "Output format",
-        }),
+        })),
     async (argv) => {
       const format = parseOutputFormat(argv.format);
       const dryRun = argv["dry-run"] as boolean;
@@ -1252,7 +1290,7 @@ export function registerTicketCommand(yargs: Argv): Argv {
           "Create a new ticket",
           (y2) =>
             addNodeOption(addFormatOption(
-              y2
+              arrayOptions(y2
                 .option("title", {
                   type: "string",
                   demandOption: true,
@@ -1275,11 +1313,6 @@ export function registerTicketCommand(yargs: Argv): Argv {
                   type: "boolean",
                   describe: "Read description from stdin",
                 })
-                .option("blocked-by", {
-                  type: "string",
-                  array: true,
-                  describe: "IDs of blocking tickets",
-                })
                 .option("parent-ticket", {
                   type: "string",
                   describe: "Parent ticket ID (makes this a sub-ticket)",
@@ -1289,7 +1322,11 @@ export function registerTicketCommand(yargs: Argv): Argv {
                   describe: "Project to assign (must belong to the ticket's phase)",
                 })
                 .conflicts("description", "stdin"),
-            )),
+              {
+                "blocked-by": { ...SPLIT_LIST, describe: "IDs of blocking tickets" },
+                "cites-ruling": { ...SPLIT_LIST, describe: "Ruling IDs this ticket cites (e.g. r-[canonical])" },
+              },
+            ))),
           async (argv) => {
             const format = parseOutputFormat(argv.format);
             const orchRoot = (
@@ -1323,12 +1360,13 @@ export function registerTicketCommand(yargs: Argv): Argv {
                   type: argv.type as string,
                   phase: argv.phase === "" ? null : (argv.phase as string | undefined) ?? null,
                   description,
-                  blockedBy: normalizeArrayOption(
-                    argv["blocked-by"] as string[] | undefined,
+                  blockedBy: (
+                    argv["blocked-by"] as string[] | undefined ?? []
                   ),
                   parentTicket:
                     argv["parent-ticket"] === "" ? null : (argv["parent-ticket"] as string | undefined) ?? null,
                   project: argv.project === "" ? null : (argv.project as string | undefined) ?? null,
+                  citesRuling: argv["cites-ruling"] as string[] | undefined,
                 },
                 format,
                 eff.root,
@@ -1361,7 +1399,7 @@ export function registerTicketCommand(yargs: Argv): Argv {
           "Update a ticket",
           (y2) =>
             addFormatOption(
-              y2
+              arrayOptions(y2
                 .positional("id", {
                   type: "string",
                   demandOption: true,
@@ -1395,16 +1433,6 @@ export function registerTicketCommand(yargs: Argv): Argv {
                   type: "boolean",
                   describe: "Read description from stdin",
                 })
-                .option("blocked-by", {
-                  type: "string",
-                  array: true,
-                  describe: "IDs of blocking tickets",
-                })
-                .option("cross-node-blocked-by", {
-                  type: "string",
-                  array: true,
-                  describe: "Cross-node blocking refs (e.g. engine:T-001). Null string clears.",
-                })
                 .option("parent-ticket", {
                   type: "string",
                   describe: "Parent ticket ID",
@@ -1417,8 +1445,30 @@ export function registerTicketCommand(yargs: Argv): Argv {
                   type: "string",
                   describe: "Node name (orchestrator only)",
                 })
-                .conflicts("description", "stdin"),
-            ),
+                .option("force", {
+                  type: "boolean",
+                  default: false,
+                  describe: "Complete a claimed ticket without proving ownership (T-442)",
+                })
+                .option("clear-cites-rulings", {
+                  type: "boolean",
+                  describe: "Clear all cited rulings",
+                })
+                .conflicts("description", "stdin")
+                .conflicts("cites-ruling", "clear-cites-rulings"),
+              {
+                "blocked-by": { ...SPLIT_LIST, describe: "IDs of blocking tickets" },
+                "cross-node-blocked-by": {
+                  ...LEGACY_SPLIT_LIST,
+                  describe: "Cross-node blocking refs (e.g. engine:T-001). Bare flag clears.",
+                },
+                "cites-ruling": {
+                  ...SPLIT_LIST,
+                  describe: "Ruling IDs this ticket cites (replaces existing)",
+                  requireValue: "Use --clear-cites-rulings to clear.",
+                },
+              },
+            )),
           async (argv) => {
             const format = parseOutputFormat(argv.format);
             const id = parseTicketId(argv.id as string);
@@ -1447,15 +1497,14 @@ export function registerTicketCommand(yargs: Argv): Argv {
               if (argv.stdin) {
                 description = await readStdinContent();
               }
+              // Splitting and trimming now happen at parse time, but the presence
+              // conversion must stay: handleTicketUpdate treats null as "remove the
+              // field" while an empty array would persist crossNodeBlockedBy: [].
               const rawCrossNode = argv["cross-node-blocked-by"] as string[] | undefined;
-              let crossNodeBlockedBy: string[] | null | undefined;
-              if (rawCrossNode) {
-                const flat = normalizeArrayOption(rawCrossNode)
-                  ?.flatMap((v) => v.split(","))
-                  .map((v) => v.trim())
-                  .filter(Boolean);
-                crossNodeBlockedBy = flat && flat.length > 0 ? flat : null;
-              }
+              const crossNodeBlockedBy: string[] | null | undefined =
+                rawCrossNode === undefined
+                  ? undefined
+                  : rawCrossNode.length > 0 ? rawCrossNode : null;
               const result = await handleTicketUpdate(
                 id,
                 {
@@ -1465,15 +1514,16 @@ export function registerTicketCommand(yargs: Argv): Argv {
                   phase: argv.phase === "" ? null : argv.phase as string | undefined,
                   order: argv.order as number | undefined,
                   description,
-                  blockedBy: argv["blocked-by"]
-                    ? normalizeArrayOption(argv["blocked-by"] as string[])
-                    : undefined,
+                  blockedBy: argv["blocked-by"] as string[] | undefined,
                   crossNodeBlockedBy,
                   parentTicket: argv["parent-ticket"] === "" ? null : argv["parent-ticket"] as string | undefined,
                   project: argv.project === "" ? null : argv.project as string | undefined,
+                  citesRuling: argv["cites-ruling"] as string[] | undefined,
+                  clearCitesRulings: argv["clear-cites-rulings"] as boolean | undefined,
                 },
                 format,
                 eff.root,
+                argv.force as boolean,
               );
               writeOutput(result.output);
               process.exitCode = result.exitCode ?? ExitCode.OK;
@@ -1862,7 +1912,7 @@ export function registerIssueCommand(yargs: Argv): Argv {
           "Create a new issue",
           (y2) =>
             addFormatOption(
-              y2
+              arrayOptions(y2
                 .option("title", {
                   type: "string",
                   demandOption: true,
@@ -1885,29 +1935,9 @@ export function registerIssueCommand(yargs: Argv): Argv {
                   type: "string",
                   describe: "Phase ID (defaults to the current working phase if omitted)",
                 })
-                .option("components", {
-                  type: "string",
-                  array: true,
-                  describe: "Affected components",
-                })
-                .option("related-tickets", {
-                  type: "string",
-                  array: true,
-                  describe: "Related ticket IDs",
-                })
-                .option("location", {
-                  type: "string",
-                  array: true,
-                  describe: "File locations",
-                })
                 .option("project", {
                   type: "string",
                   describe: "Project to assign (must belong to the issue's phase)",
-                })
-                .option("source-ref", {
-                  type: "string",
-                  array: true,
-                  describe: "Structured source reference as a JSON object",
                 })
                 .option("dedupe-key", {
                   type: "string",
@@ -1924,7 +1954,17 @@ export function registerIssueCommand(yargs: Argv): Argv {
                   }
                   return true;
                 }),
-            ),
+              {
+                components: { ...SPLIT_LIST, describe: "Affected components" },
+                "related-tickets": { ...SPLIT_LIST, describe: "Related ticket IDs" },
+                location: { ...LITERAL_DROP_BLANK, describe: "File locations" },
+                "source-ref": {
+                  ...LITERAL_KEEP_BLANK,
+                  describe: "Source reference as a JSON object",
+                },
+                "cites-ruling": { ...SPLIT_LIST, describe: "Ruling IDs this issue cites (e.g. r-[canonical])" },
+              },
+            )),
           async (argv) => {
             const format = parseOutputFormat(argv.format);
             const root = (
@@ -1951,20 +1991,15 @@ export function registerIssueCommand(yargs: Argv): Argv {
                   title: argv.title as string,
                   severity: argv.severity as string,
                   impact,
-                  components: normalizeArrayOption(
-                    argv.components as string[] | undefined,
-                  ),
-                  relatedTickets: normalizeArrayOption(
-                    argv["related-tickets"] as string[] | undefined,
-                  ),
-                  location: normalizeArrayOption(
-                    argv.location as string[] | undefined,
-                  ),
+                  components: (argv.components as string[] | undefined) ?? [],
+                  relatedTickets: (argv["related-tickets"] as string[] | undefined) ?? [],
+                  location: (argv.location as string[] | undefined) ?? [],
                   sourceRefs: parseIssueSourceRefs(argv["source-ref"] as string[] | undefined),
                   dedupeKey: argv["dedupe-key"] as string | undefined,
                   createdBy: argv["created-by"] as string | undefined,
                   phase: argv.phase === "" ? undefined : (argv.phase as string | undefined),
                   project: argv.project === "" ? null : (argv.project as string | undefined) ?? null,
+                  citesRuling: argv["cites-ruling"] as string[] | undefined,
                 },
                 format,
                 root,
@@ -1997,7 +2032,7 @@ export function registerIssueCommand(yargs: Argv): Argv {
           "Update an issue",
           (y2) =>
             addFormatOption(
-              y2
+              arrayOptions(y2
                 .positional("id", {
                   type: "string",
                   demandOption: true,
@@ -2027,26 +2062,6 @@ export function registerIssueCommand(yargs: Argv): Argv {
                   type: "string",
                   describe: "Resolution description",
                 })
-                .option("components", {
-                  type: "string",
-                  array: true,
-                  describe: "Affected components",
-                })
-                .option("related-tickets", {
-                  type: "string",
-                  array: true,
-                  describe: "Related ticket IDs",
-                })
-                .option("location", {
-                  type: "string",
-                  array: true,
-                  describe: "File locations",
-                })
-                .option("source-ref", {
-                  type: "string",
-                  array: true,
-                  describe: "Replacement structured source reference as a JSON object",
-                })
                 .option("order", {
                   type: "number",
                   describe: "New sort order",
@@ -2059,8 +2074,27 @@ export function registerIssueCommand(yargs: Argv): Argv {
                   type: "string",
                   describe: "Project to assign (must belong to the issue's phase). Empty string clears.",
                 })
-                .conflicts("impact", "stdin"),
-            ),
+                .option("clear-cites-rulings", {
+                  type: "boolean",
+                  describe: "Clear all cited rulings",
+                })
+                .conflicts("impact", "stdin")
+                .conflicts("cites-ruling", "clear-cites-rulings"),
+              {
+                components: { ...SPLIT_LIST, describe: "Affected components" },
+                "related-tickets": { ...SPLIT_LIST, describe: "Related ticket IDs" },
+                location: { ...LITERAL_DROP_BLANK, describe: "File locations" },
+                "source-ref": {
+                  ...LITERAL_KEEP_BLANK,
+                  describe: "Replacement source ref (JSON object)",
+                },
+                "cites-ruling": {
+                  ...SPLIT_LIST,
+                  describe: "Ruling IDs this issue cites (replaces existing)",
+                  requireValue: "Use --clear-cites-rulings to clear.",
+                },
+              },
+            )),
           async (argv) => {
             const format = parseOutputFormat(argv.format);
             const id = parseIssueId(argv.id as string);
@@ -2094,19 +2128,15 @@ export function registerIssueCommand(yargs: Argv): Argv {
                     argv.resolution === ""
                       ? null
                       : (argv.resolution as string | undefined),
-                  components: argv.components
-                    ? normalizeArrayOption(argv.components as string[])
-                    : undefined,
-                  relatedTickets: argv["related-tickets"]
-                    ? normalizeArrayOption(argv["related-tickets"] as string[])
-                    : undefined,
-                  location: argv.location
-                    ? normalizeArrayOption(argv.location as string[])
-                    : undefined,
+                  components: argv.components as string[] | undefined,
+                  relatedTickets: argv["related-tickets"] as string[] | undefined,
+                  location: argv.location as string[] | undefined,
                   sourceRefs: parseIssueSourceRefs(argv["source-ref"] as string[] | undefined),
                   order: argv.order as number | undefined,
                   phase: argv.phase === "" ? null : argv.phase as string | undefined,
                   project: argv.project === "" ? null : argv.project as string | undefined,
+                  citesRuling: argv["cites-ruling"] as string[] | undefined,
+                  clearCitesRulings: argv["clear-cites-rulings"] as boolean | undefined,
                 },
                 format,
                 root,
@@ -2733,7 +2763,7 @@ export function registerSnapshotCommand(yargs: Argv): Argv {
 export function registerRecapCommand(yargs: Argv): Argv {
   return yargs.command(
     "recap",
-    "Session diff — changes since last snapshot + suggested actions",
+    "Session diff -- changes since last snapshot + suggested actions",
     (y) => addFormatOption(y),
     async (argv) => {
       const format = parseOutputFormat(argv.format);
@@ -2847,7 +2877,7 @@ export function registerNoteCommand(yargs: Argv): Argv {
           "Create a note",
           (y2) =>
             addFormatOption(
-              y2
+              arrayOptions(y2
                 .option("content", {
                   type: "string",
                   describe: "Note content",
@@ -2855,10 +2885,6 @@ export function registerNoteCommand(yargs: Argv): Argv {
                 .option("title", {
                   type: "string",
                   describe: "Note title",
-                })
-                .option("tags", {
-                  type: "array",
-                  describe: "Tags for the note",
                 })
                 .option("stdin", {
                   type: "boolean",
@@ -2873,7 +2899,8 @@ export function registerNoteCommand(yargs: Argv): Argv {
                   }
                   return true;
                 }),
-            ),
+              { tags: { ...SPLIT_LIST, describe: "Tags for the note" } },
+            )),
           async (argv) => {
             const format = parseOutputFormat(argv.format);
             const root = (
@@ -2928,7 +2955,7 @@ export function registerNoteCommand(yargs: Argv): Argv {
           "Update a note",
           (y2) =>
             addFormatOption(
-              y2
+              arrayOptions(y2
                 .positional("id", {
                   type: "string",
                   demandOption: true,
@@ -2941,10 +2968,6 @@ export function registerNoteCommand(yargs: Argv): Argv {
                 .option("title", {
                   type: "string",
                   describe: "New title",
-                })
-                .option("tags", {
-                  type: "array",
-                  describe: "New tags (replaces existing)",
                 })
                 .option("clear-tags", {
                   type: "boolean",
@@ -2961,7 +2984,14 @@ export function registerNoteCommand(yargs: Argv): Argv {
                 })
                 .conflicts("content", "stdin")
                 .conflicts("tags", "clear-tags"),
-            ),
+              {
+                tags: {
+                  ...SPLIT_LIST,
+                  describe: "New tags (replaces existing)",
+                  requireValue: "Use --clear-tags to clear tags.",
+                },
+              },
+            )),
           async (argv) => {
             const format = parseOutputFormat(argv.format);
             const id = parseNoteId(argv.id as string);
@@ -3056,6 +3086,863 @@ export function registerNoteCommand(yargs: Argv): Argv {
   );
 }
 
+// ---------------------------------------------------------------------------
+// arrangement (T-473)
+// ---------------------------------------------------------------------------
+
+/**
+ * ISS-1078 ([R1-FIX 8]): parses the `key=value,key=value,...` fields of one
+ * `--party` entry, tolerating a comma INSIDE a value when the value is
+ * double-quoted (`modelTier="opus, fallback sonnet"`). Grammar:
+ *
+ * - A value may be wrapped in `"..."`; its closing quote must be immediately
+ *   followed by `,` or end-of-string (anything else after the close-quote is
+ *   refused as malformed, never silently truncated).
+ * - Inside quotes, `\"` is a literal quote and `\\` is a literal backslash;
+ *   no other backslash escape is recognized (refused by name).
+ * - An unquoted value may not contain a comma (unchanged from before this
+ *   fix) but may contain a raw `"` or `\` literally -- every existing
+ *   unquoted spec still parses byte-for-byte identically.
+ * - An unterminated quote is refused by name, never treated as an unquoted
+ *   value containing a literal quote character.
+ *
+ * `--party` is a single CLI argument, so a value containing a comma needs
+ * BOTH this quoting AND the shell's own quoting to survive argv splitting,
+ * e.g. `--party 'role=pen,client=codex,identityAnchor=session-1,modelTier="opus, fallback sonnet"'`
+ * (outer single-quotes are the shell's job, inner double-quotes are this
+ * parser's job) -- stated in the `--party` help text with this exact example.
+ */
+function parsePartyFields(spec: string): Record<string, string> {
+  const fields: Record<string, string> = {};
+  const n = spec.length;
+  let i = 0;
+  // `more` tracks whether a comma was actually consumed as a separator, so a
+  // TRAILING comma (nothing after it) still forces one more iteration that
+  // hits the `eq === -1` malformed check below -- matching the pre-fix
+  // `spec.split(",")` behavior, which produced a trailing empty segment and
+  // threw the same error. Ending cleanly at end-of-string (no trailing
+  // comma) does NOT force another iteration.
+  let more = true;
+  while (more) {
+    more = false;
+    const eq = spec.indexOf("=", i);
+    // A key never contains a comma, so a comma appearing BEFORE the next `=`
+    // means the fragment between `i` and that comma has no `=` at all --
+    // malformed, e.g. a stray `junk` between two valid `key=value` pairs.
+    // Without this check, `indexOf("=", i)` would search PAST that comma and
+    // silently absorb the garbage fragment into the next field's key (fixed
+    // post-gate-1, codex round 1: this is what the un-narrowed scan did).
+    const commaBeforeEq = spec.indexOf(",", i);
+    if (eq === -1 || (commaBeforeEq !== -1 && commaBeforeEq < eq)) {
+      const badFragment = commaBeforeEq !== -1 ? spec.slice(i, commaBeforeEq) : spec.slice(i);
+      throw new CliValidationError(
+        "invalid_input",
+        `Malformed --party entry (expected key=value pairs): "${spec}"` +
+        (badFragment.length > 0 ? ` (offending fragment: "${badFragment}")` : " (trailing comma with no following field)"),
+      );
+    }
+    const key = spec.slice(i, eq).trim();
+    let cursor = eq + 1;
+    let value: string;
+    if (spec[cursor] === "\"") {
+      let out = "";
+      let j = cursor + 1;
+      let closed = false;
+      while (j < n) {
+        const ch = spec[j];
+        if (ch === "\\") {
+          const next = spec[j + 1];
+          if (next === "\"" || next === "\\") {
+            out += next;
+            j += 2;
+            continue;
+          }
+          throw new CliValidationError(
+            "invalid_input",
+            `Malformed --party entry: invalid escape "\\${next ?? ""}" in "${spec}" (only \\" and \\\\ are recognized)`,
+          );
+        }
+        if (ch === "\"") {
+          closed = true;
+          j += 1;
+          break;
+        }
+        out += ch;
+        j += 1;
+      }
+      if (!closed) {
+        throw new CliValidationError("invalid_input", `Malformed --party entry: unterminated quote in "${spec}"`);
+      }
+      if (j < n && spec[j] !== ",") {
+        throw new CliValidationError(
+          "invalid_input",
+          `Malformed --party entry: unexpected characters after closing quote in "${spec}"`,
+        );
+      }
+      value = out;
+      if (j < n) {
+        cursor = j + 1;
+        more = true;
+      } else {
+        cursor = j;
+      }
+    } else {
+      const comma = spec.indexOf(",", cursor);
+      if (comma === -1) {
+        value = spec.slice(cursor).trim();
+        cursor = n;
+      } else {
+        value = spec.slice(cursor, comma).trim();
+        cursor = comma + 1;
+        more = true;
+      }
+    }
+    fields[key] = value;
+    i = cursor;
+  }
+  return fields;
+}
+
+/**
+ * Parses one `--party role=pen,client=codex,identityAnchor=abc123` entry.
+ * Exported for direct parser-level testing (ISS-1078) -- the argv-level CLI
+ * integration test in arrangement-party-spec.test.ts covers the full
+ * shell-quoting-plus-parser-quoting path separately.
+ */
+export function parsePartySpec(spec: string): ArrangementParty {
+  const fields = parsePartyFields(spec);
+  const { role, client, identityAnchor, modelTier } = fields;
+  if (!role || !ARRANGEMENT_ROLES.includes(role as (typeof ARRANGEMENT_ROLES)[number])) {
+    throw new CliValidationError("invalid_input", `--party role must be one of ${ARRANGEMENT_ROLES.join(", ")}: "${spec}"`);
+  }
+  if (client !== "claude" && client !== "codex") {
+    throw new CliValidationError("invalid_input", `--party client must be "claude" or "codex": "${spec}"`);
+  }
+  if (!identityAnchor) {
+    throw new CliValidationError("invalid_input", `--party identityAnchor is required: "${spec}"`);
+  }
+  return {
+    role: role as (typeof ARRANGEMENT_ROLES)[number],
+    client,
+    identityAnchor,
+    ...(modelTier !== undefined && { modelTier }),
+  };
+}
+
+export function registerArrangementCommand(yargs: Argv): Argv {
+  return yargs.command(
+    "arrangement",
+    "Manage duet-mode arrangements",
+    (y) =>
+      y
+        .command(
+          "list",
+          "List arrangements",
+          (y2) =>
+            addFormatOption(
+              y2.option("lifecycle", {
+                type: "string",
+                choices: ARRANGEMENT_LIFECYCLE,
+                describe: "Filter by lifecycle",
+              }),
+            ),
+          async (argv) => {
+            const format = parseOutputFormat(argv.format);
+            await runReadCommand(format, (ctx) =>
+              handleArrangementList({ lifecycle: argv.lifecycle as string | undefined }, ctx),
+            );
+          },
+        )
+        .command(
+          "get <id>",
+          "Get an arrangement",
+          (y2) =>
+            addFormatOption(
+              y2.positional("id", {
+                type: "string",
+                demandOption: true,
+                describe: "Arrangement ID (e.g. a-[canonical])",
+              }),
+            ),
+          async (argv) => {
+            const format = parseOutputFormat(argv.format);
+            await runReadCommand(format, (ctx) => handleArrangementGet(argv.id as string, ctx));
+          },
+        )
+        .command(
+          "create",
+          "Create a new arrangement",
+          (y2) =>
+            addFormatOption(
+              arrayOptions(
+                y2
+                  .option("unreachability-irreversible", {
+                    type: "string",
+                    choices: ["hold", "escalate"],
+                    demandOption: true,
+                    describe: "What to do on irreversible work when the arrangement is unreachable",
+                  })
+                  .option("unreachability-reversible", {
+                    type: "string",
+                    choices: ["hold", "escalate", "proceed"],
+                    describe: "What to do on reversible work when the arrangement is unreachable",
+                  }),
+                {
+                  // Atomic ticket/issue refs -- a comma can never be part of one.
+                  bounds: { ...SPLIT_LIST, describe: "Ticket/issue refs this arrangement covers (repeatable)" },
+                  // "role=pen,client=claude,identityAnchor=..." -- the comma is
+                  // the field separator WITHIN one value, so it must never be
+                  // split by this layer; parsePartySpec below does its own
+                  // splitting per entry.
+                  party: {
+                    ...LITERAL_KEEP_BLANK,
+                    describe:
+                      "role=pen|worker,client=claude|codex,identityAnchor=... (repeatable). " +
+                      "A value containing a comma must be double-quoted, e.g. modelTier=\"opus, fallback sonnet\" " +
+                      "(\\\" and \\\\ are the only recognized escapes inside quotes; identityAnchor's own format " +
+                      "never contains a comma, so quoting mainly matters for free-text fields like modelTier). " +
+                      "Since --party is a single shell argument, also quote the WHOLE entry at the shell level: " +
+                      "--party 'role=pen,client=codex,identityAnchor=session-1,modelTier=\"opus, fallback sonnet\"'",
+                  },
+                },
+              ).demandOption(["bounds", "party"]),
+            ),
+          async (argv) => {
+            const format = parseOutputFormat(argv.format);
+            const root = (await import("../core/project-root-discovery.js")).discoverProjectRoot();
+            if (!root) {
+              writeOutput(formatError("not_found", "No .story/ project found.", format));
+              process.exitCode = ExitCode.USER_ERROR;
+              return;
+            }
+            try {
+              const parties = (argv.party as string[]).map(parsePartySpec);
+              const result = await handleArrangementCreate(
+                {
+                  bounds: argv.bounds as string[],
+                  parties,
+                  onIrreversibleWork: argv["unreachability-irreversible"] as "hold" | "escalate",
+                  onReversibleWork: argv["unreachability-reversible"] as "hold" | "escalate" | "proceed" | undefined,
+                },
+                format,
+                root,
+              );
+              writeOutput(result.output);
+              process.exitCode = result.exitCode ?? ExitCode.OK;
+            } catch (err: unknown) {
+              if (err instanceof CliValidationError) {
+                writeOutput(formatError(err.code, err.message, format));
+                process.exitCode = ExitCode.USER_ERROR;
+                return;
+              }
+              const { ProjectLoaderError } = await import("../core/errors.js");
+              if (err instanceof ProjectLoaderError) {
+                writeOutput(formatError(err.code, err.message, format));
+                process.exitCode = ExitCode.USER_ERROR;
+                return;
+              }
+              const message = err instanceof Error ? err.message : String(err);
+              writeOutput(formatError("io_error", message, format));
+              process.exitCode = ExitCode.USER_ERROR;
+            }
+          },
+        )
+        .command(
+          "update <id>",
+          "Update an arrangement",
+          (y2) =>
+            addFormatOption(
+              y2
+                .positional("id", {
+                  type: "string",
+                  demandOption: true,
+                  describe: "Arrangement ID (e.g. a-[canonical])",
+                })
+                .option("lifecycle", {
+                  type: "string",
+                  choices: ARRANGEMENT_LIFECYCLE,
+                  describe: "New lifecycle",
+                }),
+            ),
+          async (argv) => {
+            const format = parseOutputFormat(argv.format);
+            const root = (await import("../core/project-root-discovery.js")).discoverProjectRoot();
+            if (!root) {
+              writeOutput(formatError("not_found", "No .story/ project found.", format));
+              process.exitCode = ExitCode.USER_ERROR;
+              return;
+            }
+            try {
+              const result = await handleArrangementUpdate(
+                argv.id as string,
+                { lifecycle: argv.lifecycle as string | undefined },
+                format,
+                root,
+              );
+              writeOutput(result.output);
+              process.exitCode = result.exitCode ?? ExitCode.OK;
+            } catch (err: unknown) {
+              if (err instanceof CliValidationError) {
+                writeOutput(formatError(err.code, err.message, format));
+                process.exitCode = ExitCode.USER_ERROR;
+                return;
+              }
+              const { ProjectLoaderError } = await import("../core/errors.js");
+              if (err instanceof ProjectLoaderError) {
+                writeOutput(formatError(err.code, err.message, format));
+                process.exitCode = ExitCode.USER_ERROR;
+                return;
+              }
+              const message = err instanceof Error ? err.message : String(err);
+              writeOutput(formatError("io_error", message, format));
+              process.exitCode = ExitCode.USER_ERROR;
+            }
+          },
+        )
+        .demandCommand(1, "Specify an arrangement subcommand: list, get, create, update")
+        .strict(),
+    () => {},
+  );
+}
+
+// ---------------------------------------------------------------------------
+// ruling (T-476)
+// ---------------------------------------------------------------------------
+
+export function registerRulingCommand(yargs: Argv): Argv {
+  return yargs.command(
+    "ruling",
+    "Manage owner-ruling attestation records",
+    (y) =>
+      y
+        .command(
+          "list",
+          "List rulings",
+          (y2) =>
+            addFormatOption(
+              y2
+                .option("scope-tag", { type: "string", describe: "Filter by scope tag" })
+                .option("superseded", { type: "boolean", describe: "Filter to superseded (true) or current (false) rulings only" }),
+            ),
+          async (argv) => {
+            const format = parseOutputFormat(argv.format);
+            await runReadCommand(format, (ctx) =>
+              handleRulingList(
+                { scopeTag: argv["scope-tag"] as string | undefined, superseded: argv.superseded as boolean | undefined },
+                ctx,
+              ),
+            );
+          },
+        )
+        .command(
+          "get <id>",
+          "Get a ruling",
+          (y2) =>
+            addFormatOption(
+              y2.positional("id", { type: "string", demandOption: true, describe: "Ruling ID (e.g. r-[canonical])" }),
+            ),
+          async (argv) => {
+            const format = parseOutputFormat(argv.format);
+            await runReadCommand(format, (ctx) => handleRulingGet(argv.id as string, ctx));
+          },
+        )
+        .command(
+          "create",
+          "Record a new ruling. Text is byte-verbatim: no markdown cleanup, no editing inside the quote.",
+          (y2) =>
+            addFormatOption(
+              arrayOptions(
+                y2
+                  .option("text", { type: "string", demandOption: true, describe: "Verbatim ruling text" })
+                  .option("attribution", {
+                    type: "string",
+                    choices: RULING_ATTRIBUTIONS,
+                    demandOption: true,
+                    describe:
+                      "Claimed source of this ruling -- a CLAIM asserted by the recorder, not verified by storybloq. " +
+                      "See src/core/ruling.ts's module docblock for the full docs statement.",
+                  })
+                  .option("date", { type: "string", demandOption: true, describe: "Ruling date (YYYY-MM-DD)" })
+                  .option("client-task-id", { type: "string", describe: "Explicit caller identity, if not resolvable from the session" }),
+                { "scope-tag": { ...SPLIT_LIST, describe: "Scope tag (repeatable)" } },
+              ),
+            ),
+          async (argv) => {
+            const format = parseOutputFormat(argv.format);
+            const root = (await import("../core/project-root-discovery.js")).discoverProjectRoot();
+            if (!root) {
+              writeOutput(formatError("not_found", "No .story/ project found.", format));
+              process.exitCode = ExitCode.USER_ERROR;
+              return;
+            }
+            try {
+              const result = await handleRulingCreate(
+                {
+                  text: argv.text as string,
+                  attribution: argv.attribution as string,
+                  date: argv.date as string,
+                  scopeTags: (argv["scope-tag"] as string[] | undefined) ?? [],
+                  clientTaskId: argv["client-task-id"] as string | undefined,
+                },
+                format,
+                root,
+              );
+              writeOutput(result.output);
+              process.exitCode = result.exitCode ?? ExitCode.OK;
+            } catch (err: unknown) {
+              if (err instanceof CliValidationError) {
+                writeOutput(formatError(err.code, err.message, format));
+                process.exitCode = ExitCode.USER_ERROR;
+                return;
+              }
+              const { ProjectLoaderError } = await import("../core/errors.js");
+              if (err instanceof ProjectLoaderError) {
+                writeOutput(formatError(err.code, err.message, format));
+                process.exitCode = ExitCode.USER_ERROR;
+                return;
+              }
+              const message = err instanceof Error ? err.message : String(err);
+              writeOutput(formatError("io_error", message, format));
+              process.exitCode = ExitCode.USER_ERROR;
+            }
+          },
+        )
+        .command(
+          "supersede <id>",
+          "Supersede a ruling -- link an existing ruling with --with, or create a new superseding ruling with --text/--attribution/--date",
+          (y2) =>
+            addFormatOption(
+              arrayOptions(
+                y2
+                  .positional("id", { type: "string", demandOption: true, describe: "Ruling ID being superseded" })
+                  .option("with", { type: "string", describe: "Existing ruling ID that supersedes <id>" })
+                  .option("text", { type: "string", describe: "Verbatim text for a new superseding ruling" })
+                  .option("attribution", { type: "string", choices: RULING_ATTRIBUTIONS, describe: "Claimed source of the new ruling" })
+                  .option("date", { type: "string", describe: "Date of the new ruling (YYYY-MM-DD)" })
+                  .option("client-task-id", { type: "string", describe: "Explicit caller identity, if not resolvable from the session" })
+                  .conflicts("with", "text")
+                  .conflicts("with", "attribution")
+                  .conflicts("with", "date"),
+                { "scope-tag": { ...SPLIT_LIST, describe: "Scope tag for a new superseding ruling (repeatable)" } },
+              ),
+            ),
+          async (argv) => {
+            const format = parseOutputFormat(argv.format);
+            const root = (await import("../core/project-root-discovery.js")).discoverProjectRoot();
+            if (!root) {
+              writeOutput(formatError("not_found", "No .story/ project found.", format));
+              process.exitCode = ExitCode.USER_ERROR;
+              return;
+            }
+            try {
+              const result = await handleRulingSupersede(
+                argv.id as string,
+                {
+                  withId: argv.with as string | undefined,
+                  text: argv.text as string | undefined,
+                  attribution: argv.attribution as string | undefined,
+                  date: argv.date as string | undefined,
+                  scopeTags: argv["scope-tag"] as string[] | undefined,
+                  clientTaskId: argv["client-task-id"] as string | undefined,
+                },
+                format,
+                root,
+              );
+              writeOutput(result.output);
+              process.exitCode = result.exitCode ?? ExitCode.OK;
+            } catch (err: unknown) {
+              if (err instanceof CliValidationError) {
+                writeOutput(formatError(err.code, err.message, format));
+                process.exitCode = ExitCode.USER_ERROR;
+                return;
+              }
+              const { ProjectLoaderError } = await import("../core/errors.js");
+              if (err instanceof ProjectLoaderError) {
+                writeOutput(formatError(err.code, err.message, format));
+                process.exitCode = ExitCode.USER_ERROR;
+                return;
+              }
+              const message = err instanceof Error ? err.message : String(err);
+              writeOutput(formatError("io_error", message, format));
+              process.exitCode = ExitCode.USER_ERROR;
+            }
+          },
+        )
+        .demandCommand(1, "Specify a ruling subcommand: list, get, create, supersede")
+        .strict(),
+    () => {},
+  );
+}
+
+// ---------------------------------------------------------------------------
+// gate-ack (T-474)
+// ---------------------------------------------------------------------------
+
+export function registerGateAckCommand(yargs: Argv): Argv {
+  return yargs.command(
+    "gate-ack",
+    "Manage duet-mode gate-ack records",
+    (y) =>
+      y
+        .command(
+          "list",
+          "List gate-acks",
+          (y2) =>
+            addFormatOption(
+              y2
+                .option("arrangement", { type: "string", describe: "Filter by arrangement ID" })
+                .option("ticket", { type: "string", describe: "Filter by ticket ref" }),
+            ),
+          async (argv) => {
+            const format = parseOutputFormat(argv.format);
+            await runReadCommand(format, (ctx) =>
+              handleGateAckList({ arrangement: argv.arrangement as string | undefined, ticket: argv.ticket as string | undefined }, ctx),
+            );
+          },
+        )
+        .command(
+          "get <id>",
+          "Get a gate-ack",
+          (y2) =>
+            addFormatOption(
+              y2.positional("id", { type: "string", demandOption: true, describe: "Gate-ack ID (e.g. g-[canonical])" }),
+            ),
+          async (argv) => {
+            const format = parseOutputFormat(argv.format);
+            await runReadCommand(format, (ctx) => handleGateAckGet(argv.id as string, ctx));
+          },
+        )
+        .command(
+          "create",
+          "Create a gate-ack",
+          (y2) =>
+            addFormatOption(
+              y2
+                .option("arrangement", { type: "string", demandOption: true, describe: "Arrangement ID this gate-ack authorizes against" })
+                .option("gate", { type: "string", demandOption: true, describe: "Gate name declared on the arrangement (e.g. plan-ack, pre-commit-ack)" })
+                .option("ticket", { type: "string", demandOption: true, describe: "Ticket ref this ack applies to" })
+                .option("plan-file", { type: "string", describe: "Path to plan.md -- computes a plan-hash pin" })
+                .option("from-staged", { type: "boolean", describe: "Compute a tree-digest pin from the currently staged index" })
+                .option("codex-session-id", { type: "string", describe: "Independent-review session id, if any (acceptance 7)" })
+                .option("verdict", { type: "string", describe: "Independent-review verdict, if any (acceptance 7)" })
+                .option("rounds", { type: "number", describe: "Independent-review round count, if any (acceptance 7)" })
+                .option("deltas", {
+                  type: "string",
+                  describe:
+                    "Ratify-with-deltas text. For pre-commit-ack, restricted BY CONVENTION to non-mutating caveats " +
+                    "(a note, a follow-up-issue pointer) -- never a condition requiring the staged content to differ, " +
+                    "since by the time this ack is checked the commit it applies to has already been made.",
+                }),
+            ),
+          async (argv) => {
+            const format = parseOutputFormat(argv.format);
+            const root = (await import("../core/project-root-discovery.js")).discoverProjectRoot();
+            if (!root) {
+              writeOutput(formatError("not_found", "No .story/ project found.", format));
+              process.exitCode = ExitCode.USER_ERROR;
+              return;
+            }
+            try {
+              const result = await handleGateAckCreate(
+                {
+                  arrangement: argv.arrangement as string,
+                  gate: argv.gate as string,
+                  ticket: argv.ticket as string,
+                  planFile: argv["plan-file"] as string | undefined,
+                  fromStaged: argv["from-staged"] as boolean | undefined,
+                  codexSessionId: argv["codex-session-id"] as string | undefined,
+                  verdict: argv.verdict as string | undefined,
+                  rounds: argv.rounds as number | undefined,
+                  deltas: argv.deltas as string | undefined,
+                },
+                format,
+                root,
+              );
+              writeOutput(result.output);
+              process.exitCode = result.exitCode ?? ExitCode.OK;
+            } catch (err: unknown) {
+              if (err instanceof CliValidationError) {
+                writeOutput(formatError(err.code, err.message, format));
+                process.exitCode = ExitCode.USER_ERROR;
+                return;
+              }
+              const { ProjectLoaderError } = await import("../core/errors.js");
+              if (err instanceof ProjectLoaderError) {
+                writeOutput(formatError(err.code, err.message, format));
+                process.exitCode = ExitCode.USER_ERROR;
+                return;
+              }
+              const message = err instanceof Error ? err.message : String(err);
+              writeOutput(formatError("io_error", message, format));
+              process.exitCode = ExitCode.USER_ERROR;
+            }
+          },
+        )
+        .command(
+          "contest <id>",
+          "Mark a gate-ack contested (record + surfaced flag only, T-474 acceptance 6)",
+          (y2) =>
+            addFormatOption(
+              y2
+                .positional("id", { type: "string", demandOption: true, describe: "Gate-ack ID" })
+                .option("reason", { type: "string", demandOption: true, describe: "Why this ack is contested" }),
+            ),
+          async (argv) => {
+            const format = parseOutputFormat(argv.format);
+            const root = (await import("../core/project-root-discovery.js")).discoverProjectRoot();
+            if (!root) {
+              writeOutput(formatError("not_found", "No .story/ project found.", format));
+              process.exitCode = ExitCode.USER_ERROR;
+              return;
+            }
+            try {
+              const result = await handleGateAckContest(argv.id as string, argv.reason as string, format, root);
+              writeOutput(result.output);
+              process.exitCode = result.exitCode ?? ExitCode.OK;
+            } catch (err: unknown) {
+              if (err instanceof CliValidationError) {
+                writeOutput(formatError(err.code, err.message, format));
+                process.exitCode = ExitCode.USER_ERROR;
+                return;
+              }
+              const { ProjectLoaderError } = await import("../core/errors.js");
+              if (err instanceof ProjectLoaderError) {
+                writeOutput(formatError(err.code, err.message, format));
+                process.exitCode = ExitCode.USER_ERROR;
+                return;
+              }
+              const message = err instanceof Error ? err.message : String(err);
+              writeOutput(formatError("io_error", message, format));
+              process.exitCode = ExitCode.USER_ERROR;
+            }
+          },
+        )
+        .demandCommand(1, "Specify a gate-ack subcommand: list, get, create, contest")
+        .strict(),
+    () => {},
+  );
+}
+
+// ---------------------------------------------------------------------------
+// landings (T-477)
+// ---------------------------------------------------------------------------
+
+export function registerLandingsCommand(yargs: Argv): Argv {
+  return yargs.command(
+    "landings",
+    "Commits that touched tickets/issues, with review coverage (CLI-only; no MCP tool)",
+    (y) =>
+      addFormatOption(
+        y
+          .option("since", {
+            type: "string",
+            describe: "Show landings after this ref (exclusive), instead of the last 200 commits on HEAD",
+          })
+          .option("limit", {
+            type: "number",
+            describe: "Cap the number of commits scanned (default 200 without --since; overrides that default with --since too)",
+          }),
+      ),
+    async (argv) => {
+      const format = parseOutputFormat(argv.format);
+      await runReadCommand(format, (ctx) =>
+        handleLandings(
+          {
+            since: argv.since as string | undefined,
+            limit: argv.limit as number | undefined,
+          },
+          ctx,
+        ),
+      );
+    },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// earmark (T-475)
+// ---------------------------------------------------------------------------
+
+export function registerEarmarkCommand(yargs: Argv): Argv {
+  return yargs.command(
+    "earmark",
+    "Manage duet-mode assignment earmarks (pick-exclusion for tickets/issues)",
+    (y) =>
+      y
+        .command(
+          "get <ref>",
+          "Get the earmark on a ticket or issue",
+          (y2) =>
+            addNodeOption(addFormatOption(
+              y2.positional("ref", { type: "string", demandOption: true, describe: "Ticket or issue ref" }),
+            )),
+          async (argv) => {
+            const format = parseOutputFormat(argv.format);
+            const nodeName = argv.node as string | undefined;
+            if (nodeName) {
+              const orchRoot = (await import("../core/project-root-discovery.js")).discoverProjectRoot();
+              if (!orchRoot) { writeOutput(formatError("not_found", "No .story/ project found.", format)); process.exitCode = ExitCode.USER_ERROR; return; }
+              const eff = resolveRootWithNode(orchRoot, nodeName, false, format);
+              if (!eff.ok) { writeOutput(eff.output); process.exitCode = ExitCode.USER_ERROR; return; }
+              await runReadCommandWithRoot(format, eff.root, (ctx) => handleEarmarkGet(argv.ref as string, ctx));
+            } else {
+              await runReadCommand(format, (ctx) => handleEarmarkGet(argv.ref as string, ctx));
+            }
+          },
+        )
+        .command(
+          "reserve <ref>",
+          "Reserve a ticket or issue for a role, pending pickup",
+          (y2) =>
+            addNodeOption(addFormatOption(
+              y2
+                .positional("ref", { type: "string", demandOption: true, describe: "Ticket or issue ref" })
+                .option("role", { type: "string", choices: EARMARK_ROLES, demandOption: true, describe: "Role this reservation is held for" })
+                .option("arrangement", { type: "string", describe: "Covering arrangement ID; required if more than one active arrangement covers this item" }),
+            )),
+          async (argv) => {
+            const format = parseOutputFormat(argv.format);
+            const root = (await import("../core/project-root-discovery.js")).discoverProjectRoot();
+            if (!root) {
+              writeOutput(formatError("not_found", "No .story/ project found.", format));
+              process.exitCode = ExitCode.USER_ERROR;
+              return;
+            }
+            try {
+              // Node routing (ISS-1077) is handled BY the handler itself: `root`
+              // stays the discovered (orchestrator) root always -- arrangements
+              // only ever live there (Q3) -- and `node` is passed straight
+              // through so the handler can resolve the item's own root
+              // separately. This is deliberately NOT `resolveRootWithNode`'s
+              // single-effective-root pattern (used by ticket/issue commands),
+              // which has no way to express "two different roots for two
+              // different purposes in the same call."
+              const result = await handleEarmarkReserve(
+                { ref: argv.ref as string, role: argv.role as (typeof EARMARK_ROLES)[number], arrangement: argv.arrangement as string | undefined },
+                format,
+                root,
+                argv.node as string | undefined,
+              );
+              writeOutput(result.output);
+              process.exitCode = result.exitCode ?? ExitCode.OK;
+            } catch (err: unknown) {
+              if (err instanceof CliValidationError) {
+                writeOutput(formatError(err.code, err.message, format));
+                process.exitCode = ExitCode.USER_ERROR;
+                return;
+              }
+              const { ProjectLoaderError } = await import("../core/errors.js");
+              if (err instanceof ProjectLoaderError) {
+                writeOutput(formatError(err.code, err.message, format));
+                process.exitCode = ExitCode.USER_ERROR;
+                return;
+              }
+              const message = err instanceof Error ? err.message : String(err);
+              writeOutput(formatError("io_error", message, format));
+              process.exitCode = ExitCode.USER_ERROR;
+            }
+          },
+        )
+        .command(
+          "assign <ref>",
+          "Assign a ticket or issue's earmark directly to a live session (direct placement, or an explicit reserved -> assigned conversion)",
+          (y2) =>
+            addNodeOption(addFormatOption(
+              y2
+                .positional("ref", { type: "string", demandOption: true, describe: "Ticket or issue ref" })
+                .option("to", { type: "string", demandOption: true, describe: "Target session selector (id or unambiguous prefix)" })
+                .option("role", { type: "string", choices: EARMARK_ROLES, demandOption: true, describe: "Role the target session must hold on the covering arrangement" })
+                .option("arrangement", { type: "string", describe: "Covering arrangement ID; required if more than one active arrangement covers this item" }),
+            )),
+          async (argv) => {
+            const format = parseOutputFormat(argv.format);
+            const root = (await import("../core/project-root-discovery.js")).discoverProjectRoot();
+            if (!root) {
+              writeOutput(formatError("not_found", "No .story/ project found.", format));
+              process.exitCode = ExitCode.USER_ERROR;
+              return;
+            }
+            try {
+              const result = await handleEarmarkAssign(
+                {
+                  ref: argv.ref as string,
+                  to: argv.to as string,
+                  role: argv.role as (typeof EARMARK_ROLES)[number],
+                  arrangement: argv.arrangement as string | undefined,
+                },
+                format,
+                root,
+                argv.node as string | undefined,
+              );
+              writeOutput(result.output);
+              process.exitCode = result.exitCode ?? ExitCode.OK;
+            } catch (err: unknown) {
+              if (err instanceof CliValidationError) {
+                writeOutput(formatError(err.code, err.message, format));
+                process.exitCode = ExitCode.USER_ERROR;
+                return;
+              }
+              const { ProjectLoaderError } = await import("../core/errors.js");
+              if (err instanceof ProjectLoaderError) {
+                writeOutput(formatError(err.code, err.message, format));
+                process.exitCode = ExitCode.USER_ERROR;
+                return;
+              }
+              const message = err instanceof Error ? err.message : String(err);
+              writeOutput(formatError("io_error", message, format));
+              process.exitCode = ExitCode.USER_ERROR;
+            }
+          },
+        )
+        .command(
+          "release <ref>",
+          "Release (clear) a ticket or issue's earmark",
+          (y2) =>
+            addNodeOption(addFormatOption(
+              y2
+                .positional("ref", { type: "string", demandOption: true, describe: "Ticket or issue ref" })
+                .option("arrangement", { type: "string", describe: "Sanity check only: must match the earmark's own authorizing arrangement ID if given (release authorizes via that stored ID, not current bounds coverage)" }),
+            )),
+          async (argv) => {
+            const format = parseOutputFormat(argv.format);
+            const root = (await import("../core/project-root-discovery.js")).discoverProjectRoot();
+            if (!root) {
+              writeOutput(formatError("not_found", "No .story/ project found.", format));
+              process.exitCode = ExitCode.USER_ERROR;
+              return;
+            }
+            try {
+              const result = await handleEarmarkRelease(
+                { ref: argv.ref as string, arrangement: argv.arrangement as string | undefined },
+                format,
+                root,
+                argv.node as string | undefined,
+              );
+              writeOutput(result.output);
+              process.exitCode = result.exitCode ?? ExitCode.OK;
+            } catch (err: unknown) {
+              if (err instanceof CliValidationError) {
+                writeOutput(formatError(err.code, err.message, format));
+                process.exitCode = ExitCode.USER_ERROR;
+                return;
+              }
+              const { ProjectLoaderError } = await import("../core/errors.js");
+              if (err instanceof ProjectLoaderError) {
+                writeOutput(formatError(err.code, err.message, format));
+                process.exitCode = ExitCode.USER_ERROR;
+                return;
+              }
+              const message = err instanceof Error ? err.message : String(err);
+              writeOutput(formatError("io_error", message, format));
+              process.exitCode = ExitCode.USER_ERROR;
+            }
+          },
+        )
+        .demandCommand(1, "Specify an earmark subcommand: get, reserve, assign, release")
+        .strict(),
+    () => {},
+  );
+}
+
 export function registerReferenceCommand(yargs: Argv): Argv {
   return yargs.command(
     "reference",
@@ -3103,12 +3990,16 @@ export function registerDispatchCommand(yargs: Argv): Argv {
     "dispatch [ids..]",
     "Dispatch work to Agent View background sessions",
     (y) =>
-      addFormatOption(y)
-        .positional("ids", {
-          type: "string",
-          array: true,
-          describe: "Ticket/issue IDs to dispatch (T-XXX, ISS-XXX)",
-        })
+      // empty: "preserve" so a supplied blank or separator-only positional still
+      // reaches the handler and is reported as an invalid ID, rather than
+      // collapsing to [] and silently taking the recommendation branch.
+      arrayPositional(addFormatOption(y), "ids", {
+        comma: "split",
+        empty: "preserve",
+        trim: "segments",
+        emptyAfterSplit: "drop",
+        describe: "Ticket/issue IDs to dispatch (T-XXX, ISS-XXX)",
+      })
         .option("recommend", {
           type: "boolean",
           default: false,
@@ -3233,7 +4124,7 @@ export function registerLessonCommand(yargs: Argv): Argv {
           "Create a lesson",
           (y2) =>
             addFormatOption(
-              y2
+              arrayOptions(y2
                 .option("title", {
                   type: "string",
                   demandOption: true,
@@ -3254,10 +4145,6 @@ export function registerLessonCommand(yargs: Argv): Argv {
                   choices: [...LESSON_SOURCES],
                   describe: "Lesson source",
                 })
-                .option("tags", {
-                  type: "array",
-                  describe: "Tags for the lesson",
-                })
                 .option("supersedes", {
                   type: "string",
                   describe: "ID of lesson this supersedes",
@@ -3275,7 +4162,8 @@ export function registerLessonCommand(yargs: Argv): Argv {
                   }
                   return true;
                 }),
-            ),
+              { tags: { ...SPLIT_LIST, describe: "Tags for the lesson" } },
+            )),
           async (argv) => {
             const format = parseOutputFormat(argv.format);
             const root = (
@@ -3333,7 +4221,7 @@ export function registerLessonCommand(yargs: Argv): Argv {
           "Update a lesson",
           (y2) =>
             addFormatOption(
-              y2
+              arrayOptions(y2
                 .positional("id", {
                   type: "string",
                   demandOption: true,
@@ -3351,10 +4239,6 @@ export function registerLessonCommand(yargs: Argv): Argv {
                   type: "string",
                   describe: "New context",
                 })
-                .option("tags", {
-                  type: "array",
-                  describe: "New tags (replaces existing)",
-                })
                 .option("clear-tags", {
                   type: "boolean",
                   describe: "Clear all tags",
@@ -3370,7 +4254,14 @@ export function registerLessonCommand(yargs: Argv): Argv {
                 })
                 .conflicts("content", "stdin")
                 .conflicts("tags", "clear-tags"),
-            ),
+              {
+                tags: {
+                  ...SPLIT_LIST,
+                  describe: "New tags (replaces existing)",
+                  requireValue: "Use --clear-tags to clear tags.",
+                },
+              },
+            )),
           async (argv) => {
             const format = parseOutputFormat(argv.format);
             const id = parseLessonId(argv.id as string);
@@ -3428,7 +4319,7 @@ export function registerLessonCommand(yargs: Argv): Argv {
         )
         .command(
           "reinforce <id>",
-          "Reinforce a lesson — increment reinforcement count and update lastValidated",
+          "Reinforce a lesson -- increment reinforcement count and update lastValidated",
           (y2) =>
             addFormatOption(
               y2.positional("id", {
@@ -3887,7 +4778,7 @@ export function registerNodeCommand(yargs: Argv): Argv {
           "Add a node to orchestrator config",
           (y2) =>
             addFormatOption(
-              y2
+              arrayOptions(y2
                 .positional("name", {
                   type: "string",
                   demandOption: true,
@@ -3913,18 +4804,15 @@ export function registerNodeCommand(yargs: Argv): Argv {
                 .option("summary", {
                   type: "string",
                   describe: "One-line status summary",
-                })
-                .option("depends-on", {
-                  type: "string",
-                  array: true,
-                  describe: "Node names this depends on",
-                })
-                .option("link", {
-                  type: "string",
-                  array: true,
-                  describe: "Runtime link (format: node or node:via_description)",
                 }),
-            ),
+              {
+                "depends-on": { ...LEGACY_SPLIT_LIST, describe: "Node names this depends on" },
+                link: {
+                  ...LITERAL_KEEP_BLANK,
+                  describe: "Runtime link (node or node:via_desc)",
+                },
+              },
+            )),
           async (argv) => {
             const format = parseOutputFormat(argv.format);
             const root = (
@@ -3949,10 +4837,7 @@ export function registerNodeCommand(yargs: Argv): Argv {
                   role: argv.role as string | undefined,
                   kind: argv.kind as string | undefined,
                   summary: argv.summary as string | undefined,
-                  dependsOn: normalizeArrayOption(argv["depends-on"] as string[] | undefined)
-                    ?.flatMap((v) => v.split(","))
-                    .map((v) => v.trim())
-                    .filter(Boolean),
+                  dependsOn: argv["depends-on"] as string[] | undefined,
                   links,
                 },
                 format,
@@ -4045,7 +4930,7 @@ export function registerNodeCommand(yargs: Argv): Argv {
           "Update an existing node's metadata",
           (y2) =>
             addFormatOption(
-              y2
+              arrayOptions(y2
                 .positional("name", {
                   type: "string",
                   demandOption: true,
@@ -4071,27 +4956,24 @@ export function registerNodeCommand(yargs: Argv): Argv {
                   type: "string",
                   describe: "New status summary",
                 })
-                .option("depends-on", {
-                  type: "string",
-                  array: true,
-                  describe: "Replace dependsOn list",
-                })
                 .option("clear-depends-on", {
                   type: "boolean",
                   default: false,
                   describe: "Clear all dependencies",
-                })
-                .option("link", {
-                  type: "string",
-                  array: true,
-                  describe: "Replace links (format: node or node:via_description)",
                 })
                 .option("clear-links", {
                   type: "boolean",
                   default: false,
                   describe: "Clear all runtime links",
                 }),
-            ),
+              {
+                "depends-on": { ...LEGACY_SPLIT_LIST, describe: "Replace dependsOn list" },
+                link: {
+                  ...LITERAL_KEEP_BLANK,
+                  describe: "Replace links (node or node:via_desc)",
+                },
+              },
+            )),
           async (argv) => {
             const format = parseOutputFormat(argv.format);
             const root = (
@@ -4116,12 +4998,7 @@ export function registerNodeCommand(yargs: Argv): Argv {
                   role: argv.role as string | undefined,
                   kind: argv.kind as string | undefined,
                   summary: argv.summary as string | undefined,
-                  dependsOn: argv["depends-on"]
-                    ? normalizeArrayOption(argv["depends-on"] as string[])
-                        ?.flatMap((v) => v.split(","))
-                        .map((v) => v.trim())
-                        .filter(Boolean)
-                    : undefined,
+                  dependsOn: argv["depends-on"] as string[] | undefined,
                   clearDependsOn: argv["clear-depends-on"] as boolean,
                   links,
                   clearLinks: argv["clear-links"] as boolean,
@@ -4171,7 +5048,7 @@ export function registerNodeCommand(yargs: Argv): Argv {
 export function registerSelftestCommand(yargs: Argv): Argv {
   return yargs.command(
     "selftest",
-    "Run integration smoke test — create/update/delete cycle across all entity types",
+    "Run integration smoke test -- create/update/delete cycle across all entity types",
     (y) => addFormatOption(y),
     async (argv) => {
       const format = parseOutputFormat(argv.format);
@@ -4274,12 +5151,19 @@ export function registerSetupCommand(yargs: Argv): Argv {
           type: "boolean",
           default: false,
           description: "Skip hook registration",
+        })
+        .option("skip-skill", {
+          type: "boolean",
+          default: false,
+          description:
+            "Skip the Codex skill-directory copy (--client codex/all only) -- for an install already managed by the storybloq Codex marketplace plugin",
         }),
     async (argv) => {
       const { handleSetup } = await import("./commands/setup-skill.js");
       await handleSetup({
         client: argv.client as SetupClient,
         skipHooks: argv["skip-hooks"] === true,
+        skipSkill: argv["skip-skill"] === true,
       });
     },
   );
@@ -4313,7 +5197,7 @@ export function registerSetupSkillCommand(yargs: Argv): Argv {
 export function registerHookStatusCommand(yargs: Argv): Argv {
   return yargs.command(
     "hook-status",
-    false as unknown as string, // hidden — machine-facing, not shown in --help
+    false as unknown as string, // hidden -- machine-facing, not shown in --help
     (y) => y.option("client", {
       type: "string",
       choices: ["claude", "codex"] as const,
@@ -4322,6 +5206,118 @@ export function registerHookStatusCommand(yargs: Argv): Argv {
     async (argv) => {
       const { handleHookStatus } = await import("./commands/hook-status.js");
       await handleHookStatus({ client: argv.client as "claude" | "codex" });
+    },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// hook-bus-tool (T-427: tool-boundary Bus delivery)
+// ---------------------------------------------------------------------------
+
+export function registerHookBusToolCommand(yargs: Argv): Argv {
+  return yargs.command(
+    "hook-bus-tool",
+    false as unknown as string, // hidden -- machine-facing PostToolUse hook
+    (y) => y,
+    async () => {
+      const { handleBusToolHook } = await import("./commands/hook-status.js");
+      await handleBusToolHook();
+    },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// limit-status (T-424: pending limit auto-resumes)
+// ---------------------------------------------------------------------------
+
+export function registerLimitStatusCommand(yargs: Argv): Argv {
+  return yargs.command(
+    "limit-status",
+    "Show pending usage-limit auto-resumes (global, all projects)",
+    (y) =>
+      addFormatOption(y
+        .option("cancel", {
+          type: "string",
+          describe: "Cancel the pending auto-resume for a record key or client session id",
+        })
+        .option("requeue", {
+          type: "string",
+          describe: "Return a manual/failed record to the wake queue",
+        })
+        .option("recent", {
+          type: "boolean",
+          describe: "ISS-944: also list terminal records (defer_exhausted, attempts_exhausted, etc.)",
+        }), 'an {"ok", "data"} object (or {"ok", "error"} on failure)'),
+    async (argv) => {
+      const { handleLimitStatus } = await import("./commands/limit-status.js");
+      try {
+        const result = await handleLimitStatus({
+          cancel: argv.cancel as string | undefined,
+          requeue: argv.requeue as string | undefined,
+          format: argv.format as "json" | "md",
+          recent: argv.recent as boolean | undefined,
+        });
+        // ISS-910: all output through writeOutput, never process.stdout. This
+        // command does NOT register --raw (its JSON shape is deviant, so the
+        // flag is rejected during argument validation); the seam still owns
+        // EPIPE handling and keeps one output path for the whole CLI.
+        writeOutput(result.output);
+        if (result.errorCode) process.exitCode = 1;
+      } catch (err: unknown) {
+        // ISS-910: an automated caller parses stdout. Answering only on
+        // stderr left it with empty stdout on failure, which is as
+        // unparseable as prose; emit this command's documented shape.
+        const message = err instanceof Error ? err.message : String(err);
+        writeOutput(
+          argv.format === "json" ? JSON.stringify({ ok: false, error: message }, null, 2) : message,
+        );
+        process.exitCode = 1;
+      }
+    },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// waker-run (T-424: hidden detached limit-waker entry point)
+// ---------------------------------------------------------------------------
+
+export function registerWakerRunCommand(yargs: Argv): Argv {
+  return yargs.command(
+    "waker-run",
+    false as unknown as string, // hidden -- spawned detached by spawnWakerIfNeeded
+    (y) =>
+      y
+        .option("sb-waker", {
+          type: "boolean",
+          default: false,
+          hidden: true,
+          describe: "argv sentinel for PID-reuse-safe singleton identification",
+        })
+        .option("once", {
+          type: "boolean",
+          default: false,
+          hidden: true,
+          describe: "Run a single poll tick and exit (E2E simulation / debugging)",
+        }),
+    async (argv) => {
+      // Require the singleton sentinel BEFORE entering the loop. A sentinel-less
+      // run would acquire and heartbeat the waker.lock while isWakerAlive()
+      // reports it absent (its argv lacks the marker), so every later
+      // housekeeping invocation would spawn another waker that futilely contends.
+      if (argv.sbWaker !== true) {
+        process.stderr.write(
+          "[storybloq] waker-run is an internal, self-spawned command; run it via the auto-resume flow, not directly.\n",
+        );
+        return;
+      }
+      try {
+        const { runWaker } = await import("../autonomous/waker.js");
+        await runWaker(undefined, argv.once === true ? { maxTicks: 1 } : {});
+      } catch (err) {
+        process.stderr.write(
+          `[storybloq] waker exited with error: ${err instanceof Error ? err.message : String(err)}\n`,
+        );
+      }
     },
   );
 }
@@ -4339,7 +5335,7 @@ export function registerConfigCommand(yargs: Argv): Argv {
         "set-overrides",
         "Set or clear recipe overrides in config.json",
         (y2) =>
-          y2
+          addFormatOption(y2
             .option("json", {
               type: "string",
               describe: "JSON object to merge into recipeOverrides",
@@ -4348,11 +5344,10 @@ export function registerConfigCommand(yargs: Argv): Argv {
               type: "boolean",
               describe: "Remove recipeOverrides entirely (reset to defaults)",
             })
-            .option("format", {
-              choices: ["json", "md"] as const,
-              default: "md" as const,
-              describe: "Output format",
-            }),
+            .option("deep", {
+              type: "boolean",
+              describe: "Deep-merge --json instead of shallow: objects recurse, null deletes at any depth, arrays and scalars replace",
+            })),
         async (argv) => {
           const { handleConfigSetOverrides } = await import("./commands/config-update.js");
           const { writeOutput } = await import("./run.js");
@@ -4361,7 +5356,11 @@ export function registerConfigCommand(yargs: Argv): Argv {
             const result = await handleConfigSetOverrides(
               process.cwd(),
               format,
-              { json: argv.json as string | undefined, clear: argv.clear === true },
+              {
+                json: argv.json as string | undefined,
+                clear: argv.clear === true,
+                deep: argv.deep === true,
+              },
             );
             writeOutput(result.output);
             if (result.errorCode) process.exitCode = 1;
@@ -4382,16 +5381,11 @@ export function registerConfigCommand(yargs: Argv): Argv {
         "set-federation",
         "Set federation settings (orchestrator only)",
         (y2) =>
-          y2
+          addFormatOption(y2
             .option("allow-node-writes", {
               type: "boolean",
               describe: "Allow orchestrator MCP tools to write to node .story/ directories",
-            })
-            .option("format", {
-              choices: ["json", "md"] as const,
-              default: "md" as const,
-              describe: "Output format",
-            }),
+            })),
         async (argv) => {
           const { handleConfigSetFederation } = await import("./commands/config-update.js");
           const { writeOutput } = await import("./run.js");
@@ -4433,7 +5427,7 @@ export function registerConfigCommand(yargs: Argv): Argv {
 export function registerSessionCommand(yargs: Argv): Argv {
   return yargs.command(
     "session",
-    false as unknown as string, // hidden — machine-facing
+    false as unknown as string, // hidden -- machine-facing
     (y) =>
       y
         .command(
@@ -4485,13 +5479,42 @@ export function registerSessionCommand(yargs: Argv): Argv {
           },
         )
         .command(
+          "limit-stop",
+          "Record a usage-limit stop for auto-resume (StopFailure hook)",
+          (y2) => y2,
+          async () => {
+            try {
+              const { handleSessionLimitStop, readHookStdinContext } = await import("./commands/session-compact.js");
+              const hookContext = await readHookStdinContext(process.stdin);
+              await handleSessionLimitStop({
+                clientTaskId: hookContext.sessionId,
+                cwd: hookContext.cwd,
+                transcriptPath: hookContext.transcriptPath,
+                errorType: hookContext.errorType,
+                permissionMode: hookContext.permissionMode,
+              });
+            } catch (err) {
+              // Hook contract: always exit 0; the session is already stopped.
+              process.stderr.write(
+                `[storybloq] limit-stop failed: ${err instanceof Error ? err.message : String(err)}\n`,
+              );
+            }
+          },
+        )
+        .command(
           "clear-compact [sessionId]",
           "Clear stale compact marker (admin)",
           (y2) =>
-            y2.positional("sessionId", {
-              type: "string",
-              describe: "Session ID (optional — scans for compactPending session if omitted)",
-            }),
+            y2
+              .positional("sessionId", {
+                type: "string",
+                describe: "Session ID (optional -- scans for compactPending session if omitted)",
+              })
+              .option("force", {
+                type: "boolean",
+                default: false,
+                describe: "Required for limit-stopped sessions (destroys the pending auto-resume)",
+              }),
           async (argv) => {
             const { discoverProjectRoot } = await import("../core/project-root-discovery.js");
             const root = discoverProjectRoot();
@@ -4502,7 +5525,9 @@ export function registerSessionCommand(yargs: Argv): Argv {
             }
             const { handleSessionClearCompact } = await import("./commands/session-compact.js");
             try {
-              const result = await handleSessionClearCompact(root, argv.sessionId as string | undefined);
+              const result = await handleSessionClearCompact(root, argv.sessionId as string | undefined, {
+                force: argv.force === true,
+              });
               process.stdout.write(result + "\n");
             } catch (err: unknown) {
               process.stderr.write(`${err instanceof Error ? err.message : String(err)}\n`);
@@ -4516,7 +5541,7 @@ export function registerSessionCommand(yargs: Argv): Argv {
           (y2) =>
             y2.positional("sessionId", {
               type: "string",
-              describe: "Session ID (optional — stops active session if omitted)",
+              describe: "Session ID (optional -- stops active session if omitted)",
             }),
           async (argv) => {
             const { discoverProjectRoot } = await import("../core/project-root-discovery.js");
@@ -4552,7 +5577,15 @@ export function registerSessionCommand(yargs: Argv): Argv {
                 describe: "Output format",
                 choices: ["text", "json"] as const,
                 default: "text",
-              }),
+              })
+              // ISS-910: this command is EXEMPT from the shared md/json
+              // envelope axis -- its text/json contract predates it and was
+              // deliberately hardened (ISS-897). Documented here instead.
+              .epilogue(
+                'JSON output (--format json) emits this command\'s own top-level shape {"sessions", "damaged"} -- ' +
+                "NOT the shared {\"version\": 1, \"data\"} envelope other commands use -- and --raw is not defined here. " +
+                "The text/json axis predates the shared envelope and its raw contract is preserved deliberately.",
+              ),
           async (argv) => {
             const { discoverProjectRoot } = await import("../core/project-root-discovery.js");
             const root = discoverProjectRoot();
@@ -4590,6 +5623,12 @@ export function registerSessionCommand(yargs: Argv): Argv {
                 choices: ["text", "json"] as const,
                 default: "text",
               })
+              // ISS-910: same exemption as `session list` -- own shape, no envelope.
+              .epilogue(
+                'JSON output (--format json) emits this command\'s own top-level shape {"state", "recentEvents"} -- ' +
+                "NOT the shared {\"version\": 1, \"data\"} envelope other commands use -- and --raw is not defined here. " +
+                "The text/json axis predates the shared envelope and its raw contract is preserved deliberately.",
+              )
               .option("events", {
                 type: "number",
                 describe: "Number of recent events to include (non-negative integer)",
@@ -4630,7 +5669,7 @@ export function registerSessionCommand(yargs: Argv): Argv {
             y2
               .positional("sessionId", {
                 type: "string",
-                describe: "Session ID or unique prefix (optional — scans for orphans if omitted)",
+                describe: "Session ID or unique prefix (optional -- scans for orphans if omitted)",
               })
               .option("dry-run", {
                 type: "boolean",
@@ -4771,9 +5810,68 @@ export function registerSessionCommand(yargs: Argv): Argv {
             }
           },
         )
+        .command(
+          "milestone <kind>",
+          "Report a self-described work milestone for presence display (duet/arrangement sessions)",
+          (y2) =>
+            y2
+              .positional("kind", {
+                type: "string",
+                choices: ["implementing", "gate-hold", "blocked-external", "reviewing"] as const,
+                demandOption: true,
+                describe: "What this session is doing right now",
+              })
+              .option("gate-name", {
+                type: "string",
+                describe: "Required for kind=gate-hold: which gate is being held at",
+              })
+              .option("note", {
+                type: "string",
+                describe: "Optional free-text note",
+              })
+              .option("client-task-id", {
+                type: "string",
+                describe: "Explicit caller identity, if not resolvable from the session",
+              })
+              .option("format", {
+                type: "string",
+                choices: ["text", "json"] as const,
+                default: "text",
+              }),
+          async (argv) => {
+            const { discoverProjectRoot } = await import("../core/project-root-discovery.js");
+            const root = discoverProjectRoot();
+            if (!root) {
+              process.stderr.write("No .story/ project found.\n");
+              process.exitCode = 1;
+              return;
+            }
+            const { MilestoneWriteSchema, handleSessionMilestone } = await import("./commands/session-milestone.js");
+            const rawInput = {
+              kind: argv.kind,
+              ...(argv["gate-name"] !== undefined ? { gateName: argv["gate-name"] } : {}),
+              ...(argv.note !== undefined ? { note: argv.note } : {}),
+            };
+            const parsed = MilestoneWriteSchema.safeParse(rawInput);
+            if (!parsed.success) {
+              process.stderr.write(`Invalid milestone input: ${parsed.error.issues.map((i) => i.message).join("; ")}\n`);
+              process.exitCode = 1;
+              return;
+            }
+            const result = handleSessionMilestone(root, parsed.data, argv["client-task-id"] as string | undefined);
+            if (argv.format === "json") {
+              process.stdout.write(JSON.stringify(result, null, 2) + "\n");
+            } else if (result.ok) {
+              process.stdout.write(`Milestone recorded: ${result.kind} at ${result.at}\n`);
+            } else {
+              process.stderr.write(`${result.message}\n`);
+            }
+            if (!result.ok) process.exitCode = 1;
+          },
+        )
         .demandCommand(
           1,
-          "Specify a session subcommand: compact-prepare, resume-prompt, clear-compact, stop, list, show, repair, delete, health, watch",
+          "Specify a session subcommand: compact-prepare, resume-prompt, limit-stop, clear-compact, stop, list, show, repair, delete, health, watch, milestone",
         )
         .strict(),
     () => {},
@@ -4792,25 +5890,20 @@ export function registerFeedbackCommand(yargs: Argv): Argv {
           "list",
           "List community feedback",
           (sub) =>
-            sub
+            addFormatOption(sub
               .option("category", {
                 type: "string",
                 choices: ["bug", "feature", "idea"] as const,
                 describe: "Filter by category",
-              })
-              .option("format", {
-                type: "string",
-                default: "md",
-                choices: ["md", "json"] as const,
-                describe: "Output format",
-              }),
+              })),
           async (argv) => {
             const { handleFeedbackList } = await import("./commands/feedback.js");
             const result = await handleFeedbackList(
               { category: argv.category as "bug" | "feature" | "idea" | undefined },
               argv.format as "md" | "json",
             );
-            process.stdout.write(result.output + "\n");
+            // ISS-910: accepts --raw, so it prints through the seam.
+            writeOutput(result.output);
             if (result.exitCode) process.exitCode = result.exitCode;
           },
         )

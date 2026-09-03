@@ -29,6 +29,34 @@ export const ISSUE_ID_REGEX = /^ISS-\d+$/;
 /** Matches canonical i-[crockford16] */
 export const ISSUE_CANONICAL_ID_REGEX = new RegExp(`^i-${CROCKFORD_CLASS}{16}$`);
 
+/**
+ * Arrangements have no legacy era (T-473): born after the canonical-id
+ * migration, so there is no display-form regex to pair with this one and no
+ * sequential allocator. Canonical-only, deliberately.
+ */
+export const ARRANGEMENT_CANONICAL_ID_REGEX = new RegExp(`^a-${CROCKFORD_CLASS}{16}$`);
+
+/** Canonical-only (T-474): a gate-ack has no legacy display-id era. */
+export const GATE_ACK_CANONICAL_ID_REGEX = new RegExp(`^g-${CROCKFORD_CLASS}{16}$`);
+
+/**
+ * Canonical-only (T-476), same reasoning as `ARRANGEMENT_CANONICAL_ID_REGEX`:
+ * rulings are born after the canonical-id migration, so there is no legacy
+ * display-form to pair with this one.
+ */
+export const RULING_CANONICAL_ID_REGEX = new RegExp(`^r-${CROCKFORD_CLASS}{16}$`);
+
+/**
+ * The client-task-identity contract (T-473), duplicated from
+ * `autonomous/client-profile.ts`'s own copy so `ArrangementPartySchema` can
+ * depend on it without importing `client-profile.ts` into the models layer.
+ * NOT re-exported from there: `client-profile.ts` sits in the presence-entry
+ * hook's zero-dependency import closure (ISS-1022), and importing this file
+ * from there pulls zod and the whole models module into that closure. Keep
+ * the two copies in sync by hand.
+ */
+export const CLIENT_TASK_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+
 // --- Ticket enums ---
 
 export const TICKET_STATUSES = ["open", "inprogress", "complete"] as const;
@@ -193,3 +221,83 @@ export const LessonRefSchema = z
     (v) => LESSON_ID_REGEX.test(v) || LESSON_CANONICAL_ID_REGEX.test(v),
     "Lesson ref must match L-NNN or l-[canonical]",
   );
+
+/** Canonical-only (T-473): no legacy form exists, so id and ref are the same shape. */
+export const ArrangementIdSchema = z
+  .string()
+  .refine((v) => ARRANGEMENT_CANONICAL_ID_REGEX.test(v), "Arrangement ID must match a-[canonical]");
+
+export const ArrangementRefSchema = z
+  .string()
+  .refine((v) => ARRANGEMENT_CANONICAL_ID_REGEX.test(v), "Arrangement ref must match a-[canonical]");
+
+/** Canonical-only (T-476): no legacy form exists, so id and ref are the same shape. */
+export const RulingIdSchema = z
+  .string()
+  .refine((v) => RULING_CANONICAL_ID_REGEX.test(v), "Ruling ID must match r-[canonical]");
+
+export const RulingRefSchema = z
+  .string()
+  .refine((v) => RULING_CANONICAL_ID_REGEX.test(v), "Ruling ref must match r-[canonical]");
+
+export const EARMARK_ROLES = ["pen", "worker"] as const;
+export type EarmarkRole = (typeof EARMARK_ROLES)[number];
+
+/**
+ * Mirrors `autonomous/client-profile.ts`'s real `OwnerTask` ({client, id,
+ * boundAt}) minus `boundAt`, which is provenance, not identity -- a
+ * placement/retraction identity is compared for equality, never recency.
+ * Duplicated here rather than imported: `models/` never depends on
+ * `autonomous/` (one-directional layering), so this is a structural mirror,
+ * kept in sync by hand the same way `ArrangementPartySchema`'s `client`
+ * field already is.
+ */
+export const OwnerTaskLikeSchema = z.object({
+  client: z.enum(["claude", "codex"]),
+  id: z.string().min(1).max(128).regex(CLIENT_TASK_ID_PATTERN),
+});
+export type OwnerTaskLike = z.infer<typeof OwnerTaskLikeSchema>;
+
+/**
+ * T-475: pick-exclusion state for assignment coordination between a duet's
+ * pen and worker. Unrelated to `reconcile.ts`'s "reservations" (git-ref
+ * duplicate-display-id tie-breaking) -- deliberately never named
+ * "reservation" to keep the two concepts from being confused in code or
+ * conversation.
+ *
+ * A discriminated union on `stage` so the invalid states (an `assigned`
+ * earmark with no `holderSession`, a `reserved` earmark bound to a session)
+ * are unrepresentable, the same discipline as `frozenGate`
+ * (autonomous/session-types.ts). The choke point that acquires an earmarked
+ * item (autonomous/stages/pick-ticket.ts) CONVERTS `reserved` -> `assigned`
+ * in place rather than clearing it -- an `assigned` earmark persists for the
+ * item's whole active life as its assignment record, cleared only at an
+ * explicit release seam (see earmarks.ts), never by acquisition itself.
+ */
+const EarmarkBaseSchema = z.object({
+  reservedBy: OwnerTaskLikeSchema,
+  arrangementId: ArrangementIdSchema,
+  since: z.string().datetime(),
+});
+
+export const EarmarkSchema = z.discriminatedUnion("stage", [
+  EarmarkBaseSchema.extend({
+    stage: z.literal("reserved"),
+    holderRole: z.enum(EARMARK_ROLES),
+    holderSession: z.null(),
+  }),
+  EarmarkBaseSchema.extend({
+    stage: z.literal("assigned"),
+    holderRole: z.enum(EARMARK_ROLES),
+    holderSession: z.string().uuid(),
+  }),
+]);
+export type Earmark = z.infer<typeof EarmarkSchema>;
+
+/**
+ * Canonical-only (T-474), and content-derived rather than randomly minted
+ * (see gate-ack.ts's `computeGateAckId`) -- no legacy form, no allocator.
+ */
+export const GateAckIdSchema = z
+  .string()
+  .refine((v) => GATE_ACK_CANONICAL_ID_REGEX.test(v), "Gate-ack ID must match g-[canonical]");

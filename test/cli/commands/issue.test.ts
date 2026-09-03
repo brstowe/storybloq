@@ -490,6 +490,52 @@ describe("handleIssueUpdate", () => {
     expect(parsed.data.severity).toBe("low");
   });
 
+  it("clearEarmarkForSession clears a same-session earmark atomically with the status write", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "issue-update-"));
+    tmpDirs.push(dir);
+    await setupIssue(dir);
+    const sessionId = "11111111-1111-4111-8111-111111111111";
+    const issuePath = join(dir, ".story", "issues", "ISS-001.json");
+    const issue = JSON.parse(await readFile(issuePath, "utf-8"));
+    issue.status = "inprogress";
+    issue.earmark = {
+      stage: "assigned", reservedBy: { client: "claude", id: "pen-task-1" },
+      arrangementId: "a-0123456789abcdef", since: "2026-08-28T00:00:00.000Z",
+      holderRole: "worker", holderSession: sessionId,
+    };
+    await writeFile(issuePath, JSON.stringify(issue, null, 2), "utf-8");
+
+    const result = await handleIssueUpdate("ISS-001", { status: "open" }, "json", dir, {
+      clearEarmarkForSession: sessionId,
+    });
+    const parsed = JSON.parse(result.output);
+    expect(parsed.data.status).toBe("open");
+    expect(parsed.data.earmark).toBeNull();
+  });
+
+  it("clearEarmarkForSession leaves a different session's earmark untouched", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "issue-update-"));
+    tmpDirs.push(dir);
+    await setupIssue(dir);
+    const foreignEarmark = {
+      stage: "assigned", reservedBy: { client: "claude", id: "pen-task-1" },
+      arrangementId: "a-0123456789abcdef", since: "2026-08-28T00:00:00.000Z",
+      holderRole: "worker", holderSession: "22222222-2222-4222-8222-222222222222",
+    };
+    const issuePath = join(dir, ".story", "issues", "ISS-001.json");
+    const issue = JSON.parse(await readFile(issuePath, "utf-8"));
+    issue.status = "inprogress";
+    issue.earmark = foreignEarmark;
+    await writeFile(issuePath, JSON.stringify(issue, null, 2), "utf-8");
+
+    const result = await handleIssueUpdate("ISS-001", { status: "open" }, "json", dir, {
+      clearEarmarkForSession: "11111111-1111-4111-8111-111111111111",
+    });
+    const parsed = JSON.parse(result.output);
+    expect(parsed.data.status).toBe("open");
+    expect(parsed.data.earmark).toEqual(foreignEarmark);
+  });
+
   it("resolved sets resolvedDate", async () => {
     const dir = await mkdtemp(join(tmpdir(), "issue-update-"));
     tmpDirs.push(dir);
@@ -683,5 +729,80 @@ describe("handleIssueDelete", () => {
     );
     const result = await handleIssueDelete("ISS-001", "md", dir);
     expect(result.output).toContain("Deleted issue ISS-001");
+  });
+});
+
+describe("T-476 section 10: setting citesRulings via create/update", () => {
+  const tmpDirs: string[] = [];
+  afterEach(async () => {
+    for (const d of tmpDirs) await rm(d, { recursive: true, force: true });
+    tmpDirs.length = 0;
+  });
+
+  const R1 = "r-0000000000000001";
+  const R2 = "r-0000000000000002";
+
+  it("create: citesRuling is deduplicated preserving first-seen order", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "issue-cites-"));
+    tmpDirs.push(dir);
+    await initProject(dir, { name: "test" });
+    const result = await handleIssueCreate(
+      { title: "i", severity: "low", impact: "x", components: [], relatedTickets: [], location: [], citesRuling: [R2, R1, R2] },
+      "json", dir,
+    );
+    const parsed = JSON.parse(result.output);
+    expect(parsed.data.citesRulings).toEqual([R2, R1]);
+  });
+
+  it("update: citesRuling fully replaces the existing array", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "issue-cites-"));
+    tmpDirs.push(dir);
+    await initProject(dir, { name: "test" });
+    await handleIssueCreate(
+      { title: "i", severity: "low", impact: "x", components: [], relatedTickets: [], location: [], citesRuling: [R1] },
+      "json", dir,
+    );
+    const result = await handleIssueUpdate("ISS-001", { citesRuling: [R2] }, "json", dir);
+    const parsed = JSON.parse(result.output);
+    expect(parsed.data.citesRulings).toEqual([R2]);
+  });
+
+  it("update: clearCitesRulings empties the array", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "issue-cites-"));
+    tmpDirs.push(dir);
+    await initProject(dir, { name: "test" });
+    await handleIssueCreate(
+      { title: "i", severity: "low", impact: "x", components: [], relatedTickets: [], location: [], citesRuling: [R1] },
+      "json", dir,
+    );
+    const result = await handleIssueUpdate("ISS-001", { clearCitesRulings: true }, "json", dir);
+    const parsed = JSON.parse(result.output);
+    expect(parsed.data.citesRulings).toEqual([]);
+  });
+
+  it("update: citesRuling and clearCitesRulings together are refused as invalid_input", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "issue-cites-"));
+    tmpDirs.push(dir);
+    await initProject(dir, { name: "test" });
+    await handleIssueCreate(
+      { title: "i", severity: "low", impact: "x", components: [], relatedTickets: [], location: [] },
+      "json", dir,
+    );
+    await expect(
+      handleIssueUpdate("ISS-001", { citesRuling: [R1], clearCitesRulings: true }, "json", dir),
+    ).rejects.toThrow(CliValidationError);
+  });
+
+  it("update: an invalid ruling id shape is refused", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "issue-cites-"));
+    tmpDirs.push(dir);
+    await initProject(dir, { name: "test" });
+    await handleIssueCreate(
+      { title: "i", severity: "low", impact: "x", components: [], relatedTickets: [], location: [] },
+      "json", dir,
+    );
+    await expect(
+      handleIssueUpdate("ISS-001", { citesRuling: ["not-a-ruling"] }, "json", dir),
+    ).rejects.toThrow(CliValidationError);
   });
 });

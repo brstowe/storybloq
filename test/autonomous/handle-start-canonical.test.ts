@@ -282,3 +282,125 @@ describe("ISS-654: handleStart targetWork canonicalization (end-to-end)", () => 
     expect(result.content[0]!.text).toContain("Targeted mode requires auto mode");
   });
 });
+
+/**
+ * T-461: review mode must run the REAL CODE_REVIEW instruction.
+ *
+ * handleStart used to build that instruction inline, which is the same defect
+ * PlanStage carried until 61b4b300, and it landed on the single round a
+ * review-mode session runs: no reviewer selection (a lenses-configured project
+ * silently got the plain agent text), no round header, and no
+ * currentReviewStartedAt. Nothing in the tree pinned it, which is why it
+ * survived.
+ */
+describe("T-461: review mode enters through CodeReviewStage", () => {
+  function setStageBackends(root: string, backends: string[]): void {
+    const configPath = join(root, ".story", "config.json");
+    const config = JSON.parse(readFileSync(configPath, "utf-8"));
+    config.recipeOverrides = {
+      ...config.recipeOverrides,
+      stages: { ...config.recipeOverrides?.stages, CODE_REVIEW: { backends } },
+    };
+    writeFileSync(configPath, JSON.stringify(config));
+    run("git add .", root);
+    run('git commit -q -m "set code review backends"', root);
+  }
+
+  async function startReview(root: string) {
+    const result = await handleAutonomousGuide(root, {
+      action: "start", sessionId: null, mode: "review", ticketId: "T-001",
+    });
+    expect(result.isError).toBeFalsy();
+    return result.content[0]!.text as string;
+  }
+
+  it("emits the stage's own round header and records the round start time", async () => {
+    const root = track(buildProject());
+    const text = await startReview(root);
+
+    // The round header is the cheapest proof the stage produced this text: the
+    // old inline instruction had no notion of rounds at all.
+    expect(text).toMatch(/Round 1 of \d+ minimum/);
+    expect(startedSession(root).currentReviewStartedAt).toBeTruthy();
+  });
+
+  it("selects the configured reviewer instead of a generic instruction", async () => {
+    // Exercises the phase 1(a) per-stage backends end to end: a lenses project
+    // must get the LENS protocol here, which is exactly what the inline
+    // instruction could never do because it never consulted a reviewer.
+    const root = track(buildProject());
+    setStageBackends(root, ["lenses"]);
+    const text = await startReview(root);
+
+    expect(text).toContain("Multi-Lens");
+    expect(text).toContain("storybloq_review_lenses_prepare");
+  });
+
+  it("still names the code_review_round report contract", async () => {
+    // The one thing the old inline text got right has to survive the swap,
+    // otherwise a review-mode session cannot report its verdict back.
+    const root = track(buildProject());
+    const text = await startReview(root);
+    expect(text).toContain("code_review_round");
+  });
+});
+
+/**
+ * T-461: the project-config INGESTION seam for the review-effort dial.
+ *
+ * resolveRecipe's own fail-closed behavior is unit-tested, but handleStart is
+ * what reads `.story/config.json` and decides what reaches it. A type filter
+ * there would silently drop a written null before the resolver could fail it
+ * closed, so the unit tests would pass while the shipped path size-mapped a
+ * chore down to light. These start a real session and read the frozen field.
+ */
+describe("T-461: handleStart ingests the project review-effort override", () => {
+  function setReviewEffortOverride(root: string, value: unknown): void {
+    const configPath = join(root, ".story", "config.json");
+    const config = JSON.parse(readFileSync(configPath, "utf-8"));
+    config.recipeOverrides = { ...config.recipeOverrides, reviewEffort: value };
+    writeFileSync(configPath, JSON.stringify(config));
+    run("git add .", root);
+    run('git commit -q -m "set review effort override"', root);
+  }
+
+  async function startAndRead(root: string): Promise<FullSessionState> {
+    const result = await handleAutonomousGuide(root, {
+      action: "start", sessionId: null, mode: "auto",
+    });
+    expect(result.isError).toBeFalsy();
+    return startedSession(root);
+  }
+
+  it("carries a valid project level through to the frozen session field", async () => {
+    const root = track(buildProject());
+    setReviewEffortOverride(root, "light");
+    const session = await startAndRead(root);
+    expect(session.resolvedReviewEffort).toMatchObject({ level: "light", source: "project" });
+  });
+
+  it("fails a written null closed to standard instead of dropping it", async () => {
+    // JSON.parse gives a real null here (`meta unset` deletes the key), so this
+    // is a value someone wrote. Dropped, it would reach the resolver as absent
+    // and let a low-risk chore size-map to LIGHT -- less review than today.
+    const root = track(buildProject());
+    setReviewEffortOverride(root, null);
+    const session = await startAndRead(root);
+    expect(session.resolvedReviewEffort).toMatchObject({ level: "standard", source: "project" });
+  });
+
+  it("fails a typo'd project level closed to standard, still attributed to the project", async () => {
+    const root = track(buildProject());
+    setReviewEffortOverride(root, "quick");
+    const session = await startAndRead(root);
+    expect(session.resolvedReviewEffort).toMatchObject({ level: "standard", source: "project" });
+  });
+
+  it("leaves a project that set nothing on the size-mapped default", async () => {
+    // The negative control: without it, every assertion above would still pass
+    // if ingestion pinned standard unconditionally and disabled the mapping.
+    const root = track(buildProject());
+    const session = await startAndRead(root);
+    expect(session.resolvedReviewEffort).toMatchObject({ level: "size-mapped", source: "default" });
+  });
+});

@@ -11,18 +11,19 @@ import { describe, it, expect } from "vitest";
 import { z } from "zod";
 import { registerAllTools } from "../../src/mcp/tools.js";
 import { buildLensHistoryUpdate } from "../../src/autonomous/stages/types.js";
+import { toolSchema } from "./tool-schema-helpers.js";
 
 function captureGuideSchema(): z.ZodTypeAny {
-  const tools = new Map<string, { inputSchema: z.ZodRawShape }>();
+  const tools = new Map<string, { inputSchema: unknown }>();
   const server = {
-    registerTool: (name: string, config: { inputSchema: z.ZodRawShape }) => {
+    registerTool: (name: string, config: { inputSchema: unknown }) => {
       tools.set(name, config);
     },
   } as unknown as Parameters<typeof registerAllTools>[0];
   registerAllTools(server, "/tmp/iss717-test-root");
   const guide = tools.get("storybloq_autonomous_guide");
   if (!guide) throw new Error("storybloq_autonomous_guide was not registered");
-  return z.object(guide.inputSchema);
+  return toolSchema(guide.inputSchema);
 }
 
 const SCHEMA = captureGuideSchema();
@@ -95,6 +96,39 @@ describe("autonomous_guide report.findings schema (ISS-717)", () => {
     expect(() =>
       parseReport([{ severity: "major", category: "x", description: "y", disposition: "bogus" }]),
     ).toThrow();
+  });
+
+  /**
+   * ISS-598: a 4th instance of the recurring MCP-schema-stripping pattern
+   * (ISS-717, ISS-724, ISS-988) -- `file` is read defensively off the raw
+   * finding by plan-review.ts, which builds the `DriftFinding` the PLAN_REVIEW
+   * scope-drift classifier (plan-review-drift.ts) actually runs against, but
+   * `file` was never declared on the schema, so a reviewer that cited a file
+   * would have it silently dropped before either ever saw it.
+   */
+  it("accepts a file field on a finding, for the scope-drift detector", () => {
+    const parsed = parseReport([
+      { severity: "major", category: "design", description: "unbounded chain", file: "src/nav/reducer.ts" },
+    ], "revise");
+    expect(parsed.report.findings[0].file).toBe("src/nav/reducer.ts");
+  });
+
+  it("omits file rather than defaulting it, so a reviewer that cites none leaves the detector to fall back on description text alone", () => {
+    const parsed = parseReport([
+      { severity: "major", category: "design", description: "unbounded chain" },
+    ], "revise");
+    expect(parsed.report.findings[0].file).toBeUndefined();
+  });
+
+  it("accepts exactly the 1024-character boundary and rejects one character past it", () => {
+    const boundary = "a".repeat(1024);
+    const ok = parseReport([
+      { severity: "major", category: "design", description: "x", file: boundary },
+    ], "revise");
+    expect(ok.report.findings[0].file).toBe(boundary);
+    expect(() => parseReport([
+      { severity: "major", category: "design", description: "x", file: "a".repeat(1025) },
+    ], "revise")).toThrow();
   });
 });
 

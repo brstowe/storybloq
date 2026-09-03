@@ -25,6 +25,7 @@ import {
   todayISO,
   normalizeTags,
   CliValidationError,
+  assertUpdateHasFields,
 } from "../helpers.js";
 import type { CommandContext, CommandResult } from "../types.js";
 import { inheritedNotesFor } from "../../federation/inherit.js";
@@ -73,7 +74,7 @@ export function handleNoteList(
   if (filters.tag) {
     const normalized = normalizeTags([filters.tag]);
     if (normalized.length === 0) {
-      // Tag normalized to empty (e.g. "!!!") — no notes can match
+      // Tag normalized to empty (e.g. "!!!") -- no notes can match
       notes = [];
     } else {
       const tag = normalized[0]!;
@@ -201,6 +202,7 @@ export async function handleNoteUpdate(
   format: OutputFormat,
   root: string,
 ): Promise<CommandResult> {
+  assertUpdateHasFields(updates, "note", "content, title, tags, clearTags, status");
   if (updates.content !== undefined && !updates.content.trim()) {
     throw new CliValidationError("invalid_input", "Note content cannot be empty");
   }

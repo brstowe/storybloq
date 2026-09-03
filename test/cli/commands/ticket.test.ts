@@ -20,6 +20,7 @@ import { ExitCode } from "../../../src/core/output-formatter.js";
 import { CliValidationError } from "../../../src/cli/helpers.js";
 import { initProject } from "../../../src/core/init.js";
 import { loadProject } from "../../../src/core/project-loader.js";
+import { writeRulingUnlocked } from "../../../src/core/ruling-loader.js";
 import { makeState, makeTicket, makeRoadmap, makePhase } from "../../core/test-factories.js";
 import type { CommandContext } from "../../../src/cli/run.js";
 
@@ -392,7 +393,10 @@ describe("handleTicketUpdate", () => {
     tmpDirs.push(dir);
     await setupProject(dir);
     await handleTicketUpdate("T-001", { status: "complete" }, "md", dir);
-    const result = await handleTicketUpdate("T-001", { status: "open" }, "json", dir);
+    // ISS-981: reopening a completed ticket now requires proof or --force,
+    // even claim-free (this fixture has none) -- the property this test
+    // pins is the completedDate lifecycle, not authorization, so force it.
+    const result = await handleTicketUpdate("T-001", { status: "open" }, "json", dir, true);
     const parsed = JSON.parse(result.output);
     expect(parsed.data.completedDate).toBeNull();
   });
@@ -402,7 +406,9 @@ describe("handleTicketUpdate", () => {
     tmpDirs.push(dir);
     await setupProject(dir);
     await handleTicketUpdate("T-001", { status: "complete" }, "md", dir);
-    const result = await handleTicketUpdate("T-001", { title: "Renamed" }, "json", dir);
+    // ISS-981: same as above -- this test pins date preservation, not
+    // authorization.
+    const result = await handleTicketUpdate("T-001", { title: "Renamed" }, "json", dir, true);
     const parsed = JSON.parse(result.output);
     // Status not changed, so date should be preserved
     expect(parsed.data.completedDate).toMatch(/^\d{4}-\d{2}-\d{2}$/);
@@ -418,12 +424,84 @@ describe("handleTicketUpdate", () => {
     raw.claimedBySession = "sess-abc";
     await writeFile(ticketPath, JSON.stringify(raw, null, 2) + "\n", "utf-8");
 
-    await handleTicketUpdate("T-001", { status: "complete" }, "json", dir);
+    // T-442: the fixture has no git identity, so ownership of alice@test.com's
+    // claim cannot be proven and the completion is now refused rather than
+    // silently taking the ticket from whoever holds it. Real single-user projects
+    // are unaffected -- the claim's user comes from gitUserEmail at claim time, so
+    // it matches. `--force` is the documented administrative bypass.
+    await expect(
+      handleTicketUpdate("T-001", { status: "complete" }, "json", dir),
+    ).rejects.toThrow(/cannot prove ownership/);
+
+    const untouched = JSON.parse(await readFile(ticketPath, "utf-8"));
+    expect(untouched.status).toBe("open");
+    expect(untouched.claim).toBeDefined();
+
+    await handleTicketUpdate("T-001", { status: "complete" }, "json", dir, true);
 
     const disk = JSON.parse(await readFile(ticketPath, "utf-8"));
     expect(disk.status).toBe("complete");
     expect(disk.claim).toBeUndefined();
     expect(disk.claimedBySession).toBeUndefined();
+  });
+
+  it("T-475 section 5: clears an assigned earmark matching the claim it strips on completion", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ticket-update-"));
+    tmpDirs.push(dir);
+    await setupProject(dir);
+    const ticketPath = join(dir, ".story", "tickets", "T-001.json");
+    const raw = JSON.parse(await readFile(ticketPath, "utf-8"));
+    const CLAIMING_SESSION = "11111111-1111-4111-8111-111111111111";
+    raw.status = "inprogress";
+    raw.claim = { user: "alice@test.com", branch: "feat/x", since: "2026-05-26T10:00:00Z" };
+    raw.claimedBySession = CLAIMING_SESSION;
+    // R5's normal worked state: the earmark's holderSession matches the
+    // ticket's own claimedBySession -- and clearClaimOnComplete is about to
+    // strip that claim, orphaning the earmark unless this seam clears it too.
+    raw.earmark = {
+      stage: "assigned",
+      reservedBy: { client: "claude", id: "pen-task-1" },
+      arrangementId: "a-0123456789abcdef",
+      since: "2026-05-26T10:00:00Z",
+      holderRole: "worker",
+      holderSession: CLAIMING_SESSION,
+    };
+    await writeFile(ticketPath, JSON.stringify(raw, null, 2) + "\n", "utf-8");
+
+    await handleTicketUpdate("T-001", { status: "complete" }, "json", dir, true);
+
+    const disk = JSON.parse(await readFile(ticketPath, "utf-8"));
+    expect(disk.status).toBe("complete");
+    expect(disk.earmark).toBeNull();
+  });
+
+  it("T-475 section 5: leaves an earmark alone when it does not match the ticket's own claimedBySession", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ticket-update-"));
+    tmpDirs.push(dir);
+    await setupProject(dir);
+    const ticketPath = join(dir, ".story", "tickets", "T-001.json");
+    const raw = JSON.parse(await readFile(ticketPath, "utf-8"));
+    raw.status = "inprogress";
+    raw.claim = { user: "alice@test.com", branch: "feat/x", since: "2026-05-26T10:00:00Z" };
+    raw.claimedBySession = "11111111-1111-4111-8111-111111111111";
+    // Already an independently-invalid split state (R5) -- not this seam's
+    // job to fix, `validate`'s stale_earmark check flags it separately.
+    const foreignEarmark = {
+      stage: "assigned",
+      reservedBy: { client: "claude", id: "pen-task-1" },
+      arrangementId: "a-0123456789abcdef",
+      since: "2026-05-26T10:00:00Z",
+      holderRole: "worker",
+      holderSession: "22222222-2222-4222-8222-222222222222",
+    };
+    raw.earmark = foreignEarmark;
+    await writeFile(ticketPath, JSON.stringify(raw, null, 2) + "\n", "utf-8");
+
+    await handleTicketUpdate("T-001", { status: "complete" }, "json", dir, true);
+
+    const disk = JSON.parse(await readFile(ticketPath, "utf-8"));
+    expect(disk.status).toBe("complete");
+    expect(disk.earmark).toEqual(foreignEarmark);
   });
 
   it("returns not_found for missing ticket", async () => {
@@ -468,7 +546,7 @@ describe("handleTicketUpdate", () => {
     ticket.customField = "preserved";
     const { writeFile: wf } = await import("node:fs/promises");
     await wf(join(dir, ".story", "tickets", "T-001.json"), JSON.stringify(ticket, null, 2));
-    // Update title — should preserve customField
+    // Update title -- should preserve customField
     const result = await handleTicketUpdate("T-001", { title: "New Title" }, "json", dir);
     const parsed = JSON.parse(result.output);
     expect(parsed.data.customField).toBe("preserved");
@@ -490,6 +568,337 @@ describe("handleTicketUpdate", () => {
     await expect(
       handleTicketUpdate("T-001", { type: "invalid" }, "md", dir),
     ).rejects.toThrow("Unknown ticket type");
+  });
+});
+
+describe("guardCompletedTicketMutation guard (ISS-981)", () => {
+  const tmpDirs: string[] = [];
+  afterEach(async () => {
+    for (const d of tmpDirs) await rm(d, { recursive: true, force: true });
+    tmpDirs.length = 0;
+  });
+
+  // A temp project with a REPO-LOCAL git identity (so gitUserEmail resolves
+  // deterministically regardless of the host's ambient git config) and a
+  // T-001 that is COMPLETE and still carries claim material -- the ISS-913
+  // "contradictory" shape. Completion normally strips claim keys on success;
+  // this fixture reproduces the case where it didn't.
+  async function setupCompletedClaimedTicket(myEmail: string, claimUser: string): Promise<string> {
+    const dir = await mkdtemp(join(tmpdir(), "ticket-guard-"));
+    tmpDirs.push(dir);
+    await initProject(dir, { name: "test" });
+    execFileSync("git", ["init", "-q"], { cwd: dir });
+    execFileSync("git", ["config", "user.email", myEmail], { cwd: dir });
+    execFileSync("git", ["config", "user.name", "Test User"], { cwd: dir });
+    await handleTicketCreate(
+      { title: "Original", type: "task", phase: "p0", description: "orig desc", blockedBy: [], parentTicket: null },
+      "md", dir,
+    );
+    const path = join(dir, ".story", "tickets", "T-001.json");
+    const ticket = JSON.parse(await readFile(path, "utf-8"));
+    ticket.status = "complete";
+    ticket.completedDate = "2026-05-26";
+    ticket.claim = { user: claimUser, branch: "feature/theirs", since: "2026-05-26T00:00:00Z" };
+    await writeFile(path, JSON.stringify(ticket, null, 2) + "\n", "utf-8");
+    return dir;
+  }
+
+  // The claim-FREE complete ticket: the shape a normal completion actually
+  // leaves behind, since clearClaimOnComplete strips claim keys on success.
+  // No claim, no claimedBySession, so nothing for the guard to authorize
+  // against and no other party's ownership at stake.
+  async function setupCompletedUnclaimedTicket(): Promise<string> {
+    const dir = await mkdtemp(join(tmpdir(), "ticket-guard-unclaimed-"));
+    tmpDirs.push(dir);
+    await initProject(dir, { name: "test" });
+    execFileSync("git", ["init", "-q"], { cwd: dir });
+    execFileSync("git", ["config", "user.email", "me@test.com"], { cwd: dir });
+    execFileSync("git", ["config", "user.name", "Test User"], { cwd: dir });
+    await handleTicketCreate(
+      { title: "Original", type: "task", phase: "p0", description: "orig desc", blockedBy: [], parentTicket: null },
+      "md", dir,
+    );
+    const path = join(dir, ".story", "tickets", "T-001.json");
+    const ticket = JSON.parse(await readFile(path, "utf-8"));
+    ticket.status = "complete";
+    ticket.completedDate = "2026-05-26";
+    await writeFile(path, JSON.stringify(ticket, null, 2) + "\n", "utf-8");
+    return dir;
+  }
+
+  // 1.9.0 scope: ISS-981 guards the REOPEN direction, which is the defect its
+  // filing names ("reopens a completed ticket and erases its completion
+  // date"). A metadata edit erases nothing and takes nothing from anyone, so
+  // guarding it only broke a routine correction on finished work. These two
+  // pin both halves of that boundary on the claim-free shape.
+
+  it("[ISS-981 scope] allows a metadata edit on a claim-free complete ticket, preserving status and completedDate", async () => {
+    const dir = await setupCompletedUnclaimedTicket();
+    await handleTicketUpdate("T-001", { title: "Corrected" }, "json", dir);
+    const after = JSON.parse(await readFile(join(dir, ".story", "tickets", "T-001.json"), "utf-8"));
+    expect(after.title).toBe("Corrected");
+    expect(after.status).toBe("complete"); // the edit must not reopen it
+    expect(after.completedDate).toBe("2026-05-26"); // and must not erase the date
+  });
+
+  it("[ISS-981 scope] still refuses to REOPEN a claim-free complete ticket without --force", async () => {
+    const dir = await setupCompletedUnclaimedTicket();
+    await expect(
+      handleTicketUpdate("T-001", { status: "open" }, "json", dir),
+    ).rejects.toThrow(/Cannot reopen/);
+    const after = JSON.parse(await readFile(join(dir, ".story", "tickets", "T-001.json"), "utf-8"));
+    expect(after.status).toBe("complete");
+    expect(after.completedDate).toBe("2026-05-26");
+  });
+
+  // test 1: RED-at-parent. Covers the missing-identity path specifically
+  // (distinct from #4b's resolvable-but-mismatched identity): an explicit
+  // repo-local `user.email ""` deterministically forces gitUserEmail to
+  // resolve null, overriding whatever the host's global git config happens
+  // to be -- relying on ambient config alone (as this test originally did)
+  // would fail on a host whose global user.email happens to equal
+  // "someone-else@test.com".
+  it("[ISS-981 #1] refuses to reopen a complete ticket when ownership is unproven (no identity available)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ticket-guard-noident-"));
+    tmpDirs.push(dir);
+    await initProject(dir, { name: "test" });
+    execFileSync("git", ["init", "-q"], { cwd: dir });
+    execFileSync("git", ["config", "user.email", ""], { cwd: dir });
+    await handleTicketCreate(
+      { title: "Original", type: "task", phase: "p0", description: "orig desc", blockedBy: [], parentTicket: null },
+      "md", dir,
+    );
+    const path = join(dir, ".story", "tickets", "T-001.json");
+    const ticket = JSON.parse(await readFile(path, "utf-8"));
+    ticket.status = "complete";
+    ticket.completedDate = "2026-05-26";
+    ticket.claim = { user: "someone-else@test.com", branch: "feature/theirs", since: "2026-05-26T00:00:00Z" };
+    await writeFile(path, JSON.stringify(ticket, null, 2) + "\n", "utf-8");
+
+    await expect(
+      handleTicketUpdate("T-001", { status: "open" }, "json", dir),
+    ).rejects.toThrow(/cannot prove ownership \(git user\.email is not configured\)/);
+
+    const untouched = JSON.parse(await readFile(path, "utf-8"));
+    expect(untouched.status).toBe("complete");
+  });
+
+  // test 2: disclosed NON-REGRESSION PIN, not RED-at-parent. Reproduced
+  // empirically against the parent commit: the pre-existing, untouched
+  // `clearClaimOnComplete(ticket, guard)` call already runs against the
+  // merged candidate whenever the candidate's status stays "complete" (its
+  // exemption is keyed on the CANDIDATE's target status, not on whether this
+  // update transitions INTO complete), so a field-only mutation with a
+  // contradictory claim already rejected at parent for that pre-existing,
+  // unrelated reason. Kept as an explicit pin -- the case must remain
+  // guarded post-fix, whichever mechanism does it -- not claimed as new
+  // coverage from `guardCompletedTicketMutation` (see plan [IMPL-F1]).
+  it("[ISS-981 #2, non-regression] refuses to change a field on a complete ticket when ownership is unproven", async () => {
+    const dir = await setupCompletedClaimedTicket("me@test.com", "someone-else@test.com");
+    await expect(
+      handleTicketUpdate("T-001", { title: "Renamed" }, "json", dir),
+    ).rejects.toThrow(/cannot prove ownership/);
+    const path = join(dir, ".story", "tickets", "T-001.json");
+    const untouched = JSON.parse(await readFile(path, "utf-8"));
+    expect(untouched.title).toBe("Original");
+  });
+
+  // test 3: disclosed non-regression pin, paired with #1 -- --force is the
+  // documented administrative bypass and must still work post-fix.
+  it("[ISS-981 #3] --force reopens a complete ticket despite unproven ownership", async () => {
+    const dir = await setupCompletedClaimedTicket("me@test.com", "someone-else@test.com");
+    const result = await handleTicketUpdate("T-001", { status: "open" }, "json", dir, true);
+    const parsed = JSON.parse(result.output);
+    expect(parsed.data.status).toBe("open");
+  });
+
+  // test 4: disclosed non-regression pin -- a caller whose git identity
+  // genuinely matches the claim can still reopen without --force.
+  it("[ISS-981 #4] reopens a complete ticket when the caller's git identity matches the claim", async () => {
+    const dir = await setupCompletedClaimedTicket("me@test.com", "me@test.com");
+    const result = await handleTicketUpdate("T-001", { status: "open" }, "json", dir);
+    const parsed = JSON.parse(result.output);
+    expect(parsed.data.status).toBe("open");
+  });
+
+  // test 4b: RED-at-parent, and the one that actually proves the comparison
+  // discriminates rather than merely gating on "no identity at all" -- a
+  // repo-local, RESOLVABLE identity that simply does not match the claim.
+  it("[ISS-981 #4b] refuses to reopen when the caller's resolvable git identity does not match the claim", async () => {
+    const dir = await setupCompletedClaimedTicket("me@test.com", "someone-else@test.com");
+    await expect(
+      handleTicketUpdate("T-001", { status: "open" }, "json", dir),
+    ).rejects.toThrow(/cannot prove ownership/);
+    const path = join(dir, ".story", "tickets", "T-001.json");
+    const untouched = JSON.parse(await readFile(path, "utf-8"));
+    expect(untouched.status).toBe("complete");
+  });
+
+  // test 6: MCP boundary, RED-at-parent. Confirms an unproven reopen through
+  // the actual registered tool -- not `handleTicketUpdate` called directly
+  // -- is refused when `force` is omitted. `force` IS declared on the schema
+  // (ISS-981's F1-BLOCKING correction, see test 10 below for the dedicated
+  // schema-shape + force-actually-works coverage); this test's job is the
+  // refusal path, not the schema shape. In-process via InMemoryTransport; no
+  // build required (ISS-978).
+  it("[ISS-981 #6] MCP boundary: refuses an unproven reopen through the real registered tool when force is omitted", async () => {
+    const { McpServer } = await import("@modelcontextprotocol/sdk/server/mcp.js");
+    const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
+    const { InMemoryTransport } = await import("@modelcontextprotocol/sdk/inMemory.js");
+    const { registerAllTools } = await import("../../../src/mcp/tools.js");
+
+    const dir = await setupCompletedClaimedTicket("me@test.com", "someone-else@test.com");
+
+    const server = new McpServer({ name: "test-server", version: "0.0.0" });
+    registerAllTools(server, dir);
+
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: "test-client", version: "0.0.0" });
+    await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
+
+    try {
+      const result = await client.callTool({
+        name: "storybloq_ticket_update",
+        arguments: { id: "T-001", status: "open" },
+      });
+      expect(result.isError).toBe(true);
+      const text = (result.content as Array<{ text: string }>)[0]!.text;
+      expect(text).toMatch(/cannot prove ownership/);
+
+      const path = join(dir, ".story", "tickets", "T-001.json");
+      const untouched = JSON.parse(await readFile(path, "utf-8"));
+      expect(untouched.status).toBe("complete");
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  // tests 7/8: RED-at-parent (plan [IMPL-F2]/[IMPL-F3]; verified by
+  // git-stash A/B, not merely a claim-free non-regression pin as originally
+  // planned). Deliberately reuse the CLAIM-BEARING/unproven fixture, not a
+  // claim-free one -- a claim-free ticket is already authorized by
+  // `clearClaimOnComplete`'s own legacy fallback regardless of any guard, so
+  // it cannot demonstrate the no-op exemption doing anything (confirmed by
+  // simulating Mutant C2 against a claim-free fixture: still succeeds).
+  // Reproduced against the actual parent commit: BOTH tests throw there --
+  // parent's single, unconditional `clearClaimOnComplete(ticket, guard)`
+  // call has no no-op awareness at all and rejects a claim-bearing/unproven
+  // resend regardless of whether anything is actually changing. Only the
+  // fix -- gating BOTH the new guard call AND the pre-existing
+  // `clearClaimOnComplete` call on `isNoOpUpdate` -- makes these succeed.
+  it("[ISS-981 #7] resends status:complete on an unproven-but-unchanged complete ticket without --force", async () => {
+    const dir = await setupCompletedClaimedTicket("me@test.com", "someone-else@test.com");
+    const result = await handleTicketUpdate("T-001", { status: "complete" }, "json", dir);
+    const parsed = JSON.parse(result.output);
+    expect(parsed.data.status).toBe("complete");
+  });
+
+  it("[ISS-981 #8] resends a field to its own current value on an unproven-but-unchanged complete ticket without --force", async () => {
+    const dir = await setupCompletedClaimedTicket("me@test.com", "someone-else@test.com");
+    const result = await handleTicketUpdate("T-001", { title: "Original" }, "json", dir);
+    const parsed = JSON.parse(result.output);
+    expect(parsed.data.title).toBe("Original");
+  });
+
+  // test 9, RED-at-parent: THE headline scenario ISS-981 was filed for --
+  // "no claim, no --force" reopening a claim-free completed ticket. This is
+  // the test whose absence let a narrower (claim-scoped) polarity survive
+  // seven plan-review rounds and two code-review rounds: guardCompletedTicketMutation
+  // must NOT reuse clearClaimOnComplete's "nothing to authorize against ->
+  // pass" fallback here, because a claim-free ticket is the ORDINARY
+  // post-completion state (completion strips claim keys on success), not an
+  // edge case. --force (test 3b below) remains the escape.
+  it("[ISS-981 #9] refuses to reopen a claim-free complete ticket without --force", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ticket-guard-claimfree-"));
+    tmpDirs.push(dir);
+    await initProject(dir, { name: "test" });
+    await handleTicketCreate(
+      { title: "Original", type: "task", phase: "p0", description: "orig desc", blockedBy: [], parentTicket: null },
+      "md", dir,
+    );
+    await handleTicketUpdate("T-001", { status: "complete" }, "json", dir);
+    await expect(
+      handleTicketUpdate("T-001", { status: "open" }, "json", dir),
+    ).rejects.toThrow(/cannot prove ownership/);
+    const path = join(dir, ".story", "tickets", "T-001.json");
+    const untouched = JSON.parse(await readFile(path, "utf-8"));
+    expect(untouched.status).toBe("complete");
+  });
+
+  // test 3b, disclosed non-regression pin, paired with #9: --force remains
+  // the documented escape for a claim-free ticket, which has no identity to
+  // prove ownership against in the first place.
+  it("[ISS-981 #3b] --force reopens a claim-free complete ticket", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ticket-guard-claimfree-force-"));
+    tmpDirs.push(dir);
+    await initProject(dir, { name: "test" });
+    await handleTicketCreate(
+      { title: "Original", type: "task", phase: "p0", description: "orig desc", blockedBy: [], parentTicket: null },
+      "md", dir,
+    );
+    await handleTicketUpdate("T-001", { status: "complete" }, "json", dir);
+    const result = await handleTicketUpdate("T-001", { status: "open" }, "json", dir, true);
+    const parsed = JSON.parse(result.output);
+    expect(parsed.data.status).toBe("open");
+  });
+
+  // test 10, MCP boundary, RED-at-parent, F1-BLOCKING per the pen's ruling:
+  // `force` must actually be declared on the registered tool's schema (it
+  // was NOT, before this correction -- widening the guard without this would
+  // have permanently locked every MCP caller, including the pen itself, out
+  // of ever reopening or editing completed work, an ISS-988-shaped refusal
+  // naming an escape the caller cannot reach) and must actually be threaded
+  // into `handleTicketUpdate`. Proves both ends: schema-shape, and a real
+  // call with `force: true` succeeding where the same call without it does
+  // not -- not an in-process handler call (same standard as ISS-982's test 9).
+  it("[ISS-981 #10] MCP boundary: force is declared on the schema and actually authorizes a claim-free reopen", async () => {
+    const { McpServer } = await import("@modelcontextprotocol/sdk/server/mcp.js");
+    const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
+    const { InMemoryTransport } = await import("@modelcontextprotocol/sdk/inMemory.js");
+    const { registerAllTools } = await import("../../../src/mcp/tools.js");
+
+    const dir = await mkdtemp(join(tmpdir(), "ticket-guard-mcp-force-"));
+    tmpDirs.push(dir);
+    await initProject(dir, { name: "test" });
+    await handleTicketCreate(
+      { title: "Original", type: "task", phase: "p0", description: "orig desc", blockedBy: [], parentTicket: null },
+      "md", dir,
+    );
+    await handleTicketUpdate("T-001", { status: "complete" }, "json", dir);
+
+    const server = new McpServer({ name: "test-server", version: "0.0.0" });
+    registerAllTools(server, dir);
+
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: "test-client", version: "0.0.0" });
+    await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
+
+    try {
+      const tools = await client.listTools();
+      const updateTool = tools.tools.find((t) => t.name === "storybloq_ticket_update");
+      expect(updateTool).toBeDefined();
+      expect(Object.keys(updateTool!.inputSchema.properties ?? {})).toContain("force");
+
+      const withoutForce = await client.callTool({
+        name: "storybloq_ticket_update",
+        arguments: { id: "T-001", status: "open" },
+      });
+      expect(withoutForce.isError).toBe(true);
+
+      const withForce = await client.callTool({
+        name: "storybloq_ticket_update",
+        arguments: { id: "T-001", status: "open", force: true },
+      });
+      expect(withForce.isError).toBeUndefined();
+
+      const path = join(dir, ".story", "tickets", "T-001.json");
+      const disk = JSON.parse(await readFile(path, "utf-8"));
+      expect(disk.status).toBe("open");
+    } finally {
+      await client.close();
+      await server.close();
+    }
   });
 });
 
@@ -776,5 +1185,185 @@ describe("global _conflicts write-block through CLI handlers (ISS-695)", () => {
     await expect(
       handleTicketCreate({ title: "New", type: "task", phase: "p0", description: "", blockedBy: [], parentTicket: null }, "md", dir),
     ).rejects.toThrow(/unresolved conflicts/i);
+  });
+});
+
+describe("T-476: handleTicketGet cited ruling rendering (acceptance 1 and 2)", () => {
+  const tmpDirs: string[] = [];
+
+  afterEach(async () => {
+    await Promise.all(tmpDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+  });
+
+  it("renders a cited ruling's verbatim text, attribution, and recorder in markdown", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ticket-ruling-"));
+    tmpDirs.push(dir);
+    await writeRulingUnlocked(
+      {
+        id: "r-0000000000000001",
+        text: "The lens-cache evidence stands; the total is 337.",
+        attribution: "owner-direct",
+        recordedBy: { client: "claude", id: "test-session" },
+        date: "2026-08-27",
+        scopeTags: [],
+        supersedes: null,
+      },
+      dir,
+      { createOnly: true },
+    );
+    const ctx = makeCtx({
+      root: dir,
+      state: makeState({ tickets: [makeTicket({ id: "T-001", citesRulings: ["r-0000000000000001"] })] }),
+    });
+    const result = handleTicketGet("T-001", ctx);
+    expect(result.output).toContain("The lens-cache evidence stands; the total is 337.");
+    expect(result.output).toContain("owner-direct");
+    expect(result.output).toContain("claude/test-session");
+    expect(result.output).toContain("does not replace the second key");
+  });
+
+  it("surfaces the CURRENT (superseding) ruling's text, not the originally-cited stale one", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ticket-ruling-"));
+    tmpDirs.push(dir);
+    await writeRulingUnlocked(
+      {
+        id: "r-0000000000000001",
+        text: "old ruling text",
+        attribution: "owner-direct",
+        recordedBy: { client: "claude", id: "test-session" },
+        date: "2026-08-01",
+        scopeTags: [],
+        supersedes: null,
+      },
+      dir,
+      { createOnly: true },
+    );
+    await writeRulingUnlocked(
+      {
+        id: "r-0000000000000002",
+        text: "new ruling text supersedes the old one",
+        attribution: "owner-direct",
+        recordedBy: { client: "claude", id: "test-session" },
+        date: "2026-08-27",
+        scopeTags: [],
+        supersedes: "r-0000000000000001",
+      },
+      dir,
+      { createOnly: true },
+    );
+    const ctx = makeCtx({
+      root: dir,
+      state: makeState({ tickets: [makeTicket({ id: "T-001", citesRulings: ["r-0000000000000001"] })] }),
+    });
+    const result = handleTicketGet("T-001", ctx);
+    expect(result.output).toContain("new ruling text supersedes the old one");
+    expect(result.output).not.toContain("old ruling text");
+    expect(result.output).toContain("superseded by r-0000000000000002");
+  });
+
+  it("JSON mode embeds citedRulings on the ticket, resolved to current state", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ticket-ruling-"));
+    tmpDirs.push(dir);
+    await writeRulingUnlocked(
+      {
+        id: "r-0000000000000001",
+        text: "verbatim quote",
+        attribution: "manager-delegated",
+        recordedBy: { client: "codex", id: "codex-thread-1" },
+        date: "2026-08-27",
+        scopeTags: [],
+        supersedes: null,
+      },
+      dir,
+      { createOnly: true },
+    );
+    const ctx = makeCtx({
+      root: dir,
+      format: "json",
+      state: makeState({ tickets: [makeTicket({ id: "T-001", citesRulings: ["r-0000000000000001"] })] }),
+    });
+    const result = handleTicketGet("T-001", ctx);
+    const parsed = JSON.parse(result.output);
+    expect(parsed.data.citedRulings).toHaveLength(1);
+    expect(parsed.data.citedRulings[0]).toMatchObject({
+      citedId: "r-0000000000000001",
+      status: "resolved",
+      current: expect.objectContaining({ text: "verbatim quote", attribution: "manager-delegated" }),
+    });
+  });
+});
+
+describe("T-476 section 10: setting citesRulings via create/update", () => {
+  const tmpDirs: string[] = [];
+  afterEach(async () => {
+    for (const d of tmpDirs) await rm(d, { recursive: true, force: true });
+    tmpDirs.length = 0;
+  });
+
+  const R1 = "r-0000000000000001";
+  const R2 = "r-0000000000000002";
+
+  it("create: citesRuling is deduplicated preserving first-seen order", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ticket-cites-"));
+    tmpDirs.push(dir);
+    await initProject(dir, { name: "test" });
+    const result = await handleTicketCreate(
+      { title: "t", type: "task", phase: "p0", description: "", blockedBy: [], parentTicket: null, citesRuling: [R2, R1, R2] },
+      "json", dir,
+    );
+    const parsed = JSON.parse(result.output);
+    expect(parsed.data.citesRulings).toEqual([R2, R1]);
+  });
+
+  it("update: citesRuling fully replaces the existing array", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ticket-cites-"));
+    tmpDirs.push(dir);
+    await initProject(dir, { name: "test" });
+    await handleTicketCreate(
+      { title: "t", type: "task", phase: "p0", description: "", blockedBy: [], parentTicket: null, citesRuling: [R1] },
+      "json", dir,
+    );
+    const result = await handleTicketUpdate("T-001", { citesRuling: [R2] }, "json", dir);
+    const parsed = JSON.parse(result.output);
+    expect(parsed.data.citesRulings).toEqual([R2]);
+  });
+
+  it("update: clearCitesRulings empties the array", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ticket-cites-"));
+    tmpDirs.push(dir);
+    await initProject(dir, { name: "test" });
+    await handleTicketCreate(
+      { title: "t", type: "task", phase: "p0", description: "", blockedBy: [], parentTicket: null, citesRuling: [R1] },
+      "json", dir,
+    );
+    const result = await handleTicketUpdate("T-001", { clearCitesRulings: true }, "json", dir);
+    const parsed = JSON.parse(result.output);
+    expect(parsed.data.citesRulings).toEqual([]);
+  });
+
+  it("update: citesRuling and clearCitesRulings together are refused as invalid_input", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ticket-cites-"));
+    tmpDirs.push(dir);
+    await initProject(dir, { name: "test" });
+    await handleTicketCreate(
+      { title: "t", type: "task", phase: "p0", description: "", blockedBy: [], parentTicket: null },
+      "json", dir,
+    );
+    await expect(
+      handleTicketUpdate("T-001", { citesRuling: [R1], clearCitesRulings: true }, "json", dir),
+    ).rejects.toThrow(CliValidationError);
+  });
+
+  it("update: an invalid ruling id shape is refused", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ticket-cites-"));
+    tmpDirs.push(dir);
+    await initProject(dir, { name: "test" });
+    await handleTicketCreate(
+      { title: "t", type: "task", phase: "p0", description: "", blockedBy: [], parentTicket: null },
+      "json", dir,
+    );
+    await expect(
+      handleTicketUpdate("T-001", { citesRuling: ["not-a-ruling"] }, "json", dir),
+    ).rejects.toThrow(CliValidationError);
   });
 });

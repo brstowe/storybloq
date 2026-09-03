@@ -51,13 +51,11 @@ describe("Storybloq Bus Git isolation", () => {
     const implementerTaskId = "git-codex-task";
     const reviewerTaskId = "git-claude-task";
     const implementer = (await joinEndpoint(root, {
-      role: "implementer",
       client: "codex",
       clientTaskId: implementerTaskId,
       surface: "codex_desktop",
     })).endpoint;
     const reviewer = (await joinEndpoint(root, {
-      role: "reviewer",
       client: "claude",
       clientTaskId: reviewerTaskId,
       surface: "claude_cli",

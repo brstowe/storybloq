@@ -1,6 +1,7 @@
 import type { Ticket } from "../models/ticket.js";
 import type { Phase, Blocker } from "../models/roadmap.js";
 import type { ProjectState, PhaseStatus } from "./project-state.js";
+import { notHiddenByEarmark } from "./earmarks.js";
 
 // --- Result Types ---
 
@@ -122,7 +123,7 @@ export function nextTicket(
 
     // Find first non-complete, unblocked leaf
     const incompleteLeaves = leaves.filter((t) => t.status !== "complete");
-    const candidate = incompleteLeaves.find((t) => !state.isBlocked(t));
+    const candidate = incompleteLeaves.find((t) => !state.isBlocked(t) && notHiddenByEarmark(t));
 
     if (candidate) {
       const impact = ticketsUnblockedBy(candidate.id, state);
@@ -165,6 +166,13 @@ export function nextTicket(
 export function nextTickets(
   state: ProjectState,
   count: number,
+  /**
+   * T-328: ids to leave out of consideration entirely (a session's skipped
+   * items). Applied BEFORE ranking and truncation -- filtering the returned
+   * candidates instead would let a session that skipped the top of the list
+   * look like it had no work while eligible lower-ranked tickets remained.
+   */
+  excludeIds: ReadonlySet<string> = new Set(),
   options?: { includeParked?: boolean },
 ): NextTicketsOutcome {
   const effectiveCount = Math.max(1, count);
@@ -196,8 +204,10 @@ export function nextTickets(
 
     allPhasesComplete = false;
 
-    const incompleteLeaves = leaves.filter((t) => t.status !== "complete");
-    const unblocked = incompleteLeaves.filter((t) => !state.isBlocked(t));
+    const incompleteLeaves = leaves
+      .filter((t) => t.status !== "complete")
+      .filter((t) => !excludeIds.has(t.id) && !(t.displayId && excludeIds.has(t.displayId)));
+    const unblocked = incompleteLeaves.filter((t) => !state.isBlocked(t) && notHiddenByEarmark(t));
 
     if (unblocked.length === 0) {
       skippedBlockedPhases.push({
@@ -251,7 +261,7 @@ export function blockedTickets(state: ProjectState): readonly Ticket[] {
 
 /**
  * Tickets that would become unblocked if ticketId were completed.
- * Direct unblocking only — no transitive chains.
+ * Direct unblocking only -- no transitive chains.
  */
 export function ticketsUnblockedBy(
   ticketId: string,

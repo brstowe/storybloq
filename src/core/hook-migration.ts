@@ -37,6 +37,51 @@ function defaultSettingsPath(): string {
 export const PRECOMPACT_SUBCOMMAND = "session compact-prepare";
 export const SESSIONSTART_SUBCOMMAND = "session resume-prompt";
 export const STOP_SUBCOMMAND = "hook-status";
+// T-427 tool-boundary delivery: guarded PostToolUse hook. Fires after every tool
+// call, so its handler (`storybloq hook-bus-tool`) does only a cheap mailbox
+// high-water check and, when peer mail is pending, injects the same advisory
+// prompt the Stop hook uses. Claude-only surface (Codex has no PostToolUse).
+export const BUSTOOL_SUBCOMMAND = "hook-bus-tool";
+// T-424: usage-limit stop detection (StopFailure hook, matcher "rate_limit").
+export const LIMITSTOP_SUBCOMMAND = "session limit-stop";
+export const STOPFAILURE_MATCHER = "rate_limit";
+/** Second SessionStart matcher group for limit wake/reopen handling (same resume-prompt command). */
+export const LIMIT_SESSIONSTART_MATCHER = "resume";
+
+// ---------------------------------------------------------------------------
+// ISS-1022: session presence
+// ---------------------------------------------------------------------------
+
+/**
+ * Presence runs from its OWN binary, not a `storybloq` subcommand: the hook
+ * fires on every PreToolUse and PostToolUse, and `dist/cli.js` costs ~310ms per
+ * invocation before any hook logic runs.
+ */
+export const PRESENCE_BIN_NAME = "storybloq-presence";
+/** The entry ignores argv; the token exists so the command parses and matches like the others. */
+export const PRESENCE_SUBCOMMAND = "hook";
+
+/**
+ * Every presence hook is registered SYNCHRONOUSLY (no `async: true`), because
+ * Claude Code's own event sequencing is the only sound source of ordering
+ * available: hook payloads carry `session_id` and nothing identifying which
+ * SessionStart minted the current record, so a record cannot verify ordering
+ * for itself. Running synchronously is how that sequencing is inherited.
+ *
+ * Claude Code's DEFAULT hook timeout is 600 seconds. On a synchronous
+ * per-tool-call hook that is not a safety net, it is a ten-minute stall waiting
+ * to happen, so every presence registration carries this explicit bound.
+ */
+export const PRESENCE_HOOK_TIMEOUT_SECONDS = 5;
+
+/** Hook types the presence bin registers under. All five, all synchronous. */
+export const PRESENCE_HOOK_TYPES: readonly string[] = [
+  "SessionStart",
+  "PreToolUse",
+  "PostToolUse",
+  "Stop",
+  "SessionEnd",
+];
 
 // ---------------------------------------------------------------------------
 // Legacy-basename set (ISS-589)
@@ -278,6 +323,7 @@ export interface LegacyHookCounts {
   PreCompact: number;
   SessionStart: number;
   Stop: number;
+  StopFailure: number;
 }
 
 /**
@@ -296,7 +342,7 @@ export async function countLegacyHooks(
   binPath: string,
   settingsPath?: string,
 ): Promise<LegacyHookCounts> {
-  const zero: LegacyHookCounts = { PreCompact: 0, SessionStart: 0, Stop: 0 };
+  const zero: LegacyHookCounts = { PreCompact: 0, SessionStart: 0, Stop: 0, StopFailure: 0 };
   const path = settingsPath ?? defaultSettingsPath();
   if (!existsSync(path)) return zero;
 
@@ -322,9 +368,10 @@ export async function countLegacyHooks(
     ["PreCompact", PRECOMPACT_SUBCOMMAND],
     ["SessionStart", SESSIONSTART_SUBCOMMAND],
     ["Stop", STOP_SUBCOMMAND],
+    ["StopFailure", LIMITSTOP_SUBCOMMAND],
   ];
 
-  const counts: LegacyHookCounts = { PreCompact: 0, SessionStart: 0, Stop: 0 };
+  const counts: LegacyHookCounts = { PreCompact: 0, SessionStart: 0, Stop: 0, StopFailure: 0 };
   for (const [hookType, subcommand] of pairs) {
     if (!(hookType in hooks) || !Array.isArray(hooks[hookType])) continue;
     const newCommand = formatHookCommand(binPath, subcommand).trim();
@@ -358,12 +405,14 @@ export async function sweepLegacyHooks(
   const precompact = formatHookCommand(binPath, PRECOMPACT_SUBCOMMAND);
   const sessionStart = formatHookCommand(binPath, SESSIONSTART_SUBCOMMAND);
   const stop = formatHookCommand(binPath, STOP_SUBCOMMAND);
+  const limitStop = formatHookCommand(binPath, LIMITSTOP_SUBCOMMAND);
 
   let total = 0;
   const pairs: Array<[string, string, string]> = [
     ["PreCompact", PRECOMPACT_SUBCOMMAND, precompact],
     ["SessionStart", SESSIONSTART_SUBCOMMAND, sessionStart],
     ["Stop", STOP_SUBCOMMAND, stop],
+    ["StopFailure", LIMITSTOP_SUBCOMMAND, limitStop],
   ];
   for (const [hookType, subcommand, newCommand] of pairs) {
     try {

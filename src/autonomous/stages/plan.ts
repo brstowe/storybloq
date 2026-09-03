@@ -1,22 +1,20 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { releaseSessionClaim } from "../../core/claims.js";
+import { clearSameSessionEarmark } from "../../core/earmarks.js";
+import type { ClaimEpoch } from "../claim-reconciliation.js";
 import type { WorkflowStage, StageResult, StageAdvance, StageContext } from "./types.js";
 import type { GuideReportInput } from "../session-types.js";
-import { normalizeRiskLevel, requiredRounds, nextReviewer } from "../review-depth.js";
-import {
-  currentStorybloqClient,
-  nativeCodexReportInstruction,
-  nativeCodexReviewCommand,
-  reviewBackendsForClient,
-  shouldUseNativeCodexReview,
-} from "./codex-native.js";
+import { PARK_ACTION, parkCurrentTicket, parkHintLines } from "./park.js";
+import { normalizeRiskLevel } from "../review-depth.js";
+import { canAcquireTicketClaim } from "../candidate-authority.js";
 
 /** Read a file, return empty string on error. */
 function readFileSafe(path: string): string {
   try { return readFileSync(path, "utf-8"); } catch { return ""; }
 }
 
-/** DJB2 hash for plan fingerprinting (ISS-035): seed 5381, base-36; same algorithm as the deferral-fingerprint hash (djb2Hash) in stages/types.ts. */
+/** DJB2 hash for plan fingerprinting (ISS-035): seed 5381, base-36. Once shared with the deferral fingerprint in stages/types.ts; that one moved to SHA-256 in T-470 because the round ceiling raised the cost of a collision there from silently skipping one distinct finding's follow-up issue to falsely satisfying the gate that says every blocker was filed. This one still only compares a plan against its own earlier self, so it is deliberately unchanged. */
 function simpleHash(content: string): string {
   let hash = 5381;
   for (let i = 0; i < content.length; i++) {
@@ -26,7 +24,7 @@ function simpleHash(content: string): string {
 }
 
 /**
- * PLAN stage — Claude writes an implementation plan.
+ * PLAN stage -- Claude writes an implementation plan.
  *
  * enter(): Instruction to write a plan.
  * report(): Validate plan exists/changed, claim ticket, advance to PLAN_REVIEW.
@@ -46,6 +44,12 @@ export class PlanStage implements WorkflowStage {
         '```json',
         `{ "sessionId": "${ctx.state.sessionId}", "action": "report", "report": { "completedAction": "plan_written" } }`,
         '```',
+        // ISS-904: a reject routes back here and clears reviews.plan, so this is
+        // the only place a repeated reject loop is visible to the agent.
+        ...parkHintLines(
+          ctx.state.sessionId,
+          ((ctx.state as Record<string, unknown>).planGateNonApprovals as number | undefined) ?? 0,
+        ),
       ].join("\n"),
       reminders: [
         "Write the plan as a markdown file -- do NOT use client-native plan mode.",
@@ -56,6 +60,13 @@ export class PlanStage implements WorkflowStage {
   }
 
   async report(ctx: StageContext, _report: GuideReportInput): Promise<StageAdvance> {
+    // ISS-904: park advances the queue past an item that is not workable AS
+    // FILED. skip_ticket below ends the session instead; the two are different
+    // outcomes and both are kept.
+    if (_report.completedAction === PARK_ACTION) {
+      return parkCurrentTicket(ctx, _report, "PLAN");
+    }
+
     if (_report.completedAction === "skip_ticket") {
       const ticketId = ctx.state.ticket?.id ?? "unknown";
       const reason = _report.notes ?? "Ticket cannot be completed in this session.";
@@ -65,11 +76,18 @@ export class PlanStage implements WorkflowStage {
           const { withProjectLock, writeTicketUnlocked } = await import("../../core/project-loader.js");
           await withProjectLock(ctx.root, { strict: false }, async ({ state: ps }) => {
             const ticket = ps.ticketByID(ticketId);
-            if (ticket && (ticket as Record<string, unknown>).claimedBySession === ctx.state.sessionId) {
-              // ISS-759/ISS-652: delete the claim keys rather than writing
-              // explicit nulls, so a released ticket carries no residual state.
-              const { claimedBySession: _cb, claim: _cl, ...rest } = ticket as Record<string, unknown>;
-              await writeTicketUnlocked({ ...rest, status: "open" as const } as typeof ticket, ctx.root);
+            if (ticket) {
+              // T-442: never delete a claim this session cannot prove is its own.
+              const { released, ticket: next } = releaseSessionClaim(
+                ticket,
+                ctx.state.sessionId,
+                (ctx.state as Record<string, unknown>).claimEpoch as ClaimEpoch | undefined,
+              );
+              // Section 5: same-session earmark release, in the same locked
+              // write. Independent of `released` -- the choke point can have
+              // converted an earmark at pick time before any claim landed.
+              const { cleared, item: nextWithEarmark } = clearSameSessionEarmark(next, ctx.state.sessionId);
+              if (released || cleared) await writeTicketUnlocked(nextWithEarmark, ctx.root);
             }
           });
         } catch { /* best-effort */ }
@@ -107,7 +125,7 @@ export class PlanStage implements WorkflowStage {
       return { action: "retry", instruction: "Plan file is empty. Write your implementation plan and call me again." };
     }
 
-    // Plan fingerprint — detect unchanged plan after revise (ISS-035)
+    // Plan fingerprint -- detect unchanged plan after revise (ISS-035)
     const planHash = simpleHash(planContent);
     if (ctx.state.ticket?.lastPlanHash && ctx.state.ticket.lastPlanHash === planHash) {
       return { action: "retry", instruction: "Plan has not changed since the last review. Address the review findings, then revise the plan and call me again." };
@@ -120,6 +138,9 @@ export class PlanStage implements WorkflowStage {
 
     // Update ticket to inprogress in .story/ with session ownership (ISS-024/ISS-027)
     let claimFailed = false;
+    // T-442: the epoch minted here is the ONLY proof of what this session
+    // actually owns. Every later guide call reconciles the ledger against it.
+    let mintedEpoch: ClaimEpoch | undefined;
     if (ctx.state.ticket) {
       try {
         const { withProjectLock, writeTicketUnlocked } = await import("../../core/project-loader.js");
@@ -127,28 +148,49 @@ export class PlanStage implements WorkflowStage {
           const ticket = projectState.ticketByID(ctx.state.ticket!.id);
           if (!ticket) return;
           const ticketClaim = (ticket as Record<string, unknown>).claimedBySession;
+          // ALREADY OURS: nothing to acquire and nothing to write. Checked
+          // separately from the predicate below, which reports this case as
+          // acquirable (it is) -- but re-writing the ticket here would be a
+          // pointless ledger write, so this arm keeps its own early return.
           if (ticket.status === "inprogress" && ticketClaim === ctx.state.sessionId) return;
-          if (ticket.status !== "open") { claimFailed = true; return; }
-          if (ticketClaim && ticketClaim !== ctx.state.sessionId) { claimFailed = true; return; }
           const draftClaim = (ctx.state as Record<string, unknown>).pendingTicketClaim as { user: string; branch: string; since: string } | undefined;
-          if (ticket.claim && draftClaim) {
-            // ISS-759: same-user claims are re-claimable on ANY branch. A
-            // per-ticket-branch session legitimately holds a claim from a
-            // previous branch of the same user (e.g. a prior story/T-xxx
-            // attempt), and the canClaim same-branch requirement made PLAN
-            // spin on retry. Only a FOREIGN user's claim blocks the recheck;
-            // freshness handling for foreign claims stays where it is today
-            // (PICK_TICKET), unchanged by this gate.
-            if (ticket.claim.user !== draftClaim.user) { claimFailed = true; return; }
-          } else if (ticket.claim && !draftClaim) {
+          // T-450 step 7a: the acquisition rule is SHARED with candidate
+          // takeover rather than restated there, so the two cannot drift.
+          // Takeover asks the same question this stage asks -- may this session
+          // hold this ticket -- and a takeover applying a stricter rule would
+          // refuse recoveries the ordinary path would have allowed. The ISS-759
+          // same-user-any-branch allowance lives inside the shared predicate.
+          if (!canAcquireTicketClaim(ticket, ctx.state.sessionId, draftClaim)) {
             claimFailed = true; return;
           }
           const updated = { ...ticket, status: "inprogress" as const, claimedBySession: ctx.state.sessionId, ...(draftClaim ? { claim: draftClaim } : {}) };
           await writeTicketUnlocked(updated, ctx.root);
+          // Recorded from the values actually written, not from the draft, so a
+          // pre-existing same-user claim that was left in place is captured as
+          // it stands on disk rather than as what we intended to write.
+          mintedEpoch = {
+            ticketId: updated.id,
+            sessionId: ctx.state.sessionId,
+            user: updated.claim ? updated.claim.user : null,
+            branch: updated.claim ? updated.claim.branch : null,
+            since: updated.claim ? updated.claim.since : null,
+            establishedAt: new Date().toISOString(),
+          };
         });
       } catch {
-        // Best-effort — don't block plan review if ticket update fails
+        // ISS-1051: a thrown lock/IO error here is indistinguishable from a
+        // legitimate CAS refusal for correctness purposes -- both mean this
+        // session does not actually hold the ticket. Routing it through the
+        // same claimFailed/PICK_TICKET redirect below (rather than silently
+        // continuing) is what closes ISS-1051.
+        claimFailed = true;
       }
+      // Persisted immediately rather than at the stage advance below. A crash in
+      // between would otherwise leave a session that OWNS the ticket but carries
+      // no epoch, and an epoch-less session is not reconciled at all -- exactly
+      // the fail-open T-442 exists to close. The window is not zero: acquisition
+      // is not yet a full five-step transaction (ISS-896).
+      if (mintedEpoch) ctx.writeState({ claimEpoch: mintedEpoch } as Partial<typeof ctx.state>);
     }
 
     if (claimFailed) {
@@ -160,7 +202,7 @@ export class PlanStage implements WorkflowStage {
       // the ticket, then send the walker back to PICK_TICKET. The goto target
       // is NOT free-form: assertTransition validates it against the state
       // machine, so PLAN's row in TRANSITIONS must list PICK_TICKET (ISS-767).
-      ctx.updateDraft({ ticket: undefined, pendingTicketClaim: undefined } as Partial<typeof ctx.state>);
+      ctx.updateDraft({ ticket: undefined, pendingTicketClaim: undefined, claimEpoch: undefined } as Partial<typeof ctx.state>);
       return {
         action: "goto",
         target: "PICK_TICKET",
@@ -185,53 +227,23 @@ export class PlanStage implements WorkflowStage {
     // Stage field updates (persisted atomically with state transition by processAdvance)
     ctx.updateDraft({
       ticket: ctx.state.ticket ? { ...ctx.state.ticket, risk, lastPlanHash: planHash } : ctx.state.ticket,
-    });
+      // Only overwrite on a fresh mint. A re-entered PLAN (revise loop) short-
+      // circuits the claim write when the ticket is already ours, and clobbering
+      // the epoch with undefined there would disarm reconciliation for the rest
+      // of the session.
+      ...(mintedEpoch ? { claimEpoch: mintedEpoch } : {}),
+    } as Partial<typeof ctx.state>);
 
-    // Produce PLAN_REVIEW instruction (advance with result for hybrid dispatch)
-    const backends = reviewBackendsForClient(ctx.state.config);
-    const existingPlanReviews = ctx.state.reviews.plan;
-    const roundNum = existingPlanReviews.length + 1;
-    const reviewer = nextReviewer(existingPlanReviews, backends);
-    const minRounds = requiredRounds(risk);
-
-    const nativeCodex = shouldUseNativeCodexReview(reviewer, ctx.state.config);
-    const bridgeCodex = currentStorybloqClient() === "claude" && reviewer === "codex";
-    return {
-      action: "advance",
-      result: {
-        instruction: nativeCodex
-          ? [
-            `# Native Codex Plan Review - Round ${roundNum} of ${Math.max(minRounds, roundNum)} minimum`,
-            "",
-            "Run native Codex plan review:",
-            "```bash",
-            nativeCodexReviewCommand("plan", ctx.state.sessionId),
-            "```",
-            "",
-            nativeCodexReportInstruction(ctx.state.sessionId),
-          ].join("\n")
-          : [
-            `# Plan Review — Round ${roundNum} of ${Math.max(minRounds, roundNum)} minimum`,
-            "",
-            `Run a plan review using **${reviewer}**.`,
-            "",
-            bridgeCodex
-              ? `Call \`review_plan\` MCP tool with the plan content.`
-              : `Launch a code review agent to review the plan.`,
-            "",
-            "When done, call `storybloq_autonomous_guide` with:",
-            '```json',
-            `{ "sessionId": "${ctx.state.sessionId}", "action": "report", "report": { "completedAction": "plan_review_round", "verdict": "<approve|revise|reject>", "findings": [...] } }`,
-            '```',
-          ].join("\n"),
-        reminders: nativeCodex
-          ? [
-            "The helper uses `codex exec --output-schema` and read-only sandboxing.",
-            "If native Codex fails, fall back to the next configured reviewer if available; otherwise use agent review and include 'codex unavailable' in notes.",
-          ]
-          : ["Report the exact verdict and findings from the reviewer."],
-        transitionedFrom: "PLAN",
-      },
-    };
+    // T-139 pattern: advance WITHOUT a precomputed result, so the walker calls
+    // the next stage's own enter(). This block used to build the PLAN_REVIEW
+    // instruction itself, which processAdvance prefers over enter() -- three
+    // things went wrong as a result. It had no lenses branch, so a
+    // lenses-configured project got the plain agent instruction on round one;
+    // it called nextReviewer without the codex-unavailable arguments, bypassing
+    // ISS-098/ISS-110; and it never wrote currentReviewStartedAt. T-461 makes
+    // it actively incorrect too: with reviewEffort off, PLAN_REVIEW is skipped
+    // and this would hand a plan-review instruction to WRITE_TESTS or
+    // IMPLEMENT. There is now one source for that text.
+    return { action: "advance" };
   }
 }

@@ -1,3 +1,12 @@
+// T-473: `models/types.ts` carries its OWN copy of this same pattern (not an
+// import of it) so `ArrangementPartySchema` can depend on it. Reusing an
+// import here instead of a literal broke ISS-1022's presence-entry closure
+// test: `presence-entry.ts` transitively reaches this file, and importing
+// `models/types.ts` pulled zod and the whole models module into that
+// zero-dependency closure. Keep this definition local and in sync by hand;
+// it is a two-line regex literal, not a relationship worth a shared import.
+export const CLIENT_TASK_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+
 export type StorybloqClient = "claude" | "codex";
 
 export interface StorybloqClientProfile {
@@ -11,8 +20,6 @@ export interface OwnerTask {
   readonly id: string;
   readonly boundAt: string;
 }
-
-export const CLIENT_TASK_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 
 const CLIENT_PROFILES: Readonly<Record<StorybloqClient, StorybloqClientProfile>> = {
   claude: {
@@ -73,6 +80,30 @@ export function ownerTaskForClient(
 ): OwnerTask | null {
   const id = normalizeClientTaskId(taskId);
   return id ? { client, id, boundAt } : null;
+}
+
+/**
+ * Read an `ownerTask` off untrusted JSON, or null.
+ *
+ * PRESENT but unusable is not the same as ABSENT (ISS-897), and every caller
+ * must decide for itself what an unreadable owner means. What no caller may do
+ * is treat a malformed record as a USABLE identity: a truthy `{}` compares
+ * unequal to every real task, so an identity-bound succession check would read
+ * it as "the owner is not among the live clients" and conclude the owner is
+ * gone, when nothing about the owner was ever established.
+ *
+ * Canonical here rather than inline at each call site, because a predicate that
+ * decides whether one task may take over another's session is not something to
+ * keep two copies of.
+ */
+export function normalizeOwnerTask(raw: unknown): OwnerTask | null {
+  if (!raw || typeof raw !== "object") return null;
+  const record = raw as Record<string, unknown>;
+  const id = normalizeClientTaskId(typeof record.id === "string" ? record.id : null);
+  if (id === null) return null;
+  if (record.client !== "claude" && record.client !== "codex") return null;
+  if (typeof record.boundAt !== "string") return null;
+  return { client: record.client, id, boundAt: record.boundAt };
 }
 
 export function isSameOwnerTask(

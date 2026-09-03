@@ -9,15 +9,87 @@ import type { Lesson } from "../models/lesson.js";
 import type { Roadmap } from "../models/roadmap.js";
 import type { ProjectState } from "./project-state.js";
 import type { LoadWarning } from "./errors.js";
-import type { ValidationResult } from "./validation.js";
+import type { ValidationResult, ValidationFinding, ValidationLevel } from "./validation.js";
 import type { LedgerIntegrityResult } from "./ledger-integrity.js";
 import type { NextTicketOutcome, NextTicketsOutcome } from "./queries.js";
 import type { RecommendResult } from "./recommend.js";
 import type { ReconcileResult } from "./reconcile.js";
 import type { DoctorResult } from "./team-doctor.js";
-import type { ActiveSessionSummary } from "./session-scan.js";
+import type { ActiveSessionSummary, SessionScanDiagnostic } from "./session-scan.js";
+import type { Arrangement, ArrangementLifecycle, ArrangementRole } from "../models/arrangement.js";
+import type { GateAck } from "../models/gate-ack.js";
+import type { LandingsResult } from "./landings.js";
+import type { Earmark } from "../models/types.js";
+import type { StorybloqClient } from "../autonomous/client-profile.js";
+import { sanitizeDisplayText, sanitizeDisplayPath, MAX_PROSE_LENGTH } from "./display-text.js";
+import { boundedLines } from "./bounded-list.js";
+import type { CitationResolution } from "./ruling.js";
+import { renderCitation, rulingAttributionCaveat } from "./ruling.js";
+import type { Ruling } from "../models/ruling.js";
+
+/**
+ * How many diagnostic lines the human-readable section may carry (ISS-897).
+ *
+ * Enough that a real incident -- a handful of unreadable directories -- is
+ * reported in full, and few enough that a directory built to flood cannot take
+ * the response. The JSON payload is unaffected and still carries every entry.
+ */
+const MAX_DIAGNOSTIC_LINES = 20;
+
+/**
+ * How many session rows either status formatter renders (ISS-897).
+ *
+ * One pen per repo is the invariant this output exists to protect, so a real
+ * project has a handful of sessions; a hundred is a signal in itself, and the
+ * count says so without the rows.
+ */
+const MAX_SESSION_ROWS = 25;
 import type { SelftestResult } from "../cli/commands/selftest.js";
 import type { BusSummary } from "../bus/schemas.js";
+import { describeDeliveryTiers } from "../bus/schemas.js";
+
+type BusStatusInput =
+  | BusSummary
+  | { readonly enabled: true; readonly error: { readonly code: string; readonly message: string } }
+  | undefined;
+
+// Bus line(s) for the Markdown status views. D7: stays quiet until the Bus is
+// enabled. T-428 adds the runtime_lost line and, for a disabled-but-evidenced
+// checkout, surfaces the config-revert diagnostic (carried in nextActions) instead
+// of staying silent, so a reverted `features.bus` is visible outside JSON.
+function busStatusLines(bus: BusStatusInput): string[] {
+  if (!bus) return [];
+  if ("error" in bus) {
+    return [`Bus: unavailable [${bus.error.code}] ${escapeMarkdownInline(bus.error.message)}`];
+  }
+  if (bus.setupState === "disabled") {
+    const revert = bus.nextActions.find((action) => action.includes("config.features.bus"));
+    return revert ? [`Bus: ${revert}`] : [];
+  }
+  if (bus.setupState === "ready") {
+    // T-427: honest per-tier wording; never the raw `deliveryMode` enum (which can
+    // read "live delivery" and oversell a notify-on-boundary channel as push).
+    return [`Bus: ready; ${bus.endpoints} connected; delivery: ${describeDeliveryTiers(bus.deliveryCapabilities)}`];
+  }
+  if (bus.setupState === "waiting_for_peer") {
+    return ["Bus: waiting for peer; run `storybloq bus setup` in the other task"];
+  }
+  if (bus.setupState === "runtime_lost") {
+    // Neutral wording: runtime_lost covers both an absent runtime and one whose
+    // instance no longer matches this checkout's evidence. BusSummary does not carry
+    // the loss reason, so avoid asserting "deleted" for the mismatch case.
+    return ["Bus: runtime lost; `.story/bus/` is absent or no longer matches this checkout's deletion-evidence; run `storybloq bus setup` to re-establish it"];
+  }
+  if (bus.setupState === "invalid") {
+    // A present-but-broken runtime: corrupt layout or unreadable deletion-evidence.
+    // Never fall through to the "not set up" line, which would misdescribe it.
+    return ["Bus: invalid; the runtime or its deletion-evidence is corrupt; run `storybloq bus doctor`"];
+  }
+  return bus.initialized
+    ? [`Bus: ${bus.setupState}`]
+    : ["Bus: enabled, not set up in this checkout; run `storybloq bus setup`"];
+}
+import type { LimitStopSummary } from "./limit-ledger.js";
 import { phasesWithStatus, isBlockerCleared } from "./queries.js";
 
 function resolveTicketRefDisplay(ref: string, state: ProjectState): string {
@@ -46,6 +118,13 @@ export const ExitCode = {
   USER_ERROR: 1,
   VALIDATION_ERROR: 2,
   PARTIAL: 3,
+  // T-427 rendezvous long-poll: distinct codes so a background `bus poll --wait`
+  // consumer can tell a timeout (nothing arrived) and a contended waiter (another
+  // --wait already owns this endpoint) apart from a delivered message (OK) or a
+  // usage/validation error. Signals (SIGINT=130, SIGTERM=143) are set directly by
+  // the wait runner and are intentionally not enum members.
+  TIMEOUT: 4,
+  WAITER_ACTIVE: 5,
 } as const;
 
 export type ExitCodeValue = (typeof ExitCode)[keyof typeof ExitCode];
@@ -78,6 +157,33 @@ export function errorEnvelope(
   message: string,
 ): ErrorEnvelope {
   return { version: 1, error: { code, message } };
+}
+
+/**
+ * The "no .story/ project" failure, rendered in whichever JSON family the
+ * calling command documents (ISS-910).
+ *
+ * These guards sit in the yargs adapter, ahead of the shared run.ts pipeline,
+ * so they never passed through a formatter and answered in prose even under
+ * --format json. That hands an automated caller non-JSON on stdout for the
+ * most routine failure there is -- the same parser breakage this issue exists
+ * to close, one layer above the handlers.
+ *
+ * `family` is the command's documented JSON shape: "envelope" for the shared
+ * {version, error} contract, "ok" for the {"ok", ...} commands. The Markdown
+ * rendering is byte-identical to what these guards emitted before.
+ *
+ * It lives HERE, beside errorEnvelope, rather than in cli/helpers.ts: helpers
+ * is in the type-fixture program for ISS-886 (via cli/array-options.ts), and
+ * giving it an edge to this module widens that fixture's tsc program to the
+ * whole repo, surfacing unrelated pre-existing errors as fixture failures.
+ */
+export function noProjectFoundOutput(format: unknown, family: "envelope" | "ok"): string {
+  const message = "No .story/ project found.";
+  if (format !== "json") return message;
+  return family === "ok"
+    ? JSON.stringify({ ok: false, error: message }, null, 2)
+    : JSON.stringify(errorEnvelope("not_found", message), null, 2);
 }
 
 export function partialEnvelope<T>(
@@ -138,6 +244,51 @@ export function escapeMarkdownDocument(text: string): string {
 }
 
 /**
+ * Break the syntax a Markdown renderer AUTOLINKS, without hiding the text.
+ *
+ * `escapeMarkdownDocument` kills the explicit `[text](url)` form by escaping
+ * the brackets and parentheses, which is the dangerous shape -- a link whose
+ * visible text and destination disagree. It leaves a BARE
+ * `https://elsewhere.example` alone, and GitHub-flavoured Markdown turns that
+ * into a clickable link on its own, so a payload that simply omits the wrapper
+ * gets a live link out of an escaper that appears to have neutralized it.
+ *
+ * `&#58;`, `&#46;` and `&#64;` render as `:`, `.` and `@`, so the address stays
+ * readable and a reader can still see exactly what was claimed. What it cannot
+ * do is form the contiguous `://` or `www.` an autolinker scans for.
+ *
+ * The `@` rule is unconditional, and the narrower `word@word` form it replaced
+ * was wrong for the same reason bracket-escaping alone was wrong about links:
+ * it neutralized the shape being thought about and left the shorter one live.
+ * An email address is not the only thing an `@` produces -- `@admin` is a
+ * MENTION on the surfaces that render this, so it notifies, links, and lends
+ * a session-controlled string the appearance of naming a person.
+ *
+ * Deliberately NOT folded into `escapeMarkdownDocument`. That function is what
+ * `storybloq export` uses, where a URL in a ticket description is content the
+ * author put there and a working link is the point. The distinction is the
+ * sink, not the syntax.
+ */
+export function neutralizeAutolinks(text: string): string {
+  return text
+    .replace(/:\/\//g, "&#58;//")
+    .replace(/\bwww\./gi, "www&#46;")
+    .replace(/@/g, "&#64;");
+}
+
+/**
+ * The full document treatment: escape structure, then break autolinks.
+ *
+ * For a value that is ALREADY sanitized -- a `sanitizeDisplayText` label or a
+ * `sanitizeDisplayPath` address -- since those two are not interchangeable and
+ * the caller is the only one who knows which it holds. Sanitizing here would
+ * either re-cap an address to a label width or leave a label unbounded.
+ */
+export function escapeMarkdownDocumentStrict(text: string): string {
+  return neutralizeAutolinks(escapeMarkdownDocument(text));
+}
+
+/**
  * Wraps multi-line content in a fenced code block.
  * Uses a fence length longer than any backtick sequence in the content.
  */
@@ -151,6 +302,101 @@ export function fencedBlock(content: string, lang?: string): string {
   }
   const fence = "`".repeat(maxTicks + 1);
   return `${fence}${lang ?? ""}\n${content}\n${fence}`;
+}
+
+/**
+ * T-476: markdown rendering for a citing item's resolved rulings.
+ * `resolutions` defaults to empty everywhere it is threaded through, so an
+ * existing caller that never resolves citations renders byte-identically to
+ * before this ticket -- this returns "" for an empty list.
+ */
+/**
+ * Shared "## Cited Rulings" markdown block, also reused verbatim by the
+ * autonomous-mode instruction builders (T-476 acceptance 4) -- an agent
+ * reading PLAN/issue-fix instructions gets the same rendering, including the
+ * unconditional anti-laundering caveat, as a human reading `ticket get`.
+ */
+export function formatCitedRulingsSection(resolutions: readonly CitationResolution[]): string {
+  if (resolutions.length === 0) return "";
+  const lines = resolutions.map((resolution) => {
+    const rendered = renderCitation(resolution);
+    if (rendered.status === "resolved" && rendered.current) {
+      const staleNote = rendered.stale ? ` (superseded by ${rendered.current.id})` : "";
+      return [
+        `- **${escapeMarkdownInline(rendered.citedId)}**${staleNote}: "${escapeMarkdownInline(rendered.current.text)}"`,
+        `  ${rendered.current.attribution}, recorded by ${rendered.current.recordedBy.client}/${rendered.current.recordedBy.id} on ${rendered.current.date}`,
+        `  > ${rendered.current.caveat}`,
+      ].join("\n");
+    }
+    return `- **${escapeMarkdownInline(rendered.citedId)}**: ${rendered.warning ?? rendered.status}`;
+  });
+  return `\n\n## Cited Rulings\n\n${lines.join("\n")}`;
+}
+
+/** T-476: JSON-safe embedding for a citing item's resolved rulings. */
+function citedRulingsForJson(resolutions: readonly CitationResolution[]): unknown[] {
+  return resolutions.map(renderCitation);
+}
+
+/**
+ * One session line's worth of state-derived strings, made safe to PRINT (ISS-897).
+ *
+ * Every field here is read straight out of `state.json`, and several are free
+ * strings by design -- `state` is deliberately unconstrained (T-328) so a newer
+ * workflow state does not brick an older reader, and `mode`, `ticketId`, and
+ * `ticketTitle` are equally open. `escapeMarkdownInline` protects line-leading Markdown markers -- it does not touch control characters, and it deliberately leaves inline links, HTML, code spans and emphasis alone;
+ * it does not touch control characters, so an ESC or a newline in any of them
+ * forges a line in the section an operator reads to decide whether another agent
+ * is running. Sanitize FIRST, then escape. JSON output keeps the decoded values
+ * unmodified,
+ * because a consumer diffing against the file needs what is actually there.
+ */
+/**
+ * Every session-row field, rendered inert for a Markdown DOCUMENT (ISS-897).
+ *
+ * `escapeMarkdownInline` was the wrong pass here and the suite pinned it as
+ * intended. It guards line-leading markers and deliberately preserves inline
+ * structure, which is right for a plain-text sink; the non-JSON branch of both
+ * status formatters is not one. It emits `#` headings and `**bold**`, clients
+ * render it, and every field below is read back out of a `state.json` -- so a
+ * `ticketTitle` could author a live link, a raw element or a code span in the
+ * status output an operator reads during an incident.
+ *
+ * The inconsistency is what settled it: `sessionDiagnosticLines` in this same
+ * file already escapes strictly, and its values come from the SAME files. One
+ * document cannot neutralize a directory name and leave the ticket title beside
+ * it live.
+ *
+ * Sanitize FIRST, escape SECOND, as everywhere else: the strict pass doubles
+ * backslashes, so running it before the encoder would double the ones the
+ * encoder is about to write and hand back a live marker.
+ *
+ * Scope: session fields only. The ledger-sourced values on the same document
+ * (project name, phase names, summaries) still take the inline pass, and that
+ * boundary is ISS-915's -- a different source, a different set of callers, and
+ * not something to change under cover of this one.
+ */
+function safeSessionFields(s: {
+  sessionId: string;
+  state: string;
+  mode: string;
+  ticketId: string | null;
+  ticketTitle: string | null;
+}): { ticket: string; state: string; mode: string; shortId: string } {
+  const id = sanitizeDisplayText(s.ticketId ?? "");
+  const title = escapeMarkdownDocumentStrict(sanitizeDisplayText(s.ticketTitle ?? ""));
+  return {
+    ticket: s.ticketId ? `${escapeMarkdownDocumentStrict(id)}: ${title}` : "",
+    state: escapeMarkdownDocumentStrict(sanitizeDisplayText(s.state)),
+    mode: escapeMarkdownDocumentStrict(sanitizeDisplayText(s.mode)),
+    // By CODE POINT, not by UTF-16 unit. `sanitizeDisplayText` is careful not
+    // to split a surrogate pair and this `slice` immediately could: an id whose
+    // eighth unit lands inside an astral character leaves a lone high
+    // surrogate, which draws as the replacement glyph -- so two different
+    // sessions can produce the same short id, on the resumable rows an operator
+    // reads to tell them apart during an incident.
+    shortId: escapeMarkdownDocumentStrict([...sanitizeDisplayText(s.sessionId)].slice(0, 8).join("")),
+  };
 }
 
 function formatConfigHints(state: ProjectState): string[] {
@@ -168,12 +414,232 @@ function formatConfigHints(state: ProjectState): string[] {
 
 // --- Format Functions ---
 
+/** T-424: md lines for the limit-stopped section (shared by both status formatters). */
+function limitStopsSection(limitStops: readonly LimitStopSummary[]): string[] {
+  if (limitStops.length === 0) return [];
+  // Neutral heading: the section mixes SCHEDULED records (stopped/deferred) with
+  // in-progress and stood-down ones, so "auto-resume pending" would mislabel the
+  // manual/cancelling/resuming rows.
+  const lines = ["", "## Limit-stop records", ""];
+  for (const s of limitStops) {
+    const when = new Date(s.nextAttemptAt).toLocaleString();
+    const target = s.sessionType === "autonomous" && s.storybloqSessionId
+      ? `session ${s.storybloqSessionId.slice(0, 8)}`
+      : `plain session ${s.clientTaskId.slice(0, 8)}`;
+    // Action text follows STATUS, not just mode: only stopped/deferred are
+    // actually SCHEDULED; manual is stood down, resuming/interactive are
+    // in-progress, and cancelling/preparing are transitions.
+    const action = s.status === "manual"
+      ? (s.reasonCode === "cancellation_blocked"
+          ? "cancellation blocked on a live wake child"
+          : `stood down -- requeue: storybloq limit-status --requeue ${s.key}`)
+      : s.status === "cancelling"
+        ? "cancellation in progress"
+        : s.status === "preparing"
+          ? "detection in progress"
+          : s.status === "resuming"
+            ? "auto-resume in progress"
+            : s.status === "interactive"
+              ? "interactive resume in progress"
+              : s.mode === "headless" ? `auto-resumes ~${when}` : `notifies ~${when}`;
+    const reason = s.reasonCode ? ` [${s.reasonCode}]` : "";
+    lines.push(`- ${target} -- ${s.status}${reason}, ${s.limitType} limit, ${action} (attempts ${s.wakeAttempts})`);
+  }
+  lines.push("", "Manage with: storybloq limit-status [--cancel <key>] [--requeue <key>]");
+  return lines;
+}
+
+/**
+ * Markdown for the faults a session scan could not account for (ISS-897).
+ *
+ * Rendered only when non-empty, so an empty diagnostics collection adds no
+ * Session Scan Warnings section at all. (Not a claim that the whole output is
+ * unchanged from before this work: session rows now take document escaping and
+ * are bounded, and a non-expired resumable lease is worded differently.) `omission` entries come first and
+ * are labelled as such, because those are the ones where a session may be
+ * running and was not seen -- the rest are annotations on records the scan
+ * ADMITTED, which appear in the reported populations unless deduplication later
+ * drops them.
+ */
+function sessionDiagnosticLines(diagnostics: readonly SessionScanDiagnostic[]): string[] {
+  if (diagnostics.length === 0) return [];
+  const concealing = diagnostics.filter((d) => d.category === "omission");
+  const header = ["", "## Session Scan Warnings", ""];
+  const lines: string[] = [];
+  if (concealing.length > 0) {
+    header.push(
+      `The scan reported ${concealing.length} gap${concealing.length === 1 ? "" : "s"} under \`.story/sessions\`, ` +
+        "so whether a session is running here cannot be established from this output alone." +
+        (concealing.some((d) => d.sourceDir === null)
+          ? " At least one is a fault against the collection itself, where nothing was enumerated and no entry was ever observed, so it names a path rather than a directory."
+          : ""),
+      "",
+    );
+  }
+  for (const d of [...concealing, ...diagnostics.filter((d) => d.category !== "omission")]) {
+    // Both the name and the reason carry filesystem input, and BOTH get the
+    // document treatment rather than the line-start-only one the rest of this
+    // formatter uses.
+    //
+    // The rest of this formatter is the way it is by an explicit decision:
+    // inline and HTML escaping were removed because they leaked visible
+    // `&amp;` and `\[` noise onto plain-text consumers. That decision is now
+    // wrong for a `format: "md"` MCP result, which a client may render -- but
+    // re-deciding it for every ticket title in the ledger is ISS-915, not this
+    // change. What this change may not do is ADD a surface with the problem.
+    // These lines are new here, they carry a directory name straight off disk,
+    // and they are the incident warning itself: a name that authors a link in
+    // the sentence telling an operator a session may be concealed is the worst
+    // place in the output to put one. Partial protection beats none; the
+    // inconsistency is recorded in ISS-915 rather than used as a reason to
+    // leave the new surface open.
+    //
+    // BOTH renderings when there is a directory name, because they answer
+    // different questions and neither substitutes for the other. The name is a
+    // LABEL: short, readable, capped at a label width, and the thing a reader
+    // scans a list by. It is also LOSSY -- `sanitizeDisplayText` maps every
+    // control character, bidi mark and invisible to `?`, and `?` is itself a
+    // legal filename character -- so `dir<ESC>x`, `dir<U+202E>x` and a directory
+    // genuinely named `dir?x` all print as `dir?x`. On the one line in this
+    // output that says a session may be CONCEALED, that is the failure the line
+    // exists to report, manufactured by the line reporting it.
+    //
+    // So the reversible `sourcePath` comes too, as the ADDRESS. It is bounded by
+    // `PATH_MAX` rather than a label width (truncating an address does not
+    // shorten it, it makes it wrong) and it is injective, so the three names
+    // above stay three names. Collection-level faults have `sourceDir: null` by
+    // design and have only the address, which is why that branch prints it
+    // alone rather than printing an empty label beside it.
+    //
+    // Sanitize FIRST, neutralize Markdown SECOND, in both branches -- but for
+    // different reasons, and only one of them is a hazard. For the `sourcePath`
+    // ADDRESS the order is load-bearing: `sanitizeDisplayPath` introduces and
+    // doubles backslashes, and `escapeMarkdownDocumentStrict` doubles them as
+    // its first step, so running the escaper last is what leaves those escapes
+    // as literal text. Reversed, the encoder would double the backslash the
+    // Markdown pass had just inserted and `\[` would become `\\[` -- an
+    // escaped backslash followed by a live `[`. For the `sourceDir` LABEL the
+    // same order is a convention: `sanitizeDisplayText` substitutes `?` and
+    // touches no backslash, so it cannot suffer that. Keep it anyway, so one
+    // order covers every prose sink and a call site is checkable at a glance.
+    const address = escapeMarkdownDocumentStrict(sanitizeDisplayPath(d.sourcePath));
+    const where =
+      d.sourceDir !== null
+        ? `**${escapeMarkdownDocumentStrict(sanitizeDisplayText(d.sourceDir))}** (path: ${address})`
+        : `**${address}**`;
+    lines.push(
+      `- ${where} (${d.kind}, ${d.category}) -- ` +
+        // A PROSE budget, not the label width the name above takes. The label
+        // cap truncated these paragraphs mid-remedy, and the remedy is the
+        // part that says not to delete anything.
+        `${escapeMarkdownDocumentStrict(sanitizeDisplayText(d.reason, MAX_PROSE_LENGTH))}`,
+    );
+  }
+  // Bounded as a SECTION, not only per entry. Each reason is capped and each
+  // name is capped; the NUMBER of diagnostics is neither, and a
+  // workspace-controlled sessions directory decides it -- so an md status
+  // response can still be flooded with every per-value bound in place. What
+  // survives the cut is the count and where the complete set is, because a
+  // shortened section that does not say so reads as a complete one.
+  return [
+    ...header,
+    ...boundedLines(lines, {
+      maxLines: MAX_DIAGNOSTIC_LINES,
+      noun: "scan warnings",
+      fullSetHint: "The complete set is in `sessionDiagnostics` of the JSON output.",
+    }),
+  ];
+}
+
+/**
+ * Markdown for records the scan observed but could place in neither
+ * `activeSessions` nor `resumableSessions` because their lease is
+ * determinately expired (ISS-943).
+ *
+ * Membership proves only that the LEASE is expired, never that the owning
+ * process is dead -- worded accordingly, and rendered through
+ * `safeSessionFields` exactly as the other two session populations are,
+ * since this shares the identical `ActiveSessionSummary` shape and the
+ * identical hostile-field exposure.
+ */
+function expiredLeaseSessionsSection(expiredLeaseSessions: readonly ActiveSessionSummary[]): string[] {
+  if (expiredLeaseSessions.length === 0) return [];
+  const lines = ["", "## Expired-Lease Sessions", ""];
+  const rows = expiredLeaseSessions.map((s) => {
+    const f = safeSessionFields(s);
+    const ticket = f.ticket || `session ${f.shortId}`;
+    return `- ${ticket} -- ${f.state} (${f.mode} mode), lease determinately expired; process liveness not established`;
+  });
+  lines.push(
+    ...boundedLines(rows, {
+      maxLines: MAX_SESSION_ROWS,
+      noun: "expired-lease sessions",
+      fullSetHint: "The complete set is in `expiredLeaseSessions` of the JSON output.",
+    }),
+  );
+  return lines;
+}
+
+/**
+ * Markdown for active duet-mode arrangements (T-473). Rendered only when
+ * non-empty. `arrangementWarnings` is advisory text composed elsewhere
+ * (`arrangement-loader.ts`'s `loadArrangementsSafe`, `handleStatus`'s bounds
+ * staleness check) and already passed through `sanitizeDisplayText` at that
+ * composition point (control/bidi characters neutralized); this function
+ * additionally runs every string through `escapeMarkdownInline` before
+ * rendering, same as every other piece of prose in this file, since
+ * sanitizing control characters and neutralizing Markdown structure are two
+ * separate concerns.
+ */
+function arrangementsSection(arrangements: StatusArrangements): string[] {
+  if (arrangements.items.length === 0 && arrangements.warnings.length === 0) return [];
+  const lines = ["", "## Arrangements", ""];
+  for (const a of arrangements.items) {
+    const parties = a.parties.map((p) => `${p.role} (${p.client})`).join(", ");
+    lines.push(
+      `- ${escapeMarkdownInline(a.id)} [${a.lifecycle}] -- bounds: ${escapeMarkdownInline(a.bounds.join(", "))}; parties: ${escapeMarkdownInline(parties)}`,
+    );
+  }
+  for (const w of arrangements.warnings) {
+    lines.push(`- warning: ${escapeMarkdownInline(w)}`);
+  }
+  return lines;
+}
+
+/** Active-only projection of an Arrangement for status display (T-473). */
+export interface StatusArrangementSummary {
+  readonly id: string;
+  readonly lifecycle: ArrangementLifecycle;
+  readonly bounds: readonly string[];
+  readonly parties: readonly { readonly role: ArrangementRole; readonly client: StorybloqClient }[];
+}
+
+export interface StatusArrangements {
+  readonly items: readonly StatusArrangementSummary[];
+  readonly warnings: readonly string[];
+}
+
 export function formatStatus(
   state: ProjectState,
   format: OutputFormat,
   activeSessions: readonly ActiveSessionSummary[] = [],
   resumableSessions: readonly ActiveSessionSummary[] = [],
   bus?: BusSummary | { readonly enabled: true; readonly error: { readonly code: string; readonly message: string } },
+  limitStops: readonly LimitStopSummary[] = [],
+  sessionDiagnostics?: readonly SessionScanDiagnostic[],
+  // ISS-943, APPENDED LAST and deliberately not inserted beside
+  // `activeSessions`/`resumableSessions`: `formatStatus` is positional and
+  // exported from the package root (`core/index.ts` -> `src/index.ts`), so
+  // inserting a parameter anywhere but the end would shift `bus`/`limitStops`/
+  // `sessionDiagnostics` for any external caller still using positional args.
+  expiredLeaseSessions: readonly ActiveSessionSummary[] = [],
+  // T-473, same APPENDED-LAST discipline as `expiredLeaseSessions` above.
+  // Always present, empty-when-none (same ISS-891 convention as
+  // `activeSessions`) -- `arrangementWarnings` is advisory prose text and is
+  // NEVER folded into `sessionDiagnostics`/any integrity-warning channel:
+  // doing so would change this command's exit classification for a merely
+  // degraded, non-blocking arrangement read.
+  arrangements: StatusArrangements = { items: [], warnings: [] },
 ): string {
   const phases = phasesWithStatus(state);
   const data = {
@@ -195,9 +661,44 @@ export function formatStatus(
       status: p.status,
       leafCount: p.leafCount,
     })),
-    ...(activeSessions.length > 0 ? { activeSessions } : {}),
-    ...(resumableSessions.length > 0 ? { resumableSessions } : {}),
+    // ISS-891: always present, empty when there are none. Omitting them made
+    // "no sessions" and "server too old to report sessions" the same observation,
+    // so every consumer -- the skill's active-session guard most of all -- had to
+    // fail closed and re-verify through the CLI. Presence is now the capability
+    // signal and the contents are the answer.
+    activeSessions,
+    resumableSessions,
+    // ISS-943: same always-present, empty-when-none contract as the two
+    // populations above -- a record whose lease is determinately expired but
+    // whose process may still be alive, held in neither of those two.
+    expiredLeaseSessions,
+    // ISS-897: everything the scan could NOT account for.
+    //
+    // Serialized ONLY when the caller actually supplied it, which is why this
+    // parameter has no default. An empty array is a positive claim -- "the scan
+    // ran and concealed nothing" -- and defaulting to one would make every
+    // caller that performed NO scan assert a verified-clean result, which is
+    // exactly the fail-open the field exists to close. `handleStatus` always
+    // passes the scanner's own output, so real status responses always carry it;
+    // a bare formatter call omits it, and an absent key means "unknown", not
+    // "clean".
+    ...(sessionDiagnostics ? { sessionDiagnostics } : {}),
+    // `bus` stays conditional, and is NOT the same defect: it is an optional
+    // parameter of these exported formatters, not an answer withheld when
+    // empty. The CLI always supplies a summary -- busSummary returns one with
+    // `enabled: false` for a disabled project rather than undefined -- so its
+    // absence here means only that a caller omitted the argument.
     ...(bus ? { bus } : {}),
+    // ISS-893: always present, empty when there are none -- the same contract
+    // ISS-891 gave the session arrays, for the same reason. This was the last
+    // field in these two objects still using the omit-when-empty pattern.
+    limitStops,
+    // T-473: active-only arrangements, same always-present/empty-when-none
+    // convention. `arrangementWarnings` is a separate, purely advisory key --
+    // never merged into `sessionDiagnostics` or any other channel this
+    // command's exit code reads from.
+    arrangements: arrangements.items,
+    arrangementWarnings: arrangements.warnings,
   };
 
   if (format === "json") {
@@ -212,13 +713,7 @@ export function formatStatus(
     `Notes: ${state.activeNoteCount} active, ${state.archivedNoteCount} archived`,
     `Lessons: ${state.activeLessonCount} active, ${state.deprecatedLessonCount} deprecated`,
     `Handovers: ${state.handoverFilenames.length}`,
-    ...(bus
-      ? ["error" in bus
-          ? `Bus: unavailable [${bus.error.code}] ${escapeMarkdownInline(bus.error.message)}`
-          : bus.initialized
-            ? `Bus: ${bus.endpoints} endpoints, ${bus.pendingMessages} pending, ${bus.openThreads} open, ${bus.parkedThreads} parked, ${bus.quarantined} quarantined; hooks Claude ${bus.hookDelivery.claude ? "on" : "off"}, Codex ${bus.hookDelivery.codex ? "on" : "off"}`
-            : "Bus: enabled, not initialized in this checkout"]
-      : []),
+    ...busStatusLines(bus),
     "",
     ...formatConfigHints(state),
     "## Phases",
@@ -227,7 +722,7 @@ export function formatStatus(
   for (const p of phases) {
     const indicator = p.status === "complete" ? "[x]" : p.status === "inprogress" ? "[~]" : "[ ]";
     const summary = p.phase.summary ?? truncate(p.phase.description, 80);
-    lines.push(`${indicator} **${escapeMarkdownInline(p.phase.name)}** (${p.leafCount} tickets) — ${escapeMarkdownInline(summary)}`);
+    lines.push(`${indicator} **${escapeMarkdownInline(p.phase.name)}** (${p.leafCount} tickets) -- ${escapeMarkdownInline(summary)}`);
   }
 
   const resumableIds = new Set(resumableSessions.map((session) => session.sessionId));
@@ -236,23 +731,55 @@ export function formatStatus(
     lines.push("");
     lines.push("## Active Sessions");
     lines.push("");
-    for (const s of ordinaryActiveSessions) {
-      const ticket = s.ticketId ? `${s.ticketId}: ${escapeMarkdownInline(s.ticketTitle ?? "")}` : "no ticket";
-      const owner = s.ownerTask ? ` in a ${s.ownerTask.client === "codex" ? "Codex" : "Claude Code"} task` : "";
-      lines.push(`- ${ticket} -- ${s.state}${owner} (${s.mode} mode)`);
-    }
+    // Bounded across the POPULATION: the sessions directory decides how many
+    // rows there are, and an unbounded list pushes the scan warnings below it
+    // out of view. The JSON payload stays complete.
+    lines.push(
+      ...boundedLines(
+        ordinaryActiveSessions.map((s) => {
+          const f = safeSessionFields(s);
+          const ticket = f.ticket || "no ticket";
+          const owner = s.ownerTask ? ` in a ${s.ownerTask.client === "codex" ? "Codex" : "Claude Code"} task` : "";
+          return `- ${ticket} -- ${f.state}${owner} (${f.mode} mode)`;
+        }),
+        {
+          maxLines: MAX_SESSION_ROWS,
+          noun: "active sessions",
+          fullSetHint: "The complete set is in `activeSessions` of the JSON output.",
+        },
+      ),
+    );
   }
 
   if (resumableSessions.length > 0) {
     lines.push("");
     lines.push("## Resumable Sessions");
     lines.push("");
-    for (const s of resumableSessions) {
-      const ticket = s.ticketId ? `${s.ticketId}: ${escapeMarkdownInline(s.ticketTitle ?? "")}` : `session ${s.sessionId.slice(0, 8)}`;
-      const lease = s.leaseState === "expired" ? "expired lease" : `${s.leaseState ?? "unknown"} lease`;
-      lines.push(`- ${ticket} -- COMPACT recovery available (${lease})`);
-    }
+    const resumableRows = resumableSessions.map((s) => {
+      const f = safeSessionFields(s);
+      const ticket = f.ticket || `session ${f.shortId}`;
+      // ISS-897: membership in this population does NOT mean resumable. Only a
+      // positively EXPIRED lease is. `missing` and `invalid` mean the lease was
+      // never established, so announcing recovery for them offers recovery
+      // against a liveness nobody observed -- which is what the old wording,
+      // "COMPACT recovery available (missing lease)", did for every member.
+      return s.leaseState === "expired"
+        ? `- ${ticket} -- COMPACT recovery available (expired lease)`
+        : `- ${ticket} -- COMPACT, but its lease is ${s.leaseState ?? "unknown"}, so its liveness is undetermined and it is NOT resumable; run \`storybloq session list\``;
+    });
+    lines.push(
+      ...boundedLines(resumableRows, {
+        maxLines: MAX_SESSION_ROWS,
+        noun: "resumable sessions",
+        fullSetHint: "The complete set is in `resumableSessions` of the JSON output.",
+      }),
+    );
   }
+
+  lines.push(...expiredLeaseSessionsSection(expiredLeaseSessions));
+  lines.push(...sessionDiagnosticLines(sessionDiagnostics ?? []));
+  lines.push(...limitStopsSection(limitStops));
+  lines.push(...arrangementsSection(arrangements));
 
   if (state.isEmptyScaffold) {
     lines.push("");
@@ -272,6 +799,17 @@ export function formatFederatedStatus(
   activeSessions: readonly ActiveSessionSummary[] = [],
   resumableSessions: readonly ActiveSessionSummary[] = [],
   bus?: BusSummary | { readonly enabled: true; readonly error: { readonly code: string; readonly message: string } },
+  limitStops: readonly LimitStopSummary[] = [],
+  sessionDiagnostics?: readonly SessionScanDiagnostic[],
+  // ISS-943: appended last, matching `formatStatus`'s placement, for signature
+  // symmetry between the two -- this function is not in `core/index.ts`'s
+  // export list and has exactly one in-repo call site, so it carries no
+  // external-compatibility risk of its own, but drifting the two functions
+  // into different parameter orders for the same concept would be its own
+  // hazard.
+  expiredLeaseSessions: readonly ActiveSessionSummary[] = [],
+  // T-473: appended last, matching `formatStatus`'s placement, same reasons.
+  arrangements: StatusArrangements = { items: [], warnings: [] },
 ): string {
   const sanitizedNodes = fedState.nodes.map((node) => ({
     name: node.name,
@@ -287,9 +825,43 @@ export function formatFederatedStatus(
     federation: { ...fedState, nodes: sanitizedNodes },
     project: config.project,
     type: config.type,
-    ...(activeSessions.length > 0 ? { activeSessions } : {}),
-    ...(resumableSessions.length > 0 ? { resumableSessions } : {}),
+    // ISS-891: always present, empty when there are none. Omitting them made
+    // "no sessions" and "server too old to report sessions" the same observation,
+    // so every consumer -- the skill's active-session guard most of all -- had to
+    // fail closed and re-verify through the CLI. Presence is now the capability
+    // signal and the contents are the answer.
+    activeSessions,
+    resumableSessions,
+    // ISS-943: same always-present, empty-when-none contract as the two
+    // populations above.
+    expiredLeaseSessions,
+    // ISS-897: everything the scan could NOT account for.
+    //
+    // Serialized ONLY when the caller actually supplied it, which is why this
+    // parameter has no default. An empty array is a positive claim -- "the scan
+    // ran and concealed nothing" -- and defaulting to one would make every
+    // caller that performed NO scan assert a verified-clean result, which is
+    // exactly the fail-open the field exists to close. `handleStatus` always
+    // passes the scanner's own output, so real status responses always carry it;
+    // a bare formatter call omits it, and an absent key means "unknown", not
+    // "clean".
+    ...(sessionDiagnostics ? { sessionDiagnostics } : {}),
+    // `bus` stays conditional, and is NOT the same defect: it is an optional
+    // parameter of these exported formatters, not an answer withheld when
+    // empty. The CLI always supplies a summary -- busSummary returns one with
+    // `enabled: false` for a disabled project rather than undefined -- so its
+    // absence here means only that a caller omitted the argument.
     ...(bus ? { bus } : {}),
+    // ISS-893: always present, empty when there are none -- the same contract
+    // ISS-891 gave the session arrays, for the same reason. This was the last
+    // field in these two objects still using the omit-when-empty pattern.
+    limitStops,
+    // T-473: active-only arrangements, same always-present/empty-when-none
+    // convention. `arrangementWarnings` is a separate, purely advisory key --
+    // never merged into `sessionDiagnostics` or any other channel this
+    // command's exit code reads from.
+    arrangements: arrangements.items,
+    arrangementWarnings: arrangements.warnings,
   };
 
   if (format === "json") {
@@ -301,13 +873,7 @@ export function formatFederatedStatus(
     "",
     `Federation: ${fedState.nodeCount} nodes (${fedState.reachableCount} reachable${fedState.unreachableCount > 0 ? `, ${fedState.unreachableCount} unreachable` : ""})`,
     `Tickets: ${fedState.totalCompleteTickets}/${fedState.totalTickets} across all nodes | Issues: ${fedState.totalOpenIssues} open`,
-    ...(bus
-      ? ["error" in bus
-          ? `Bus: unavailable [${bus.error.code}] ${escapeMarkdownInline(bus.error.message)}`
-          : bus.initialized
-            ? `Bus: ${bus.endpoints} endpoints, ${bus.pendingMessages} pending, ${bus.openThreads} open, ${bus.parkedThreads} parked, ${bus.quarantined} quarantined; hooks Claude ${bus.hookDelivery.claude ? "on" : "off"}, Codex ${bus.hookDelivery.codex ? "on" : "off"}`
-            : "Bus: enabled, not initialized in this checkout"]
-      : []),
+    ...busStatusLines(bus),
     "",
   ];
 
@@ -342,21 +908,54 @@ export function formatFederatedStatus(
     lines.push("");
     lines.push("## Active Sessions");
     lines.push("");
-    for (const s of ordinaryActiveSessions) {
-      const ticket = s.ticketId ? `${s.ticketId}: ${escapeMarkdownInline(s.ticketTitle ?? "")}` : "no ticket";
-      lines.push(`- ${ticket} -- ${s.state} (${s.mode} mode)`);
-    }
+    // Bounded across the POPULATION: the sessions directory decides how many
+    // rows there are, and an unbounded list pushes the scan warnings below it
+    // out of view. The JSON payload stays complete.
+    lines.push(
+      ...boundedLines(
+        ordinaryActiveSessions.map((s) => {
+          const f = safeSessionFields(s);
+          return `- ${f.ticket || "no ticket"} -- ${f.state} (${f.mode} mode)`;
+        }),
+        {
+          maxLines: MAX_SESSION_ROWS,
+          noun: "active sessions",
+          fullSetHint: "The complete set is in `activeSessions` of the JSON output.",
+        },
+      ),
+    );
   }
 
   if (resumableSessions.length > 0) {
     lines.push("");
     lines.push("## Resumable Sessions");
     lines.push("");
-    for (const s of resumableSessions) {
-      const ticket = s.ticketId ? `${s.ticketId}: ${escapeMarkdownInline(s.ticketTitle ?? "")}` : `session ${s.sessionId.slice(0, 8)}`;
-      lines.push(`- ${ticket} -- COMPACT recovery available (${s.leaseState ?? "unknown"} lease)`);
-    }
+    const resumableRows = resumableSessions.map((s) => {
+      const f = safeSessionFields(s);
+      const ticket = f.ticket || `session ${f.shortId}`;
+      // Same rule as the standard formatter, and it has to be stated twice
+      // because the two build their rows independently (ISS-897). Membership in
+      // this population does NOT mean resumable: only a positively EXPIRED
+      // lease is. `missing` and `invalid` mean the lease was never established,
+      // so announcing recovery for them offers recovery against a liveness
+      // nobody observed -- and a federation operator sees only this surface.
+      return s.leaseState === "expired"
+        ? `- ${ticket} -- COMPACT recovery available (expired lease)`
+        : `- ${ticket} -- COMPACT, but its lease is ${s.leaseState ?? "unknown"}, so its liveness is undetermined and it is NOT resumable; run \`storybloq session list\``;
+    });
+    lines.push(
+      ...boundedLines(resumableRows, {
+        maxLines: MAX_SESSION_ROWS,
+        noun: "resumable sessions",
+        fullSetHint: "The complete set is in `resumableSessions` of the JSON output.",
+      }),
+    );
   }
+
+  lines.push(...expiredLeaseSessionsSection(expiredLeaseSessions));
+  lines.push(...sessionDiagnosticLines(sessionDiagnostics ?? []));
+  lines.push(...limitStopsSection(limitStops));
+  lines.push(...arrangementsSection(arrangements));
 
   return lines.join("\n");
 }
@@ -384,7 +983,7 @@ export function formatPhaseList(
   for (const p of data) {
     const indicator = p.status === "complete" ? "[x]" : p.status === "inprogress" ? "[~]" : "[ ]";
     const parked = p.state ? ` [${p.state.toUpperCase()}]` : "";
-    lines.push(`${indicator}${parked} **${escapeMarkdownInline(p.name)}** (${p.id}) — ${p.leafCount} tickets — ${escapeMarkdownInline(truncate(p.description, 80))}`);
+    lines.push(`${indicator}${parked} **${escapeMarkdownInline(p.name)}** (${p.id}) -- ${p.leafCount} tickets -- ${escapeMarkdownInline(truncate(p.description, 80))}`);
   }
   return lines.join("\n");
 }
@@ -393,22 +992,36 @@ export function formatPhaseTickets(
   phaseId: string,
   state: ProjectState,
   format: OutputFormat,
+  citedRulingsByTicketId: ReadonlyMap<string, readonly CitationResolution[]> = new Map(),
 ): string {
   const tickets = state.phaseTickets(phaseId);
   if (format === "json") {
-    return JSON.stringify(successEnvelope(tickets), null, 2);
+    return JSON.stringify(
+      successEnvelope(
+        tickets.map((t) => ({ ...t, citedRulings: citedRulingsForJson(citedRulingsByTicketId.get(t.id) ?? []) })),
+      ),
+      null,
+      2,
+    );
   }
   if (tickets.length === 0) return "No tickets in this phase.";
-  return tickets.map((t) => formatTicketOneLiner(t, state)).join("\n");
+  const lines: string[] = [];
+  for (const t of tickets) {
+    lines.push(formatTicketOneLiner(t, state));
+    const rulingsSection = formatCitedRulingsSection(citedRulingsByTicketId.get(t.id) ?? []);
+    if (rulingsSection) lines.push(rulingsSection);
+  }
+  return lines.join("\n");
 }
 
 export function formatTicket(
   ticket: Ticket,
   state: ProjectState,
   format: OutputFormat,
+  citedRulings: readonly CitationResolution[] = [],
 ): string {
   if (format === "json") {
-    return JSON.stringify(successEnvelope(ticket), null, 2);
+    return JSON.stringify(successEnvelope({ ...ticket, citedRulings: citedRulingsForJson(citedRulings) }), null, 2);
   }
 
   const blocked = state.isBlocked(ticket) ? " [BLOCKED]" : "";
@@ -430,16 +1043,21 @@ export function formatTicket(
   if (ticket.description) {
     lines.push("", "## Description", "", fencedBlock(ticket.description));
   }
-  return lines.join("\n");
+  return lines.join("\n") + formatCitedRulingsSection(citedRulings);
 }
 
 export function formatNextTicketOutcome(
   outcome: NextTicketOutcome,
   state: ProjectState,
   format: OutputFormat,
+  citedRulings: readonly CitationResolution[] = [],
 ): string {
   if (format === "json") {
-    return JSON.stringify(successEnvelope(outcome), null, 2);
+    const enriched =
+      outcome.kind === "found"
+        ? { ...outcome, ticket: { ...outcome.ticket, citedRulings: citedRulingsForJson(citedRulings) } }
+        : outcome;
+    return JSON.stringify(successEnvelope(enriched), null, 2);
   }
 
   switch (outcome.kind) {
@@ -461,7 +1079,7 @@ export function formatNextTicketOutcome(
     case "found": {
       const t = outcome.ticket;
       const lines: string[] = [
-        `# Next: ${escapeMarkdownInline(displayIdOf(t))} — ${escapeMarkdownInline(t.title)}`,
+        `# Next: ${escapeMarkdownInline(displayIdOf(t))} -- ${escapeMarkdownInline(t.title)}`,
         "",
         `Phase: ${t.phase ?? "none"} | Order: ${t.order} | Type: ${t.type}`,
       ];
@@ -480,7 +1098,7 @@ export function formatNextTicketOutcome(
         lines.push("", fencedBlock(t.description));
       }
 
-      return lines.join("\n");
+      return lines.join("\n") + formatCitedRulingsSection(citedRulings);
     }
   }
 }
@@ -489,9 +1107,20 @@ export function formatNextTicketsOutcome(
   outcome: NextTicketsOutcome,
   state: ProjectState,
   format: OutputFormat,
+  citedRulingsByTicketId: ReadonlyMap<string, readonly CitationResolution[]> = new Map(),
 ): string {
   if (format === "json") {
-    return JSON.stringify(successEnvelope(outcome), null, 2);
+    const enriched =
+      outcome.kind === "found"
+        ? {
+            ...outcome,
+            candidates: outcome.candidates.map((c) => ({
+              ...c,
+              ticket: { ...c.ticket, citedRulings: citedRulingsForJson(citedRulingsByTicketId.get(c.ticket.id) ?? []) },
+            })),
+          }
+        : outcome;
+    return JSON.stringify(successEnvelope(enriched), null, 2);
   }
 
   switch (outcome.kind) {
@@ -526,9 +1155,9 @@ export function formatNextTicketsOutcome(
         // Single candidate: use # Next: format; multiple: use numbered format
         const tLabel = displayIdOf(t);
         if (candidates.length === 1) {
-          lines.push(`# Next: ${escapeMarkdownInline(tLabel)} — ${escapeMarkdownInline(t.title)}`);
+          lines.push(`# Next: ${escapeMarkdownInline(tLabel)} -- ${escapeMarkdownInline(t.title)}`);
         } else {
-          lines.push(`# ${i + 1}. ${escapeMarkdownInline(tLabel)} — ${escapeMarkdownInline(t.title)}`);
+          lines.push(`# ${i + 1}. ${escapeMarkdownInline(tLabel)} -- ${escapeMarkdownInline(t.title)}`);
         }
         lines.push("", `Phase: ${t.phase ?? "none"} | Order: ${t.order} | Type: ${t.type}`);
 
@@ -545,6 +1174,8 @@ export function formatNextTicketsOutcome(
         if (t.description) {
           lines.push("", fencedBlock(t.description));
         }
+        const rulingsSection = formatCitedRulingsSection(citedRulingsByTicketId.get(t.id) ?? []);
+        if (rulingsSection) lines.push(rulingsSection);
       }
 
       if (skippedBlockedPhases.length > 0) {
@@ -562,15 +1193,24 @@ export function formatNextTicketsOutcome(
 export function formatTicketList(
   tickets: readonly Ticket[],
   format: OutputFormat,
+  citedRulingsByTicketId: ReadonlyMap<string, readonly CitationResolution[]> = new Map(),
 ): string {
   if (format === "json") {
-    return JSON.stringify(successEnvelope(tickets), null, 2);
+    return JSON.stringify(
+      successEnvelope(
+        tickets.map((t) => ({ ...t, citedRulings: citedRulingsForJson(citedRulingsByTicketId.get(t.id) ?? []) })),
+      ),
+      null,
+      2,
+    );
   }
   if (tickets.length === 0) return "No tickets found.";
   const lines: string[] = [];
   for (const t of tickets) {
     const status = t.status === "complete" ? "[x]" : t.status === "inprogress" ? "[~]" : "[ ]";
     lines.push(`${status} ${displayIdOf(t)}: ${escapeMarkdownInline(t.title)} (${t.phase ?? "none"})`);
+    const rulingsSection = formatCitedRulingsSection(citedRulingsByTicketId.get(t.id) ?? []);
+    if (rulingsSection) lines.push(rulingsSection);
   }
   return lines.join("\n");
 }
@@ -579,9 +1219,10 @@ export function formatIssue(
   issue: Issue,
   format: OutputFormat,
   state?: ProjectState,
+  citedRulings: readonly CitationResolution[] = [],
 ): string {
   if (format === "json") {
-    return JSON.stringify(successEnvelope(issue), null, 2);
+    return JSON.stringify(successEnvelope({ ...issue, citedRulings: citedRulingsForJson(citedRulings) }), null, 2);
   }
 
   const lines: string[] = [
@@ -613,21 +1254,30 @@ export function formatIssue(
   if (issue.resolution) {
     lines.push("", "## Resolution", "", fencedBlock(issue.resolution));
   }
-  return lines.join("\n");
+  return lines.join("\n") + formatCitedRulingsSection(citedRulings);
 }
 
 export function formatIssueList(
   issues: readonly Issue[],
   format: OutputFormat,
+  citedRulingsByIssueId: ReadonlyMap<string, readonly CitationResolution[]> = new Map(),
 ): string {
   if (format === "json") {
-    return JSON.stringify(successEnvelope(issues), null, 2);
+    return JSON.stringify(
+      successEnvelope(
+        issues.map((i) => ({ ...i, citedRulings: citedRulingsForJson(citedRulingsByIssueId.get(i.id) ?? []) })),
+      ),
+      null,
+      2,
+    );
   }
   if (issues.length === 0) return "No issues found.";
   const lines: string[] = [];
   for (const i of issues) {
     const status = i.status === "resolved" ? "[x]" : "[ ]";
     lines.push(`${status} ${displayIdOf(i)} [${i.severity}]: ${escapeMarkdownInline(i.title)} (${i.phase ?? "none"})`);
+    const rulingsSection = formatCitedRulingsSection(citedRulingsByIssueId.get(i.id) ?? []);
+    if (rulingsSection) lines.push(rulingsSection);
   }
   return lines.join("\n");
 }
@@ -636,6 +1286,7 @@ export function formatBlockedTickets(
   tickets: readonly Ticket[],
   state: ProjectState,
   format: OutputFormat,
+  citedRulingsByTicketId: ReadonlyMap<string, readonly CitationResolution[]> = new Map(),
 ): string {
   if (format === "json") {
     return JSON.stringify(
@@ -646,6 +1297,7 @@ export function formatBlockedTickets(
             id: bid,
             status: state.ticketByID(bid)?.status ?? "unknown",
           })),
+          citedRulings: citedRulingsForJson(citedRulingsByTicketId.get(t.id) ?? []),
         })),
       ),
       null,
@@ -664,9 +1316,39 @@ export function formatBlockedTickets(
         return `${bid} (unknown)`;
       })
       .join(", ");
-    lines.push(`${displayIdOf(t)}: ${escapeMarkdownInline(t.title)} — blocked by: ${blockerInfo}`);
+    lines.push(`${displayIdOf(t)}: ${escapeMarkdownInline(t.title)} -- blocked by: ${blockerInfo}`);
+    const rulingsSection = formatCitedRulingsSection(citedRulingsByTicketId.get(t.id) ?? []);
+    if (rulingsSection) lines.push(rulingsSection);
   }
   return lines.join("\n");
+}
+
+/** Findings listed per group before the remainder is summarized (ISS-890). */
+export const VALIDATION_GROUP_LIST_LIMIT = 10;
+
+const VALIDATION_LEVEL_ORDER = { error: 0, warning: 1, info: 2 } as const;
+
+const VALIDATION_LEVEL_PREFIX = { error: "ERROR", warning: "WARN", info: "INFO" } as const;
+
+/**
+ * Orders finding groups so the specific sits above the systemic (ISS-890).
+ *
+ * Level first, so an error is never below a warning. Within a level, SMALLEST
+ * group first: a finding that occurs three times is a specific defect you go and
+ * fix, while one that occurs ninety-two times is a pattern you triage as a batch,
+ * and reading it line by line tells you nothing the count did not. Sorting by
+ * count rather than by code keeps that true whichever code happens to be the bulk
+ * one in a given project. Ties break on code so the output is deterministic.
+ */
+function compareValidationGroups(
+  a: { level: ValidationLevel; code: string; findings: ValidationFinding[] },
+  b: { level: ValidationLevel; code: string; findings: ValidationFinding[] },
+): number {
+  const byLevel = VALIDATION_LEVEL_ORDER[a.level] - VALIDATION_LEVEL_ORDER[b.level];
+  if (byLevel !== 0) return byLevel;
+  const byCount = a.findings.length - b.findings.length;
+  if (byCount !== 0) return byCount;
+  return a.code.localeCompare(b.code);
 }
 
 export function formatValidation(
@@ -674,6 +1356,8 @@ export function formatValidation(
   format: OutputFormat,
 ): string {
   if (format === "json") {
+    // Always complete: grouping and the per-group list limit below are a reading
+    // aid for humans, never a filter on what the data says.
     return JSON.stringify(successEnvelope(result), null, 2);
   }
 
@@ -683,11 +1367,36 @@ export function formatValidation(
   ];
 
   if (result.findings.length > 0) {
-    lines.push("");
-    for (const f of result.findings) {
-      const prefix = f.level === "error" ? "ERROR" : f.level === "warning" ? "WARN" : "INFO";
-      const entity = f.entity ? `[${escapeMarkdownInline(f.entity)}] ` : "";
-      lines.push(`${prefix}: ${entity}${escapeMarkdownInline(f.message)}`);
+    // Grouped by code rather than printed flat (ISS-890). A flat list makes a
+    // handful of actionable findings visually indistinguishable from a hundred
+    // lines of accumulated drift, so the actionable ones stop being read.
+    const groups = new Map<string, { level: ValidationLevel; code: string; findings: ValidationFinding[] }>();
+    for (const finding of result.findings) {
+      const key = `${finding.level}:${finding.code}`;
+      const group = groups.get(key);
+      if (group) group.findings.push(finding);
+      else groups.set(key, { level: finding.level, code: finding.code, findings: [finding] });
+    }
+
+    for (const group of [...groups.values()].sort(compareValidationGroups)) {
+      const prefix = VALIDATION_LEVEL_PREFIX[group.level];
+      const count = group.findings.length;
+      lines.push("");
+      lines.push(`## ${group.code} -- ${count} ${count === 1 ? "finding" : "findings"}`);
+
+      // Errors are never abbreviated: they are what makes validation fail, so
+      // every one has to be readable without a second command.
+      const limit = group.level === "error" ? count : VALIDATION_GROUP_LIST_LIMIT;
+      for (const finding of group.findings.slice(0, limit)) {
+        const entity = finding.entity ? `[${escapeMarkdownInline(finding.entity)}] ` : "";
+        lines.push(`${prefix}: ${entity}${escapeMarkdownInline(finding.message)}`);
+      }
+      const hidden = count - Math.min(count, limit);
+      if (hidden > 0) {
+        // Stated, never silent: an abbreviated group says exactly how much it is
+        // holding back and where the rest is.
+        lines.push(`... and ${hidden} more. Run \`storybloq validate --format json\` for the full list.`);
+      }
     }
   }
 
@@ -748,7 +1457,7 @@ export function formatBlockerList(
   const lines: string[] = [];
   for (const b of roadmap.blockers) {
     const status = isBlockerCleared(b) ? "[x]" : "[ ]";
-    const note = b.note ? ` — ${escapeMarkdownInline(b.note)}` : "";
+    const note = b.note ? ` -- ${escapeMarkdownInline(b.note)}` : "";
     lines.push(`${status} ${escapeMarkdownInline(b.name)}${note}`);
   }
   return lines.join("\n");
@@ -762,7 +1471,7 @@ export function formatNote(
     return JSON.stringify(successEnvelope(note), null, 2);
   }
 
-  const title = note.title ?? `${note.createdDate} — ${displayIdOf(note)}`;
+  const title = note.title ?? `${note.createdDate} -- ${displayIdOf(note)}`;
   const statusBadge = note.status === "archived" ? " (archived)" : "";
   const lines: string[] = [
     `# ${escapeMarkdownInline(title)}${statusBadge}`,
@@ -839,6 +1548,313 @@ export function formatNoteDeleteResult(
     return `Note ${id} is already deleted; existing tombstone preserved.`;
   }
   return `Deleted note ${id}.`;
+}
+
+// --- Arrangement formatters (T-473) ---
+
+export function formatArrangement(
+  arrangement: Arrangement,
+  format: OutputFormat,
+  citedRulings: readonly CitationResolution[] = [],
+): string {
+  if (format === "json") {
+    return JSON.stringify(successEnvelope({ ...arrangement, citedRulings: citedRulingsForJson(citedRulings) }), null, 2);
+  }
+  const parties = arrangement.parties.map((p) => `${p.role} (${p.client})`).join(", ");
+  const lines: string[] = [
+    `# Arrangement ${escapeMarkdownInline(arrangement.id)} [${arrangement.lifecycle}]`,
+    "",
+    `Bounds: ${escapeMarkdownInline(arrangement.bounds.join(", "))}`,
+    `Parties: ${escapeMarkdownInline(parties)}`,
+    `Unreachability (irreversible): ${arrangement.unreachability.onIrreversibleWork}`,
+  ];
+  return lines.join("\n") + formatCitedRulingsSection(citedRulings);
+}
+
+export function formatArrangementList(
+  arrangements: readonly Arrangement[],
+  format: OutputFormat,
+  citedRulingsByArrangementId: ReadonlyMap<string, readonly CitationResolution[]> = new Map(),
+): string {
+  if (format === "json") {
+    return JSON.stringify(
+      successEnvelope(
+        arrangements.map((a) => ({ ...a, citedRulings: citedRulingsForJson(citedRulingsByArrangementId.get(a.id) ?? []) })),
+      ),
+      null,
+      2,
+    );
+  }
+  if (arrangements.length === 0) return "No arrangements found.";
+  return arrangements
+    .map((a) => {
+      const parties = a.parties.map((p) => p.role).join("/");
+      return `- ${escapeMarkdownInline(a.id)} [${a.lifecycle}] (${escapeMarkdownInline(parties)}) -- bounds: ${escapeMarkdownInline(a.bounds.join(", "))}`;
+    })
+    .join("\n");
+}
+
+export function formatArrangementCreateResult(
+  arrangement: Arrangement,
+  format: OutputFormat,
+  citedRulings: readonly CitationResolution[] = [],
+): string {
+  if (format === "json") {
+    return JSON.stringify(successEnvelope({ ...arrangement, citedRulings: citedRulingsForJson(citedRulings) }), null, 2);
+  }
+  return `Created arrangement ${arrangement.id}.`;
+}
+
+export function formatArrangementUpdateResult(
+  arrangement: Arrangement,
+  format: OutputFormat,
+  citedRulings: readonly CitationResolution[] = [],
+): string {
+  if (format === "json") {
+    return JSON.stringify(successEnvelope({ ...arrangement, citedRulings: citedRulingsForJson(citedRulings) }), null, 2);
+  }
+  return `Updated arrangement ${arrangement.id} [${arrangement.lifecycle}].`;
+}
+
+// --- Gate-ack formatters (T-474) ---
+
+// --- Ruling formatters (T-476) ---
+
+export function formatRuling(
+  ruling: Ruling,
+  format: OutputFormat,
+  resolution?: CitationResolution,
+): string {
+  const rendered = resolution ? renderCitation(resolution) : undefined;
+  if (format === "json") {
+    // Codex round-3 finding 4: the caveat must be unconditional at the TOP
+    // level too -- relying on chainStatus.current.caveat (renderCitation's
+    // "resolved" case only) means an indeterminate/missing/unreadable/branch/
+    // cycle resolution -- or no resolution at all -- exposed the ruling's
+    // attribution with no caveat anywhere in the JSON output.
+    return JSON.stringify(
+      successEnvelope({ ...ruling, attributionCaveat: rulingAttributionCaveat(ruling.recordedBy), chainStatus: rendered ?? null }),
+      null,
+      2,
+    );
+  }
+  const lines: string[] = [
+    `# Ruling ${escapeMarkdownInline(ruling.id)}`,
+    "",
+    `Attribution: ${ruling.attribution} | Recorded by: ${ruling.recordedBy.client}/${ruling.recordedBy.id} | Date: ${ruling.date}`,
+  ];
+  if (ruling.scopeTags.length > 0) {
+    lines.push(`Scope: ${ruling.scopeTags.map((t) => escapeMarkdownInline(t)).join(", ")}`);
+  }
+  if (ruling.supersedes) {
+    lines.push(`Supersedes: ${escapeMarkdownInline(ruling.supersedes)}`);
+  }
+  lines.push("", "## Text", "", fencedBlock(ruling.text));
+  lines.push("", rulingAttributionCaveat(ruling.recordedBy));
+  if (rendered) {
+    if (rendered.status === "resolved") {
+      lines.push(
+        "",
+        rendered.stale ? `Status: superseded by ${rendered.current!.id}` : "Status: current",
+      );
+    } else {
+      lines.push("", `Status: ${rendered.warning ?? rendered.status}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+export function formatRulingList(rulings: readonly Ruling[], format: OutputFormat): string {
+  if (format === "json") {
+    // Codex round-2 finding 2: attribution is a CLAIM (see
+    // rulingAttributionCaveat's binding constraint) and must render
+    // unconditionally everywhere a ruling's attribution is shown, including
+    // the list surface -- not only single-ruling get/create/supersede.
+    return JSON.stringify(
+      successEnvelope(rulings.map((r) => ({ ...r, attributionCaveat: rulingAttributionCaveat(r.recordedBy) }))),
+      null,
+      2,
+    );
+  }
+  if (rulings.length === 0) return "No rulings found.";
+  return rulings
+    .map((r) => {
+      const preview = r.text.length > 80 ? `${r.text.slice(0, 80)}...` : r.text;
+      return [
+        `- ${escapeMarkdownInline(r.id)} [${r.attribution}] (${r.date}): "${escapeMarkdownInline(preview)}"`,
+        `  ${rulingAttributionCaveat(r.recordedBy)}`,
+      ].join("\n");
+    })
+    .join("\n");
+}
+
+export function formatRulingCreateResult(ruling: Ruling, format: OutputFormat): string {
+  if (format === "json") {
+    return JSON.stringify(
+      successEnvelope({ ...ruling, attributionCaveat: rulingAttributionCaveat(ruling.recordedBy) }),
+      null,
+      2,
+    );
+  }
+  return `Created ruling ${ruling.id}.`;
+}
+
+export function formatRulingSupersedeResult(ruling: Ruling, noop: boolean, format: OutputFormat): string {
+  if (format === "json") {
+    return JSON.stringify(
+      successEnvelope({ ...ruling, noop, attributionCaveat: rulingAttributionCaveat(ruling.recordedBy) }),
+      null,
+      2,
+    );
+  }
+  return noop
+    ? `Ruling ${ruling.id} already supersedes ${ruling.supersedes} (no-op).`
+    : `Ruling ${ruling.id} now supersedes ${ruling.supersedes}.`;
+}
+
+/**
+ * T-477 section 4.3: `storybloq landings` is the CLI-only surface for the
+ * full feed -- no MCP tool, no `storybloq_status` field (plan 4.3's explicit
+ * non-goal). JSON is the same versioned envelope every other read command
+ * uses; `landings-unavailable` renders as a `formatError`-style envelope,
+ * translated at the CLI layer -- the library itself never throws for it.
+ */
+export function formatLandings(result: LandingsResult, format: OutputFormat): string {
+  if (result.status === "landings-unavailable") {
+    return format === "json"
+      ? JSON.stringify(errorEnvelope("io_error", result.reason), null, 2)
+      : `Error [io_error]: ${escapeMarkdownInline(result.reason)}`;
+  }
+  if (format === "json") {
+    return JSON.stringify(successEnvelope(result), null, 2);
+  }
+  if (result.landings.length === 0) return "No landings found.";
+  const lines: string[] = [];
+  for (const landing of result.landings) {
+    const shortSha = landing.sha.slice(0, 12);
+    lines.push(`### ${shortSha} -- ${escapeMarkdownInline(landing.subject)}`);
+    lines.push(`  authored: ${landing.authoredAt} | summary: ${landing.summary}`);
+    if (landing.refs.length === 0) {
+      lines.push("  refs: (none)");
+    } else {
+      for (const ref of landing.refs) {
+        const cov = ref.coverage;
+        const evidenceNote = cov.reviewEvidence === "present" ? ", evidence present" : cov.reviewEvidence === "absent" ? ", evidence absent" : "";
+        const multi = cov.multipleMatches ? ", multiple matches" : "";
+        const crossConfirmed = ref.crossConfirmed ? ", cross-confirmed" : "";
+        lines.push(
+          `  - ${escapeMarkdownInline(ref.ref)} (${ref.source}${crossConfirmed}): ${cov.gateAckCoverage}${evidenceNote}${multi}`,
+        );
+      }
+    }
+    if (landing.unresolvedTokens.length > 0) {
+      lines.push(`  unresolved tokens: ${landing.unresolvedTokens.map((t) => escapeMarkdownInline(t)).join(", ")}`);
+    }
+    lines.push("");
+  }
+  if (result.unresolvedResolutionShas.length > 0) {
+    lines.push("### Unresolved resolution-field shas");
+    for (const u of result.unresolvedResolutionShas) {
+      lines.push(`  - ${escapeMarkdownInline(u.issueRef)}: ${escapeMarkdownInline(u.token)} (${u.reason})`);
+    }
+    lines.push("");
+  }
+  if (result.unattributedGateAckWarnings.length > 0) {
+    lines.push("### Unattributed gate-ack warnings (force every ticket-shaped ref to \"unknown\" this run)");
+    for (const w of result.unattributedGateAckWarnings) {
+      lines.push(`  - ${escapeMarkdownInline(w)}`);
+    }
+    lines.push("");
+  }
+  return lines.join("\n").trimEnd();
+}
+
+function formatGateAckPin(ack: GateAck): string {
+  return ack.pin.kind === "plan-hash"
+    ? `plan-hash:${sanitizeDisplayText(ack.pin.sha256).slice(0, 12)}...`
+    : `tree-digest:${sanitizeDisplayText(ack.pin.treeId).slice(0, 12)}... (parent ${sanitizeDisplayText(ack.pin.parentSha).slice(0, 12)}...)`;
+}
+
+export function formatGateAck(ack: GateAck, format: OutputFormat): string {
+  if (format === "json") {
+    return JSON.stringify(successEnvelope(ack), null, 2);
+  }
+  const contestedBadge = ack.contested ? " [CONTESTED]" : "";
+  const lines: string[] = [
+    `# Gate-ack ${escapeMarkdownInline(sanitizeDisplayText(ack.id))}${contestedBadge}`,
+    "",
+    `Arrangement: ${escapeMarkdownInline(sanitizeDisplayText(ack.arrangementId))} | Gate: ${escapeMarkdownInline(sanitizeDisplayText(ack.gateName))} | Acked by: ${escapeMarkdownInline(sanitizeDisplayText(ack.ackRole))}`,
+    `Ticket: ${escapeMarkdownInline(sanitizeDisplayText(ack.ticketRef))}`,
+    `Pin: ${formatGateAckPin(ack)}`,
+    `Decided: ${escapeMarkdownInline(sanitizeDisplayText(ack.decidedAt ?? "unknown"))}`,
+    `Review trail: ${ack.reviewTrail.present ? `${escapeMarkdownInline(sanitizeDisplayText(ack.reviewTrail.verdict ?? "present"))}${ack.reviewTrail.rounds !== undefined ? ` (${ack.reviewTrail.rounds} rounds)` : ""}` : "none (acked on inspection)"}`,
+  ];
+  if (ack.deltas) lines.push("", "## Deltas", "", sanitizeDisplayText(ack.deltas, MAX_PROSE_LENGTH));
+  if (ack.contested) lines.push("", `Contested: ${escapeMarkdownInline(sanitizeDisplayText(ack.contestedReason ?? ""))}`);
+  return lines.join("\n");
+}
+
+export function formatGateAckList(acks: readonly GateAck[], format: OutputFormat): string {
+  if (format === "json") {
+    return JSON.stringify(successEnvelope(acks), null, 2);
+  }
+  if (acks.length === 0) return "No gate-acks found.";
+  return acks
+    .map((a) => {
+      const contestedBadge = a.contested ? " [CONTESTED]" : "";
+      return `- ${escapeMarkdownInline(sanitizeDisplayText(a.id))}${contestedBadge} -- ${escapeMarkdownInline(sanitizeDisplayText(a.gateName))} on ${escapeMarkdownInline(sanitizeDisplayText(a.ticketRef))} (${escapeMarkdownInline(sanitizeDisplayText(a.ackRole))})`;
+    })
+    .join("\n");
+}
+
+export function formatGateAckCreateResult(ack: GateAck, format: OutputFormat): string {
+  if (format === "json") {
+    return JSON.stringify(successEnvelope(ack), null, 2);
+  }
+  return `Created gate-ack ${escapeMarkdownInline(sanitizeDisplayText(ack.id))} (${escapeMarkdownInline(sanitizeDisplayText(ack.gateName))} on ${escapeMarkdownInline(sanitizeDisplayText(ack.ticketRef))}).`;
+}
+
+export function formatGateAckContestResult(ack: GateAck, format: OutputFormat): string {
+  if (format === "json") {
+    return JSON.stringify(successEnvelope(ack), null, 2);
+  }
+  return `Gate-ack ${escapeMarkdownInline(sanitizeDisplayText(ack.id))} marked contested: ${escapeMarkdownInline(sanitizeDisplayText(ack.contestedReason ?? ""))}`;
+}
+
+// --- Earmark formatters (T-475) ---
+
+function formatEarmarkLine(earmark: Earmark): string {
+  const holder =
+    earmark.stage === "assigned"
+      ? `assigned to session ${escapeMarkdownInline(sanitizeDisplayText(earmark.holderSession))}`
+      : `reserved for role ${escapeMarkdownInline(sanitizeDisplayText(earmark.holderRole))}`;
+  return (
+    `${holder} (role ${escapeMarkdownInline(sanitizeDisplayText(earmark.holderRole))}), ` +
+    `reserved by ${escapeMarkdownInline(sanitizeDisplayText(earmark.reservedBy.client))}:${escapeMarkdownInline(sanitizeDisplayText(earmark.reservedBy.id))}, ` +
+    `arrangement ${escapeMarkdownInline(sanitizeDisplayText(earmark.arrangementId))}, since ${escapeMarkdownInline(sanitizeDisplayText(earmark.since))}`
+  );
+}
+
+export function formatEarmarkGetResult(ref: string, earmark: Earmark | null, format: OutputFormat): string {
+  if (format === "json") {
+    return JSON.stringify(successEnvelope({ ref, earmark }), null, 2);
+  }
+  if (!earmark) return `${escapeMarkdownInline(sanitizeDisplayText(ref))} has no earmark.`;
+  return `Earmark on ${escapeMarkdownInline(sanitizeDisplayText(ref))}: ${formatEarmarkLine(earmark)}`;
+}
+
+export function formatEarmarkActionResult(
+  action: "reserved" | "assigned" | "released",
+  ref: string,
+  earmark: Earmark | null,
+  format: OutputFormat,
+): string {
+  if (format === "json") {
+    return JSON.stringify(successEnvelope({ ref, action, earmark }), null, 2);
+  }
+  const target = escapeMarkdownInline(sanitizeDisplayText(ref));
+  if (action === "released") return `Released earmark on ${target}.`;
+  return `${action === "reserved" ? "Reserved" : "Assigned"} ${target}: ${formatEarmarkLine(earmark!)}`;
 }
 
 // --- Lesson formatters ---
@@ -1039,15 +2055,15 @@ export function formatRecap(
   const lines: string[] = [];
 
   if (!recap.snapshot) {
-    // No snapshot fallback — show status + note
-    lines.push(`# ${escapeMarkdownInline(state.config.project)} — Recap`);
+    // No snapshot fallback -- show status + note
+    lines.push(`# ${escapeMarkdownInline(state.config.project)} -- Recap`);
     lines.push("");
     lines.push("No snapshot found. Run `storybloq snapshot` to enable session diffs.");
     lines.push("");
     lines.push(`Tickets: ${state.completeLeafTicketCount}/${state.leafTicketCount} complete, ${state.blockedCount} blocked`);
     lines.push(`Issues: ${state.activeIssueCount} open`);
   } else {
-    lines.push(`# ${escapeMarkdownInline(state.config.project)} — Recap`);
+    lines.push(`# ${escapeMarkdownInline(state.config.project)} -- Recap`);
     lines.push("");
     lines.push(`Since snapshot: ${recap.snapshot.createdAt}`);
     if (recap.partial) {
@@ -1055,9 +2071,18 @@ export function formatRecap(
     }
     if (recap.staleness) {
       if (recap.staleness.status === "diverged") {
+        // Genuinely anomalous: the snapshot's commit is no longer in history, so
+        // the diff below may compare against work that no longer exists. Keeps the
+        // Warning prefix.
         lines.push("**Warning:** Snapshot commit is not an ancestor of current HEAD (history diverged; possible rebase, force-push, or branch switch).");
-      } else if (recap.staleness.status === "behind" && recap.staleness.commitsBehind) {
-        lines.push(`**Warning:** Snapshot is ${recap.staleness.commitsBehind} commit(s) behind HEAD -- context may be stale.`);
+      } else if (recap.staleness.status === "behind" && (recap.staleness.commitsBehind ?? 0) > 0) {
+        // ISS-889: being behind HEAD is the ORDINARY state of a snapshot -- you
+        // take one, then you keep working. Labelling routine progress a warning
+        // teaches readers to skip the prefix, which costs the diverged case above
+        // the attention it actually needs. Stated as the plain fact it is; the
+        // count is there for anyone who wants to judge how stale that is.
+        const commits = recap.staleness.commitsBehind ?? 0;
+        lines.push(`Snapshot is ${commits} commit${commits === 1 ? "" : "s"} behind HEAD.`);
       }
     }
 
@@ -1083,13 +2108,13 @@ export function formatRecap(
         lines.push("");
         lines.push("## Tickets");
         for (const t of ticketChanges.statusChanged) {
-          lines.push(`- ${displayIdOf(t)}: ${escapeMarkdownInline(t.title)} — ${t.from} → ${t.to}`);
+          lines.push(`- ${displayIdOf(t)}: ${escapeMarkdownInline(t.title)} -- ${t.from} → ${t.to}`);
         }
         for (const t of ticketChanges.added) {
-          lines.push(`- ${displayIdOf(t)}: ${escapeMarkdownInline(t.title)} — **new**`);
+          lines.push(`- ${displayIdOf(t)}: ${escapeMarkdownInline(t.title)} -- **new**`);
         }
         for (const t of ticketChanges.removed) {
-          lines.push(`- ${displayIdOf(t)}: ${escapeMarkdownInline(t.title)} — **removed**`);
+          lines.push(`- ${displayIdOf(t)}: ${escapeMarkdownInline(t.title)} -- **removed**`);
         }
         for (const t of ticketChanges.descriptionChanged) {
           lines.push(`- ${displayIdOf(t)}: description updated`);
@@ -1102,13 +2127,13 @@ export function formatRecap(
         lines.push("");
         lines.push("## Issues");
         for (const i of issueChanges.resolved) {
-          lines.push(`- ${displayIdOf(i)}: ${escapeMarkdownInline(i.title)} — **resolved**`);
+          lines.push(`- ${displayIdOf(i)}: ${escapeMarkdownInline(i.title)} -- **resolved**`);
         }
         for (const i of issueChanges.statusChanged) {
-          lines.push(`- ${displayIdOf(i)}: ${escapeMarkdownInline(i.title)} — ${i.from} → ${i.to}`);
+          lines.push(`- ${displayIdOf(i)}: ${escapeMarkdownInline(i.title)} -- ${i.from} → ${i.to}`);
         }
         for (const i of issueChanges.added) {
-          lines.push(`- ${displayIdOf(i)}: ${escapeMarkdownInline(i.title)} — **new**`);
+          lines.push(`- ${displayIdOf(i)}: ${escapeMarkdownInline(i.title)} -- **new**`);
         }
         for (const i of issueChanges.impactChanged) {
           lines.push(`- ${displayIdOf(i)}: impact updated`);
@@ -1120,10 +2145,10 @@ export function formatRecap(
         lines.push("");
         lines.push("## Blockers");
         for (const name of changes.blockers.cleared) {
-          lines.push(`- ${escapeMarkdownInline(name)} — **cleared**`);
+          lines.push(`- ${escapeMarkdownInline(name)} -- **cleared**`);
         }
         for (const name of changes.blockers.added) {
-          lines.push(`- ${escapeMarkdownInline(name)} — **new**`);
+          lines.push(`- ${escapeMarkdownInline(name)} -- **new**`);
         }
       }
 
@@ -1132,10 +2157,10 @@ export function formatRecap(
         lines.push("");
         lines.push("## Handovers");
         for (const h of changes.handovers.added) {
-          lines.push(`- ${h} — **new**`);
+          lines.push(`- ${h} -- **new**`);
         }
         for (const h of changes.handovers.removed) {
-          lines.push(`- ${h} — removed`);
+          lines.push(`- ${h} -- removed`);
         }
       }
 
@@ -1159,16 +2184,16 @@ export function formatRecap(
         lines.push("");
         lines.push("## Lessons");
         for (const l of changes.lessons.added) {
-          lines.push(`- ${displayIdOf(l)}: ${escapeMarkdownInline(l.title)} — **new**`);
+          lines.push(`- ${displayIdOf(l)}: ${escapeMarkdownInline(l.title)} -- **new**`);
         }
         for (const l of changes.lessons.removed) {
-          lines.push(`- ${displayIdOf(l)}: ${escapeMarkdownInline(l.title)} — removed`);
+          lines.push(`- ${displayIdOf(l)}: ${escapeMarkdownInline(l.title)} -- removed`);
         }
         for (const l of changes.lessons.updated) {
           lines.push(`- ${displayIdOf(l)}: updated (${l.changedFields.join(", ")})`);
         }
         for (const l of changes.lessons.reinforced) {
-          lines.push(`- ${displayIdOf(l)}: ${escapeMarkdownInline(l.title)} — reinforced (${l.from} → ${l.to})`);
+          lines.push(`- ${displayIdOf(l)}: ${escapeMarkdownInline(l.title)} -- reinforced (${l.from} → ${l.to})`);
         }
       }
     }
@@ -1180,12 +2205,12 @@ export function formatRecap(
   lines.push("## Suggested Actions");
 
   if (actions.nextTicket) {
-    lines.push(`- **Next:** ${displayIdOf(actions.nextTicket)} — ${escapeMarkdownInline(actions.nextTicket.title)}${actions.nextTicket.phase ? ` (${actions.nextTicket.phase})` : ""}`);
+    lines.push(`- **Next:** ${displayIdOf(actions.nextTicket)} -- ${escapeMarkdownInline(actions.nextTicket.title)}${actions.nextTicket.phase ? ` (${actions.nextTicket.phase})` : ""}`);
   }
 
   if (actions.highSeverityIssues.length > 0) {
     for (const i of actions.highSeverityIssues) {
-      lines.push(`- **${i.severity} issue:** ${displayIdOf(i)} — ${escapeMarkdownInline(i.title)}`);
+      lines.push(`- **${i.severity} issue:** ${displayIdOf(i)} -- ${escapeMarkdownInline(i.title)}`);
     }
   }
 
@@ -1317,7 +2342,7 @@ function formatPhaseExport(
     lines.push("");
     lines.push("## Active Blockers");
     for (const b of activeBlockers) {
-      lines.push(`- ${escapeMarkdownDocument(b.name)}${b.note ? ` — ${escapeMarkdownDocument(b.note)}` : ""}`);
+      lines.push(`- ${escapeMarkdownDocument(b.name)}${b.note ? ` -- ${escapeMarkdownDocument(b.note)}` : ""}`);
     }
   }
 
@@ -1377,7 +2402,7 @@ function formatFullExport(
   }
 
   const lines: string[] = [];
-  lines.push(`# ${escapeMarkdownDocument(state.config.project)} — Full Export`);
+  lines.push(`# ${escapeMarkdownDocument(state.config.project)} -- Full Export`);
   lines.push("");
   lines.push(`Tickets: ${state.completeLeafTicketCount}/${state.leafTicketCount} complete`);
   lines.push(`Issues: ${state.activeIssueCount} open`);
@@ -1440,7 +2465,7 @@ function formatFullExport(
     lines.push("## Blockers");
     for (const b of blockers) {
       const cleared = isBlockerCleared(b) ? "[x]" : "[ ]";
-      lines.push(`${cleared} ${escapeMarkdownDocument(b.name)}${b.note ? ` — ${escapeMarkdownDocument(b.note)}` : ""}`);
+      lines.push(`${cleared} ${escapeMarkdownDocument(b.name)}${b.note ? ` -- ${escapeMarkdownDocument(b.note)}` : ""}`);
     }
   }
 
@@ -1494,7 +2519,7 @@ export function formatSelftestResult(
     lines.push(`## ${entity.charAt(0).toUpperCase() + entity.slice(1)}`);
     for (const check of checks) {
       const mark = check.passed ? "[x]" : "[ ]";
-      const suffix = check.passed ? "" : ` — ${check.detail}`;
+      const suffix = check.passed ? "" : ` -- ${check.detail}`;
       lines.push(`- ${mark} ${check.step}${suffix}`);
     }
     lines.push("");
@@ -1562,6 +2587,12 @@ export function formatReference(
   lines.push("");
   lines.push("## CLI Commands");
   lines.push("");
+  // ISS-910: the JSON envelope is part of every command's contract; document
+  // it once at the top of the command reference rather than per command.
+  lines.push("### JSON output envelope");
+  lines.push("");
+  lines.push('Commands accepting `--format json` wrap their payload in a versioned envelope: `{"version": 1, "data": ...}` on success, `{"version": 1, "error": {"code": ..., "message": ...}}` on failure, plus a `warnings` array on partial loads (exit code 3). Pass `--raw` with `--format json` to emit the `data` payload verbatim: errors keep the envelope, partial-load warnings are dropped (the exit code still signals them), and commands whose JSON is not the standard envelope reject `--raw` naming their shape. A few commands predate the envelope and emit their own JSON instead: `gc`, `limit-status`, `conflicts list`, `conflicts show`, `resolve` and `team reserve` return an `{"ok", "data"}` object, and `team init` and `team setup` return a bare result object. `session list` and `session show` use a text/json axis with their own top-level shapes, and the `bus` subcommands speak the versioned Bus wire format. Every one of these names its own shape in its `--help` and does not accept `--raw` at all, so passing it is rejected during argument validation, before the command runs -- which matters because several of them mutate state.');
+  lines.push("");
   for (const cmd of commands) {
     lines.push(`### ${cmd.name}`);
     lines.push(cmd.description);
@@ -1574,7 +2605,7 @@ export function formatReference(
 
   lines.push("## MCP Tools");
   lines.push("");
-  lines.push("The base tools below are registered in full mode (inside a .story/ project). The five storybloq_bus_* tools are feature-gated and appear only when `features.bus` is enabled at MCP process start.");
+  lines.push("The base tools below are registered in full mode (inside a .story/ project). The five storybloq_bus_* tools are always registered in full mode; when the Bus is disabled or uninitialized they return setup guidance pointing at `storybloq bus setup`, with no MCP restart required.");
   lines.push("");
   for (const tool of mcpTools) {
     const params = tool.params?.length ? ` (${tool.params.join(", ")})` : "";
@@ -1586,8 +2617,9 @@ export function formatReference(
   lines.push("");
   lines.push("With no .story/ project on the path, the MCP server starts degraded and registers only:");
   lines.push("");
-  lines.push("- **storybloq_init** — bootstrap a .story/ project, then dynamically register the full tool set");
-  lines.push("- **storybloq_status** — returns setup guidance instead of a project summary");
+  lines.push("- **storybloq_session_guard** -- the ownership verdict, available here because the no-project case is exactly where the skill runs its Step 0.5 guard first (T-446)");
+  lines.push("- **storybloq_init** -- bootstrap a .story/ project, then dynamically register the full tool set");
+  lines.push("- **storybloq_status** -- returns setup guidance instead of a project summary");
   lines.push("");
   lines.push("Destructive, admin, and git-integration workflows (delete, reconcile, conflicts, resolve, merge-driver, team, gc, repair, config, feedback) are CLI-only in both modes; see the CLI Commands section above.");
 
@@ -1618,6 +2650,16 @@ export function formatReference(
   lines.push("");
   lines.push("`/story` surfaces this option proactively at context load when the client is capable and the actionable backlog is orchestrate-sized, so you do not have to know the command exists; it stays a recommendation, and selecting it still routes through the explicit opt-in.");
   lines.push("");
+  lines.push("## /story triage");
+  lines.push("");
+  lines.push("Read-only triage of the open issue backlog: verifies each finding against the pinned current HEAD (reusing the same source-reference provenance checks as `storybloq validate`), flags already-fixed and duplicate issues, groups issues that share one verified root cause, and produces a prioritized recommendations report.");
+  lines.push("");
+  lines.push("```");
+  lines.push("/story triage                    # triage all open issues, report only");
+  lines.push("```");
+  lines.push("");
+  lines.push("Mutates no issue and no ticket: classifications and recommendations are report vocabulary, and closing or filing stays with the maintainer. The only optional write is saving the finished report as a handover (snapshot first), offered once and performed only on explicit confirmation. The full procedure -- integrity branching, alias correlation, evidence bars, report format -- is in `triage-mode.md`.");
+  lines.push("");
   lines.push("## /story bus");
   lines.push("");
   lines.push("Poll or coordinate through the current task-bound local Bus endpoint. Peer content is advisory; confirmed review findings become canonical issues before an issue notice is sent.");
@@ -1631,14 +2673,14 @@ export function formatReference(
   lines.push("## Common Workflows");
   lines.push("");
   lines.push("### Session Start");
-  lines.push("1. `storybloq status` — project overview");
-  lines.push("2. `storybloq recap` — what changed since last snapshot");
-  lines.push("3. `storybloq handover latest` — last session context");
-  lines.push("4. `storybloq ticket next` — what to work on");
+  lines.push("1. `storybloq status` -- project overview");
+  lines.push("2. `storybloq recap` -- what changed since last snapshot");
+  lines.push("3. `storybloq handover latest` -- last session context");
+  lines.push("4. `storybloq ticket next` -- what to work on");
   lines.push("");
   lines.push("### Session End");
-  lines.push("1. `storybloq snapshot` — save state for diffs");
-  lines.push("2. `storybloq handover create --content <md>` — write session handover");
+  lines.push("1. `storybloq snapshot` -- save state for diffs");
+  lines.push("2. `storybloq handover create --content <md>` -- write session handover");
   lines.push("");
   lines.push("### Project Setup");
   lines.push("1. `npm install -g @storybloq/storybloq` - install CLI");
@@ -1666,7 +2708,7 @@ export function formatRecommendations(
 
   if (result.recommendations.length === 0) {
     if (state.isEmptyScaffold) {
-      return "No recommendations yet — this project needs tickets and phases. Run the /story setup flow to get started.";
+      return "No recommendations yet -- this project needs tickets and phases. Run the /story setup flow to get started.";
     }
     if (state.config.type === "orchestrator") {
       return "No recommendations. Run storybloq status for federation overview.";
@@ -1679,7 +2721,7 @@ export function formatRecommendations(
   for (let i = 0; i < result.recommendations.length; i++) {
     const rec = result.recommendations[i]!;
     lines.push(
-      `${i + 1}. **${escapeMarkdownInline(displayIdOf(rec))}** (${rec.kind}) — ${escapeMarkdownInline(rec.title)}`,
+      `${i + 1}. **${escapeMarkdownInline(displayIdOf(rec))}** (${rec.kind}) -- ${escapeMarkdownInline(rec.title)}`,
     );
     lines.push(`   _${escapeMarkdownInline(rec.reason)}_`);
     lines.push("");

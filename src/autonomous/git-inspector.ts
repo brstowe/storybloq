@@ -4,7 +4,7 @@ import type { GitResult, DiffStats } from "./session-types.js";
 const GIT_TIMEOUT = 10_000;
 
 // ---------------------------------------------------------------------------
-// Core executor — async execFile with timeout, returns GitResult<T>
+// Core executor -- async execFile with timeout, returns GitResult<T>
 // ---------------------------------------------------------------------------
 
 async function git<T>(
@@ -101,7 +101,7 @@ export async function gitDiffCachedNames(cwd: string): Promise<GitResult<string[
 
 /**
  * Stash dirty tracked files with a descriptive message.
- * Returns the stash commit hash (stable identifier — won't shift if other stashes are created).
+ * Returns the stash commit hash (stable identifier -- won't shift if other stashes are created).
  */
 export async function gitStash(cwd: string, message: string): Promise<GitResult<string>> {
   // Push the stash
@@ -111,17 +111,17 @@ export async function gitStash(cwd: string, message: string): Promise<GitResult<
   // Capture the commit hash of the stash we just created (it's at stash@{0} right now)
   const hashResult = await git(cwd, ["rev-parse", "stash@{0}"], (out) => out.trim());
   if (!hashResult.ok) {
-    // Stash was created but we can't identify it — try to find by message, or pop it to restore workspace
+    // Stash was created but we can't identify it -- try to find by message, or pop it to restore workspace
     const listResult = await git(cwd, ["stash", "list", "--format=%gd %s"], (out) =>
       out.split("\n").filter(l => l.includes(message)),
     );
     if (listResult.ok && listResult.data.length > 0) {
-      // Found by message — extract ref from first match
+      // Found by message -- extract ref from first match
       const ref = listResult.data[0]!.split(" ")[0]!;
       const refHash = await git(cwd, ["rev-parse", ref], (out) => out.trim());
       if (refHash.ok) return { ok: true, data: refHash.data };
     }
-    // Can't identify — do NOT pop blindly (could pop wrong stash if concurrent operations)
+    // Can't identify -- do NOT pop blindly (could pop wrong stash if concurrent operations)
     return { ok: false, reason: "stash_hash_failed", message: "Stash created but could not be identified. Run `git stash list` to find and pop it manually." };
   }
 
@@ -145,7 +145,7 @@ export async function gitStashPop(cwd: string, commitHash?: string): Promise<Git
     }),
   );
   if (!listResult.ok) {
-    // Cannot list stashes — do NOT fall back to git stash pop (might pop wrong entry)
+    // Cannot list stashes -- do NOT fall back to git stash pop (might pop wrong entry)
     return { ok: false, reason: "stash_list_failed", message: `Cannot list stash entries to find ${commitHash}. Run \`git stash list\` and pop manually.` };
   }
 
@@ -336,9 +336,158 @@ export async function gitCheckRefFormat(cwd: string, refName: string): Promise<G
   });
 }
 
+/**
+ * T-328: resolve what `branchStrategy: "main"` means in this repository.
+ *
+ * The contract is main-PREFERRED, not default-branch-aware: `main` if it exists
+ * locally, else `master`. A repo that keeps a vestigial `main` while `master` is
+ * its real default gets `main`. That is a deliberate simplification over reading
+ * `refs/remotes/<remote>/HEAD`, and it is why the config value is spelled
+ * "main" rather than "trunk".
+ *
+ * Resolution is local-only: no fetch, no remote probe, no fast-forward. A stale
+ * local `main` is used as-is.
+ */
+export async function resolveMainBranch(cwd: string): Promise<GitResult<string>> {
+  for (const candidate of ["main", "master"]) {
+    const exists = await gitBranchExists(cwd, candidate);
+    if (!exists.ok) return exists as GitResult<string>;
+    if (exists.data) return { ok: true, data: candidate };
+  }
+  return {
+    ok: false,
+    reason: "git_error",
+    message: "Neither a local \"main\" nor a local \"master\" branch exists",
+  };
+}
+
+/** Resolve a ref to its commit OID. */
+export async function gitRevParse(cwd: string, ref: string): Promise<GitResult<string>> {
+  return git(cwd, ["rev-parse", "--verify", `${ref}^{commit}`], (out) => out.trim());
+}
+
 export async function gitUserEmail(cwd: string): Promise<string | null> {
   const result = await git(cwd, ["config", "user.email"], (out) => out.trim());
   return result.ok && result.data ? result.data : null;
+}
+
+/**
+ * Committer email recorded ON a specific commit (ISS-982), as opposed to
+ * `gitUserEmail`'s live, ambient `user.email` config. No `--` separator: with
+ * one, git treats `hash` as a PATH FILTER rather than a revision and silently
+ * returns empty output for every real hash.
+ */
+export async function gitCommitterEmail(cwd: string, hash: string): Promise<GitResult<string>> {
+  if (!SAFE_REF.test(hash)) {
+    return { ok: false, reason: "git_error", message: "invalid ref format" };
+  }
+  return git(cwd, ["log", "-1", "--format=%ce", hash], (out) => out.trim());
+}
+
+/** The repository's object hash format ("sha1" or "sha256"). */
+export async function gitObjectFormat(cwd: string): Promise<GitResult<string>> {
+  return git(cwd, ["rev-parse", "--show-object-format"], (out) => out.trim());
+}
+
+/**
+ * T-474: writes the tree object for the CURRENTLY STAGED index -- standard
+ * git plumbing (used internally by `git commit` itself), content-addressed
+ * and idempotent, not a working-tree mutation.
+ */
+export async function gitWriteTree(cwd: string): Promise<GitResult<string>> {
+  return git(cwd, ["write-tree"], (out) => out.trim());
+}
+
+/**
+ * T-474 (D2): a sha256-format repository's commit hashes are 64 hex chars,
+ * longer than `SAFE_REF`'s 40-char (sha1-length) cap -- checking object
+ * format BEFORE ref-shape validation is what makes the refusal message
+ * actually name the real reason (unsupported repo format) instead of a
+ * misleading "invalid ref format" that a too-long sha256 hash would
+ * otherwise trip first.
+ */
+async function refuseUnlessSha1(cwd: string): Promise<{ ok: false; reason: string; message: string } | null> {
+  const format = await gitObjectFormat(cwd);
+  if (!format.ok) return format;
+  if (format.data !== "sha1") {
+    return { ok: false, reason: "unsupported_object_format", message: `gate-ack v1 only supports SHA-1 git repositories (found: ${format.data})` };
+  }
+  return null;
+}
+
+/**
+ * Robustly counts a commit's parents via `git rev-list --parents -n 1
+ * <sha>`, whose one-line output is `<commit> <parent1> <parent2> ...` --
+ * never string-parses `rev-parse` output, which cannot express plurality at
+ * all (`<sha>^` always names exactly the first parent, silently, for any
+ * parent count).
+ */
+async function gitParentCount(cwd: string, commitSha: string): Promise<GitResult<number>> {
+  return git(cwd, ["rev-list", "--parents", "-n", "1", commitSha], (out) => {
+    const tokens = out.trim().split(/\s+/).filter(Boolean);
+    if (tokens.length === 0) throw new Error("empty rev-list output");
+    return tokens.length - 1;
+  });
+}
+
+/**
+ * T-474 (AM3, codex round 1 finding #1): a merge commit's tree id fully
+ * captures its resulting content but not its ancestry -- a commit sharing
+ * the approved first parent and tree id could carry arbitrary additional
+ * parents and still satisfy the same pin. v1 refuses merge commits entirely
+ * rather than extending the pin's identity shape post-ratification: the same
+ * posture as `refuseUnlessSha1` -- an unsupported commit shape is a NAMED
+ * hard block, never a silent degradation. The autonomous FINALIZE flow never
+ * produces a merge commit, so one appearing at a duet-gated commit is itself
+ * a signal worth stopping on, not accommodating.
+ */
+async function refuseIfMergeCommit(cwd: string, commitSha: string): Promise<{ ok: false; reason: string; message: string } | null> {
+  const count = await gitParentCount(cwd, commitSha);
+  if (!count.ok) return count;
+  if (count.data > 1) {
+    return {
+      ok: false,
+      reason: "merge_commit_unsupported",
+      message: `commit ${commitSha.slice(0, 12)} has ${count.data} parents -- merge commits are not supported by the pre-commit ack gate (v1); escalate to the pen`,
+    };
+  }
+  return null;
+}
+
+/**
+ * T-474 (D2): the committed commit's direct git parent. `ok: false` covers a
+ * root commit (no parent), a merge commit (v1-unsupported, AM3), an
+ * unresolvable sha, an unsupported (non-sha1) object format, or a git
+ * process failure -- never a thrown exception, never a silently-absent or
+ * silently-partial value treated as a matchable pin.
+ */
+export async function gitParentOf(cwd: string, commitSha: string): Promise<GitResult<string>> {
+  const refusal = await refuseUnlessSha1(cwd);
+  if (refusal) return refusal;
+  if (!SAFE_REF.test(commitSha)) {
+    return { ok: false, reason: "git_error", message: "invalid ref format" };
+  }
+  const mergeRefusal = await refuseIfMergeCommit(cwd, commitSha);
+  if (mergeRefusal) return mergeRefusal;
+  return git(cwd, ["rev-parse", `${commitSha}^`], (out) => out.trim());
+}
+
+/**
+ * T-474 (D2): the committed commit's own tree object id, read directly from
+ * the commit object -- no diff computation at all. Refuses a sha256 object
+ * format (v1 constraint, R1-FIX 12) and a merge commit (v1 constraint, AM3)
+ * for the same reason `gitParentOf` does: called standalone, this must not
+ * be the caller's only line of defense against either unsupported shape.
+ */
+export async function gitTreeOf(cwd: string, commitSha: string): Promise<GitResult<string>> {
+  const refusal = await refuseUnlessSha1(cwd);
+  if (refusal) return refusal;
+  if (!SAFE_REF.test(commitSha)) {
+    return { ok: false, reason: "git_error", message: "invalid ref format" };
+  }
+  const mergeRefusal = await refuseIfMergeCommit(cwd, commitSha);
+  if (mergeRefusal) return mergeRefusal;
+  return git(cwd, ["rev-parse", `${commitSha}^{tree}`], (out) => out.trim());
 }
 
 // ---------------------------------------------------------------------------

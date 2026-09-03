@@ -51,8 +51,8 @@ export const COMMANDS: readonly CommandEntry[] = [
   {
     name: "ticket update",
     description: "Update a ticket",
-    usage: "storybloq ticket update <id> [--status <s>] [--title <t>] [--type <type>] [--phase <p>] [--order <n>] [--description <d>] [--blocked-by <ids>] [--parent-ticket <id>] [--format json|md]",
-    flags: ["--status", "--title", "--type", "--phase", "--order", "--description", "--blocked-by", "--parent-ticket"],
+    usage: "storybloq ticket update <id> [--status <s>] [--title <t>] [--type <type>] [--phase <p>] [--order <n>] [--description <d>] [--blocked-by <ids>] [--parent-ticket <id>] [--force] [--format json|md]",
+    flags: ["--status", "--title", "--type", "--phase", "--order", "--description", "--blocked-by", "--parent-ticket", "--force"],
   },
   {
     name: "ticket meta",
@@ -288,10 +288,16 @@ export const COMMANDS: readonly CommandEntry[] = [
     flags: ["--session", "--format"],
   },
   {
+    name: "limit-status",
+    description: "Show pending usage-limit auto-resumes (global across projects); cancel or requeue records",
+    usage: "storybloq limit-status [--cancel <key>] [--requeue <key>] [--recent] [--format json|md]",
+    flags: ["--cancel", "--requeue", "--recent", "--format"],
+  },
+  {
     name: "setup",
     description: "Install Storybloq skill, MCP, and hooks for Claude, Codex, or both",
-    usage: "storybloq setup [--client claude|codex|all] [--skip-hooks]",
-    flags: ["--client", "--skip-hooks"],
+    usage: "storybloq setup [--client claude|codex|all] [--skip-hooks] [--skip-skill]",
+    flags: ["--client", "--skip-hooks", "--skip-skill"],
   },
   {
     name: "setup-skill",
@@ -389,13 +395,26 @@ export const COMMANDS: readonly CommandEntry[] = [
   },
   {
     name: "bus init",
-    description: "Enable the local Storybloq Bus",
+    description: "Low-level initializer: enable the local Storybloq Bus v2 for this project (prefer `storybloq bus setup`). Initializes a fresh v2 runtime only; if a v1 runtime is present it refuses with `upgrade_required` and directs you to `storybloq bus setup`, which resolves this task's identity and runs the guided drain/upgrade.",
     usage: "storybloq bus init [--format json|md]",
+    flags: [],
+  },
+  {
+    name: "bus setup",
+    description: "Connect this task to the Storybloq Bus in one idempotent, resumable command. Initializes or upgrades the runtime, joins this task's endpoint, and (when hook delivery is enabled) enables this client's guarded on-boundary hooks. With one endpoint it ends with a handoff line inviting the other task to connect. --replace <endpoint-id> retires a proven-offline incumbent and takes its place, redelivering that endpoint's undelivered mail to this successor. --force-archive overrides unread noncritical v1 delivery only during a v1->v2 upgrade; it never bypasses ship-gate blockers (unacknowledged critical messages, parked unresolved critical threads, quarantined threads).",
+    usage: "storybloq bus setup [--client claude|codex] [--task-id <id>] [--surface claude_cli|codex_cli|codex_desktop] [--delivery live|poll] [--replace <endpoint-id>] [--force-archive] [--format json|md]",
+    flags: ["--client", "--task-id", "--surface", "--delivery", "--replace", "--force-archive"],
+  },
+  {
+    name: "bus auto-attach",
+    description: "Turn per-session Bus auto-attach on or off for this project (opt-in, default off). `on` runs the full `bus setup` bootstrap once (initializing the runtime, joining this task, and installing the global client hooks) and sets the opt-in flag; thereafter every new session auto-attaches at SessionStart with its on-boundary delivery tiers enabled, no command, and a session that finds a proven-dead peer reclaims its slot and inherits its undelivered mail. `off` clears the flag and leaves the runtime and existing endpoints in place.",
+    usage: "storybloq bus auto-attach <on|off> [--client claude|codex] [--task-id <id>] [--surface claude_cli|codex_cli|codex_desktop] [--force-archive] [--format json|md]",
+    flags: ["--client", "--task-id", "--surface", "--force-archive"],
   },
   {
     name: "bus join",
-    description: "Bind the current client task to one exclusive Bus role",
-    usage: "storybloq bus join implementer|reviewer [--client claude|codex] [--task-id <id>] [--surface <surface>] [--replace] [--format json|md]",
+    description: "Deprecated: roles are now per-message, so the legacy role argument is ignored. Use `storybloq bus setup`.",
+    usage: "storybloq bus join [legacy-role] [--client claude|codex] [--task-id <id>] [--surface <surface>] [--replace <endpoint-id>] [--format json|md]",
     flags: ["--client", "--task-id", "--surface", "--replace"],
   },
   {
@@ -411,14 +430,15 @@ export const COMMANDS: readonly CommandEntry[] = [
   },
   {
     name: "bus send",
-    description: "Create a Bus thread or send a reply",
-    usage: "storybloq bus send --to <role> --kind <kind> --body <text> --idempotency-key <key> [--thread <id>] [--thread-kind <kind>] [--issue <id>] [--ticket <id>] [--commit <sha>] [--ci-run <id>] [--file <path>] [--format json|md]",
-    flags: ["--to", "--kind", "--body", "--idempotency-key", "--thread", "--thread-kind", "--issue", "--ticket", "--commit", "--ci-run", "--file"],
+    description: "Create a Bus thread or send a reply. Routing always targets the sole peer; `--to` is deprecated and ignored.",
+    usage: "storybloq bus send --kind <kind> --body <text> --idempotency-key <key> [--to <role>] [--thread <id>] [--thread-kind <kind>] [--issue <id>] [--ticket <id>] [--commit <sha>] [--ci-run <id>] [--file <path>] [--format json|md]",
+    flags: ["--kind", "--body", "--idempotency-key", "--to", "--thread", "--thread-kind", "--issue", "--ticket", "--commit", "--ci-run", "--file"],
   },
   {
     name: "bus poll",
-    description: "Poll unacknowledged messages for the task-bound endpoint",
-    usage: "storybloq bus poll [--endpoint <id>] [--client claude|codex] [--task-id <id>] [--limit N] [--format json|md]",
+    description: "Poll unacknowledged messages for the task-bound endpoint. --limit bounds how many messages are returned (applies to the wait drain too). With --wait, block until a message arrives or --timeout elapses (v2 only), then exit: 0 = message delivered, 4 = timed out, 5 = another --wait already owns this endpoint.",
+    usage: "storybloq bus poll [--endpoint <id>] [--client claude|codex] [--task-id <id>] [--limit N] [--wait] [--timeout <seconds>] [--format json|md]",
+    flags: ["--wait", "--timeout"],
   },
   {
     name: "bus ack",
@@ -433,7 +453,7 @@ export const COMMANDS: readonly CommandEntry[] = [
   },
   {
     name: "bus hooks",
-    description: "Enable or disable guarded live Bus delivery for this project",
+    description: "Enable or disable guarded on-boundary Bus delivery for this project",
     usage: "storybloq bus hooks enable|disable [--client claude|codex|all] [--format json|md]",
     flags: ["--client"],
   },
@@ -478,7 +498,7 @@ export const COMMANDS: readonly CommandEntry[] = [
 ];
 
 export const MCP_TOOLS: readonly McpToolEntry[] = [
-  { name: "storybloq_status", description: "Project summary: phase statuses, ticket/issue counts, blockers. Markdown is the default; JSON includes full active/resumable session ownership and lease metadata.", params: ["format?"] },
+  { name: "storybloq_status", description: "Project summary: phase statuses, ticket/issue counts, blockers. Markdown is the default; JSON includes full active/resumable session ownership and lease metadata. clientTaskId (T-477) also enriches this session's own arrangementPresence/ownerIdentity onto its presence record as a side effect; omit to inherit the environment identity, same as storybloq_session_guard.", params: ["format?", "clientTaskId?"] },
   { name: "storybloq_phase_list", description: "All phases with derived status" },
   { name: "storybloq_phase_current", description: "First non-complete phase" },
   { name: "storybloq_phase_tickets", description: "Leaf tickets for a specific phase", params: ["phaseId"] },
@@ -505,7 +525,7 @@ export const MCP_TOOLS: readonly McpToolEntry[] = [
   { name: "storybloq_note_create", description: "Create note", params: ["content", "title?", "tags?"] },
   { name: "storybloq_note_update", description: "Update note", params: ["id", "content?", "title?", "tags?", "status?"] },
   { name: "storybloq_ticket_create", description: "Create ticket", params: ["title", "type", "phase?", "description?", "blockedBy?", "parentTicket?"] },
-  { name: "storybloq_ticket_update", description: "Update ticket", params: ["id", "status?", "title?", "type?", "order?", "description?", "phase?", "parentTicket?", "blockedBy?"] },
+  { name: "storybloq_ticket_update", description: "Update ticket", params: ["id", "status?", "title?", "type?", "order?", "description?", "phase?", "parentTicket?", "blockedBy?", "force?"] },
   { name: "storybloq_ticket_meta_set", description: "Set custom passthrough metadata on a ticket", params: ["id", "path", "value"] },
   { name: "storybloq_ticket_meta_unset", description: "Unset custom passthrough metadata from a ticket", params: ["id", "path"] },
   { name: "storybloq_issue_create", description: "Create issue with optional durable review provenance and retry deduplication", params: ["title", "severity", "impact", "components?", "relatedTickets?", "location?", "sourceRefs?", "dedupeKey?", "createdBy?", "phase?"] },
@@ -523,11 +543,14 @@ export const MCP_TOOLS: readonly McpToolEntry[] = [
   { name: "storybloq_review_lenses_prepare", description: "Prepare multi-lens review on @storybloq/lenses: activation, secrets gate, context packaging, complete lens prompts", params: ["stage", "diff", "changedFiles", "ticketDescription?", "reviewRound?", "priorDeferrals?", "sessionId?"] },
   { name: "storybloq_review_lenses_synthesize", description: "Run the @storybloq/lenses merger pipeline programmatically over raw lens outputs; returns the ReviewVerdict envelope (no merger agent)", params: ["stage?", "lensResults", "activeLenses", "skippedLenses", "reviewRound?", "reviewId?", "diff?", "changedFiles?", "sessionId?"] },
   { name: "storybloq_review_lenses_judge", description: "Deterministic three-value verdict mapping over the synthesize ReviewVerdict plus convergence history (no judge agent)", params: ["reviewVerdict", "convergenceHistory?"] },
-  { name: "storybloq_autonomous_guide", description: "Autonomous session orchestrator -- call at every decision point to drive PICK_TICKET through COMPLETE", params: ["sessionId?", "action", "mode?", "ticketId?", "clientTaskId?", "takeover?"] },
+  { name: "storybloq_autonomous_guide", description: "Autonomous session orchestrator -- call at every decision point to drive PICK_TICKET through COMPLETE", params: ["sessionId?", "action", "mode?", "ticketId?", "clientTaskId?", "takeover?", "reviewEffort?"] },
+  { name: "storybloq_session_guard", description: "Session ownership verdict: is anything running, and may I write? Reads only .story/sessions/, no ledger load. Also registered in degraded mode", params: ["clientTaskId?"] },
+  { name: "storybloq_session_milestone", description: "Report a self-described work milestone (implementing/gate-hold/blocked-external/reviewing) onto this session's own presence record, for duet/arrangement visibility. Self-reported, never a computed verdict. gateName is required when kind is gate-hold. On lock contention or write failure, returns an explicit machine-readable retryable error rather than a false success.", params: ["kind", "gateName?", "note?", "clientTaskId?"] },
   { name: "storybloq_session_report", description: "Structured analysis of an autonomous session (works even if project state is corrupted)", params: ["sessionId"] },
   { name: "storybloq_register_subprocess", description: "Register a running subprocess so monitors can tell slow builds from hung agents", params: ["pid", "cmd", "category?", "sessionId?"] },
   { name: "storybloq_unregister_subprocess", description: "Unregister a subprocess after it completes (idempotent)", params: ["pid", "sessionId?"] },
-  { name: "storybloq_bus_send", description: "Send a task-bound advisory peer message", params: ["endpointId", "clientTaskId", "threadId?", "threadKind?", "predecessorThreadId?", "toRole", "messageKind", "severity", "body", "refs?", "inReplyTo?", "idempotencyKey"] },
+  { name: "storybloq_bus_send", description: "Send a task-bound advisory peer message; routes to the sole peer (toRole is deprecated, optional, and ignored)", params: ["endpointId", "clientTaskId", "threadId?", "threadKind?", "predecessorThreadId?", "toRole?", "messageKind", "severity", "body", "refs?", "inReplyTo?", "idempotencyKey"] },
+  { name: "storybloq_bus_redeliver", description: "Redeliver a hop-cap-parked, never-dropped message onto a fresh successor thread; content is always the resolved refused artifact, never caller-supplied", params: ["endpointId", "clientTaskId", "predecessorThreadId", "refusedEntryHash"] },
   { name: "storybloq_bus_poll", description: "Poll a task-bound endpoint mailbox with peer-authority envelopes", params: ["endpointId", "clientTaskId", "limit?"] },
   { name: "storybloq_bus_ack", description: "Record delivery disposition without resolving canonical work", params: ["endpointId", "clientTaskId", "messageId", "disposition", "reason?"] },
   { name: "storybloq_bus_thread_get", description: "Read a participant thread's verified prefix and folded state", params: ["endpointId", "clientTaskId", "threadId"] },

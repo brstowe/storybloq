@@ -130,7 +130,7 @@ describe("recommend", () => {
     expect(action!.reason).toContain("validation error");
   });
 
-  it("dedup keeps highest score — in-progress ticket also in phase_momentum", () => {
+  it("dedup keeps highest score -- in-progress ticket also in phase_momentum", () => {
     // Single in-progress ticket is both inprogress_ticket (800) and phase_momentum (500)
     const state = makeState({
       tickets: [
@@ -389,7 +389,7 @@ describe("recommend", () => {
     // Construct two recommendations that end up with identical scores.
     // phase_momentum gives exactly 500. A quick_win chore at index 0 gives 400.
     // These don't collide, so use a different approach: verify final sort is stable.
-    // Two open medium issues get scores 300, 299 — different scores, ordered by index.
+    // Two open medium issues get scores 300, 299 -- different scores, ordered by index.
     // The generator sorts by severity desc then discoveredDate asc.
     // With same severity/date, array order determines index → score.
     const state = makeState({
@@ -590,6 +590,114 @@ describe("recommend", () => {
     const t1 = result.recommendations.find((r) => r.id === "T-001");
     // T-001 (open) should get boost from fallback, T-002 (inprogress) should not
     expect(t1!.reason).toContain("handover context");
+  });
+
+  // --- T-475 section 5: Layer 2 (advisory) earmark exclusion ---
+
+  const ASSIGNED_EARMARK = {
+    stage: "assigned" as const,
+    reservedBy: { client: "claude" as const, id: "pen-task-1" },
+    arrangementId: "a-0123456789abcdef",
+    since: "2026-08-28T00:00:00.000Z",
+    holderRole: "worker" as const,
+    holderSession: "11111111-1111-4111-8111-111111111111",
+  };
+
+  it("hides an OPEN earmarked critical issue from critical_issue", () => {
+    const state = makeState({
+      issues: [makeIssue({ id: "ISS-001", severity: "critical", status: "open", earmark: ASSIGNED_EARMARK })],
+    });
+    const result = recommend(state, 10);
+    expect(result.recommendations.find((r) => r.id === "ISS-001")).toBeUndefined();
+  });
+
+  it("never hides an INPROGRESS earmarked critical issue -- R5's normal worked state", () => {
+    const state = makeState({
+      issues: [makeIssue({ id: "ISS-001", severity: "critical", status: "inprogress", earmark: ASSIGNED_EARMARK })],
+    });
+    const result = recommend(state, 10);
+    expect(result.recommendations.find((r) => r.id === "ISS-001")).toBeDefined();
+  });
+
+  it("hides an OPEN earmarked medium/low issue from open_issue", () => {
+    const state = makeState({
+      issues: [makeIssue({ id: "ISS-001", severity: "medium", status: "open", earmark: ASSIGNED_EARMARK })],
+    });
+    const result = recommend(state, 10);
+    expect(result.recommendations.find((r) => r.id === "ISS-001")).toBeUndefined();
+  });
+
+  it("hides an OPEN earmarked chore from quick_win", () => {
+    const state = makeState({
+      tickets: [makeTicket({ id: "T-001", phase: "p1", status: "open", type: "chore", earmark: ASSIGNED_EARMARK })],
+      roadmap: makeRoadmap([makePhase({ id: "p1" })]),
+    });
+    const result = recommend(state, 10);
+    expect(result.recommendations.find((r) => r.id === "T-001")).toBeUndefined();
+  });
+
+  it("hides an OPEN earmarked ticket from high_impact_unblock", () => {
+    const state = makeState({
+      tickets: [
+        makeTicket({ id: "T-001", phase: "p1", status: "open", earmark: ASSIGNED_EARMARK }),
+        makeTicket({ id: "T-002", phase: "p1", status: "open", blockedBy: ["T-001"] }),
+        makeTicket({ id: "T-003", phase: "p1", status: "open", blockedBy: ["T-001"] }),
+      ],
+      roadmap: makeRoadmap([makePhase({ id: "p1" })]),
+    });
+    const result = recommend(state, 10);
+    expect(result.recommendations.find((r) => r.category === "high_impact_unblock" && r.id === "T-001")).toBeUndefined();
+  });
+
+  it("never hides an INPROGRESS earmarked ticket from inprogress_ticket", () => {
+    const state = makeState({
+      tickets: [makeTicket({ id: "T-001", phase: "p1", status: "inprogress", earmark: ASSIGNED_EARMARK })],
+      roadmap: makeRoadmap([makePhase({ id: "p1" })]),
+    });
+    const result = recommend(state, 10);
+    const rec = result.recommendations.find((r) => r.id === "T-001");
+    expect(rec).toBeDefined();
+    expect(rec!.category).toBe("inprogress_ticket");
+  });
+
+  it("applyHandoverBoost does not surface an OPEN earmarked ticket referenced in a handover (fresh-add branch)", () => {
+    const state = makeState({
+      tickets: [
+        makeTicket({ id: "T-001", phase: "p1", status: "open", earmark: ASSIGNED_EARMARK }),
+        makeTicket({ id: "T-002", phase: "p1", status: "open" }), // keeps the phase non-empty
+      ],
+      roadmap: makeRoadmap([makePhase({ id: "p1" })]),
+    });
+    const handover = "## What's Next\n- T-001: pick this back up\n";
+    const result = recommend(state, 10, { latestHandoverContent: handover });
+    const t1 = result.recommendations.find((r) => r.id === "T-001");
+    expect(t1).toBeUndefined();
+  });
+
+  it("applyHandoverBoost does not re-boost an OPEN earmarked ticket already listed by another generator (boost branch)", () => {
+    const state = makeState({
+      tickets: [makeTicket({ id: "T-001", phase: "p1", status: "open", type: "chore", earmark: ASSIGNED_EARMARK })],
+      roadmap: makeRoadmap([makePhase({ id: "p1" })]),
+    });
+    // T-001 would otherwise be a quick_win candidate -- already suppressed by
+    // notHiddenByEarmark before this ever reaches dedup, so no boost applies.
+    const handover = "## What's Next\n- T-001: pick this back up\n";
+    const result = recommend(state, 10, { latestHandoverContent: handover });
+    expect(result.recommendations.find((r) => r.id === "T-001")).toBeUndefined();
+  });
+
+  it("applyHandoverBoost still boosts an INPROGRESS earmarked ticket referenced in a handover", () => {
+    const state = makeState({
+      tickets: [makeTicket({ id: "T-001", phase: "p1", status: "inprogress", earmark: ASSIGNED_EARMARK })],
+      roadmap: makeRoadmap([makePhase({ id: "p1" })]),
+    });
+    const handover = "## What's Next\n- T-001: pick this back up\n";
+    const withHandover = recommend(state, 10, { latestHandoverContent: handover });
+    const without = recommend(state, 10);
+    const t1With = withHandover.recommendations.find((r) => r.id === "T-001");
+    const t1Without = without.recommendations.find((r) => r.id === "T-001");
+    expect(t1With).toBeDefined();
+    expect(t1With!.score).toBeGreaterThan(t1Without!.score);
   });
 
   // --- ISS-019: Debt trend detection ---

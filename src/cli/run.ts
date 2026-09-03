@@ -6,6 +6,7 @@ import { CliValidationError } from "./helpers.js";
 import { RefResolutionError } from "../core/ref-normalization.js";
 import type { OutputFormat } from "../models/types.js";
 import type { CommandContext, CommandResult, DeleteCommandContext } from "./types.js";
+import { transformForRawMode } from "./raw-mode.js";
 
 // Re-export types so existing test imports that reference run.ts still resolve.
 export type { CommandContext, CommandResult, DeleteCommandContext } from "./types.js";
@@ -16,7 +17,7 @@ process.stdout.on("error", (err: NodeJS.ErrnoException) => {
     process.exitCode = ExitCode.OK;
     return;
   }
-  // Other stdout errors — set exit code but don't crash
+  // Other stdout errors -- set exit code but don't crash
   process.exitCode = ExitCode.USER_ERROR;
 });
 
@@ -25,8 +26,11 @@ process.stdout.on("error", (err: NodeJS.ErrnoException) => {
  * Treats EPIPE as controlled termination (e.g. piping to head).
  */
 export function writeOutput(text: string): void {
+  // ISS-910: the single seam where --raw unwraps the standard JSON envelope
+  // (identity unless raw mode is active).
+  const finalText = transformForRawMode(text);
   try {
-    process.stdout.write(text + "\n");
+    process.stdout.write(finalText + "\n");
   } catch (err: unknown) {
     if ((err as NodeJS.ErrnoException).code === "EPIPE") {
       process.exitCode = ExitCode.OK;
@@ -34,6 +38,39 @@ export function writeOutput(text: string): void {
     }
     throw err;
   }
+}
+
+/**
+ * T-476 ruling #9 fix: `CommandResult.warnings` previously only flipped the
+ * exit code to PARTIAL -- the warning TEXT itself never reached the CLI
+ * output, so a corrupt ruling file was invisible short of re-running
+ * `storybloq validate`. `raw-mode.ts` already documents and tests a
+ * `{version, data, warnings}` JSON shape (`--raw is defined only for the
+ * standard {version, data} JSON envelope, but ... warnings` -- see its
+ * `transformForRawMode`), so this completes that pre-existing, forward-
+ * declared contract rather than inventing a new one: for JSON, `warnings` is
+ * injected as a sibling of `data`, never nested inside it, and only when the
+ * output is that exact standard envelope shape (an error envelope, or any
+ * other JSON shape, is left untouched -- never corrupt a shape this wasn't
+ * designed for). For markdown, the text is appended as a plain warning line.
+ */
+function applyHandlerWarnings(output: string, format: OutputFormat, warnings: readonly string[]): string {
+  if (warnings.length === 0) return output;
+  if (format !== "json") {
+    return `${output}\n\nWarning: ${warnings.join("; ")}`;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(output);
+  } catch {
+    return output;
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return output;
+  const keys = Object.keys(parsed as Record<string, unknown>).sort();
+  const isStandardEnvelope = (parsed as Record<string, unknown>).version === 1
+    && keys.length === 2 && keys[0] === "data" && keys[1] === "version";
+  if (!isStandardEnvelope) return output;
+  return JSON.stringify({ ...(parsed as Record<string, unknown>), warnings }, null, 2);
 }
 
 /** Returns true if any warnings are integrity-level (not cosmetic). */
@@ -70,11 +107,13 @@ export async function runReadCommand(
     const handoversDir = join(root, ".story", "handovers");
 
     const result = await handler({ state, warnings, root, handoversDir, format });
-    writeOutput(result.output);
+    writeOutput(applyHandlerWarnings(result.output, format, result.warnings ?? []));
 
     let exitCode = result.exitCode ?? ExitCode.OK;
-    // Upgrade to PARTIAL only for integrity warnings, not cosmetic
-    if (exitCode === ExitCode.OK && hasIntegrityWarnings(warnings)) {
+    // Upgrade to PARTIAL for integrity warnings OR handler-produced render
+    // warnings (T-476 ruling #9) -- never for cosmetic ones, and never
+    // overriding a handler's own non-OK exit code either way.
+    if (exitCode === ExitCode.OK && (hasIntegrityWarnings(warnings) || (result.warnings?.length ?? 0) > 0)) {
       exitCode = ExitCode.PARTIAL;
     }
     process.exitCode = exitCode;
@@ -112,10 +151,10 @@ export async function runReadCommandWithRoot(
     const handoversDir = join(explicitRoot, ".story", "handovers");
 
     const result = await handler({ state, warnings, root: explicitRoot, handoversDir, format });
-    writeOutput(result.output);
+    writeOutput(applyHandlerWarnings(result.output, format, result.warnings ?? []));
 
     let exitCode = result.exitCode ?? ExitCode.OK;
-    if (exitCode === ExitCode.OK && hasIntegrityWarnings(warnings)) {
+    if (exitCode === ExitCode.OK && (hasIntegrityWarnings(warnings) || (result.warnings?.length ?? 0) > 0)) {
       exitCode = ExitCode.PARTIAL;
     }
     process.exitCode = exitCode;

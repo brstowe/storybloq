@@ -1,7 +1,9 @@
 import { realpathSync } from "node:fs";
 import { z } from "zod";
 import { CLIENT_TASK_ID_PATTERN, type OwnerTask } from "./client-profile.js";
-import { CROCKFORD_CLASS } from "../models/types.js";
+import { CROCKFORD_CLASS, ArrangementIdSchema, TicketRefSchema } from "../models/types.js";
+import { ArrangementGateSchema } from "../models/arrangement.js";
+import type { ClaimEpoch } from "./claim-reconciliation.js";
 
 /** Combined ticket + issue ID regex for targetWork validation (sequential + canonical). ISS-703: canonical char class derived from CROCKFORD_CLASS. */
 export const TARGET_WORK_ID_REGEX = new RegExp(`^(T-\\d+[a-z]?|ISS-\\d+|t-${CROCKFORD_CLASS}{16}|i-${CROCKFORD_CLASS}{16})$`);
@@ -18,7 +20,7 @@ export const TARGET_WORK_INPUT_REGEX = new RegExp(`^(T-\\d+[a-z]?|ISS-\\d+|t-${C
  * ISS-556: Canonical dispositions for lens-review findings.
  * Used at the MCP input boundary AND in the persisted SessionStateSchema so
  * the write and read paths enforce the same vocabulary. Adding a value here
- * automatically widens both sides — no second file to update.
+ * automatically widens both sides -- no second file to update.
  */
 export const LENS_FINDING_DISPOSITIONS = ["open", "addressed", "contested", "deferred"] as const;
 export type LensFindingDisposition = typeof LENS_FINDING_DISPOSITIONS[number];
@@ -101,7 +103,7 @@ export type WorkflowState =
   | "SESSION_END";
 
 // ---------------------------------------------------------------------------
-// Claude status derivation — exhaustive mapping
+// Claude status derivation -- exhaustive mapping
 // ---------------------------------------------------------------------------
 
 export type ClaudeStatus = "working" | "idle" | "waiting" | "unknown";
@@ -147,12 +149,12 @@ export function deriveClaudeStatus(
 }
 
 // ---------------------------------------------------------------------------
-// Workspace ID — shared between hook-status (reader) and guide (writer)
+// Workspace ID -- shared between hook-status (reader) and guide (writer)
 // ---------------------------------------------------------------------------
 
 /**
  * Derives a stable workspace ID from the project root path.
- * Uses realpathSync to resolve symlinks — deterministic across sessions.
+ * Uses realpathSync to resolve symlinks -- deterministic across sessions.
  * T-119 may extend to include branch/worktree info.
  *
  * @throws {Error} If projectRoot does not exist or is not readable (ENOENT, EACCES).
@@ -174,7 +176,7 @@ export interface CurrentIssueRef {
 }
 
 // ---------------------------------------------------------------------------
-// Session state — minimal shape that hook-status reads from state.json
+// Session state -- minimal shape that hook-status reads from state.json
 // ---------------------------------------------------------------------------
 
 export interface SessionState {
@@ -182,6 +184,28 @@ export interface SessionState {
   readonly state: WorkflowState | string;
   readonly waitingForRetry?: boolean;
   readonly lastGuideCall?: string;
+  /**
+   * PID of the MCP server process that made the last recorded MCP guide call
+   * (T-450). Its timestamp is `mcpGuideCallAt`, NOT `lastGuideCall`: the latter
+   * also advances on CLI refreshes that leave this pid alone.
+   *
+   * Its ONLY job is to invalidate a stale death marker. The alive sidecar is
+   * spawned by the MCP server and watches `process.ppid`, so it writes its
+   * death marker when the SERVER exits, which an ordinary MCP restart does
+   * while the owner task lives on. If this pid is still alive, a server that
+   * recently served this session is running and the marker cannot be trusted.
+   *
+   * PID reuse points the safe way here: a recycled pid reads as alive, which
+   * SUPPRESSES the takeover offer. That is why no signature check is needed.
+   */
+  readonly mcpServerPid?: number | null;
+  /**
+   * When `mcpServerPid` was stamped. Paired with it and written in the same
+   * update, because `lastGuideCall` also advances on CLI refreshes that leave
+   * the pid untouched; reading the pid against `lastGuideCall` would then
+   * describe two different calls as though they were one.
+   */
+  readonly mcpGuideCallAt?: string | null;
   readonly ticket?: {
     readonly id: string;
     readonly displayId?: string;
@@ -189,8 +213,30 @@ export interface SessionState {
     readonly risk?: string;
   };
   readonly currentIssue?: CurrentIssueRef | null;
+  /**
+   * T-442: proof of what this session actually claimed, minted at PLAN from the
+   * values written to the ticket. Reconciliation compares the ledger against
+   * this on every later guide call; absent means a pre-T-442 session, which
+   * reconciles to a no-op rather than to a conflict.
+   */
+  readonly claimEpoch?: ClaimEpoch | null;
   readonly completedTickets?: ReadonlyArray<{ readonly id: string; readonly displayId?: string }>;
   readonly resolvedIssues?: ReadonlyArray<string>;
+  /**
+   * ISS-982: append-only, per-commit attribution audit trail. Written in the
+   * SAME `writeState` call as each commit's `finalizeCheckpoint: "committed"`
+   * write, never replaced or cleared -- following the `completedTickets` /
+   * `resolvedIssues` per-item-accumulation precedent, since a bare top-level
+   * boolean would be silently overwritten every time FINALIZE runs for a
+   * later item in a multi-item session.
+   */
+  readonly commitAttributionAudits?: ReadonlyArray<{
+    readonly commitHash: string;
+    readonly itemKind: "ticket" | "issue" | "none";
+    readonly itemId: string | null;
+    readonly overrideRequested: boolean;
+    readonly at: string;
+  }>;
   readonly resolvedIssueDisplayIds?: Readonly<Record<string, string>>;
   readonly targetWorkDisplayIds?: Readonly<Record<string, string>>;
   readonly contextPressure?: {
@@ -249,7 +295,7 @@ export interface SessionState {
 }
 
 // ---------------------------------------------------------------------------
-// Status payload — written to .story/status.json by hook-status
+// Status payload -- written to .story/status.json by hook-status
 // ---------------------------------------------------------------------------
 
 export const CURRENT_STATUS_SCHEMA_VERSION = 1 as const;
@@ -364,6 +410,8 @@ export interface ReviewRecord {
   readonly majorCount: number;
   readonly suggestionCount: number;
   readonly codexSessionId?: string;
+  /** T-461: the effort level this round ran at. Absent on pre-dial records. */
+  readonly effort?: string;
   readonly timestamp: string;
 }
 
@@ -400,14 +448,240 @@ export interface GitBaseline {
 // Pending project mutation (cross-domain consistency)
 // ---------------------------------------------------------------------------
 
+/**
+ * Presence-preserving snapshot of one field.
+ *
+ * `{ present: false }` and `{ present: true, value: "" }` are different
+ * observations and produce different replay decisions. Collapsing absence to
+ * `undefined` would also make "the field was absent" indistinguishable from
+ * "no snapshot was recorded", which is the difference between a replayable
+ * record and a legacy one.
+ */
+export type FieldSnapshot =
+  | { readonly present: false }
+  | { readonly present: true; readonly value: string };
+
+/**
+ * Who prepared a pending mutation, and against what.
+ *
+ * Recorded where the artifact is PREPARED rather than derived at recovery
+ * time. A record without a structurally valid provenance object is legacy and
+ * quarantines in every state: recovery authorizes a write, and an authority
+ * reconstructed from the record it is authorizing is not an authority (L-038).
+ */
+export interface MutationProvenance {
+  /** Creating owner task. Null when the client supplied no task identity. */
+  readonly ownerTask: string | null;
+  /** Session revision at prepare time. */
+  readonly revision: number;
+  /** Ticket id where the variant is ticket-scoped; null where it is not. */
+  readonly ticket: string | null;
+}
+
+interface PendingMutationCommon {
+  readonly transitionId: string;
+  readonly provenance?: MutationProvenance;
+}
+
+/**
+ * Ticket identities produced BY THE RESOLVER, over a real project state.
+ *
+ * The brand states the claim; a runtime registry enforces it, because a type
+ * cannot survive a cast. Only `resolvePayloadTicketIdentities` produces a
+ * registered value, so a caller cannot satisfy this by handing back the same
+ * list it was asked to authenticate, which is exactly the self-confirming
+ * guard the check exists to prevent (L-038).
+ */
+export type ResolvedTicketIdentities = readonly string[] & {
+  readonly __resolvedTicketIdentities: unique symbol;
+};
+
+/**
+ * A ticket identity that has been PROVEN canonical, not merely assumed to be.
+ *
+ * Canonical means "what the resolver returns for it", in EITHER form the ledger
+ * uses: a legacy ticket's canonical id is its display-form value (`T-001`) and
+ * a post-migration ticket's is a hash (`t-...`). Both are canonical, and a rule
+ * that read one syntax as canonical would quarantine every create linked to the
+ * other.
+ *
+ * So the proof is provenance, not spelling. Minted only by
+ * `asCanonicalTicketIdentities`, which requires the stored set to agree with a
+ * `ResolvedTicketIdentities` that a resolver actually produced. A preparer
+ * writing a display ALIAS -- a spelling that resolves to something else -- gets
+ * a disagreement rather than a record that replays, gets its references
+ * rewritten by the create, and can then no longer recognize its own result.
+ */
+export type CanonicalTicketIdentity = string & {
+  readonly __canonicalTicketIdentity: unique symbol;
+};
+
+/**
+ * A digest produced by `issueCreateFingerprint`, and by nothing else.
+ *
+ * Branded so a preparer writing `satisfies PendingProjectMutation` cannot
+ * store an arbitrary string, or a whole-entity digest, where the semantic
+ * projection belongs. Persisted JSON loses the brand, so the classifier also
+ * re-derives the value at runtime; the brand stops the mistake being written,
+ * the runtime check stops it being believed.
+ */
+export type IssueCreateSemanticFingerprint = string & {
+  readonly __issueCreateSemantic: unique symbol;
+};
+
+/**
+ * The create input a replay would actually submit.
+ *
+ * Typed rather than `unknown`, and shared by the preparer, the classifier and
+ * the eventual replay consumer, because a replay verdict is a promise that the
+ * operation can be executed. An `unknown` payload lets a number, a string or an
+ * array satisfy "a payload is present" while no create can be performed from
+ * it. Mirrors the required arguments of `handleIssueCreate`; legacy records
+ * stay representable through the OPTIONAL `content`, never through an
+ * unvalidated payload.
+ */
+export interface PendingIssueCreatePayload {
+  readonly title: string;
+  readonly severity: string;
+  readonly impact: string;
+  readonly components: readonly string[];
+  /**
+   * CANONICAL ticket identities, resolved at preparation time.
+   *
+   * Not the spellings a caller happened to use. The create resolves ticket
+   * references, so raw references and the written entity would hold different
+   * representations of the same relationship and could not be compared. Storing
+   * the resolved form is what makes the relationship comparable, and storing it
+   * ONCE is what stops the replay input and the identity prediction disagreeing:
+   * `handleIssueCreate` resolves canonical ids to themselves, so this one field
+   * is both what a replay writes and what a recognition compares.
+   */
+  readonly relatedTickets: readonly CanonicalTicketIdentity[];
+  readonly location: readonly string[];
+  /**
+   * REQUIRED, and the single canonical identity of an issue_create.
+   *
+   * It lives here rather than beside the record because a create can only be
+   * identified by something the create itself writes. Stored in two places it
+   * could disagree, and a replay would then produce an issue that its own
+   * record could never afterwards recognize.
+   */
+  readonly dedupeKey: string;
+  readonly phase?: string | null;
+}
+
+/**
+ * A field write that can be replayed, because the value to write is stored.
+ *
+ * `expectedCurrent` is the legacy three-way key and is still written and still
+ * read by the shipped recovery path. `preimage` / `postimage` are what the
+ * outcome table reads for the named field.
+ *
+ * BOTH whole-entity digests are stored, and both are load-bearing.
+ * `postimageFingerprint` corroborates a postimage match on targets that carry
+ * no transition nonce: the field value alone proves nothing, since anyone can
+ * write the same value. `preimageFingerprint` is what makes a REPLAY verdict
+ * safe to give. Corroboration is whole-entity, so replay has to be too: if some
+ * OTHER field drifted while the named one stayed at its preimage, replaying
+ * would produce an entity whose digest can never match the stored postimage,
+ * and this record would quarantine on its own result instead of clearing.
+ */
+interface PendingFieldWrite extends PendingMutationCommon {
+  readonly target: string;
+  readonly field: string;
+  readonly value: string;
+  readonly expectedCurrent?: string;
+  readonly preimage?: FieldSnapshot;
+  readonly postimage?: FieldSnapshot;
+  readonly preimageFingerprint?: string | null;
+  readonly postimageFingerprint?: string | null;
+}
+
+/**
+ * The pending-mutation record, as it is actually written.
+ *
+ * Two fields on `ticket_update` are undeclared in every build before this one
+ * even though the shipped recovery path reads both: `claimedBySession`, which
+ * it copies onto the replayed ticket, and `postMutation`, which drives the
+ * session transition after a successful replay. A union that omits what the
+ * code reads is a comment, not a type.
+ */
 export type PendingProjectMutation =
-  | { type: "ticket_update"; target: string; field: string; value: string; transitionId: string }
-  | { type: "ticket_recovery_write"; target: string; transitionId: string }
-  | { type: "ticket_recovery_clear"; target: string; transitionId: string }
-  | { type: "handover_create"; filename: string | null; transitionId: string }
-  | { type: "issue_create"; expectedId: string; transitionId: string }
-  | { type: "issue_update"; target: string; field: string; value: string; transitionId: string }
-  | { type: "snapshot_save"; filename: string | null; transitionId: string };
+  | (PendingFieldWrite & {
+      readonly type: "ticket_update";
+      readonly claimedBySession?: string;
+      readonly postMutation?: {
+        readonly nextSessionState?: string;
+        readonly terminationReason?: string;
+        readonly clearTicket?: boolean;
+      };
+    })
+  | (PendingFieldWrite & { readonly type: "ticket_recovery_write" })
+  | (PendingFieldWrite & { readonly type: "ticket_recovery_clear" })
+  | (PendingFieldWrite & { readonly type: "issue_update" })
+  | (PendingMutationCommon & {
+      readonly type: "issue_create";
+      /**
+       * Where the create was expected to land. A LOCATOR and an audit record,
+       * never the identity: `handleIssueCreate` allocates the next free id and
+       * cannot be aimed at a chosen one, so a display id is not something any
+       * replay can promise to produce. Identity is the payload's dedupe key.
+       */
+      readonly expectedId: string;
+      /**
+       * Canonical create content plus a stable dedupe key. Both are required
+       * for this variant to be replayable or recognizable: a display id can be
+       * occupied by unrelated content in this ledger, so identity alone would
+       * accept a foreign issue as this transaction's postimage.
+       *
+       * `payload` is the create input itself, kept because a replay has to
+       * write something and an id plus a digest is not something.
+       *
+       * `semanticFingerprint` is named apart from the whole-entity digests used
+       * elsewhere BECAUSE it must not be one. A create cannot be aimed, so the
+       * issue it produces carries an allocated id, order and dates no preparer
+       * could predict; a whole-entity digest taken beforehand could never match
+       * what was written, and the record would execute its own replay and then
+       * fail to recognize the result. Produce it only with
+       * `issueCreateFingerprint`.
+       */
+      readonly content?: {
+        readonly payload: PendingIssueCreatePayload;
+        readonly semanticFingerprint: IssueCreateSemanticFingerprint;
+      };
+    })
+  | (PendingMutationCommon & {
+      readonly type: "handover_create";
+      readonly filename: string | null;
+      /**
+       * These two variants store a filename, never a body. They are therefore
+       * recognizable or quarantined, never replayable: rewriting one would
+       * have to invent the content, which fabricates a record.
+       */
+      readonly contentFingerprint?: string;
+    })
+  | (PendingMutationCommon & {
+      readonly type: "snapshot_save";
+      readonly filename: string | null;
+      readonly contentFingerprint?: string;
+    });
+
+/**
+ * A pending mutation that could not be safely replayed or confirmed applied.
+ *
+ * Durable, because the alternative to keeping it is dropping authorized work
+ * silently. Carries the original payload verbatim so the record stays readable
+ * after the schema moves on.
+ */
+export interface QuarantinedMutation {
+  /** The record's `type`, or "unknown" when it had none. */
+  readonly kind: string;
+  readonly payload: unknown;
+  readonly reason: string;
+  readonly quarantinedAt: string;
+  /** The owner task the record was prepared by, when it recorded one. */
+  readonly displacedOwner: string | null;
+}
 
 // ---------------------------------------------------------------------------
 // Event entry (append-only JSONL in events.log)
@@ -424,12 +698,149 @@ export interface EventEntry {
 // Full session state (authoritative, written to state.json)
 // ---------------------------------------------------------------------------
 
+/**
+ * ISS-907: a hand-edit stores null where this build omits the field. For a
+ * declared-optional SCALAR the two forms are semantically identical, so both
+ * parse and reads see undefined for either -- otherwise one cosmetic null
+ * fails the whole state.json parse and the session becomes unreadable (the
+ * ISS-902 escalation class).
+ *
+ * Scalars only, and only ones declared `.optional()`:
+ * - Required fields keep rejecting null. A null `startedAt` is damage, not
+ *   skew, and forgiving it would conceal the difference.
+ * - Fields declared `.nullable()` keep their meaningful null. Wrapping one of
+ *   those here would destroy the null the field exists to carry, so the
+ *   parameter is CONSTRAINED to the three scalar classes rather than left as
+ *   ZodTypeAny -- a comment is not a guard. Verified: swapping any site to a
+ *   nullable, array, or object inner fails tsc with TS2345. The guard has to
+ *   live in the type because it cannot live in a test -- tsconfig excludes
+ *   `test`, so a `@ts-expect-error` probe there would never be compiled.
+ *   (The return type is also inferred rather than annotated: an annotation of
+ *   `z.output<T> | undefined` re-widens to include the null that
+ *   `?? undefined` just discarded, which type-checks clean and turns every
+ *   downstream `=== null` branch into dead code.)
+ * - Optional CONTAINERS (objects, arrays, records) stay `.optional()`: null
+ *   there is a shape corruption, not a scalar-presence question, and must
+ *   stay visible as one.
+ *
+ * Note this widens the READ only. Nothing in this build writes null to any of
+ * these fields, and a parsed state re-serializes without one.
+ */
+const forgiveNull = <T extends z.ZodString | z.ZodNumber | z.ZodBoolean>(inner: T) =>
+  // The cast is load-bearing, do not remove it. Calling `.nullish()` directly
+  // on a UNION-constrained generic resolves the method against the whole
+  // union, so `z.output<T>` comes back as `string | number | boolean` for
+  // every field and 67 call sites across the stages stop type-checking.
+  // Casting to the single-parameter `ZodType<z.output<T>>` keeps the
+  // constraint (misuse is still TS2345 at the call) while restoring precise
+  // per-field inference.
+  (inner as z.ZodType<z.output<T>>).nullish().transform((v) => v ?? undefined);
+
+/**
+ * ISS-918: `codexUnavailable` and `codexUnavailableSince` are read as a PAIR
+ * (review-depth.ts: `timestamp ? withinTTL(timestamp) : !!boolean`). The
+ * timestamp carries the TTL; the boolean is a pre-ISS-110 shim that nothing
+ * ever clears. So the boolean WITHOUT a usable timestamp is the one
+ * combination that blocks codex forever.
+ *
+ * Forgiving null on the timestamp alone would let a CURRENT paired state
+ * normalize into that legacy sticky shape. The shape itself is not new -- it
+ * is exactly what a genuine pre-ISS-110 state looks like, and that one is
+ * still honored. What is new is reaching it from a state this build wrote,
+ * via the most natural hand-edit there is: clearing a stale timestamp to
+ * un-stick codex would instead stick it permanently, and silently.
+ *
+ * This runs on the RAW object, BEFORE per-field normalization, which is what
+ * makes the fix possible without touching ISS-098's semantics: at this point
+ * an EXPLICIT null is still distinguishable from a legacy ABSENT field. Only
+ * the explicit null clears the flag. A genuine pre-ISS-110 state (boolean
+ * present, timestamp never written) keeps its sticky block exactly as before.
+ *
+ * It is applied by `parseSessionState` rather than by wrapping the schema in
+ * `z.preprocess`, so that `SessionStateSchema` stays an exported ZodObject:
+ * the raw cross-field repair is centralized at the persisted-state read
+ * boundary instead of changing the schema's type. That boundary is the right
+ * seam regardless -- the threat model is a hand-edited FILE, and every
+ * production full-schema validation of persisted state goes through this
+ * function. (Raw or minimal readers, such as health telemetry, read the file
+ * without validating it and so do not pass through here.)
+ *
+ * The repair is deliberately NARROW. It fires only on an explicit null
+ * timestamp, and it clears only a flag that is literally `true`. Anything
+ * else -- false, null, or a malformed value -- is left for the schema to
+ * handle, because rewriting those would conceal corruption that should stay
+ * visible (a string `codexUnavailable` must still fail the parse and name
+ * itself, not be quietly normalized to false).
+ */
+function clearExplicitlyNulledCodexBlock(raw: unknown): unknown {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return raw;
+  const o = raw as Record<string, unknown>;
+  if (!Object.hasOwn(o, "codexUnavailableSince") || o.codexUnavailableSince !== null) return raw;
+  const next: Record<string, unknown> = { ...o, codexUnavailableSince: undefined };
+  // Only a genuine sticky flag is cleared. Absent stays absent, false stays
+  // false, and anything invalid stays invalid: this repairs one specific
+  // contradiction, it does not mint state and it does not launder damage.
+  if (o.codexUnavailable === true) next.codexUnavailable = false;
+  return next;
+}
+
+/** True for a non-empty string -- the type a genuine legacy field always carried. */
+function isNonEmptyString(v: unknown): v is string {
+  return typeof v === "string" && v.length > 0;
+}
+
+/**
+ * ISS-1049/ISS-1032 (T-470 B6): maps ONLY a genuine pre-rename
+ * `codeReviewRoundCounter` record (`{ticketId: <string>, completedRounds:
+ * <number>}`, no `workItemId`/`kind`) to `null` before validation runs.
+ *
+ * Deliberately narrower than a blanket `.catch(null)` on the wrapped object
+ * schema (codex round-1 finding), AND narrower than a bare key-presence check
+ * (codex round-3 finding): checking only that a `ticketId` KEY exists, with
+ * no `workItemId`/`kind`, still treats `{ticketId: 123, completedRounds:
+ * "corrupt"}` as safely legacy -- it has the right shape but the wrong types,
+ * which is corruption, not the pre-rename format. That would silently reset
+ * an in-progress ceiling round count exactly the way D1 forbids. Recognizing
+ * the VALUE types too means a same-shaped-but-corrupt record falls through to
+ * the current schema unchanged and fails the parse loudly instead.
+ */
+function preprocessLegacyRoundCounterShape(val: unknown): unknown {
+  if (val === null || typeof val !== "object" || Array.isArray(val)) return val;
+  const raw = val as Record<string, unknown>;
+  if ("workItemId" in raw || "kind" in raw) return val;
+  return isNonEmptyString(raw.ticketId) && typeof raw.completedRounds === "number" ? null : val;
+}
+
+/**
+ * Same reasoning as `preprocessLegacyRoundCounterShape` above, for
+ * `pendingCeilingEscalation`'s richer pre-rename shape: every REQUIRED legacy
+ * field's type is checked, not merely `ticketId`'s presence, so a truncated
+ * or type-corrupted record (a real codex round-3 example: a legacy-shaped
+ * object missing `reason` or carrying a non-numeric `round`) fails the parse
+ * loudly rather than silently degrading to "no pending escalation".
+ */
+function preprocessLegacyPendingEscalationShape(val: unknown): unknown {
+  if (val === null || typeof val !== "object" || Array.isArray(val)) return val;
+  const raw = val as Record<string, unknown>;
+  if ("workItemId" in raw || "kind" in raw) return val;
+  const legacyShaped =
+    isNonEmptyString(raw.ticketId) &&
+    typeof raw.round === "number" &&
+    typeof raw.ceiling === "number" &&
+    typeof raw.maxReviewRounds === "number" &&
+    typeof raw.reason === "string" &&
+    typeof raw.unresolvedCritical === "number" &&
+    typeof raw.unresolvedMajor === "number" &&
+    typeof raw.decidedAt === "string";
+  return legacyShaped ? null : val;
+}
+
 export const SessionStateSchema = z.object({
   schemaVersion: z.literal(CURRENT_SESSION_SCHEMA_VERSION),
   sessionId: z.string().uuid(),
   recipe: z.string(),
   state: z.string(),
-  previousState: z.string().optional(),
+  previousState: forgiveNull(z.string()),
   revision: z.number().int().min(0),
   status: z.enum(["active", "completed", "superseded"]).default("active"),
   mode: z.enum(["auto", "review", "plan", "guided"]).default("auto"),
@@ -437,13 +848,42 @@ export const SessionStateSchema = z.object({
   // Ticket in progress
   ticket: z.object({
     id: z.string(),
-    displayId: z.string().optional(),
+    displayId: forgiveNull(z.string()),
     title: z.string(),
-    risk: z.string().optional(),
-    realizedRisk: z.string().optional(),
+    risk: forgiveNull(z.string()),
+    realizedRisk: forgiveNull(z.string()),
     claimed: z.boolean().default(false),
-    lastPlanHash: z.string().optional(),
+    lastPlanHash: forgiveNull(z.string()),
+    // T-461: carried so the review-effort size mapping can read it.
+    // T-461 introduced this field for size mapping, so it carries the same
+    // catch as the other dial fields: a hand-edited non-string must cost the
+    // mapping (which then falls to standard), never the session.
+    type: forgiveNull(z.string()).catch(undefined),
   }).optional(),
+
+  // T-461: the current item's resolved review effort, and where it came from.
+  // Top-level rather than on the ticket projection because it must serve issue
+  // items too. Absent reads as "standard" everywhere, which is what keeps a
+  // session frozen before this feature behaving exactly as it did.
+  //
+  // Stored as a permissive string, NOT an enum, for the T-328 reason: this
+  // schema gates persisted session reads, so an enum here does not drop a
+  // corrupt value, it makes the whole session UNREADABLE and the resume fails.
+  // A dial field must never be able to cost someone their session. The value is
+  // normalized on read by effectiveReviewEffort, which fails closed to standard,
+  // so corruption costs today's review instead. The enum still guards the INPUT
+  // boundary (GuideInput.reviewEffort), where rejecting a bad value is correct.
+  //
+  // `.catch` on top of forgiveNull because the two forgive different things:
+  // forgiveNull admits a null, but a hand-edited `currentReviewEffort: 1` is
+  // still a type error that fails the whole parse. Both are corruption and
+  // neither may cost someone their session, so both land on undefined and the
+  // read-time normalizers resolve them to standard. NOTE: this is stricter than
+  // the ~67 other forgiveNull fields in this schema, which do still reject a
+  // type-mismatched value; that gap is pre-existing and filed separately rather
+  // than changed here under a dial ticket.
+  currentReviewEffort: forgiveNull(z.string()).catch(undefined),
+  currentReviewEffortSource: forgiveNull(z.string()).catch(undefined),
 
   // Review tracking
   reviews: z.object({
@@ -453,10 +893,15 @@ export const SessionStateSchema = z.object({
       verdict: z.string(),
       findingCount: z.number(),
       criticalCount: z.number(),
-      unresolvedCriticalCount: z.number().optional(),
+      unresolvedCriticalCount: forgiveNull(z.number()),
       majorCount: z.number(),
       suggestionCount: z.number(),
-      codexSessionId: z.string().optional(),
+      codexSessionId: forgiveNull(z.string()),
+      // T-461: the level this round actually ran at. A bare string, not an
+      // enum, for the reason branch-strategy.test.ts:13-15 records: an enum on
+      // a persisted field turns one unrecognized value into a session that
+      // cannot be read at all. Normalized on the way out, never on the way in.
+      effort: forgiveNull(z.string()).catch(undefined),
       timestamp: z.string(),
     })).default([]),
     code: z.array(z.object({
@@ -465,10 +910,12 @@ export const SessionStateSchema = z.object({
       verdict: z.string(),
       findingCount: z.number(),
       criticalCount: z.number(),
-      unresolvedCriticalCount: z.number().optional(),
+      unresolvedCriticalCount: forgiveNull(z.number()),
       majorCount: z.number(),
       suggestionCount: z.number(),
-      codexSessionId: z.string().optional(),
+      codexSessionId: forgiveNull(z.string()),
+      // T-461: see the plan array above for why this is a bare string.
+      effort: forgiveNull(z.string()).catch(undefined),
       timestamp: z.string(),
     })).default([]),
   }).default({ plan: [], code: [] }),
@@ -476,7 +923,7 @@ export const SessionStateSchema = z.object({
   // T-153: Current issue being fixed (null when working on a ticket)
   currentIssue: z.object({
     id: z.string(),
-    displayId: z.string().optional(),
+    displayId: forgiveNull(z.string()),
     title: z.string(),
     severity: z.string(),
   }).nullable().default(null),
@@ -484,19 +931,54 @@ export const SessionStateSchema = z.object({
   // T-153: Issues resolved this session
   resolvedIssues: z.array(z.string()).default([]),
 
+  // T-461: per-issue review effort, kept durably because currentReviewEffort is
+  // overwritten by the next pick. Without this an issue fixed at `off` would
+  // lose its disclosure the moment the session moved on.
+  // The `.catch` on the ARRAY is the important one. This field is pure audit:
+  // nothing resumes work from it, so a damaged container (a non-array, or an
+  // entry whose id is not a string) must cost the DISCLOSURE and never the
+  // session. Discarding the history is recoverable; refusing to load the
+  // session is not. Per-member catches below apply the same rule one level in.
+  resolvedIssuesMeta: z.array(z.object({
+    id: z.string(),
+    // `.catch` as well as forgiveNull: forgiveNull admits null but still
+    // rejects a number or an object, and a dial field must never be the reason
+    // a session cannot be read. See currentReviewEffort below for the full
+    // reasoning. The read side normalizes whatever survives.
+    reviewEffort: forgiveNull(z.string()).catch(undefined),
+    source: forgiveNull(z.string()).catch(undefined),
+  })).catch([]).default([]),
+
   // T-382: Cached display IDs for resolved issues (canonical -> display)
   resolvedIssueDisplayIds: z.record(z.string()).default({}),
 
   // Completed tickets this session
   completedTickets: z.array(z.object({
     id: z.string(),
-    displayId: z.string().optional(),
-    title: z.string().optional(),
-    commitHash: z.string().optional(),
-    risk: z.string().optional(),
-    realizedRisk: z.string().optional(),
-    startedAt: z.string().optional(),
-    completedAt: z.string().optional(),
+    displayId: forgiveNull(z.string()),
+    title: forgiveNull(z.string()),
+    commitHash: forgiveNull(z.string()),
+    risk: forgiveNull(z.string()),
+    realizedRisk: forgiveNull(z.string()),
+    startedAt: forgiveNull(z.string()),
+    completedAt: forgiveNull(z.string()),
+    // T-461: the level this item was reviewed at, kept per item because the
+    // top-level `currentReviewEffort` is overwritten by the next pick. Without
+    // it a session that ran one ticket at light and the next at standard would
+    // report only the last one's level.
+    reviewEffort: forgiveNull(z.string()).catch(undefined),
+  })).default([]),
+
+  // ISS-982: per-commit attribution audit trail (see interface docstring
+  // above). `.default([])` is load-bearing: a session written to disk before
+  // this field existed must still parse -- ISS-902's exact shape -- and the
+  // default is what supplies `[]` for a key absent from the input.
+  commitAttributionAudits: z.array(z.object({
+    commitHash: z.string(),
+    itemKind: z.enum(["ticket", "issue", "none"]),
+    itemId: z.string().nullable(),
+    overrideRequested: z.boolean(),
+    at: z.string(),
   })).default([]),
 
   // T-187: Per-ticket timing -- set when ticket is picked, cleared on commit
@@ -505,12 +987,77 @@ export const SessionStateSchema = z.object({
   // FINALIZE checkpoint
   finalizeCheckpoint: z.enum(["staged", "staged_override", "precommit_passed", "committed"]).nullable().default(null),
 
-  // Git state
+  /**
+   * T-450 step 7a: WHICH item the `committed` checkpoint committed.
+   *
+   * It exists because at that checkpoint nothing else can say. FinalizeStage
+   * clears the item identity in the SAME write that records `committed` --
+   * `currentIssue: null` for an issue, `ticket: undefined` for a ticket -- and
+   * the advance to COMPLETE happens after, so a process death in between leaves
+   * a legitimate session with neither field. Candidate takeover has to decide
+   * that session's authority, and every attempt to INFER the item from the
+   * surviving fields is unsound: `completedTickets[].commitHash` stores
+   * `normalizedHash` while `git.itemBaseHead` stores `fullHead`, and those
+   * differ whenever the accepted commit is an ancestor of HEAD rather than HEAD
+   * itself, at which point a residual rule reads a ticket completion as an older
+   * resolved issue. The session events cannot stand in either: they carry no
+   * revision, so in the very window this answers, the last `commit` event still
+   * belongs to the PREVIOUS item.
+   *
+   * INVARIANT: written only beside `finalizeCheckpoint: "committed"`, and nulled
+   * at every site that nulls `finalizeCheckpoint`. Clearing it at COMPLETE alone
+   * would not be enough -- a FINALIZE that resets its own checkpoint, or a
+   * HEAD-drift recovery that routes back to IMPLEMENT, would carry a stale item
+   * into later work, which is worse than having no field at all.
+   */
+  finalizedItem: z.discriminatedUnion("kind", [
+    z.object({
+      kind: z.literal("ticket"),
+      id: z.string().min(1),
+      commitHash: z.string().min(1),
+    }),
+    z.object({
+      kind: z.literal("issue"),
+      id: z.string().min(1),
+      commitHash: z.string().min(1),
+    }),
+    // The re-entry shape: FINALIZE reached `committed` with neither a ticket
+    // nor an issue to attribute. Recorded POSITIVELY rather than as null,
+    // because null is also how a state written before this field appears, and
+    // the legacy fallback then guesses from `completedTickets` /
+    // `resolvedIssues` -- which on a no-item commit would name an OLDER item
+    // and authorize a takeover against work this checkpoint is not about.
+    // Every newly written `committed` checkpoint carries a non-null value; null
+    // means legacy and nothing else.
+    z.object({
+      kind: z.literal("none"),
+      commitHash: z.string().min(1),
+    }),
+  ]).nullable().default(null),
+
+  // Git state.
+  //
+  // ISS-922: each of these four commits answers a DIFFERENT question, and
+  // they are not interchangeable. Conflating two of them closed every exit
+  // from FINALIZE and stranded a session with no supported recovery.
+  //
+  // - initHead      HEAD at session start. Never mutated.
+  // - mergeBase     Diff base for the current item's review. NOT a
+  //                 finalization baseline: it starts as the fork point from
+  //                 main, so on a feature branch it sits behind HEAD.
+  // - expectedHead  The last OBSERVED head, for resume drift detection ONLY.
+  //                 Park, resume-drift and checkout all advance it, which is
+  //                 correct for drift detection and wrong for anything else.
+  // - itemBaseHead  The commit from which the current item must produce a
+  //                 newly validated commit. Initialized at item pick, reset
+  //                 when drift invalidates the work/review epoch. The only
+  //                 field FINALIZE measures a work commit against.
   git: z.object({
     branch: z.string().nullable().default(null),
-    initHead: z.string().optional(),
+    initHead: forgiveNull(z.string()),
     mergeBase: z.string().nullable().default(null),
-    expectedHead: z.string().optional(),
+    expectedHead: forgiveNull(z.string()),
+    itemBaseHead: forgiveNull(z.string()),
     baseline: z.object({
       porcelain: z.array(z.string()).default([]),
       dirtyTrackedFiles: z.record(z.object({ blobHash: z.string() })).default({}),
@@ -525,7 +1072,7 @@ export const SessionStateSchema = z.object({
 
   // Lease
   lease: z.object({
-    workspaceId: z.string().optional(),
+    workspaceId: forgiveNull(z.string()),
     lastHeartbeat: z.string(),
     expiresAt: z.string(),
   }),
@@ -543,8 +1090,8 @@ export const SessionStateSchema = z.object({
     ticketsCompleted: z.number().default(0),
     compactionCount: z.number().default(0),
     eventsLogBytes: z.number().default(0),
-    workItemsAtLastCompaction: z.number().int().min(0).optional(),
-    eventsLogBytesAtLastCompaction: z.number().int().min(0).optional(),
+    workItemsAtLastCompaction: forgiveNull(z.number().int().min(0)),
+    eventsLogBytesAtLastCompaction: forgiveNull(z.number().int().min(0)),
   }).default({ level: "low", guideCallCount: 0, ticketsCompleted: 0, compactionCount: 0, eventsLogBytes: 0 }),
 
   // Persist why COMPLETE must rotate instead of selecting more work. This
@@ -560,6 +1107,28 @@ export const SessionStateSchema = z.object({
   // Pending project mutation (for crash recovery)
   pendingProjectMutation: z.any().nullable().default(null),
 
+  /**
+   * ISS-965: set when claimPreflightBlock terminalizes a session that observed
+   * its own consistent completion (status "complete", claim keys stripped).
+   * Marks the HANDOVER transition as ISS-965 terminal routing rather than an
+   * ordinary handover, so compaction/limit-parking preserve HANDOVER as the
+   * resume target instead of rewriting it to PICK_TICKET (session.ts) -- an
+   * ordinary handover still resumes at PICK_TICKET, unchanged. Discriminates
+   * on this marker ONLY, never on anything the agent can write directly.
+   */
+  terminalDisposition: z.object({
+    kind: z.literal("completion-observed"),
+    ticketId: z.string(),
+    observedAt: z.string(),
+  }).nullable().default(null),
+
+  // Pending mutations that recovery refused to replay or confirm. `z.any()`
+  // entries for the same reason `pendingProjectMutation` is: this array is an
+  // audit trail, and a strict inner schema would fail the whole state.json
+  // parse over one malformed entry, destroying the record it exists to keep
+  // (the ISS-902 escalation class). Shape is asserted at the write site.
+  quarantinedMutations: z.array(z.any()).default([]),
+
   // COMPACT resume
   resumeFromRevision: z.number().nullable().default(null),
   preCompactState: z.string().nullable().default(null),
@@ -567,6 +1136,21 @@ export const SessionStateSchema = z.object({
   compactPreparedAt: z.string().nullable().default(null),
   compactObservedAt: z.string().nullable().default(null),
   resumeBlocked: z.boolean().default(false),
+
+  // T-424: Usage-limit interruption. Rides the COMPACT lane; interruptionKind
+  // discriminates the two park reasons (absent = "compact" for back-compat).
+  // limitPermissionMode is the AUTHORITY for wake posture (written only under
+  // withSessionLock from the StopFailure hook payload, enum-validated) -- the
+  // global ledger is a work queue, never a posture source.
+  interruptionKind: z.enum(["compact", "limit"]).nullish(),
+  limitStopPending: z.boolean().default(false),
+  limitResumeAt: z.number().nullable().default(null),
+  // Closed set at the SCHEMA level, not just at write time: this field is the
+  // posture authority, so a hand-corrupted value must degrade to null (no
+  // flag, safest posture) rather than pass through as an arbitrary string.
+  // .catch(null) keeps a malformed value from bricking the whole session read.
+  limitPermissionMode: z.enum(["bypassPermissions", "acceptEdits", "default", "plan"]).nullable().catch(null).default(null),
+  limitEventId: z.string().nullable().default(null),
 
   // Last cumulative work boundary reserved for an automatic checkpoint handover.
   lastCheckpointWorkCount: z.number().int().min(0).default(0),
@@ -593,19 +1177,21 @@ export const SessionStateSchema = z.object({
 
   // Session metadata
   waitingForRetry: z.boolean().default(false),
-  lastGuideCall: z.string().optional(),
+  lastGuideCall: forgiveNull(z.string()),
+  mcpServerPid: z.number().int().positive().nullish(),
+  mcpGuideCallAt: forgiveNull(z.string()),
   startedAt: z.string(),
   guideCallCount: z.number().default(0),
 
   // ISS-098: Codex availability cache -- skip codex after failure
   // ISS-110: Changed from boolean to ISO timestamp with 10-minute TTL
-  codexUnavailable: z.boolean().optional(),
-  codexUnavailableSince: z.string().optional(),
+  codexUnavailable: forgiveNull(z.boolean()),
+  codexUnavailableSince: forgiveNull(z.string()),
 
   // Supersession tracking
-  supersededBy: z.string().optional(),
-  supersededSession: z.string().optional(),
-  stealReason: z.string().optional(),
+  supersededBy: forgiveNull(z.string()),
+  supersededSession: forgiveNull(z.string()),
+  stealReason: forgiveNull(z.string()),
 
   // Recipe overrides (maxTicketsPerSession: 0 = no limit)
   config: z.object({
@@ -657,7 +1243,7 @@ export const SessionStateSchema = z.object({
     severity: z.string(),
     disposition: z.enum(LENS_FINDING_DISPOSITIONS),
     description: z.string(),
-    dismissReason: z.string().optional(),
+    dismissReason: forgiveNull(z.string()),
     timestamp: z.string(),
   })).default([]),
 
@@ -686,22 +1272,87 @@ export const SessionStateSchema = z.object({
   writeTestsRetryCount: z.number().default(0),
   buildRetryCount: z.number().default(0),
   verifyRetryCount: z.number().default(0),
+  // ISS-912: bounded rebuild-and-re-run retries when TEST/VERIFY establish
+  // stale build artifacts before accepting a report. Nonnegative integers by
+  // schema: a negative value would satisfy `retries < MAX` forever and turn
+  // the bounded fail-open gate into a hard block, so a malformed counter
+  // fails the parse loudly and names itself (ISS-907 doctrine: a repair or a
+  // loose bound must not double as a corruption filter).
+  testFreshnessRetryCount: z.number().int().min(0).default(0),
+  verifyFreshnessRetryCount: z.number().int().min(0).default(0),
   verifyAutoDetected: z.boolean().default(false),
 
   // T-128: Resolved recipe (frozen at session start, survives compact/resume)
   resolvedPipeline: z.array(z.string()).optional(),
   resolvedPostComplete: z.array(z.string()).optional(),
-  resolvedRecipeId: z.string().optional(),
+  resolvedRecipeId: forgiveNull(z.string()),
   resolvedStages: z.record(z.record(z.unknown())).optional(),
-  resolvedDirtyFileHandling: z.string().optional(),
-  resolvedBranchStrategy: z.enum(["none", "per-ticket"]).default("none"),
+  resolvedDirtyFileHandling: forgiveNull(z.string()),
+  // T-328: this gates every session read through safeParse, so it accepts the
+  // full input set (including the legacy "none") and transforms to canonical.
+  // An un-widened enum here would not drop the field -- it would make a session
+  // that persisted a newer value unreadable.
+  resolvedBranchStrategy: z.enum(["current", "per-ticket", "main", "none"])
+    .default("current")
+    .transform((v) => (v === "none" ? "current" : v)),
+
+  // T-328: an open branch-mismatch episode. Persisted so the offer, its bounded
+  // failure count, and any write-ahead branch attempt all survive compaction
+  // and resume. Null whenever no episode is open.
+  pendingMismatch: z.object({
+    targetId: z.string(),
+    targetKind: z.enum(["ticket", "issue"]),
+    branch: z.string(),
+    controlFailures: z.number().default(0),
+    attempt: z.object({
+      name: z.string(),
+      baseOid: z.string(),
+      status: z.literal("planned"),
+    }).nullable().default(null),
+  }).nullable().default(null),
+
+  // T-328: items skipped at PICK_TICKET. Excluded from targeted remaining-work
+  // AND from untargeted candidate generation, so a skip is not undone by the
+  // next pass re-offering the same item.
+  skippedTargets: z.array(z.string()).default([]),
   resolvedDefaults: z.object({
     maxTicketsPerSession: z.number(),
     compactThreshold: z.string(),
     reviewBackends: z.array(z.string()),
     codexReviewBackends: z.array(z.string()).optional(),
-    handoverInterval: z.number().optional(),
+    handoverInterval: forgiveNull(z.number()),
   }).optional(),
+
+  // T-461: frozen at start alongside resolvedDefaults. Doubles as the marker
+  // that a session was created after the dial shipped: its ABSENCE is what
+  // keeps a legacy session on the pre-dial reviewer selection, which matters
+  // because legacy sessions persisted recipe stage backends that the stages
+  // of their era ignored.
+  //
+  // Every field inside is permissive for the same reason currentReviewEffort is:
+  // this schema gates persisted READS, so a required field here does not fail a
+  // corrupt marker gracefully, it makes the session unreadable and the resume
+  // dies. sessionEffortFromState resolves a marker missing its level (or
+  // carrying an unreadable one) to standard, and that recovery can only run if
+  // the parse lets the record through first. `.nullish()` rather than
+  // `.optional()` because a literal null must stay DISTINGUISHABLE from an
+  // absent key: absence is a pre-dial session, null is a post-dial record
+  // someone damaged, and only the first may be disclosed as `legacy`.
+  resolvedReviewEffort: z.object({
+    level: forgiveNull(z.string()),
+    source: forgiveNull(z.string()),
+    explicitKnobs: z.object({
+      codeReviewMaxRounds: forgiveNull(z.boolean()),
+      planReviewBackends: forgiveNull(z.boolean()),
+      codeReviewBackends: forgiveNull(z.boolean()),
+    }).catch({}).default({}),
+    // The CONTAINER gets the same treatment as its fields. Permissive fields
+    // inside a strict object still brick the session when the marker itself is
+    // damaged into a string or an array, which is the shape a partial write or
+    // a hand-edit produces just as easily as a missing field. An unusable
+    // container lands on null, which reads as a damaged marker (`unknown`)
+    // rather than as the absent key of a pre-dial session.
+  }).nullish().catch(null),
 
   // T-257: Verification counters (accumulated from telemetry JSONL)
   verificationCounters: z.object({
@@ -714,6 +1365,13 @@ export const SessionStateSchema = z.object({
 
   // Stuck-detection: consecutive retry count for cancel gate bypass
   stuckRetryCount: z.number().default(0),
+
+  // ISS-904: plan-gate rounds for the CURRENT ticket that did not approve,
+  // counted across rejects. A reject clears `reviews.plan`, so round numbers
+  // restart at 1 and the reject loop -- the exact shape that produced three
+  // hand-recorded campaign parks -- is invisible to any counter derived from
+  // review history. Reset when a ticket is picked, parked, or approved.
+  planGateNonApprovals: z.number().default(0),
 
   // T-260: Liveness infrastructure
   sidecarPid: z.number().nullish(),
@@ -740,11 +1398,17 @@ export const SessionStateSchema = z.object({
     verdict: z.string(),
     findingCount: z.number(),
     criticalCount: z.number(),
-    unresolvedCriticalCount: z.number().optional(),
+    unresolvedCriticalCount: forgiveNull(z.number()),
     majorCount: z.number(),
     suggestionCount: z.number(),
     durationMs: z.number(),
     summary: z.string(),
+    // T-461: without this key the Tier1 projection's `effort` is STRIPPED on
+    // every write -- a plain z.object drops what it does not declare -- so the
+    // artifact would carry the level and the session record a reader actually
+    // consults would not. Same trap as recipeOverrides.reviewEffort, which was
+    // dead for exactly this reason until an end-to-end test caught it.
+    effort: forgiveNull(z.string()).catch(undefined),
   }).nullish(),
   landingDecision: z.object({
     stage: z.string(),
@@ -759,6 +1423,285 @@ export const SessionStateSchema = z.object({
     }),
     timestamp: z.string(),
   }).nullable().default(null),
+  /**
+   * T-470: completed CODE_REVIEW rounds, KEYED BY TICKET.
+   *
+   * Not derived from `reviews.code.length`, which two separate paths clear:
+   * the plan-redirect branch writes `reviews: { plan: [], code: [] }` before
+   * returning, and `RECOVERY_MAPPING.CODE_REVIEW` resets both on any recovery
+   * out of CODE_REVIEW -- and in a session heading for sixty rounds,
+   * compaction is close to certain. Either would silently reset a ceiling read
+   * off that array.
+   *
+   * The id+kind pair makes the reset an IDENTITY INVARIANT rather than a
+   * convention some future call site can forget: recording a round resets the
+   * count when the id or the kind differs, and reading the ceiling accepts
+   * the count only when it matches the current work item. A legacy state
+   * without the field reads as zero.
+   *
+   * ISS-1049/ISS-1032: `ticketId` renamed to `workItemId` + a new `kind` field
+   * (a work item is now a ticket OR an issue). `preprocessLegacyRoundCounterShape`
+   * maps ONLY the known pre-rename shape (`{ ticketId, completedRounds }`, no
+   * `kind`, no `workItemId`) to `null` before validation runs, landing at the
+   * same safe restart-at-0 posture as the legacy-field-absent case above,
+   * proven against the real schema in the resume-across-upgrade test
+   * (T-470/ISS-1049 B8). Deliberately NOT a blanket `.catch(null)`: that would
+   * convert ANY parse failure to null, including a malformed CURRENT-format
+   * record (a typo'd `kind`, a corrupted `completedRounds`) -- silently
+   * discarding an in-progress ceiling round count rather than failing loud,
+   * which is exactly the fail-open shape D1 forbids everywhere else in this
+   * batch (codex round-1 finding).
+   */
+  codeReviewRoundCounter: z.preprocess(
+    preprocessLegacyRoundCounterShape,
+    z.object({
+      workItemId: z.string(),
+      kind: z.enum(["ticket", "issue"]),
+      completedRounds: z.number(),
+    }).nullable().default(null),
+  ),
+
+  /**
+   * T-470: a ceiling escalation that has been DECIDED but not finished.
+   *
+   * Persisting the ceiling round and filing its findings is not atomic. If
+   * filing partially fails the session correctly stays in CODE_REVIEW, and
+   * resubmitting the same report would otherwise be processed as ANOTHER
+   * completed round: counter incremented again, another artifact and event,
+   * the handover retried from a different round.
+   *
+   * The findings are QUEUED FIRST and then copied into this record with their
+   * fingerprints, so a lost decision leaves the durable queue intact for the
+   * ordinary drain rather than leaving a record whose findings never reached
+   * anything.
+   *
+   * So the decision is written with the round, and any later guide call
+   * RESUMES it -- finishing the filing, then transitioning -- without
+   * re-running normal round processing. It is MARKED COMPLETED, not deleted,
+   * once the issues and the transition are both durable -- the session report
+   * renders it, and a session that ended this way has to be able to say so. Same queue-then-drain shape as
+   * `pendingDeferrals`, not a new subsystem.
+   */
+  pendingCeilingEscalation: z.preprocess(preprocessLegacyPendingEscalationShape, z.object({
+    // ISS-1049/ISS-1032: `ticketId` renamed to `workItemId` + `kind`, same
+    // rationale and precise-preprocess safety as `codeReviewRoundCounter`
+    // above -- NOT a blanket `.catch(null)` (codex round-1 finding), and NOT
+    // a bare key-presence check either (codex round-3 finding).
+    workItemId: z.string(),
+    kind: z.enum(["ticket", "issue"]),
+    /**
+     * The item's DISPLAY id, carried on the record.
+     *
+     * The park clears the draft ticket before the transition, so by the time
+     * the session report renders there is nowhere else to read it from -- and a
+     * report that can only say `t-ce111n9000000001` when a person is looking
+     * for `T-901` is a worse answer for no reason. Optional because a legacy
+     * record predates it and the canonical id is still a correct fallback.
+     */
+    displayId: z.string().optional(),
+    round: z.number(),
+    ceiling: z.number(),
+    maxReviewRounds: z.number(),
+    reason: z.string(),
+    unresolvedCritical: z.number(),
+    unresolvedMajor: z.number(),
+    decidedAt: z.string(),
+    /**
+     * The outstanding findings this escalation exists to file.
+     *
+     * Copied here AFTER they are queued into `pendingDeferrals`, so a resume is
+     * self-contained: the resumed call carries no findings of its own and would
+     * otherwise park the item having filed none of the blockers that stopped
+     * it. The earlier queue write is the durable copy that survives a lost
+     * decision; this one is what lets the resume proceed without it.
+     */
+    findings: z.array(z.object({
+      severity: z.string(),
+      category: z.string(),
+      description: z.string(),
+    })).default([]),
+    /**
+     * Fingerprints of the findings THIS escalation is filing.
+     *
+     * Recorded because the session report has to name the issues it produced,
+     * and `filedDeferrals` is session-wide: it also holds deferrals filed
+     * earlier for unrelated reasons. Listing all of them under a "round
+     * ceiling" heading would attribute other work to this stop. Written at
+     * queue time rather than after the drain, so a resume after a partial
+     * filing still knows which findings belong here -- the resumed call carries
+     * no findings of its own.
+     */
+    fingerprints: z.array(z.string()).default([]),
+    /**
+     * Set once the filing AND the transition are both durable.
+     *
+     * The record is not deleted at that point, because it is the only place the
+     * session STATE says why it ended this way: the termination reason is
+     * generic and `landingDecision` is never rendered. Clearing it would remove
+     * the structured reason from state entirely, leaving the formatter unable
+     * to surface the single most consequential fact about the session without
+     * reconstructing it from the ceiling event or the item's park record.
+     * `resumeCeilingEscalation` ignores a completed record, so keeping it costs
+     * nothing.
+     */
+    completed: z.boolean().default(false),
+  }).nullable().default(null)),
+
+  /**
+   * ISS-598/ISS-1031: the ticket-scoped PLAN_REVIEW round counter.
+   *
+   * Advances on EVERY completed PLAN_REVIEW round, including one routed back
+   * to PLAN by a reject. `reviews.plan` is cleared on every reject, so a
+   * round number derived from it restarts at 1 -- this counter is what makes
+   * a reject/replan loop, not just a revise/revise loop, bounded by
+   * `planReviewHardCeiling`. Identity-scoped by ticketId, same invariant as
+   * `codeReviewRoundCounter`: a counter belonging to another ticket is not a
+   * smaller count, it is no count.
+   */
+  planReviewRoundCounter: z.object({
+    ticketId: z.string(),
+    completedRounds: z.number().int().nonnegative(),
+  }).nullable().default(null),
+
+  /**
+   * ISS-598/ISS-1031: a plan-review ceiling park that has been DECIDED but
+   * not finished, mirroring `pendingCeilingEscalation`'s crash-safety shape.
+   * `trigger` records which mechanism fired -- only "round-ceiling" is
+   * currently reachable as an automatic park; "scope-drift" is reserved for
+   * when the drift signal (currently advisory-only) is promoted to an
+   * automatic trigger.
+   */
+  pendingPlanCeilingEscalation: z.object({
+    ticketId: z.string(),
+    displayId: z.string().optional(),
+    round: z.number().int().nonnegative(),
+    ceiling: z.number().int().nonnegative(),
+    trigger: z.enum(["round-ceiling", "scope-drift"]),
+    reason: z.string(),
+    unresolvedCritical: z.number().int().nonnegative(),
+    unresolvedMajor: z.number().int().nonnegative(),
+    /** Present only when `trigger === "scope-drift"` (not yet reachable). */
+    driftFraction: z.number().min(0).max(1).optional(),
+    /**
+     * Whether the advisory drift signal would independently have fired for
+     * this same round, and at which round, even though drift itself never
+     * routes to park while it is advisory-only. Recorded so a round-ceiling
+     * park does not silently hide a drift signal that was present the whole
+     * time -- Gate-1 ratification condition (b).
+     */
+    driftWouldHaveFiredAtRound: z.number().int().nonnegative().optional(),
+    decidedAt: z.string(),
+    findings: z.array(z.object({
+      severity: z.string(),
+      category: z.string(),
+      description: z.string(),
+    })).default([]),
+    fingerprints: z.array(z.string()).default([]),
+    completed: z.boolean().default(false),
+  }).nullable().default(null),
+
+  /**
+   * ISS-598: the round-1 plan-text vocabulary for the CURRENT ticket, used by
+   * the scope-drift detector (plan-review-drift.ts) to tell whether a later
+   * finding's subject existed when review began. Captured once, at
+   * PLAN_REVIEW's first `enter()` for a ticket (re-captured on a later re-plan
+   * cycle for the same ticket, since a CODE_REVIEW redirect back to PLAN
+   * rewrites plan.md and resets `reviews.plan` to empty). `truncated` means
+   * extraction hit the scan-length or token cap while building this baseline
+   * -- when true, drift is disabled entirely for this ticket rather than run
+   * against known-incomplete data.
+   *
+   * `tokens` are SHA-256 digests (`hashToken` in plan-review-drift.ts), never
+   * raw plan-text substrings: plan.md is arbitrary project content and can
+   * legitimately contain secret-shaped values, which the identifier-shaped
+   * extraction cannot distinguish from ordinary vocabulary. Hashing prevents
+   * casual disclosure of a pasted secret through the session ledger; it does
+   * not make every digest irreversible, since a short, low-entropy token can
+   * still be recovered from its digest by dictionary or brute-force guessing.
+   *
+   * `planHash` is a SHA-256 digest of the FULL plan.md text at capture time
+   * (codex round 2, ISS-598): the generation identity this baseline belongs
+   * to. `ticketId` alone cannot distinguish "the same round-1 entry resumed
+   * after compaction" (same plan, must not recapture) from "a genuine re-plan
+   * for the same ticket" (different plan, must recapture) -- both leave
+   * `reviews.plan` empty. Comparing `planHash` against the current plan.md's
+   * digest resolves it: unchanged content skips the write entirely, and
+   * changed content replaces (or explicitly clears) the baseline.
+   */
+  planReviewBaseline: z.object({
+    ticketId: z.string(),
+    planHash: z.string().regex(/^[a-f0-9]{64}$/),
+    tokens: z.array(z.string().regex(/^[a-f0-9]{32}$/)).max(500),
+    truncated: z.boolean(),
+  }).nullable().default(null),
+
+  /**
+   * ISS-598: per-round fold-introduced-fraction history for the CURRENT
+   * ticket. A round with no signal-bearing findings contributes NO entry at
+   * all (not a zero), so `driftTriggered`'s adjacency check cannot be bridged
+   * by a silently-omitted round.
+   */
+  planReviewDriftHistory: z.object({
+    ticketId: z.string(),
+    rounds: z.array(z.object({
+      round: z.number().int().nonnegative(),
+      fraction: z.number().min(0).max(1),
+    })),
+  }).nullable().default(null),
+
+  /**
+   * T-474: this session's duet-mode gate posture for its CURRENT ticket, a
+   * discriminated union rather than three independently-optional fields
+   * (R3-FIX 7) -- "gated with no requirement snapshot" or "unresolved with a
+   * gated snapshot attached" are unrepresentable at the type level rather
+   * than merely disciplined against at runtime. `undefined` (the field
+   * omitted) means "not yet resolved" -- a legacy session written before this
+   * field existed; enforcement resolves it lazily on first check and caches
+   * the result via `ctx.writeState`. Resolved once at PICK_TICKET and reset
+   * unconditionally (along with `pendingPlanAck`/`approvedPlanAckDeltas`)
+   * every time PICK_TICKET runs for this session -- no cross-ticket
+   * carryover, ever. Ticket-only (ISS-1032-shaped descope, T-474 section 7):
+   * an issue-fix session has no ticket to resolve gates against and always
+   * carries `{status: "ungated"}` here.
+   */
+  frozenGate: z.discriminatedUnion("status", [
+    z.object({ status: z.literal("ungated") }),
+    z.object({ status: z.literal("gated"), arrangementId: ArrangementIdSchema, gates: z.array(ArrangementGateSchema) }),
+    z.object({ status: z.literal("unresolved"), reason: z.string().max(1024) }),
+  ]).optional(),
+
+  /**
+   * T-474: a plan-ack gate-ack was not yet found for the current plan.md's
+   * content hash, so PLAN_REVIEW is holding at this generation until one
+   * appears. Cleared (along with a matching generation reset) the moment
+   * plan.md's content changes underneath the hold, since a stale hold against
+   * superseded content would otherwise linger forever.
+   */
+  pendingPlanAck: z.object({
+    ticketId: TicketRefSchema,
+    arrangementId: ArrangementIdSchema,
+    gateName: z.string().min(1).max(128),
+    pinSha256: z.string().regex(/^[0-9a-f]{64}$/),
+  }).nullable().optional(),
+
+  /** T-474: the pen's ratify-with-deltas text from the plan-ack gate that just cleared, rendered once at IMPLEMENT's enter() and never again. */
+  approvedPlanAckDeltas: z.string().max(4096).nullable().optional(),
+
+  /**
+   * ISS-1050 full fix: the content-addressed plan snapshot ImplementStage
+   * reads from, written at PLAN_REVIEW's IMPLEMENT-landing decision. Absent
+   * means either a legacy session (predates this field), a landing that
+   * failed to snapshot, or PICK_TICKET's unconditional per-item reset --
+   * implement.ts's D1 branch is what keeps those cases from being treated
+   * alike when a plan-ack gate covers the item. The filename shape is NOT
+   * enforced at the schema level (a hand-corrupted value must cost the READ
+   * via plan-snapshot.ts's own validation, never the whole session parse).
+   */
+  approvedPlanSnapshot: z.object({
+    filename: z.string().min(1).max(200),
+    sha256: z.string().regex(/^[0-9a-f]{64}$/),
+  }).nullable().optional(),
+
   recentDeferrals: z.object({
     total: z.number(),
     critical: z.number(),
@@ -770,9 +1713,679 @@ export const SessionStateSchema = z.object({
   lastMcpCall: z.string().nullish(),
   healthState: z.string().nullish(),
   currentReviewStartedAt: z.string().nullish(),
+
+  // T-450 step 6a: the durable cancellation transition record.
+  //
+  // DELIBERATELY `unknown`, and it stays that way. `CancellationTransitionSchema`
+  // below is the strict shape; the reader that applies it to this field arrives
+  // with the behavior half of 6a.
+  //
+  // WHY THE BOUNDARY MUST BE TOLERANT. `readSessionDetailed` (session.ts:963)
+  // runs THIS schema, and `findSessionByIdDetailed` runs it before
+  // `handleCancel` is reachable at all. A strict field here would make a
+  // malformed transition report a corrupt SESSION, so the fail-closed
+  // fall-through the recovery path is meant to reach would be unreachable code.
+  //
+  // ISS-556 is the nearest precedent and the mechanism is deliberately
+  // DIFFERENT. There, the schema stays strict and `parseSessionResilient`
+  // (session.ts:432-462) recovers after the fact, but only from one enumerated
+  // corruption (`lensReviewHistory[N].disposition` outside its enum) and only
+  // by DELETING the offending entries. Neither half transfers: a transition
+  // record can be malformed in ways that cannot be enumerated in advance, and
+  // deleting it would destroy the very intent recovery exists to read. What
+  // does transfer is the principle stated at session.ts:388-396, that
+  // historical metadata must not make a live session unreachable.
+  cancellationTransition: z.unknown().optional(),
+  /**
+   * THE TAKEOVER POSTIMAGE (T-450 6b, ruling ea611619 B5/B6): the durable
+   * proof that a candidate takeover was COMMITTED, written by
+   * commitCandidateTakeover atomically with the ownership fields it proves,
+   * in the SAME state write. One field, not an array: retirement is the only
+   * exit from `closed`, so a cycle's proof is always consumed before the next
+   * cycle could overwrite it, and every archived cycle's audit link survives
+   * in the archive's raw bytes.
+   *
+   * `z.unknown()` for the same reason as cancellationTransition above: a
+   * typed-strict sub-record would brick the whole session parse on one
+   * malformed field. The dedicated strict reader is
+   * `CandidateTakeoverPostimageSchema`, and a value that fails it is
+   * "takeover-postimage-unreadable", which is a REFUSAL, deliberately
+   * distinct from absent-means-underivable.
+   */
+  candidateTakeover: z.unknown().optional(),
+
+  /**
+   * T-450: the heartbeat generation this session's owner is bound to, published
+   * by `commitCandidateTakeoverLocked` in the same atomic write as the
+   * ownership rebind. `readOwnerLiveness` resolves the telemetry directory from
+   * it, so an owner's liveness evidence is scoped to the generation that owner
+   * established rather than shared with every owner in turn.
+   *
+   * DECLARED, not merely tolerated. It has been persisted since step 6b and
+   * survived a schema round-trip only because this object ends `.passthrough()`
+   * -- while its two untyped neighbours above are each declared with a reason.
+   * A later tightening of that passthrough would have silently dropped the one
+   * field the whole generation feature rests on, and the failure would have
+   * been a session reading its own liveness out of the previous owner's
+   * directory.
+   *
+   * Declaring it now cannot break a migration, because there is nothing to
+   * migrate: `candidate-recovery.ts` has ZERO importers in `src`, so nothing
+   * persisted anywhere carries this field yet. That is the same safety argument
+   * that made the REQUIRED `cycleNonce` acceptable under ruling ea611619, and it
+   * is why this is a declaration rather than a filed schema risk.
+   *
+   * `z.unknown()` for the same reason as those neighbours: the strict reader is
+   * `resolveTelemetryLocation`, which deliberately takes `unknown` and refuses
+   * anything that is not a valid id rather than falling back to the legacy
+   * directory. A typed field here would move that refusal into the whole-session
+   * parse, bricking a session over one damaged value.
+   */
+  heartbeatGeneration: z.unknown().optional(),
 }).passthrough();
 
 export type FullSessionState = z.infer<typeof SessionStateSchema>;
+
+// ---------------------------------------------------------------------------
+// T-450 step 6a: the cancellation transition record
+//
+// The durable answer to "what had the crashed process already done?". Every
+// constraint below exists because the alternative is a FALSE durable record,
+// which is worse than an absent one: an absent record leaves recovery open,
+// while a false one closes it against a lie.
+// ---------------------------------------------------------------------------
+
+/**
+ * What the stash pop actually did.
+ *
+ * `indeterminate` is the honest terminal value when a crash makes the answer
+ * unknowable, and it is NOT a synonym for failure: `failed` is reserved for a
+ * pop that was attempted and OBSERVED to fail. There is deliberately no fifth
+ * spelling such as `unknown`; two names for one state is how audit records
+ * start disagreeing with each other.
+ */
+export const StashPopOutcomeSchema = z.enum(["popped", "failed", "none", "indeterminate"]);
+export type StashPopOutcome = z.infer<typeof StashPopOutcomeSchema>;
+
+/**
+ * What was DONE, never what was believed.
+ *
+ * Ruling A: a durable record names the action and its authority, because it is
+ * read in isolation long after anyone remembers the context that produced it.
+ * `candidate_recovery_takeover` is declared here in 6a although only 6b writes
+ * it, so 6b needs no schema migration, and so an unrecognized action can be
+ * refused rather than guessed at.
+ *
+ * ISS-967: `candidate_recovery_cancellation` was MISSING, and the cancel commit
+ * therefore stamped the takeover value into the record of a session it had just
+ * ENDED. `authority.kind` cannot disambiguate the two, because `candidate` is
+ * correct for both operations, so the record read in isolation said the exact
+ * opposite of what happened -- the failure this docstring exists to prevent.
+ * Added ADDITIVELY: nothing is removed or repurposed, so every record already
+ * written stays readable, and the takeover literal remains accepted wherever a
+ * pre-fix cycle recorded one. The cross-field `superRefine` below needed no
+ * change to its PAIRING LOGIC, which was verified rather than assumed: it
+ * enforces the pairing in BOTH directions -- `ordinary_cancellation` may not
+ * carry candidate authority, and either candidate action requires it -- and a
+ * third non-ordinary value satisfies that on both sides. Its refusal MESSAGE
+ * did need changing, because it named one action unconditionally.
+ */
+export const CancellationActionSchema = z.enum([
+  "ordinary_cancellation",
+  "candidate_recovery_takeover",
+  "candidate_recovery_cancellation",
+]);
+export type CancellationAction = z.infer<typeof CancellationActionSchema>;
+
+/**
+ * The canonical `Date.prototype.toISOString()` grammar, and only that.
+ *
+ * Persisted timestamps here are compared for BYTE equality against session
+ * state, so a merely parseable spelling (`+00:00`, no milliseconds, a space
+ * separator) could never match and would strand recovery forever. The refine
+ * proves the value is a real instant that round-trips to itself.
+ */
+export const CanonicalInstantSchema = z.string()
+  .regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/, "must be a canonical toISOString() instant")
+  .refine((v) => {
+    const parsed = new Date(v);
+    return !Number.isNaN(parsed.getTime()) && parsed.toISOString() === v;
+  }, "must round-trip through Date.toISOString()");
+
+/**
+ * The PERSISTED projection of owner-liveness evidence.
+ *
+ * `OwnerLivenessSignals` is a TypeScript interface, which proves nothing about
+ * bytes that came off disk. 6b persists evidence inside an authority record, so
+ * the durability boundary needs a real runtime schema.
+ *
+ * THIS MIRRORS THE ACTUAL SIGNAL UNIONS, field for field, rather than flattening
+ * them into a generic `{kind, state}` list. A lossy projection would be worse
+ * than none: `evidenceFingerprint` digests specific VALUES (the stored
+ * timestamp, the expiry, the recorded pid), so evidence that survived a lossy
+ * round trip could never re-derive the fingerprint it was stored with, and the
+ * confirmation check 6b exists to perform would reject every legitimate
+ * confirmation. Every arm below is `.strict()` for the same reason the source
+ * unions are discriminated: an arm that quietly accepts a foreign field is an
+ * arm that can carry a claim nobody validated.
+ *
+ * The TS type is INFERRED from the schema rather than declared beside it, so
+ * the two cannot drift.
+ */
+const TelemetryUnusableReasonSchema = z.enum([
+  "malformed-generation-id",
+  "generation-escapes-telemetry",
+  "generation-path-unresolvable",
+]);
+
+export const PersistedOwnerActivitySignalSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("fresh"), at: z.string().min(1), ageMs: z.number() }).strict(),
+  z.object({ kind: z.literal("stale"), at: z.string().min(1), ageMs: z.number() }).strict(),
+  z.object({ kind: z.literal("unknown"), reason: z.enum(["absent", "unparseable", "future"]) }).strict(),
+]);
+
+export const PersistedLeaseSignalSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("live"), expiresAt: z.string().min(1), remainingMs: z.number() }).strict(),
+  z.object({ kind: z.literal("expired"), expiresAt: z.string().min(1), agoMs: z.number() }).strict(),
+  z.object({ kind: z.literal("unknown"), reason: z.enum(["absent", "unparseable"]) }).strict(),
+]);
+
+export const PersistedDeathMarkerSignalSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("shutdown-marker"), at: z.string().min(1).nullable() }).strict(),
+  z.object({ kind: z.literal("alive-zero"), at: z.string().min(1) }).strict(),
+  z.object({ kind: z.literal("none"), aliveAt: z.number() }).strict(),
+  z.object({
+    kind: z.literal("unreadable"),
+    reason: z.union([
+      z.enum(["absent", "non-numeric", "future", "raced", "no-marker-time"]),
+      TelemetryUnusableReasonSchema,
+    ]),
+  }).strict(),
+]);
+
+export const PersistedMarkerValiditySignalSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("invalidated"),
+    reason: z.enum(["recorded-mcp-pid-alive", "superseded-by-owner-identity"]),
+    pid: z.number().int(),
+    recordedAt: z.string().min(1).nullable(),
+    successorPids: z.array(z.number().int()).max(64).optional(),
+  }).strict(),
+  z.object({
+    kind: z.literal("not-invalidated"),
+    pid: z.number().int(),
+    recordedAt: z.string().min(1).nullable(),
+  }).strict(),
+  z.object({
+    kind: z.literal("unknown"),
+    reason: z.enum([
+      "no-recorded-pid",
+      "pid-probe-failed",
+      "successors-unavailable",
+      "owner-identity-unrecorded",
+      "successor-identity-unknown",
+    ]),
+    pid: z.number().int().nullable(),
+  }).strict(),
+]);
+
+export const PersistedSidecarProbeSignalSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("match"), pid: z.number().int() }).strict(),
+  z.object({ kind: z.literal("absent"), pid: z.number().int() }).strict(),
+  z.object({
+    kind: z.literal("unknown"),
+    reason: z.union([z.enum(["no-pid", "probe-unknown"]), TelemetryUnusableReasonSchema]),
+    pid: z.number().int().nullable(),
+  }).strict(),
+]);
+
+/**
+ * A registered server, mirroring `RegisteredServer` (mcp-registry.ts:53-80).
+ *
+ * `identity` is the load-bearing field, not an optional extra: an entry whose
+ * identity equals the session's owner proves the owner's client is alive NOW,
+ * which is the only thing that positively invalidates the death marker on
+ * succession grounds. It is REQUIRED and nullable, never absent, because `null`
+ * carries real meaning here (an unattributable server, which resolves to
+ * undetermined rather than to either verdict) and a missing key would let that
+ * distinction be lost in persistence.
+ */
+export const PersistedRegisteredServerSchema = z.object({
+  pid: z.number().int(),
+  identity: z.object({
+    client: z.enum(["claude", "codex"]),
+    id: z.string().min(1).max(128).regex(CLIENT_TASK_ID_PATTERN),
+    // NOT `.min(1)`. The registry normalizer (mcp-registry.ts:190) yields
+    // `boundAt: ""` whenever the stored entry omits this display-only field,
+    // and that identity is still fully valid for succession, which is decided
+    // by client and id alone. Requiring a non-empty value here would make the
+    // persisted schema reject evidence the producer legitimately emits.
+    boundAt: z.string(),
+  }).strict().nullable(),
+  // Display and audit only per ruling C-2, but the fingerprint may legitimately
+  // include it, so it round-trips exactly.
+  registeredAt: z.string().min(1).nullable(),
+}).strict();
+
+export const PersistedSuccessorServersSchema = z.discriminatedUnion("kind", [
+  // `unavailable` is NOT an empty `servers`: empty means the registry was read
+  // and nothing else is running, while unavailable means it could not be read,
+  // so nothing is confirmed or ruled out. Keeping them distinct is why this is
+  // a union rather than a nullable array.
+  z.object({
+    kind: z.literal("observed"),
+    servers: z.array(PersistedRegisteredServerSchema).max(64),
+  }).strict(),
+  z.object({ kind: z.literal("unavailable"), reason: z.string().max(512) }).strict(),
+]);
+
+export const PersistedLivenessEvidenceSchema = z.object({
+  activity: PersistedOwnerActivitySignalSchema,
+  lease: PersistedLeaseSignalSchema,
+  deathMarker: PersistedDeathMarkerSignalSchema,
+  markerValidity: PersistedMarkerValiditySignalSchema,
+  sidecarProbe: PersistedSidecarProbeSignalSchema,
+  observedAt: z.string().min(1),
+  staleThresholdMs: z.number().int().min(0),
+  successors: PersistedSuccessorServersSchema,
+}).strict();
+export type PersistedLivenessEvidence = z.infer<typeof PersistedLivenessEvidenceSchema>;
+
+/**
+ * Who authorized this cancellation.
+ *
+ * Separate ARMS rather than a `kind` plus optional fields, so that the
+ * contradictions are unrepresentable instead of merely unwritten: the shape
+ * this replaced admitted `basis: "task"` with a null caller id, which asserts
+ * an identity check that never happened.
+ *
+ * `legacy` is not a degraded `task`. It records that no task identity existed
+ * at cancel time, which is the true state for pre-identity sessions, and it
+ * stays recoverable precisely because refusing it would strand exactly the
+ * sessions most likely to need recovery.
+ */
+export const CancellationAuthoritySchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("legacy") }).strict(),
+  z.object({
+    kind: z.literal("task"),
+    callerTaskId: z.string().min(1).max(128).regex(CLIENT_TASK_ID_PATTERN),
+  }).strict(),
+  z.object({
+    kind: z.literal("candidate"),
+    clientTaskId: z.string().min(1).max(128).regex(CLIENT_TASK_ID_PATTERN),
+    confirmedSessionRevision: z.number().int().min(0),
+    confirmedFingerprint: z.string().min(1).max(256),
+    evidence: PersistedLivenessEvidenceSchema,
+  }).strict(),
+]);
+export type CancellationAuthority = z.infer<typeof CancellationAuthoritySchema>;
+
+/** The persisted ticket disposition, mirroring the in-memory union. */
+export const PersistedTicketDispositionSchema = z.union([
+  z.object({ kind: z.literal("not-authorized") }).strict(),
+  z.object({ kind: z.literal("no-ticket") }).strict(),
+  z.object({ kind: z.literal("released"), ticketId: z.string().min(1) }).strict(),
+  z.object({ kind: z.literal("conflict"), ticketId: z.string().min(1) }).strict(),
+  // `unchanged` is split BY REASON because the reasons disagree about the
+  // ticket id. `empty-id` is the case where the id itself was empty, which the
+  // cancel path reaches at guide.ts:3010 with `ticketId: ""`, so a blanket
+  // `.min(1)` would refuse to record a REACHABLE disposition. The other two
+  // reasons always name a ticket. Separate arms also make the contradictions
+  // (`empty-id` with a real id, `missing` with none) unrepresentable.
+  z.object({
+    kind: z.literal("unchanged"),
+    ticketId: z.literal(""),
+    reason: z.literal("empty-id"),
+  }).strict(),
+  z.object({
+    kind: z.literal("unchanged"),
+    ticketId: z.string().min(1),
+    reason: z.enum(["missing", "not-inprogress"]),
+  }).strict(),
+  z.object({ kind: z.literal("failed"), ticketId: z.string().min(1) }).strict(),
+]);
+export type PersistedTicketDisposition = z.infer<typeof PersistedTicketDispositionSchema>;
+
+/** The one and only shutdown-result artifact basename. See `shutdownArtifact`. */
+export const CANCELLATION_SHUTDOWN_ARTIFACT = "cancellation-shutdown.json" as const;
+
+/** What the verified shutdown actually did, and what became of the resume marker. */
+export const CancellationShutdownResultSchema = z.object({
+  sidecar: z.enum(["signalled", "already-absent", "declined"]),
+  resumeMarker: z.enum(["removed", "absent", "preserved-foreign", "preserved-unstructured"]),
+  detail: z.string().max(512).optional(),
+}).strict();
+
+/**
+ * THE predicate for a transition identifier, exported so a pre-write gate can
+ * apply the very schema the reader will, by reference rather than by parallel
+ * construction. A second spelling of "is this a uuid" is a drift waiting to
+ * happen: a gate that accepts what the reader refuses writes records that can
+ * never be read again.
+ */
+export const TransitionIdSchema = z.string().uuid();
+
+const transitionCommon = {
+  transitionId: TransitionIdSchema,
+  action: CancellationActionSchema,
+  authority: CancellationAuthoritySchema,
+  disposition: PersistedTicketDispositionSchema,
+  // IDENTITY BINDING. `sessionStartedAt` cannot serve this role: it is
+  // wall-clock and millisecond-granular, so two sessions can carry the same
+  // value and a transplanted record would pass a timestamp check and apply
+  // another session's disposition, authority and stash outcome here. Typed as
+  // a uuid to match `SessionStateSchema.sessionId`, so a record that could
+  // never name a real session fails the strict reader rather than the
+  // comparison.
+  sessionId: z.string().uuid(),
+  // PROVENANCE only, checked in addition to the id, never instead of it.
+  sessionStartedAt: CanonicalInstantSchema,
+  transitionStartedRevision: z.number().int().min(0),
+};
+
+/**
+ * Phases are separate ARMS because `endedAt` and `terminalRevision` do not
+ * EXIST before publication. A flat record with optional fields would let a
+ * writer set a termination time on a session that had not terminated, and an
+ * auditor would have no way to tell that apart from a real one.
+ */
+export const CancellationTransitionSchema = z.discriminatedUnion("phase", [
+  z.object({
+    ...transitionCommon,
+    phase: z.literal("stash_pending"),
+    // `null` means "not yet decided", which is only ever true before
+    // publication.
+    stash: z.object({ outcome: StashPopOutcomeSchema.nullable() }).strict(),
+  }).strict(),
+  z.object({
+    ...transitionCommon,
+    phase: z.literal("published"),
+    // Concrete by construction: publication is where the outcome becomes
+    // final, and the honest terminal value for an unknowable pop is
+    // `indeterminate`, never `null`.
+    stash: z.object({ outcome: StashPopOutcomeSchema }).strict(),
+    endedAt: CanonicalInstantSchema,
+    terminalRevision: z.number().int().min(0),
+    // NO shutdown result here, deliberately. Publication is write 4 and the
+    // sidecar shutdown and resume-marker removal are step 5, so nothing at
+    // this point can know their outcomes; a field for them could only ever be
+    // fabricated, or bought by reordering the characterized tail, or by an
+    // unplanned extra state write. The outcomes live in the durable
+    // shutdown-result artifact, which the completion gate reads back and
+    // verifies. What the transition CAN carry is a precomputable pointer to
+    // that artifact, which is enough for recovery to find and classify it.
+    shutdownArtifact: z.object({
+      schemaVersion: z.literal(1),
+      // A LITERAL, not a pattern. Commit B resolves this against the session
+      // telemetry directory, so any string field here is an instruction from a
+      // file the operator may have edited: separators, `..` segments, an
+      // absolute path or a Windows-style prefix would each redirect a read or
+      // write outside the telemetry directory. There is exactly one shutdown
+      // artifact per session, so the name never needs to vary, and a literal
+      // removes the traversal surface entirely rather than trying to filter it.
+      filename: z.literal(CANCELLATION_SHUTDOWN_ARTIFACT),
+    }).strict(),
+  }).strict(),
+]).superRefine((value, ctx) => {
+  // THE CROSS-FIELD RULE. Each half parses alone; the PAIRING is the lie.
+  // Enforced in the schema rather than at call sites because an audit record is
+  // read in isolation, where no call site is around to have been careful.
+  const ordinary = value.action === "ordinary_cancellation";
+  const candidate = value.authority.kind === "candidate";
+  if (ordinary === candidate) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["authority", "kind"],
+      // ACTION-AWARE (ISS-967 follow-up). This branch used to name
+      // `candidate_recovery_takeover` unconditionally, so a
+      // `candidate_recovery_cancellation` record carrying legacy or task
+      // authority was correctly rejected while the diagnostic named an action
+      // the record does not contain. This schema exists for records read in
+      // ISOLATION, so a message that misnames the record it is refusing is the
+      // same class of defect as the record misnaming itself.
+      message: ordinary
+        ? "ordinary_cancellation cannot carry candidate authority"
+        : `${value.action} requires candidate authority`,
+    });
+  }
+});
+export type CancellationTransition = z.infer<typeof CancellationTransitionSchema>;
+
+// ---------------------------------------------------------------------------
+// The durable candidate-cancellation intent (T-450 step 6b)
+// ---------------------------------------------------------------------------
+
+/** The one and only intent basename. Lives in the session directory, NOT in
+ * `state.json`: the candidate invariant `transitionStartedRevision ===
+ * confirmedSessionRevision + 1` requires that nothing increments the session
+ * revision between authorize and write 1, so the pre-publication phases must
+ * be durable without a session write. */
+export const CANCELLATION_INTENT_FILE = "cancellation-intent.json" as const;
+
+/**
+ * `Field<T>` in its persisted spelling, exactly the in-memory shape
+ * (claim-reconciliation.ts): presence and value are SEPARATE facts, and
+ * `value` is REQUIRED and nullable rather than optional. `claim` deleted
+ * versus `claim: null` are different ledger states (ISS-759 gates on key
+ * presence, not truthiness): the first persists `{present: false, value:
+ * null}`, the second `{present: true, value: null}`, and a schema that could
+ * not carry the explicit null would collapse a release into a null write.
+ */
+const PersistedFieldSchema = <T extends z.ZodTypeAny>(inner: T) =>
+  z.object({ present: z.boolean(), value: inner.nullable() }).strict();
+
+const PersistedClaimSchema = z.object({
+  user: z.string().nullable(),
+  branch: z.string().nullable(),
+  since: z.string().nullable(),
+}).strict();
+
+export const PersistedClaimEpochSchema = z.object({
+  ticketId: z.string().min(1),
+  sessionId: z.string(),
+  user: z.string().nullable(),
+  branch: z.string().nullable(),
+  since: z.string().nullable(),
+  establishedAt: z.string(),
+}).strict();
+
+/** The claim-bearing slice of a ticket at a moment in time, exactly the shape
+ * `recoverClaimTransaction` compares against. */
+export const PersistedTicketSnapshotSchema = z.object({
+  ticketId: z.string().min(1),
+  lifecycle: PersistedFieldSchema(z.string()),
+  status: PersistedFieldSchema(z.string()),
+  completedDate: PersistedFieldSchema(z.string()),
+  claim: PersistedFieldSchema(PersistedClaimSchema),
+  claimedBySession: PersistedFieldSchema(z.string()),
+}).strict();
+export type PersistedTicketSnapshot = z.infer<typeof PersistedTicketSnapshotSchema>;
+
+/** A `ClaimTxn` in its persisted spelling, nested INSIDE the intent so the
+ * claim transaction and the cancellation it serves cannot be orphaned from
+ * one another by a crash between two files. */
+const persistedClaimTxnCore = {
+  kind: z.enum(["acquire", "release", "complete"]),
+  ticketId: z.string().min(1),
+  transitionId: z.string().uuid(),
+  fromEpoch: PersistedClaimEpochSchema.nullable(),
+  toEpoch: PersistedClaimEpochSchema.nullable(),
+  fromBusiness: PersistedTicketSnapshotSchema,
+  toBusiness: PersistedTicketSnapshotSchema,
+  startedAt: z.string().min(1),
+};
+export const PersistedClaimTxnSchema = z.discriminatedUnion("phase", [
+  z.object({ ...persistedClaimTxnCore, phase: z.literal("prepared") }).strict(),
+  z.object({ ...persistedClaimTxnCore, phase: z.literal("ticket_applied") }).strict(),
+]);
+export type PersistedClaimTxn = z.infer<typeof PersistedClaimTxnSchema>;
+
+/**
+ * The takeover's evidence bundle: what the auditor reads, and what the
+ * derivability proof deliberately does NOT. `argvProof` lives here per
+ * liveness.ts's sidecar-termination contract (a degraded-unknown acceptance
+ * must be visible to an auditor), and the proof never reads it: a
+ * degraded-unknown takeover retires on identical proof to a proven one,
+ * because derivability asks whether the record exists and names this cycle,
+ * not how strongly the takeover was authorized.
+ */
+export const CandidateRecoveryEvidenceSchema = z.object({
+  /** How the sidecar-termination authorization was proven, per liveness.ts. */
+  argvProof: z.enum(["proven", "degraded-unknown"]),
+  /** The liveness picture the human confirmed, persisted verbatim. */
+  liveness: PersistedLivenessEvidenceSchema,
+}).strict();
+
+export type CandidateRecoveryEvidence = z.infer<typeof CandidateRecoveryEvidenceSchema>;
+
+/**
+ * The DEDICATED STRICT READER for `state.candidateTakeover` (ruling ea611619
+ * B5/B6). Proof fields are strict; `evidence` is opaque (`z.unknown()`) to
+ * the PROOF, though writers validate it against
+ * CandidateRecoveryEvidenceSchema before writing, because no writer may
+ * produce a record its own reader refuses.
+ *
+ * `takeoverKind`, not `disposition`: the name deliberately avoids colliding
+ * with PersistedTicketDispositionSchema's `disposition`, whose values mean
+ * something else entirely. `confirmationEpoch` is AUDIT ONLY and is never
+ * compared by any proof: adoption is legal after the postimage is written,
+ * so the closed intent may legitimately sit at a higher epoch than the
+ * postimage captured, and comparing would make exactly those recovery
+ * histories permanently unretirable. NO revision field, so nothing here can
+ * disagree with `committedRevision`.
+ */
+export const CandidateTakeoverPostimageSchema = z.object({
+  schemaVersion: z.literal(1),
+  kind: z.literal("candidate_takeover_committed"),
+  /** DECISIVE for the proof: equality with the closed intent's cycleNonce. */
+  cycleNonce: z.string().uuid(),
+  takeoverKind: z.literal("owner_gone_candidate_takeover"),
+  /** Corroboration, by reference so writer and reader share one predicate. */
+  intentTransitionId: TransitionIdSchema,
+  clientTaskId: z.string().min(1).max(128).regex(CLIENT_TASK_ID_PATTERN),
+  confirmationEpoch: z.number().int().min(0),
+  evidence: z.unknown(),
+}).strict();
+
+export type CandidateTakeoverPostimage = z.infer<typeof CandidateTakeoverPostimageSchema>;
+
+const intentCommon = {
+  schemaVersion: z.literal(1),
+  /** Pre-minted at authorize; write 1 carries it verbatim. Superseded only
+   * while ticket work has not begun (the R2 adoption rule). */
+  transitionId: z.string().uuid(),
+  /**
+   * THE CYCLE'S OWN IDENTITY, minted internally by the writer that births the
+   * cycle (create, supersession's replacement, retirement's replacement) and
+   * NEVER accepted from a caller. It exists because nothing else can serve:
+   * a revision counter is satisfied by any later write, a transitionId can be
+   * copied off an archived record, and an epoch legally drifts under R2
+   * adoption. The takeover postimage records this nonce, and retirement's
+   * derivability proof matches on it DECISIVELY, so a doctored copy of an old
+   * cycle's record can never make a new cycle's takeover look committed.
+   *
+   * REQUIRED, not optional, and that is safe: candidate-recovery has zero
+   * production callers on origin/main, so no nonce-less persisted intent
+   * exists anywhere. Collision-negligible randomUUID entropy is load-bearing,
+   * since it is what lets the postimage omit sessionId/sessionStartedAt
+   * (incarnation provenance is subsumed by nonce freshness: createSession
+   * always mints a fresh uuid directory and fresh state).
+   */
+  cycleNonce: z.string().uuid(),
+  /** Monotonic, bumped on EVERY re-authorization including
+   * transitionId-preserving ones, so two confirmations can never collide on
+   * the archive pathname their supersession writes. */
+  confirmationEpoch: z.number().int().min(0),
+  clientTaskId: z.string().min(1).max(128).regex(CLIENT_TASK_ID_PATTERN),
+  // IDENTITY + PROVENANCE, the same pair the transition record binds: session
+  // directories are reused, so an intent left by an earlier incarnation
+  // carries the right id and the wrong start time.
+  sessionId: z.string().uuid(),
+  sessionStartedAt: CanonicalInstantSchema,
+  confirmedSessionRevision: z.number().int().min(0),
+  confirmedFingerprint: z.string().min(1).max(256),
+  evidence: PersistedLivenessEvidenceSchema,
+  /** The ticket exactly as authorize read it, BEFORE anything touched it, so
+   * recovery at any pre-publication boundary reconstructs the release
+   * transaction deterministically. Null when the session held no ticket. */
+  ticketPreimage: PersistedTicketSnapshotSchema.nullable(),
+  /** Present only on an intent that superseded another; validated on
+   * acceptance against the named archive's existence and content, so the
+   * audit chain holds even when supersession changes the id. */
+  predecessor: z.object({
+    predecessorTransitionId: z.string().uuid(),
+    predecessorEpoch: z.number().int().min(0),
+    predecessorFingerprint: z.string().min(1).max(256),
+  }).strict().optional(),
+  /**
+   * THE RECEIPT that an adoption ran, and the only thing that distinguishes a
+   * completed adoption from the state it started in.
+   *
+   * Adoption replaces the confirmation pair in place under the SAME
+   * transitionId, so after it lands the record is `epoch N+1, triple T`. A
+   * caller retrying that exact adoption presents `epoch N+1, triple T` and
+   * must be told "already done". A caller making a FIRST adoption request
+   * that merely happens to carry the canonical epoch presents `epoch N,
+   * triple T` against a record at `epoch N, triple T` -- identical equality,
+   * completely different situation, and it must be refused, because two
+   * distinct re-authorizations may never collapse onto one epoch and evidence
+   * cannot separate them (the fingerprint is time-independent by design).
+   *
+   * Recording the epoch adopted FROM separates them: a record that was
+   * created rather than adopted carries no receipt at all, so the equal-epoch
+   * first request cannot be mistaken for a retry.
+   */
+  adoptedFromEpoch: z.number().int().min(0).optional(),
+};
+
+/**
+ * Phases are separate ARMS for the same reason the transition record's are:
+ * `claimTxn` does not EXIST outside prepared/ticket_applied, and the closed
+ * outcome pointer does not exist before closure. A flat record with optional
+ * fields would let a writer claim a phase whose obligations it never wrote.
+ */
+export const CancellationIntentSchema = z.discriminatedUnion("phase", [
+  z.object({ ...intentCommon, phase: z.literal("authorized") }).strict(),
+  // The nested transaction's phase is BOUND to the enclosing intent's, so an
+  // intent cannot claim `prepared` while carrying a transaction that says the
+  // ticket was already applied: that contradiction is exactly the ambiguity
+  // recoverClaimTransaction persists the phase to rule out.
+  z.object({
+    ...intentCommon,
+    phase: z.literal("prepared"),
+    claimTxn: z.object({ ...persistedClaimTxnCore, phase: z.literal("prepared") }).strict(),
+  }).strict(),
+  z.object({
+    ...intentCommon,
+    phase: z.literal("ticket_applied"),
+    claimTxn: z.object({ ...persistedClaimTxnCore, phase: z.literal("ticket_applied") }).strict(),
+  }).strict(),
+  z.object({ ...intentCommon, phase: z.literal("claim_cleared") }).strict(),
+  z.object({
+    ...intentCommon,
+    phase: z.literal("closed"),
+    /** Derivable evidence, not authority: closed-ness is confirmed from the
+     * record this points at, never from this pointer alone. */
+    outcome: z.discriminatedUnion("kind", [
+      z.object({ kind: z.literal("cancellation"), transitionId: z.string().uuid() }).strict(),
+      z.object({ kind: z.literal("takeover"), committedRevision: z.number().int().min(0) }).strict(),
+    ]),
+  }).strict(),
+]);
+export type CancellationIntent = z.infer<typeof CancellationIntentSchema>;
+
+/**
+ * The single parse seam for persisted session state.
+ *
+ * Every production full `SessionStateSchema` validation of a state.json ends
+ * here, so cross-field repairs that must see the RAW shape (ISS-918) live in
+ * this function rather than in the schema. Call this instead of
+ * `SessionStateSchema.safeParse` on anything that came off disk; parsing the
+ * schema directly skips those repairs.
+ */
+export function parseSessionState(raw: unknown): z.SafeParseReturnType<unknown, FullSessionState> {
+  return SessionStateSchema.safeParse(clearExplicitlyNulledCodexBlock(raw));
+}
 
 /** ISS-400: Named type for verification counters, derived from the Zod schema. */
 export type VerificationCounters = NonNullable<FullSessionState["verificationCounters"]>;
@@ -797,10 +2410,54 @@ export interface GuideReportInput {
   readonly findings?: readonly Finding[];
   readonly reviewerSessionId?: string;
   readonly overrideOverlap?: boolean;
+  /** ISS-982: explicit override for handleCommit's fast-path attribution check. */
+  readonly overrideAttribution?: boolean;
   readonly notes?: string;
   readonly reviewer?: string;  // ISS-102: actual reviewer backend used (overrides computed nextReviewer)
   readonly reviewId?: string;  // ISS-720: lens reviewId from prepare/synthesize; joins to verification telemetry to record the path actually taken
 }
+
+/**
+ * ONE schema, used at BOTH boundaries (the MCP tool definition and the direct
+ * guide path).
+ *
+ * Validating in only one of them is a hole rather than an inconvenience: an
+ * earlier revision checked the fingerprint at the guide and left
+ * `sessionRevision` to the MCP schema alone, so a non-MCP caller could pass a
+ * negative, fractional or non-finite revision straight into a compare-and-swap.
+ *
+ * The digest shape is not decoration. `evidenceFingerprint` is a
+ * `createHash("sha256").digest("hex")`, so 64 lowercase hex characters is the
+ * only thing a real confirmation can be.
+ */
+export const OwnerGoneCandidateTakeoverSchema = z.object({
+  sessionRevision: z.number().int().nonnegative().finite(),
+  evidenceFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+}).strict();
+
+export type OwnerGoneCandidateTakeover = z.infer<typeof OwnerGoneCandidateTakeoverSchema>;
+
+/**
+ * The CANCEL door's confirmation (T-450 step 8), same two fields for the same
+ * reasons, and deliberately its OWN schema rather than a reuse of the takeover
+ * one.
+ *
+ * The fields match today because the confirmed picture is the same artifact.
+ * They are not the same CONTRACT: sharing one object would make any later
+ * divergence (cancel gaining a disposition hint, say) a silent change to the
+ * takeover door's published input. Each door's schema is named after its door,
+ * so a change to one cannot reach the other by accident.
+ *
+ * Both doors validate at BOTH boundaries for the reason given above: the MCP
+ * schema alone would let a non-MCP caller push a negative, fractional or
+ * non-finite revision into a compare-and-swap.
+ */
+export const OwnerGoneCandidateCancelSchema = z.object({
+  sessionRevision: z.number().int().nonnegative().finite(),
+  evidenceFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+}).strict();
+
+export type OwnerGoneCandidateCancel = z.infer<typeof OwnerGoneCandidateCancelSchema>;
 
 export interface GuideInput {
   readonly sessionId: string | null;
@@ -808,6 +2465,8 @@ export interface GuideInput {
   readonly report?: GuideReportInput;
   /** Execution mode (default: "auto"). Only used with action: "start". */
   readonly mode?: SessionMode;
+  /** T-461: pin the session's review effort. Only used with action: "start". */
+  readonly reviewEffort?: "off" | "light" | "standard" | "thorough";
   /** Ticket ID for tiered modes (review, plan, guided). */
   readonly ticketId?: string;
   /** T-188: Target work items for targeted auto mode. Array of T-XXX and ISS-XXX IDs. */
@@ -816,6 +2475,38 @@ export interface GuideInput {
   readonly clientTaskId?: string;
   /** Explicitly recover a COMPACT session after confirming its recorded owner is gone. */
   readonly takeover?: boolean;
+  /**
+   * T-450 step 7b: the confirmed picture behind an owner-gone candidate
+   * TAKEOVER of a LIVE, non-COMPACT session.
+   *
+   * Its own field rather than a widening of `takeover`, for the same reason
+   * `ownerGoneCandidateCancel` is its own field: `takeover` is a SHIPPED
+   * published boolean, and changing its type changes what an already-advertised
+   * field means. A carrier is unavoidable in any case, because the handshake
+   * decides on two values only the CLIENT can know -- the revision a human was
+   * shown, and the digest of the picture they were shown -- so symmetry with
+   * cancel is the only defensible shape.
+   */
+  readonly ownerGoneCandidateTakeover?: OwnerGoneCandidateTakeover;
+  /**
+   * T-450 step 8. The confirmed owner-gone picture authorizing a CANCELLATION
+   * of a session whose recorded owner is gone: the door that ENDS such a
+   * session rather than adopting it.
+   *
+   * NO SECOND FLAG accompanies this one, and the asymmetry with the takeover
+   * field is deliberate rather than an oversight. `takeover: true` is a real
+   * second decision on `resume` ("adopt rather than refuse"), and it is
+   * refused outright on any action but `resume`, so cancel could not require
+   * it without relaxing a shipped rule. On `cancel` the ACTION is already the
+   * destructive intent, so this field's presence plus the two values it
+   * carries is the whole request.
+   *
+   * Supplying it REQUIRES an explicit `sessionId`. `handleCancel` otherwise
+   * auto-selects an active session, and this object names a revision and a
+   * fingerprint but no session, so a human who confirmed a picture for one
+   * session could end another with nothing downstream able to notice.
+   */
+  readonly ownerGoneCandidateCancel?: OwnerGoneCandidateCancel;
 }
 
 // ---------------------------------------------------------------------------

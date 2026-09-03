@@ -9,8 +9,16 @@ import {
   type BusEndpoint,
 } from "../../src/bus/index.js";
 
+// v2 endpoints are role-free (roles are per-message). The fixture joins two
+// endpoints, `a` (a Codex Desktop client) and `b` (a Claude Code client).
+// Legacy `implementer`/`reviewer` aliases are kept so existing tests that phrase
+// intent in the old role vocabulary still exercise the same endpoints.
 export interface BusFixture {
   readonly root: string;
+  readonly a: BusEndpoint;
+  readonly b: BusEndpoint;
+  readonly aTaskId: string;
+  readonly bTaskId: string;
   readonly implementer: BusEndpoint;
   readonly reviewer: BusEndpoint;
   readonly implementerTaskId: string;
@@ -21,21 +29,29 @@ export async function createBusFixture(name = "bus-test"): Promise<BusFixture> {
   const root = await mkdtemp(join(tmpdir(), `${name}-`));
   await initProject(root, { name });
   await initializeBus(root);
-  const implementerTaskId = "codex-task-implementer";
-  const reviewerTaskId = "claude-task-reviewer";
-  const implementer = (await joinEndpoint(root, {
-    role: "implementer",
+  const aTaskId = "codex-task-implementer";
+  const bTaskId = "claude-task-reviewer";
+  const a = (await joinEndpoint(root, {
     client: "codex",
-    clientTaskId: implementerTaskId,
+    clientTaskId: aTaskId,
     surface: "codex_desktop",
   })).endpoint;
-  const reviewer = (await joinEndpoint(root, {
-    role: "reviewer",
+  const b = (await joinEndpoint(root, {
     client: "claude",
-    clientTaskId: reviewerTaskId,
+    clientTaskId: bTaskId,
     surface: "claude_cli",
   })).endpoint;
-  return { root, implementer, reviewer, implementerTaskId, reviewerTaskId };
+  return {
+    root,
+    a,
+    b,
+    aTaskId,
+    bTaskId,
+    implementer: a,
+    reviewer: b,
+    implementerTaskId: aTaskId,
+    reviewerTaskId: bTaskId,
+  };
 }
 
 export async function createIssue(

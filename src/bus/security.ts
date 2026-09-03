@@ -1,7 +1,7 @@
 import { posix } from "node:path";
 import { BusError } from "./errors.js";
 import { canonicalHash, sha256 } from "./canonical.js";
-import type { BusMessageKind, BusMessageRefs, BusRole } from "./schemas.js";
+import type { BusMessageKind, BusMessageRefs } from "./schemas.js";
 
 const HIGH_CONFIDENCE_SECRET_PATTERNS: readonly { name: string; pattern: RegExp }[] = [
   { name: "private key", pattern: /-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----/ },
@@ -81,14 +81,14 @@ export function idempotencyKeyHash(endpointId: string, key: string): string {
 }
 
 export function actionableFingerprint(input: {
-  fromRole: BusRole;
-  toRole: BusRole;
+  fromEndpointId: string;
+  toEndpointId: string;
   kind: BusMessageKind;
   body: string;
   refs: BusMessageRefs;
 }): string {
   return canonicalHash({
-    direction: `${input.fromRole}->${input.toRole}`,
+    direction: `${input.fromEndpointId}->${input.toEndpointId}`,
     kind: input.kind,
     body: input.body,
     refs: input.refs,

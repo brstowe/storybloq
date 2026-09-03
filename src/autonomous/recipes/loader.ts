@@ -2,6 +2,8 @@ import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ResolvedRecipe } from "../stages/types.js";
+import { parseBranchStrategy, parseBranchStrategyOrDefault } from "../branch-strategy.js";
+import { normalizeReviewEffortDefault } from "../review-effort.js";
 
 // ---------------------------------------------------------------------------
 // Recipe schema (raw JSON shape)
@@ -14,12 +16,13 @@ interface RawRecipe {
   postComplete?: readonly string[];
   stages?: Record<string, Record<string, unknown>>;
   dirtyFileHandling?: string;
-  branchStrategy?: "none" | "per-ticket";
+  branchStrategy?: string;
   defaults?: {
     maxTicketsPerSession?: number;
     compactThreshold?: string;
     reviewBackends?: string[];
     codexReviewBackends?: string[];
+    handoverInterval?: number;
   };
 }
 
@@ -41,6 +44,7 @@ const DEFAULT_DEFAULTS = {
   compactThreshold: "high" as const,
   reviewBackends: ["codex", "agent"] as readonly string[],
   codexReviewBackends: ["lenses"] as readonly string[],
+  handoverInterval: 3,
 };
 
 // ---------------------------------------------------------------------------
@@ -77,15 +81,19 @@ export function resolveRecipe(
     compactThreshold?: string;
     reviewBackends?: string[];
     codexReviewBackends?: string[];
+    handoverInterval?: number;
     stages?: Record<string, Record<string, unknown>>;
-    branchStrategy?: "none" | "per-ticket";
+    branchStrategy?: string;
+    /** T-461: session-level review-effort pin, if the caller resolved one. */
+    reviewEffort?: string;
+    reviewEffortSource?: "start-call" | "project";
   },
 ): ResolvedRecipe {
   let raw: RawRecipe;
   try {
     raw = loadRecipe(recipeName);
   } catch (err: unknown) {
-    // Only fallback for missing file — re-throw parse errors and I/O failures
+    // Only fallback for missing file -- re-throw parse errors and I/O failures
     if (err && typeof err === "object" && "code" in err && (err as { code: string }).code === "ENOENT") {
       raw = {
         id: recipeName,
@@ -117,7 +125,7 @@ export function resolveRecipe(
     }
   }
 
-  // WRITE_TESTS: insert BEFORE IMPLEMENT (TDD — write failing tests first)
+  // WRITE_TESTS: insert BEFORE IMPLEMENT (TDD -- write failing tests first)
   if ((stages.WRITE_TESTS as Record<string, unknown>)?.enabled) {
     const implementIdx = pipeline.indexOf("IMPLEMENT");
     if (implementIdx !== -1 && !pipeline.includes("WRITE_TESTS")) {
@@ -176,6 +184,28 @@ export function resolveRecipe(
     codexReviewBackends: projectOverrides?.codexReviewBackends
       ?? recipeDefaults.codexReviewBackends
       ?? [...DEFAULT_DEFAULTS.codexReviewBackends],
+    handoverInterval: projectOverrides?.handoverInterval
+      ?? recipeDefaults.handoverInterval
+      ?? DEFAULT_DEFAULTS.handoverInterval,
+  };
+
+  // T-461: which review knobs the PROJECT set, as opposed to which the recipe
+  // ships. After the shallow merge above the two are indistinguishable, and the
+  // dial may supersede a recipe-shipped value but never a project-set one.
+  const projectStages = projectOverrides?.stages ?? {};
+  const reviewEffort = {
+    level: normalizeReviewEffortDefault(projectOverrides?.reviewEffort),
+    // Provenance follows PRESENCE, not validity: a project that wrote a value
+    // we could not read still set one, and reporting that as "default" would
+    // hide the typo behind the level it fell closed to.
+    source: projectOverrides?.reviewEffort !== undefined
+      ? (projectOverrides.reviewEffortSource ?? "project")
+      : "default" as const,
+    explicitKnobs: {
+      codeReviewMaxRounds: projectStages.CODE_REVIEW?.maxReviewRounds !== undefined,
+      planReviewBackends: projectStages.PLAN_REVIEW?.backends !== undefined,
+      codeReviewBackends: projectStages.CODE_REVIEW?.backends !== undefined,
+    },
   };
 
   return {
@@ -183,8 +213,12 @@ export function resolveRecipe(
     pipeline,
     postComplete,
     stages,
+    reviewEffort,
     dirtyFileHandling: raw.dirtyFileHandling ?? "block",
-    branchStrategy: projectOverrides?.branchStrategy ?? raw.branchStrategy ?? "none",
+    // T-328: normalize here rather than trusting either source. Both the
+    // project override and the recipe JSON can carry the legacy "none".
+    branchStrategy: parseBranchStrategy(projectOverrides?.branchStrategy)
+      ?? parseBranchStrategyOrDefault(raw.branchStrategy),
     defaults,
   };
 }

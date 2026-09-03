@@ -76,6 +76,19 @@ The CLI also silently refreshes the skill dir and migrates any legacy hook entri
 
 Alternative install via the Claude Code plugin system: see [Storybloq/plugin-archive](https://github.com/Storybloq/plugin-archive) (legacy path; `storybloq setup --client all` is the recommended install).
 
+## Codex plugin marketplace
+
+```bash
+codex plugin marketplace add https://github.com/Storybloq/storybloq
+codex plugin add storybloq@storybloq
+```
+
+This installs the Storybloq skill only. It does not run this package's npm install, register the MCP server, or configure hooks -- those still need the CLI, which the skill's own bootstrap step installs for you the first time you invoke it: on your first `$story`, if the CLI or MCP server isn't set up yet, the skill runs `npm install -g @storybloq/storybloq@latest` followed by `storybloq setup --client codex --skip-skill` for you. `--skip-skill` skips re-copying the skill files, since the plugin already manages that copy -- passing it yourself only matters if you're driving `storybloq setup` directly instead of letting the skill's bootstrap step do it.
+
+If you already have a standalone Codex skill copy from a prior direct `storybloq setup --client codex` (at `~/.agents/skills/story/` and/or `~/.codex/skills/story/`), installing the marketplace plugin on top of it is an untested configuration, not a verified-harmless one -- Codex's handling of two same-named skill providers isn't something this project has tested. Recommended migration: move the existing copy OUT of the skills root rather than deleting it. A backup left under `~/.agents/skills/` (for example `story.bak`) still contains a `SKILL.md` and can be discovered as a second skill, which is the duplicate this procedure exists to remove, so park it one level up instead: `mkdir -p ~/.agents/story-skill-backups && mv ~/.agents/skills/story ~/.agents/story-skill-backups/story.$(date +%s)`, and the same for `~/.codex/skills/story` into `~/.codex/story-skill-backups/` if present. Restart Codex and confirm `$story` still works via the plugin-managed copy. To roll back, move the backup to its original path. Only then, separately and at your own discretion, remove the backup.
+
+If the CLI or MCP server is still missing after installing the plugin and invoking `$story` once, run the bootstrap command yourself: `npm install -g @storybloq/storybloq@latest && storybloq setup --client codex --skip-skill`.
+
 ## Bootstrap a project
 
 ```bash
@@ -113,14 +126,29 @@ Inside Claude Code or Codex:
 - **`/story auto T-001 T-002 ISS-013` / `$story auto T-001 T-002 ISS-013`** - autonomous mode scoped to those items. Drives a ticket through plan -> plan review -> implement -> tests -> code review -> commit with handovers at each checkpoint.
 - **`/story review T-001` / `$story review T-001`** - runs the multi-lens review (see [Storybloq/lenses](https://github.com/Storybloq/lenses)) against a ticket's diff.
 - **`/story orchestrate` / `$story orchestrate`** - drives a multi-repo (or large single-repo) backlog when the client exposes exact callable workflow/subagent tools. Codex uses `multi_agent_v1.spawn_agent`, its normalized `multi_agent_v1__spawn_agent` identifier, or an exact `spawn_agent` tool. The Claude Agent View-backed `storybloq dispatch` command is shipped; a product-managed Codex dispatch backend is not.
+- **`/story triage` / `$story triage`** - read-only triage of the open issue backlog: verifies each finding against the pinned current HEAD, flags already-fixed and duplicate issues, groups issues that share one verified root cause, and recommends a prioritized ticket plan. Mutates no issue and no ticket.
 - **`/story bus` / `$story bus`** - polls a task-bound local Bus endpoint so an implementer and an independent reviewer can exchange advisory findings without copy and paste.
 - **`/story handover` / `$story handover`** - writes a session handover capturing decisions, blockers, and next steps.
 
-Both clients support context loading, autonomous mode, MCP, and compaction/status hooks. Codex Desktop can open an autonomous session's owning task and relay an exact owner response to it; Codex CLI safely falls back to a manual task switch. Autonomous code review defaults to a 12-round landing cap (clamped upward by ticket risk): unresolved critical findings and rejects still block, while non-blocking findings become follow-up issues at the cap. Set `recipeOverrides.stages.CODE_REVIEW.maxReviewRounds` to `0` to disable the cap explicitly.
+Both clients support context loading, autonomous mode, MCP, and compaction/status hooks. Codex Desktop can open an autonomous session's owning task and relay an exact owner response to it; Codex CLI safely falls back to a manual task switch. Autonomous code review defaults to a 12-round landing cap (clamped upward by ticket risk): unresolved critical findings and rejects still block, while non-blocking findings become follow-up issues at the cap. Set `recipeOverrides.stages.CODE_REVIEW.maxReviewRounds` to `0` for unlimited, which disables the cap and the ceiling below it alike. Otherwise, three rounds past the cap a hard ceiling ends the session: the outstanding findings are filed as issues, the work is left uncommitted in the tree, and a handover is written. The item returns to `open` when the session still owns its claim; if the claim has moved, the item is left exactly as it is.
 
 `recipeOverrides.compactThreshold` accepts `medium`, `high` (default), or `critical`. The value selects both the pressure limits and the rotation trigger: `medium` uses lower limits and rotates at medium pressure, while `critical` uses higher limits and waits for critical pressure. At a clean COMPLETE boundary, threshold pressure ends the bounded session through HANDOVER because Storybloq cannot invoke a client compaction command. When the client itself compacts, the PreCompact and SessionStart hooks preserve the same session; pressure resets only after SessionStart confirms `source: compact`.
 
 Outside the AI client, the same state is one `storybloq` invocation away.
+
+## Usage-limit auto-resume
+
+Claude Code sessions stop at usage limits ("You've hit your usage limit"), and overnight autonomous work silently dies with them. Storybloq detects the stop through Claude Code's `StopFailure` hook, parses the reset time from the session transcript, records the stop in a global ledger (`~/.claude/storybloq/limit-ledger.json`), and resumes the session when the limit resets. On by default once hooks are installed.
+
+- **Autonomous sessions** are parked on the same recovery lane as compaction and woken headlessly through the full state machine -- ownership rebind, git-HEAD validation, and recovery mapping all apply, so a wake after the workspace changed is validated, not blindly replayed. Sessions stopped mid-FINALIZE are never auto-resumed (commit replay is not proven safe); you get a notification with manual recovery steps instead.
+- **Plain sessions** get a desktop notification at reset with the exact `claude --resume` command. Per-project opt-in (`limitResume.plainMode: "headless"`) wakes them headlessly instead.
+- **Permission posture is never escalated.** A session that ran with `--dangerously-skip-permissions` is only woken with that flag if the project explicitly opts in (`limitResume.inheritBypass: true`); otherwise it notifies.
+
+The wake is driven by a transient detached waker process, not a daemon: it polls the ledger every 30 seconds, resumes what is due (attempt-capped, staggered, concurrency-bounded), and exits when nothing is pending. It survives laptop sleep but not reboot or logout -- after a reboot, the next `storybloq` invocation or hook fire in any project respawns it, so weekly-scale waits recover on your next activity. That trade is the cost of "no daemon."
+
+Inspect and manage the queue with `storybloq limit-status` (`--cancel <key>` destroys a pending auto-resume, `--requeue <key>` retries a stood-down record). Disable globally with `{"limitResume": {"enabled": false}}` in `~/.claude/storybloq/config.json`, or per project via `limitResume` in `.story/config.json` (also `maxAttempts`, `staggerMs`, `maxConcurrent`, `notify`, and more).
+
+Prior art: the detection-and-reparse approach is modeled on [unsnooze](https://github.com/saaranshM/unsnooze) (MIT), which pioneered transcript-based limit detection and reset-time parsing for tmux-hosted sessions. Storybloq's version drops the tmux layer in favor of the documented hook surface and resumes autonomous sessions through its own state machine instead of a keystroke.
 
 ## Storybloq Bus
 
@@ -138,7 +166,7 @@ Bus runtime is local and gitignored, so run `storybloq bus init` once in each ch
 
 The foreground protocol includes send, poll, acknowledge, thread state, status, doctor, export, and ship checks. Messages are hash-chained, idempotent, bounded, task-bound, secret-screened, and delivered through crash-recoverable recipient mailboxes. Critical messages require a matching unresolved critical issue by default. Bus text is always peer-agent advice: it never grants owner approval or authorizes merge, push, signing, deployment, credentials, spending, or destructive actions.
 
-V1 does not include a daemon, process spawning, headless resume, or automatic offline wake. Natural SessionStart/Stop hooks and explicit polling are the delivery paths. Codex Desktop remains non-wakeable.
+V1 does not include a daemon, process spawning, headless resume, or automatic offline wake as Bus delivery paths. Natural SessionStart/Stop hooks and explicit polling are the delivery paths. Codex Desktop remains non-wakeable. (Usage-limit auto-resume, above, is a scoped exception outside the Bus: its transient waker recovers limit-stopped sessions and is not a message delivery path.)
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/Storybloq/storybloq/main/assets/autonomous.png" alt="Autonomous mode running a ticket through plan, implement, test, review" />
@@ -242,6 +270,7 @@ All commands accept `--format json|md` (default `md`). Pipe JSON through `jq` fo
 | `storybloq blocker list` · `blocker add` · `blocker clear` | External dependencies blocking progress |
 | `storybloq snapshot` · `storybloq recap` | Capture state and diff against the last snapshot |
 | `storybloq export [--phase <id>] [--all] [--format json\|md]` | Self-contained project document |
+| `storybloq limit-status [--cancel <key>] [--requeue <key>]` | Pending usage-limit auto-resumes (global across projects) |
 
 ### Storybloq Bus (opt-in)
 
@@ -365,6 +394,35 @@ Injects a compact-aware resume prompt. Codex setup uses the same command with `-
 ```
 
 `storybloq bus hooks enable` is a separate project opt-in. It adds endpoint metadata and pending counts to SessionStart, and permits the synchronous Stop hook to block once for each new mailbox cursor. Peer payload bytes never appear in hook output. Claude's shared hook structure is upgraded once and remains guarded by project-local policy; Codex uses `storybloq hook-status --client codex`.
+
+### Stop (live status for the Mac app)
+
+Runs `storybloq hook-status` at the end of every turn, refreshing the gitignored `.story/status.json` that the Mac app and iOS companion read for live session state.
+
+The write is content-gated: when the payload is identical to what the file already says (ignoring the observation timestamp and which writer produced it), nothing is written and the file's timestamps and inode are left alone. Idle turns therefore leave the working tree completely untouched. Genuine changes -- a workflow transition, a new MCP call, a health or lease change -- still write immediately.
+
+Projects whose test harness treats any write during a run as a failure can turn the turn-end writer off entirely:
+
+```json
+{ "statusWriter": { "stopHook": false } }
+```
+
+in `.story/config.json`. The hook then performs no status work at all: no session scan, no payload build, no gitignore self-heal, no write. Autonomous sessions keep refreshing status on their own MCP transitions, so the Mac app still shows live state while a session is running -- it just stops updating between turns of ordinary interactive work. The flag defaults to on, and any unreadable or malformed config leaves it on.
+
+### StopFailure (usage-limit detection)
+
+Runs `storybloq session limit-stop` when a Claude Code session stops on a rate limit, recording the stop for auto-resume (see Usage-limit auto-resume above). Setup also adds a second SessionStart matcher group (`"resume"`) carrying the same `session resume-prompt` command so a manual reopen of a limit-stopped session gets limit-aware guidance. Both entries are Claude-only, reconciled on every upgrade, and removed automatically when the global kill switch is set.
+
+```json
+{
+  "hooks": {
+    "StopFailure": [{
+      "matcher": "rate_limit",
+      "hooks": [{ "type": "command", "command": "storybloq session limit-stop" }]
+    }]
+  }
+}
+```
 
 ## Library usage
 
@@ -554,6 +612,10 @@ For team-mode projects, add CI validation to catch duplicate displayIds and stal
 
 - **[@storybloq/lenses](https://github.com/Storybloq/lenses)** - multi-lens code review MCP server and library. 9 specialized reviewers run in parallel and return structured verdicts; the storybloq autonomous lens backend consumes it directly.
 - **[Storybloq for Mac](https://apps.apple.com/us/app/storybloq/id6761348691)** - native macOS app that watches `.story/` and updates live while your AI client works. Free on the Mac App Store.
+
+## Support
+
+Email [shayegh@me.com](mailto:shayegh@me.com) for anything: setup trouble, questions, feature requests, or just to say what you are building. Bug reports are also welcome as [GitHub issues](https://github.com/Storybloq/storybloq/issues).
 
 ## Contributing
 

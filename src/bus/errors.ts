@@ -9,6 +9,10 @@ export type BusErrorCode =
   | "secret_detected"
   | "thread_parked"
   | "idempotency_conflict"
+  | "no_peer"
+  | "participant_retired"
+  | "upgrade_required"
+  | "runtime_lost"
   | "io_error";
 
 export class BusError extends Error {

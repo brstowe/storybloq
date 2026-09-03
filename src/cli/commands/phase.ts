@@ -20,6 +20,8 @@ import {
   successEnvelope,
   ExitCode,
 } from "../../core/output-formatter.js";
+import { loadCitationContext } from "../../core/ruling-loader.js";
+import { citationMapFor } from "../../core/ruling.js";
 import { CliValidationError } from "../helpers.js";
 import type { CommandContext, CommandResult } from "../types.js";
 
@@ -50,7 +52,7 @@ export function handlePhaseCurrent(ctx: CommandContext): CommandResult {
       return { output: JSON.stringify(successEnvelope(phase), null, 2) };
     }
     const summary = phase.summary ?? phase.description;
-    return { output: `${phase.name} (${phase.id}) — ${summary}` };
+    return { output: `${phase.name} (${phase.id}) -- ${summary}` };
   }
 
   // Differentiate: no phases with leaves vs all complete
@@ -84,7 +86,7 @@ export function handlePhaseTickets(
   phaseId: string,
   ctx: CommandContext,
 ): CommandResult {
-  // Check phase existence — return not_found for unknown phase
+  // Check phase existence -- return not_found for unknown phase
   const phaseExists = ctx.state.roadmap.phases.some((p) => p.id === phaseId);
   if (!phaseExists) {
     return {
@@ -93,7 +95,10 @@ export function handlePhaseTickets(
       errorCode: "not_found",
     };
   }
-  return { output: formatPhaseTickets(phaseId, ctx.state, ctx.format) };
+  const tickets = ctx.state.phaseTickets(phaseId);
+  return {
+    output: formatPhaseTickets(phaseId, ctx.state, ctx.format, citationMapFor(tickets, loadCitationContext(ctx.root))),
+  };
 }
 
 // --- Write Handlers ---

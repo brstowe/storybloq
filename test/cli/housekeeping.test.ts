@@ -100,6 +100,61 @@ describe("preCommandHousekeeping end-to-end", () => {
     // (d) unrelated top-level settings preserved
     expect(settings.permissions).toEqual({ allow: ["Bash(git status)"] });
   });
+
+  async function seedBinAndHookFreeSettings(): Promise<{ binPath: string; settingsPath: string }> {
+    const binDir = join(tempDir, "bin");
+    await mkdir(binDir, { recursive: true });
+    const binPath = join(binDir, "storybloq");
+    await writeFile(binPath, "#!/bin/sh\n", "utf-8");
+    await chmod(binPath, 0o755);
+    process.env.PATH = binDir;
+    const settingsPath = join(tempDir, ".claude", "settings.json");
+    await writeFile(settingsPath, JSON.stringify({ model: "opus" }, null, 2), "utf-8");
+    return { binPath, settingsPath };
+  }
+
+  it("threads `setup --skip-hooks` through housekeeping: no limit hooks installed", async () => {
+    // The CLI entry point must honor the explicit opt-out end-to-end: neither
+    // the version-refresh reconcile nor the direct ensureLimitHooksRegistered
+    // may install limit hooks over hook-free settings.
+    const { settingsPath } = await seedBinAndHookFreeSettings();
+    const savedDisable = process.env.STORYBLOQ_DISABLE_WAKER_SPAWN;
+    process.env.STORYBLOQ_DISABLE_WAKER_SPAWN = "1";
+    try {
+      const { preCommandHousekeeping } = await import("../../src/cli/housekeeping.js");
+      await preCommandHousekeeping("1.1.6", ["setup", "--skip-hooks"]);
+
+      const settings = JSON.parse(await readFile(settingsPath, "utf-8")) as { hooks?: Record<string, unknown> };
+      expect(settings.hooks?.StopFailure).toBeUndefined();
+      expect(settings.hooks?.SessionStart).toBeUndefined();
+    } finally {
+      if (savedDisable === undefined) delete process.env.STORYBLOQ_DISABLE_WAKER_SPAWN;
+      else process.env.STORYBLOQ_DISABLE_WAKER_SPAWN = savedDisable;
+    }
+  });
+
+  it("installs limit hooks through housekeeping for an ordinary (non-skip) invocation", async () => {
+    const { binPath, settingsPath } = await seedBinAndHookFreeSettings();
+    const savedDisable = process.env.STORYBLOQ_DISABLE_WAKER_SPAWN;
+    process.env.STORYBLOQ_DISABLE_WAKER_SPAWN = "1";
+    try {
+      const { preCommandHousekeeping } = await import("../../src/cli/housekeeping.js");
+      await preCommandHousekeeping("1.1.6", ["status"]);
+
+      const settings = JSON.parse(await readFile(settingsPath, "utf-8")) as {
+        hooks?: { StopFailure?: Array<{ matcher: string; hooks: Array<{ command: string }> }>;
+                  SessionStart?: Array<{ matcher: string; hooks: Array<{ command: string }> }> };
+      };
+      expect(settings.hooks?.StopFailure).toEqual([
+        { matcher: "rate_limit", hooks: [{ type: "command", command: `${binPath} session limit-stop` }] },
+      ]);
+      const resume = (settings.hooks?.SessionStart ?? []).find((g) => g.matcher === "resume");
+      expect(resume?.hooks).toEqual([{ type: "command", command: `${binPath} session resume-prompt` }]);
+    } finally {
+      if (savedDisable === undefined) delete process.env.STORYBLOQ_DISABLE_WAKER_SPAWN;
+      else process.env.STORYBLOQ_DISABLE_WAKER_SPAWN = savedDisable;
+    }
+  });
 });
 
 // ISS-777: pure predicate deciding when the CLI skips preCommandHousekeeping
@@ -115,6 +170,11 @@ describe("shouldSkipHousekeeping (ISS-777)", () => {
   it("skips the hook-status Stop hook", async () => {
     const { shouldSkipHousekeeping } = await import("../../src/cli/housekeeping.js");
     expect(shouldSkipHousekeeping(["hook-status"])).toBe(true);
+  });
+
+  it("skips the hook-bus-tool PostToolUse hook (T-427)", async () => {
+    const { shouldSkipHousekeeping } = await import("../../src/cli/housekeeping.js");
+    expect(shouldSkipHousekeeping(["hook-bus-tool"])).toBe(true);
   });
 
   it("skips session compact-prepare (PreCompact hook)", async () => {

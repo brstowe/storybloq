@@ -21,6 +21,25 @@ export async function syncDirectory(directory: string): Promise<void> {
   }
 }
 
+// Durably flush a file's contents to disk, then its containing directory entry.
+// Used to make an in-place writeFile (e.g. `.story/.gitignore`) crash-durable so a
+// power loss cannot preserve a durably-written sibling while losing this file. A
+// missing file (ENOENT) is a no-op; other errors propagate.
+export async function syncFile(path: string): Promise<void> {
+  let handle;
+  try {
+    handle = await open(path, "r");
+    await handle.sync();
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return;
+    if (code !== "EINVAL" && code !== "ENOTSUP" && code !== "EPERM") throw err;
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+  await syncDirectory(dirname(path));
+}
+
 type DurableTempWriter = (handle: FileHandle, content: string) => Promise<void>;
 
 const defaultTempWriter: DurableTempWriter = async (handle, content) => {
@@ -100,21 +119,102 @@ export async function durableUnlink(target: string): Promise<void> {
   }
 }
 
+interface OpenReadNoFollowOptions {
+  // Injectable ONLY so a test can force the degraded (flag-unavailable) platform
+  // branch and prove the lstat floor + identity check still refuse a symlink.
+  readonly noFollowFlag?: number;
+  // Test-only seam: runs AFTER the pre-open lstat and BEFORE open, to deterministically
+  // exercise the swap window the identity check defends.
+  readonly afterInspect?: () => Promise<void>;
+}
+
+// Bounded retries for a benign concurrent atomic rename landing in the lstat->open
+// window. The window is two syscalls, so a legitimate durableRename settles within one
+// retry; the bound only guards against pathological churn.
+const NO_FOLLOW_MAX_ATTEMPTS = 5;
+
+// Open a file for reading while refusing a final-component symlink AND verifying the
+// opened handle is the same inode lstat saw. The lstat check is the PORTABLE floor:
+// lstat never follows, so a symlinked target is refused on EVERY platform, including
+// where `O_NOFOLLOW` is unavailable and the open cannot enforce it (there, silently
+// substituting 0 would otherwise follow the link). `O_NOFOLLOW` is ALSO applied when
+// available. The dev/ino identity check closes the residual lstat->open swap window on
+// platforms lacking `O_NOFOLLOW`: a mismatch is EITHER a benign atomic rename (a new
+// regular file now lives at the path) OR a symlink swap the degraded open followed, so
+// we close and retry the whole lstat/open -- the next lstat reads the CURRENT file, so
+// a benign rename settles to a matching regular file while a symlink is rejected. This
+// keeps concurrently-rewritten bus-store reads correct (they read the new inode on
+// retry) without ever following a swapped-in symlink.
+async function openReadNoFollow(path: string, options: OpenReadNoFollowOptions = {}): Promise<FileHandle> {
+  const noFollowFlag = options.noFollowFlag ?? (typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0);
+  // O_NONBLOCK so a swap to a FIFO cannot block the open before identity is verified.
+  const nonBlock = typeof constants.O_NONBLOCK === "number" ? constants.O_NONBLOCK : 0;
+  for (let attempt = 0; ; attempt++) {
+    let linkStat;
+    try {
+      linkStat = await lstat(path);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === "ENOENT") throw new BusError("not_found", `File not found: ${basename(path)}`, err);
+      throw new BusError("io_error", `Failed to inspect ${basename(path)}`, err);
+    }
+    if (linkStat.isSymbolicLink()) throw new BusError("corrupt", `Symlink rejected: ${basename(path)}`);
+    if (!linkStat.isFile()) throw new BusError("corrupt", `${basename(path)} is not a regular file`);
+    if (options.afterInspect) await options.afterInspect();
+    const handle = await open(path, constants.O_RDONLY | noFollowFlag | nonBlock);
+    let openedStat;
+    try {
+      openedStat = await handle.stat();
+    } catch (err) {
+      // Close before propagating: the caller only receives the handle on success, so
+      // its finally cannot close a handle we fail to return (fd-leak on fstat error).
+      await handle.close().catch(() => undefined);
+      throw err;
+    }
+    if (openedStat.isFile() && openedStat.dev === linkStat.dev && openedStat.ino === linkStat.ino) {
+      return handle;
+    }
+    await handle.close().catch(() => undefined);
+    if (attempt + 1 >= NO_FOLLOW_MAX_ATTEMPTS) {
+      throw new BusError("corrupt", `${basename(path)} changed identity during open`);
+    }
+  }
+}
+
+// Read at most maxBytes+1 bytes from an already-opened handle, rejecting if the file exceeds
+// maxBytes. Bounding the READ (not just a pre-read stat) is what actually caps allocation: a
+// file the stat saw as small can grow through the same inode before the read completes, so the
+// pre-read stat is only a fast-reject and this loop is the real ceiling.
+async function boundedReadAll(handle: FileHandle, maxBytes: number, path: string): Promise<string> {
+  const cap = maxBytes + 1;
+  const buf = Buffer.allocUnsafe(cap);
+  let total = 0;
+  while (total < cap) {
+    const { bytesRead } = await handle.read(buf, total, cap - total, total);
+    if (bytesRead === 0) break;
+    total += bytesRead;
+  }
+  if (total > maxBytes) throw new BusError("corrupt", `${basename(path)} exceeds ${maxBytes} bytes`);
+  return buf.subarray(0, total).toString("utf-8");
+}
+
 export async function readJsonNoFollow<T>(
   path: string,
   schema: ZodType<T>,
   maxBytes = DEFAULT_MAX_BYTES,
+  // Injectable ONLY for the degraded-platform / swap tests (see openReadNoFollow).
+  noFollowFlag?: number,
+  afterInspect?: () => Promise<void>,
 ): Promise<T> {
   let handle;
   try {
-    const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
-    handle = await open(path, constants.O_RDONLY | noFollow);
+    handle = await openReadNoFollow(path, { noFollowFlag, afterInspect });
     const stat = await handle.stat();
     if (!stat.isFile()) throw new BusError("corrupt", `${basename(path)} is not a regular file`);
     if (stat.size < 0 || stat.size > maxBytes) {
       throw new BusError("corrupt", `${basename(path)} exceeds ${maxBytes} bytes`);
     }
-    const raw = await handle.readFile("utf-8");
+    const raw = await boundedReadAll(handle, maxBytes, path);
     let parsed: unknown;
     try {
       parsed = JSON.parse(raw);
@@ -126,6 +226,39 @@ export async function readJsonNoFollow<T>(
       throw new BusError("corrupt", `Invalid schema in ${basename(path)}: ${result.error.issues[0]?.message ?? "unknown error"}`);
     }
     return result.data;
+  } catch (err) {
+    if (err instanceof BusError) throw err;
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") throw new BusError("not_found", `File not found: ${basename(path)}`, err);
+    if (code === "ELOOP") throw new BusError("corrupt", `Symlink rejected: ${basename(path)}`, err);
+    throw new BusError("io_error", `Failed to read ${basename(path)}`, err);
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
+// Read a text file WITHOUT following a final-component symlink (openReadNoFollow does
+// the lstat floor + O_NOFOLLOW + dev/ino identity check). Git does not honor a symlinked
+// working-tree `.gitignore`, so any guard that parses `.gitignore` must read it
+// no-follow (else a symlinked file whose target carries the expected rule would pass the
+// guard while git ignores it). A symlink or swapped identity surfaces as `corrupt`; a
+// missing file -> `not_found`. `noFollowFlag` and `afterInspect` are injectable only for
+// the degraded-platform / swap tests.
+export async function readTextNoFollow(
+  path: string,
+  maxBytes = DEFAULT_MAX_BYTES,
+  noFollowFlag?: number,
+  afterInspect?: () => Promise<void>,
+): Promise<string> {
+  let handle;
+  try {
+    handle = await openReadNoFollow(path, { noFollowFlag, afterInspect });
+    const stat = await handle.stat();
+    if (!stat.isFile()) throw new BusError("corrupt", `${basename(path)} is not a regular file`);
+    if (stat.size < 0 || stat.size > maxBytes) {
+      throw new BusError("corrupt", `${basename(path)} exceeds ${maxBytes} bytes`);
+    }
+    return await boundedReadAll(handle, maxBytes, path);
   } catch (err) {
     if (err instanceof BusError) throw err;
     const code = (err as NodeJS.ErrnoException).code;

@@ -1,5 +1,5 @@
 import { fork, type ChildProcess } from "node:child_process";
-import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -8,6 +8,7 @@ import {
   __testing,
   acquireHardenedLock,
   releaseHardenedLock,
+  tryAcquireHardenedLock,
 } from "../../src/bus/lock.js";
 
 const roots: string[] = [];
@@ -112,6 +113,110 @@ describe("Storybloq Bus hardened lock", () => {
     await expect(acquireHardenedLock(lockPath, { timeoutMs: 80, pollMs: 5 }))
       .rejects.toMatchObject({ code: "lock_timeout" });
     expect(await readFile(lockPath, "utf-8")).toContain("99999999");
+  });
+
+  describe("tryAcquireHardenedLock (single-attempt, non-blocking)", () => {
+    it("acquires a free lock on the first attempt", async () => {
+      const { lockPath } = await tempLock();
+      const handle = await tryAcquireHardenedLock(lockPath);
+      expect(handle).not.toBeNull();
+      await releaseHardenedLock(handle!);
+    });
+
+    it("returns the busy sentinel for a live holder without throwing", async () => {
+      // Non-waiting is structural (tryAcquireHardenedLock has no poll loop, unlike the deadline
+      // variant), so this asserts the observable contract -- a null sentinel, never a throw --
+      // rather than a flaky wall-clock bound.
+      const { lockPath } = await tempLock();
+      const held = await acquireHardenedLock(lockPath);
+      const busy = await tryAcquireHardenedLock(lockPath);
+      expect(busy).toBeNull();
+      await releaseHardenedLock(held);
+    });
+
+    it("reclaims a positively dead holder and acquires", async () => {
+      const { lockPath } = await tempLock();
+      await import("node:fs/promises").then((fs) => fs.mkdir(dirname(lockPath), { recursive: true }));
+      await writeFile(lockPath, JSON.stringify({
+        pid: 99999999,
+        token: "a".repeat(64),
+        acquiredAt: new Date().toISOString(),
+        processSignature: null,
+      }), "utf-8");
+      const handle = await tryAcquireHardenedLock(lockPath);
+      expect(handle).not.toBeNull();
+      await releaseHardenedLock(handle!);
+    });
+
+    it("returns busy without reclaiming when the reaper guard is held", async () => {
+      const { lockPath } = await tempLock();
+      await import("node:fs/promises").then((fs) => fs.mkdir(dirname(lockPath), { recursive: true }));
+      const dead = {
+        pid: 99999999,
+        token: "b".repeat(64),
+        acquiredAt: new Date().toISOString(),
+        processSignature: null,
+      };
+      await writeFile(lockPath, JSON.stringify(dead), "utf-8");
+      await writeFile(`${lockPath}.reap`, JSON.stringify({ ...dead, token: "c".repeat(64) }), "utf-8");
+      const busy = await tryAcquireHardenedLock(lockPath);
+      expect(busy).toBeNull();
+      expect(await readFile(lockPath, "utf-8")).toContain("99999999");
+    });
+
+    it("wedges (throws) on an unreadable lock instead of guessing", async () => {
+      const { lockPath } = await tempLock();
+      await import("node:fs/promises").then((fs) => fs.mkdir(dirname(lockPath), { recursive: true }));
+      await writeFile(lockPath, "not-json", "utf-8");
+      await expect(tryAcquireHardenedLock(lockPath)).rejects.toMatchObject({ code: "corrupt" });
+    });
+
+    it("lets exactly one of two sequential contenders acquire", async () => {
+      const { lockPath } = await tempLock();
+      const first = await tryAcquireHardenedLock(lockPath);
+      const second = await tryAcquireHardenedLock(lockPath);
+      expect(first).not.toBeNull();
+      expect(second).toBeNull();
+      await releaseHardenedLock(first!);
+      const third = await tryAcquireHardenedLock(lockPath);
+      expect(third).not.toBeNull();
+      await releaseHardenedLock(third!);
+    });
+
+    it("lets exactly one of two CONCURRENTLY racing contenders acquire (atomic link)", async () => {
+      const { lockPath } = await tempLock();
+      // Both start together: the link() is the atomic arbiter, so exactly one gets a handle and
+      // the other sees EEXIST from a live (this-process) holder -> null. No throw, no double-grant.
+      const [a, b] = await Promise.all([
+        tryAcquireHardenedLock(lockPath),
+        tryAcquireHardenedLock(lockPath),
+      ]);
+      const handles = [a, b].filter((h) => h !== null);
+      expect(handles).toHaveLength(1);
+      // The winner's lock is releasable and the path is immediately reusable afterward.
+      await releaseHardenedLock(handles[0]!);
+      const again = await tryAcquireHardenedLock(lockPath);
+      expect(again).not.toBeNull();
+      await releaseHardenedLock(again!);
+    });
+
+    it("removes its published lock when a post-link step fails (leaves no live-caller lock)", async () => {
+      const { lockPath } = await tempLock();
+      // Force a failure AFTER the primary link publishes but BEFORE sync completes: the
+      // ownership-verified cleanup must remove the just-published lock so it is not left naming
+      // this still-live process (which would wedge every later contender as "busy").
+      __testing.setAfterPrimaryLinkHook(async () => { throw new Error("forced post-link failure"); });
+      try {
+        await expect(tryAcquireHardenedLock(lockPath)).rejects.toMatchObject({ code: "io_error" });
+      } finally {
+        __testing.setAfterPrimaryLinkHook(null);
+      }
+      // The published lock was cleaned up, so the path is absent and a fresh contender acquires it.
+      await expect(lstat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+      const recovered = await tryAcquireHardenedLock(lockPath);
+      expect(recovered).not.toBeNull();
+      await releaseHardenedLock(recovered!);
+    });
   });
 
   it("serializes forty contenders after a SIGKILL without duplicate sequence 1", async () => {

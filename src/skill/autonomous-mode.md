@@ -16,6 +16,23 @@ This file is referenced from SKILL.md for `/story auto` / `$story auto`, review,
 
 **Ticket review depth:** Optional ticket metadata `reviewRisk` accepts `low`, `medium`, or `high` and sets the minimum PLAN_REVIEW depth to one, two, or three rounds. Set it with `storybloq ticket meta set T-001 reviewRisk '"high"'` or `storybloq_ticket_meta_set`. Legacy `risk` metadata remains compatible. Malformed explicit values fail closed to high, and risk metadata never skips a review stage.
 
+**Review effort:** Optional `reviewEffort` metadata on a ticket or issue accepts `off`, `light`, `standard`, or `thorough` and sets how hard BOTH review stages work for that item. Set it with `storybloq ticket meta set T-001 reviewEffort '"light"'` or `storybloq_ticket_meta_set`. Unset, it is derived per item: risk `high` maps to `thorough`, a `chore` at risk `low` maps to `light`, everything else maps to `standard` (issues map severity `low` or `medium` to `light`, else `standard`). A session-wide default can be set with `recipeOverrides.reviewEffort` or the `reviewEffort` argument on the start call, and an item's own value beats both. Malformed explicit values fail closed to `standard`, so a typo never buys less review than you have today -- the opposite direction from `reviewRisk`, which fails closed to `high`, because both point away from accidentally reviewing less. `reviewRisk` never skips a review stage; only `reviewEffort: off` does, and every level is disclosed on the review instruction, in a `review_effort_resolved` event, on the round record, and in `storybloq session-report`. The dial never overrides an explicit `stages.PLAN_REVIEW`/`stages.CODE_REVIEW` knob.
+
+### Review effort levels
+
+| Level | Plan review | Code review |
+|-------|-------------|-------------|
+| `off` | skipped | skipped (a plan-mode or review-mode session still runs its own review, at `light`) |
+| `light` | 1 round minimum; prefers one fast reviewer | 1 round minimum, cap 4; prefers one fast reviewer |
+| `standard` | risk-derived rounds | risk-derived rounds, cap 12 |
+| `thorough` | at least 2 rounds | at least 2 rounds |
+
+"Prefers" is exact: the dial narrows WITHIN the configured backends and never adds one, so a per-stage `backends` list you set explicitly is left alone, and a lenses-only project keeps its lens fan-out because there is no other reviewer to fall back to.
+
+`off` is the ONLY level that removes a review stage from the walk. `light` lowers the depth of both stages and never skips either one, which matters because `light` is reachable automatically through size mapping: a heuristic may make a review cheaper, but it never makes a gate disappear.
+
+The fix-then-re-review rule holds at every level. At `off` no review runs, so no change request can exist and the rule is vacuously satisfied; at `light` the landing rule below is what keeps it true under a lower cap.
+
 **Frontend design:** If the current ticket involves UI, frontend, components, layouts, or styling, read `design/design.md` in the same directory as the skill file for design principles. Load the relevant platform reference from `design/references/`. Apply the priority order (clarity > hierarchy > platform correctness > accessibility > state completeness) during both planning and implementation.
 
 ## Precedence: task-aware active-session guard
@@ -32,7 +49,7 @@ Before any guide call that could start, resume, or cancel a session, run SKILL.m
 - Do NOT use client-native plan mode -- write plans as markdown files in `.story/sessions/<id>/plan.md`.
 - Do NOT ask the user for confirmation or approval during the normal pipeline. The guard asks only for foreign/recovery choices; same-owner continuation is automatic.
 - Do NOT stop or summarize between tickets unless the guide reaches a context-rotation HANDOVER -- otherwise call the guide IMMEDIATELY
-- Do NOT wrap autonomous execution in scheduler or automation loops such as Claude Code's `/loop` skill, `ScheduleWakeup`, `CronCreate`, Codex automations, or thread wakeups. The state machine IS the loop: PICK_TICKET -> PLAN -> ... -> COMPLETE -> PICK_TICKET. "Continue immediately" means advance on THIS turn, not schedule a future wakeup. Scheduler and automation tools persist across compactions independent of conversation state, so a scheduled chain can self-perpetuate through compact/resume and keep burning prompt cache + compute; the user has no natural interrupt point because each turn looks like "just one more small close." The only correct pacing is the guide's `report` -> next-action cadence. See ISS-588 for the observed failure mode.
+- Do NOT wrap autonomous execution in scheduler or automation loops such as Claude Code's `/loop` skill, `ScheduleWakeup`, `CronCreate`, Codex automations, or thread wakeups. The state machine IS the loop: PICK_TICKET -> PLAN -> ... -> COMPLETE -> PICK_TICKET. "Continue immediately" means advance on THIS turn, not schedule a future wakeup. Scheduler and automation tools persist across compactions independent of conversation state, so a scheduled chain can self-perpetuate through compact/resume and keep burning prompt cache + compute; the user has no natural interrupt point because each turn looks like "just one more small close." The only correct pacing is the guide's `report` -> next-action cadence. See ISS-588 for the observed failure mode. Carve-out: Storybloq's built-in usage-limit waker (T-424) is NOT this pattern -- it is one bounded recovery episode per detected limit reset (wake launches retry only up to a small attempt cap when a launch fails or blocks on approvals, each is verified, and the waker exits once no ACTIONABLE records remain -- inert stood-down `manual` records that await an explicit user `--requeue` do not keep it polling), not a self-perpetuating scheduler chain. The anti-scheduler rule above still stands for everything the model itself could schedule.
 - Follow the guide's instructions exactly -- it specifies which tools to call, what parameters to use
 - After each step completes, call `storybloq_autonomous_guide` with `action: "report"`, `clientTaskId` when known, and the results
 
@@ -87,6 +104,39 @@ Pass the project id verbatim -- do NOT pre-expand it yourself.
 - Working through a dependency chain in order
 - Fixing a cascade of related issues
 - Driving a project (roadmap.projects grouping) to completion end-to-end
+
+## Parking an item at the plan gate
+
+Sometimes the plan gate keeps rejecting because the ITEM is defective, not the plan:
+an acceptance criterion that contradicts a stated constraint, a cited `file:line` that
+does not hold, or a scope item that cannot be sound in isolation from the others. A plan
+cannot be written around a contradiction, and an approve verdict must never be faked to
+escape one.
+
+From `PLAN` or `PLAN_REVIEW`, report:
+
+```json
+{ "completedAction": "park_item", "notes": "<the contradiction, specifically>" }
+```
+
+The guide releases the claim, records your reason on the item, returns it to `open`,
+and moves this session to the next item. The rest of a targeted queue is preserved.
+
+| | `park_item` | `skip_ticket` |
+|---|---|---|
+| Where | `PLAN`, `PLAN_REVIEW` | `PLAN`, `PLAN_REVIEW`, `CODE_REVIEW` |
+| Session | continues to the next item | ends with a handover |
+| Reason | required, written onto the item | optional, written into the handover |
+
+Notes:
+- The reason is mandatory. An unexplained park is indistinguishable from someone
+  releasing the claim by hand, which is what the guard machinery is there to catch.
+- After three plan-review rounds without approval the guide surfaces this option
+  itself, with the "this may be a filing defect" hypothesis attached.
+- Park only for a defect in the item. Ordinary review findings get addressed and
+  re-reviewed as usual.
+- If the claim moved to another session in the meantime, the guide writes nothing to
+  the item and tells you so; file the defect as an issue instead.
 
 ## Tiered Access -- Review, Plan, Guided Modes
 
@@ -145,17 +195,17 @@ Use `/story auto T-XXX` instead. A single-ticket targeted auto session is equiva
 
 `recipeOverrides.stages.CODE_REVIEW.maxReviewRounds` defaults to 12. The effective cap is the larger of that value and the ticket risk's required review rounds; `0` explicitly disables the cap. `reject`, plan redirects, and unresolved critical findings remain blocking at any round. At the cap, `revise` or `request_changes` with zero unresolved critical findings advances to FINALIZE and converts unresolved major/minor findings into deduplicated follow-up issues. A `landingDecision.reason` of `max_review_rounds_no_blocking` is an instruction to land the ticket, not reopen implementation. PLAN_REVIEW convergence remains separate.
 
-### Plan-review landing cap and review depth
+At `reviewEffort: light` the cap is 4 rather than 12, and it becomes a routing point rather than a landing point: a change request AT the cap goes back to IMPLEMENT like any other, and its fix gets exactly one more review round, during which landing is permitted again. The bound is therefore 5. Without that grace round a lower cap would land unreviewed fixes as a matter of course, which is the one rule that holds at every level. Setting `maxReviewRounds` explicitly beats the dial and opts out of both the cap and the grace round.
 
-`recipeOverrides.stages.PLAN_REVIEW.maxReviewRounds` (default `0` = disabled) applies the same landing-cap semantics to PLAN_REVIEW: at the cap, `revise`/`request_changes` with zero unresolved critical findings advances to IMPLEMENT and defers remaining major/minor findings as follow-up issues. `reject` and unresolved criticals remain blocking at any round.
+### The hard ceiling
 
-`recipeOverrides.reviewDepth` controls how much machinery an agent-backend review round may use (the guide embeds it in every review instruction):
+The cap above does not bound a review that keeps producing blocking findings, and it was never meant to: forced landing requires nothing blocking to be outstanding, so `reject` and unresolved criticals continue instead of finalizing at every round -- normally back to IMPLEMENT, or to PLAN when a finding asks for a replan. A reviewer that keeps finding the same class of problem therefore loops without limit.
 
-- `light` — the main agent reviews inline; NO reviewer subagents at all.
-- `standard` (default) — exactly ONE reviewer subagent per round; no panels, no parallel reviewers, no primary-source verification sweeps.
-- `thorough` — deep review; multiple reviewer perspectives allowed where risk justifies them.
+Three rounds past the effective cap, the session STOPS working on that item. It files the outstanding findings as open issues in the ledger (critical stays critical, major becomes high, minor becomes medium; suggestions are exempt) and goes to HANDOVER. When the session still owns the item's claim it also records the reason on the ticket, releases the claim, and the item returns to `open`. When the claim has moved to another session, or the item is no longer readable, nothing is written to it: the session drops it unchanged, and its current ledger state is what to check.
 
-Per-ticket override: set `reviewDepth` ticket metadata (`storybloq ticket meta set T-001 reviewDepth '"thorough"'`) to escalate or reduce one ticket without changing the session default. Depth governs the plain agent backend only; the `lenses` backend has its own bounded fan-out. If a configured reviewer backend (e.g. codex) is unavailable, substitute a review at the stated depth — never a heavier process.
+It ends the session rather than moving to the next item because the parked item's work is still uncommitted in the working tree, and nothing re-checks the tree mid-session; ending puts it in front of the start-of-session dirty-tree guard instead of letting the next item build on top of it. An item released back to `open` can be picked again once a person has dealt with the tree.
+
+`maxReviewRounds: 0` disables the ceiling along with the cap, deliberately: a project that turned the cap off explicitly did not ask for a bound three rounds later. Rounds are counted per ticket and survive both a plan redirect and a compaction recovery, either of which clears the review history the cap's own round number is derived from. The issue-fix path and PLAN_REVIEW have no ceiling yet (ISS-1032, ISS-1031).
 
 ### Federation inheritance (lessons + notes)
 
@@ -206,17 +256,46 @@ current git branch contains a ticket or issue ID (e.g. `story/T-012-rebrand`).
 - If the branch contains multiple IDs (ambiguous), a warning is shown but no blocking
   occurs.
 
-**If mismatch blocking triggers, tell the user:**
-> This branch is scoped to {id}. The session will end with a handover.
-> To work on other tickets:
-> - Switch to `main` and run `/story auto` from there
-> - Use targeted mode: `/story auto T-XXX` (skips the branch check)
-> - Set `branchStrategy: "per-ticket"` in config (auto-creates branches per ticket)
+**If you pick a different ticket, the guide offers three escapes.** The first mismatch is a
+retry, not the end of the session. Report exactly one of:
 
-**When branchStrategy is "per-ticket":**
-The guide creates a new branch per ticket automatically. The mismatch check is skipped
-because each ticket gets its own branch.
+| Report | What the guide does |
+|---|---|
+| `{ "completedAction": "new_branch_from_main" }` | Resolves main, creates this item's branch from it, and proceeds with the pick. The guide runs git itself; you do not run any command. |
+| `{ "completedAction": "skip_ticket" }` | Records the item as skipped for this session and returns to the pick stage. It will not be offered again. |
+| `{ "completedAction": "end_session" }` | Ends the session with a handover, the pre-existing behavior. |
+
+You may also simply pick one of the ids the branch is scoped to.
+
+Each of these acts on the pending item only. Send no id, or the id matching it; a different
+id is rejected rather than silently ignored. Re-reporting the same mismatched pick, or
+failing to resolve the mismatch repeatedly, ends the session with a handover.
+
+## branchStrategy
+
+Set under `recipeOverrides` in `.story/config.json`.
+
+| Value | Behavior |
+|---|---|
+| `"current"` (default) | Work on whatever branch is checked out. Branch affinity guards against contaminating a feature branch. |
+| `"per-ticket"` | Create a branch per item automatically (`story/` for tickets, `fix/` for issues). The mismatch check is skipped, since each item gets its own branch. |
+| `"main"` | Switch to main before working. The mismatch check is skipped for the same reason. |
+| `"none"` | Deprecated spelling of `"current"`. Still accepted so existing configs keep working; never written by the CLI. |
+
+**What `"main"` resolves to.** The local branch named `main`, falling back to `master` when
+no local `main` exists. It is main-preferred, not default-branch-aware: a repository that
+keeps a vestigial `main` while `master` is its real default gets `main`. Resolution is
+local-only, with no fetch and no fast-forward, so a stale local `main` is used as-is.
+
+**Where branches are cut from.** These deliberately differ:
+
+- `new_branch_from_main` always bases the new branch on the resolved local main. Its whole
+  purpose is to get off a branch whose history you do not want.
+- `per-ticket` bases branches on the session's starting commit, which is the behavior that
+  shipped. Changing it to main is an open decision, not an oversight: someone who starts a
+  session from a release or integration branch today gets ticket branches rooted there, and
+  moving them silently would relocate their work.
 
 **Targeted mode (`/story auto T-XXX ISS-YYY`):**
 Branch affinity is skipped entirely. The targetWork list constrains picks regardless of
-branch name.
+branch name, so no mismatch episode can arise.

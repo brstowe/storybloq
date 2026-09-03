@@ -18,6 +18,7 @@ import {
   isCrossNodeBlocked,
 } from "./queries.js";
 import { validateProject } from "./validation.js";
+import { notHiddenByEarmark } from "./earmarks.js";
 import { applyClaimAnnotations } from "./claims.js";
 import type { Claim } from "../models/types.js";
 
@@ -149,7 +150,7 @@ export function recommend(
   }
 
   // Parked phases (state: pending/paused/skipped) never surface in
-  // recommendations — that work is deliberately on hold
+  // recommendations -- that work is deliberately on hold
   const parkedPhaseIds = new Set(
     state.roadmap.phases.filter((p) => p.state).map((p) => p.id),
   );
@@ -163,7 +164,7 @@ export function recommend(
     }
   }
 
-  // ISS-018: Handover context boost — tickets referenced in actionable sections get +50
+  // ISS-018: Handover context boost -- tickets referenced in actionable sections get +50
   applyHandoverBoost(state, dedup, options);
 
   // Phase-distance penalty: tickets in future phases are penalized
@@ -223,7 +224,7 @@ function generateValidationSuggestions(
       kind: "action",
       title: "Run storybloq validate",
       category: "validation_errors",
-      reason: `${result.errorCount} validation error${result.errorCount === 1 ? "" : "s"} — fix before other work`,
+      reason: `${result.errorCount} validation error${result.errorCount === 1 ? "" : "s"} -- fix before other work`,
       score: 1000,
     },
   ];
@@ -234,7 +235,8 @@ function generateCriticalIssues(state: ProjectState): Recommendation[] {
     .filter(
       (i) =>
         i.status !== "resolved" &&
-        (i.severity === "critical" || i.severity === "high"),
+        (i.severity === "critical" || i.severity === "high") &&
+        notHiddenByEarmark(i),
     )
     .sort((a, b) => {
       const sevDiff = SEVERITY_RANK[b.severity] - SEVERITY_RANK[a.severity];
@@ -249,8 +251,8 @@ function generateCriticalIssues(state: ProjectState): Recommendation[] {
     title: issue.title,
     category: "critical_issue" as const,
     reason: issue.status === "inprogress"
-      ? `${capitalize(issue.severity)} severity issue — in-progress, ensure it's being addressed`
-      : `${capitalize(issue.severity)} severity issue — address before new features`,
+      ? `${capitalize(issue.severity)} severity issue -- in-progress, ensure it's being addressed`
+      : `${capitalize(issue.severity)} severity issue -- address before new features`,
     score: 900 - Math.min(index, 99),
   }));
 }
@@ -271,7 +273,7 @@ function generateInProgressTickets(
     kind: "ticket" as const,
     title: ticket.title,
     category: "inprogress_ticket" as const,
-    reason: "In-progress — finish what's started",
+    reason: "In-progress -- finish what's started",
     score: 800 - Math.min(index, 99),
   }));
 }
@@ -283,6 +285,7 @@ function generateHighImpactUnblocks(state: ProjectState, crossNodeStatuses?: Rec
     if (ticket.status === "complete") continue;
     if (state.isBlocked(ticket)) continue;
     if (isCrossNodeBlocked(ticket, crossNodeStatuses)) continue;
+    if (!notHiddenByEarmark(ticket)) continue;
 
     const wouldUnblock = ticketsUnblockedBy(ticket.id, state);
     if (wouldUnblock.length >= 2) {
@@ -328,7 +331,11 @@ function generateNearCompleteUmbrellas(
 
     const leaves = descendantLeaves(umbrellaId, state);
     const incomplete = leaves.filter(
-      (t) => t.status !== "complete" && !state.isBlocked(t) && !isCrossNodeBlocked(t, crossNodeStatuses),
+      (t) =>
+        t.status !== "complete" &&
+        !state.isBlocked(t) &&
+        !isCrossNodeBlocked(t, crossNodeStatuses) &&
+        notHiddenByEarmark(t),
     );
     const sorted = sortByPhaseAndOrder(incomplete, phaseIndex);
     if (sorted.length === 0) continue;
@@ -352,7 +359,7 @@ function generateNearCompleteUmbrellas(
     kind: "ticket" as const,
     title: c.firstIncompleteLeaf.title,
     category: "near_complete_umbrella" as const,
-    reason: `${c.complete}/${c.total} complete in umbrella ${c.umbrellaId} — close it out`,
+    reason: `${c.complete}/${c.total} complete in umbrella ${c.umbrellaId} -- close it out`,
     score: 600 - Math.min(index, 99),
   }));
 }
@@ -362,7 +369,11 @@ function generatePhaseMomentum(state: ProjectState, crossNodeStatuses?: Record<s
     if (state.phaseStatus(phase.id) === "complete") continue;
     const leaves = state.phaseTickets(phase.id);
     const candidate = leaves.find(
-      (t) => t.status !== "complete" && !state.isBlocked(t) && !isCrossNodeBlocked(t, crossNodeStatuses),
+      (t) =>
+        t.status !== "complete" &&
+        !state.isBlocked(t) &&
+        !isCrossNodeBlocked(t, crossNodeStatuses) &&
+        notHiddenByEarmark(t),
     );
     if (!candidate) continue;
     return [
@@ -383,7 +394,11 @@ function generatePhaseMomentum(state: ProjectState, crossNodeStatuses?: Record<s
 function generateQuickWins(state: ProjectState, phaseIndex: Map<string, number>, crossNodeStatuses?: Record<string, string>): Recommendation[] {
   const tickets = state.leafTickets.filter(
     (t) =>
-      t.status === "open" && t.type === "chore" && !state.isBlocked(t) && !isCrossNodeBlocked(t, crossNodeStatuses),
+      t.status === "open" &&
+      t.type === "chore" &&
+      !state.isBlocked(t) &&
+      !isCrossNodeBlocked(t, crossNodeStatuses) &&
+      notHiddenByEarmark(t),
   );
   const sorted = sortByPhaseAndOrder(tickets, phaseIndex);
 
@@ -393,7 +408,7 @@ function generateQuickWins(state: ProjectState, phaseIndex: Map<string, number>,
     kind: "ticket" as const,
     title: ticket.title,
     category: "quick_win" as const,
-    reason: "Chore — quick win",
+    reason: "Chore -- quick win",
     score: 400 - Math.min(index, 99),
   }));
 }
@@ -403,7 +418,8 @@ function generateOpenIssues(state: ProjectState): Recommendation[] {
     .filter(
       (i) =>
         i.status !== "resolved" &&
-        (i.severity === "medium" || i.severity === "low"),
+        (i.severity === "medium" || i.severity === "low") &&
+        notHiddenByEarmark(i),
     )
     .sort((a, b) => {
       const sevDiff = SEVERITY_RANK[b.severity] - SEVERITY_RANK[a.severity];
@@ -418,7 +434,7 @@ function generateOpenIssues(state: ProjectState): Recommendation[] {
     title: issue.title,
     category: "open_issue" as const,
     reason: issue.status === "inprogress"
-      ? `${capitalize(issue.severity)} severity issue — in-progress`
+      ? `${capitalize(issue.severity)} severity issue -- in-progress`
       : `${capitalize(issue.severity)} severity issue`,
     score: 300 - Math.min(index, 99),
   }));
@@ -485,6 +501,11 @@ function applyHandoverBoost(
   for (const id of actionableIds) {
     const ticket = state.ticketByID(id);
     if (!ticket || ticket.status === "complete") continue;
+    // Layer 2: applies to BOTH branches below -- boosting an already-listed
+    // rec and freshly adding one that bypassed the generators entirely.
+    // Never suppresses an already-inprogress ticket referenced in a
+    // handover; only an open one's earmark is a pick temptation here.
+    if (!notHiddenByEarmark(ticket)) continue;
 
     const existing = dedup.get(id);
     if (existing) {

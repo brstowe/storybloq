@@ -3,9 +3,12 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  busSummary,
   consumeCompactionSuccession,
   findEndpointForTask,
+  initializeBus,
   joinEndpoint,
+  listEndpoints,
   mintCompactionSuccession,
   pollBus,
   retireEndpoint,
@@ -222,14 +225,20 @@ describe("Storybloq Bus endpoint succession", () => {
     expect(record.consumedAt).not.toBeNull();
   });
 
-  it("does not let another task replace an unknown role owner", async () => {
+  it("does not let another task replace an unknown-liveness owner", async () => {
     const value = await fixture();
+    // Two-endpoint invariant: a third join without --replace fails closed.
     await expect(joinEndpoint(value.root, {
-      role: "implementer",
       client: "codex",
       clientTaskId: "foreign-codex-task",
       surface: "codex_desktop",
-      replace: true,
+    })).rejects.toMatchObject({ code: "conflict" });
+    // Replacing an unknown-liveness incumbent fails without positive offline proof.
+    await expect(joinEndpoint(value.root, {
+      client: "codex",
+      clientTaskId: "foreign-codex-task",
+      surface: "codex_desktop",
+      replace: value.implementer.endpointId,
     })).rejects.toMatchObject({ code: "conflict" });
 
     await expect(retireEndpoint(
@@ -247,6 +256,63 @@ describe("Storybloq Bus endpoint succession", () => {
     expect(retired.retiredAt).not.toBeNull();
   });
 
+  it("leaves the incumbent active when a --replace join fails surface validation (R16)", async () => {
+    const value = await fixture();
+    // Make the claude incumbent (reviewer) positively offline: a processRef whose
+    // pid does not exist reads as dead, so the --replace offline proof passes and
+    // control reaches the fallible surface detection that follows it.
+    const reviewerPath = join(value.root, ".story", "bus", "endpoints", `${value.reviewer.endpointId}.json`);
+    const reviewer = JSON.parse(await readFile(reviewerPath, "utf-8"));
+    await writeFile(reviewerPath, JSON.stringify({
+      ...reviewer,
+      state: "attached",
+      processRef: { pid: 999999999, signature: "darwin:deadbeef", capturedAt: new Date().toISOString() },
+    }, null, 2) + "\n", "utf-8");
+
+    // A codex --replace join with an inherently incompatible explicit surface
+    // (claude_cli is never a codex surface) fails surface validation as invalid_input
+    // BEFORE the retire, regardless of process ancestry, so the incumbent survives.
+    await expect(joinEndpoint(value.root, {
+      client: "codex",
+      clientTaskId: "codex-replace-task",
+      surface: "claude_cli",
+      replace: value.reviewer.endpointId,
+    })).rejects.toMatchObject({ code: "invalid_input" });
+
+    // The incumbent was never retired: the runtime keeps both active endpoints and
+    // never drops to zero on the failed replace.
+    const after = JSON.parse(await readFile(reviewerPath, "utf-8"));
+    expect(after.retiredAt ?? null).toBeNull();
+    const { endpoints } = await listEndpoints(value.root);
+    expect(endpoints.filter((endpoint) => !endpoint.retiredAt)).toHaveLength(2);
+  });
+
+  it("rejects a same-task rejoin with an inherently incompatible explicit surface before the early return (G)", async () => {
+    const value = await fixture();
+    // value.a is an already-joined codex endpoint (surface codex_desktop). A
+    // same-task, same-client rejoin normally short-circuits to the existing
+    // endpoint, but an explicit surface inherently incompatible with the client
+    // (claude_cli is never a codex surface) is rejected as invalid_input BEFORE
+    // that early return -- proving the compatibility check now precedes it.
+    const endpointPath = join(value.root, ".story", "bus", "endpoints", `${value.a.endpointId}.json`);
+    const before = await readFile(endpointPath, "utf-8");
+    const activeBefore = (await listEndpoints(value.root)).endpoints.filter((endpoint) => !endpoint.retiredAt);
+
+    await expect(joinEndpoint(value.root, {
+      client: "codex",
+      clientTaskId: value.aTaskId,
+      surface: "claude_cli",
+    })).rejects.toMatchObject({ code: "invalid_input" });
+
+    // No filesystem mutation: the incumbent record is byte-identical and the set of
+    // active endpoints is unchanged (still exactly the two the fixture joined).
+    expect(await readFile(endpointPath, "utf-8")).toBe(before);
+    const activeAfter = (await listEndpoints(value.root)).endpoints.filter((endpoint) => !endpoint.retiredAt);
+    expect(activeAfter.map((endpoint) => endpoint.endpointId).sort())
+      .toEqual(activeBefore.map((endpoint) => endpoint.endpointId).sort());
+    expect(activeAfter).toHaveLength(2);
+  });
+
   it("does not create runtime files when the feature flag is hand-set", async () => {
     const root = await mkdtemp(join(tmpdir(), "bus-hand-set-"));
     extraDirs.push(root);
@@ -257,17 +323,16 @@ describe("Storybloq Bus endpoint succession", () => {
     await writeFile(configPath, JSON.stringify(config, null, 2) + "\n", "utf-8");
 
     await expect(joinEndpoint(root, {
-      role: "implementer",
       client: "codex",
       clientTaskId: "hand-set-task",
       surface: "codex_desktop",
     })).rejects.toMatchObject({
       code: "not_found",
-      message: "Bus is not initialized in this checkout. Run `storybloq bus init` first.",
+      message: "Bus is not initialized in this checkout. Run `storybloq bus setup` first.",
     });
     await expect(setBusHookPolicy(root, ["codex"], true)).rejects.toMatchObject({
       code: "not_found",
-      message: "Bus is not initialized in this checkout. Run `storybloq bus init` first.",
+      message: "Bus is not initialized in this checkout. Run `storybloq bus setup` first.",
     });
     await expect(readdir(join(root, ".story", "bus"))).rejects.toMatchObject({ code: "ENOENT" });
   });
@@ -321,6 +386,86 @@ describe("Storybloq Bus endpoint succession", () => {
   });
 });
 
+// Marks an endpoint record retired in place, reproducing the on-disk state a crash
+// leaves AFTER the incumbent retire write but BEFORE the replacement create.
+async function retireEndpointOnDisk(root: string, endpointId: string): Promise<void> {
+  const path = join(root, ".story", "bus", "endpoints", `${endpointId}.json`);
+  const record = JSON.parse(await readFile(path, "utf-8"));
+  const now = new Date().toISOString();
+  await writeFile(path, JSON.stringify({
+    ...record,
+    state: "offline",
+    retiredAt: now,
+    retiredReason: "replaced",
+    lastSeenAt: now,
+  }, null, 2) + "\n", "utf-8");
+}
+
+describe("Storybloq Bus replacement atomicity (crash recovery)", () => {
+  it("recovers a fresh working endpoint after a --replace crashed post-retire, pre-create", async () => {
+    const value = await fixture();
+    // Crash window: the incumbent (codex) was retired but the replacement was
+    // never created. Only the claude peer remains active.
+    await retireEndpointOnDisk(value.root, value.implementer.endpointId);
+    const afterCrash = await listEndpoints(value.root);
+    expect(afterCrash.endpoints.filter((endpoint) => !endpoint.retiredAt)).toHaveLength(1);
+
+    // Re-running the join for the replacing task mints a working endpoint; the
+    // runtime is degraded-but-recoverable, never bricked.
+    const replacement = (await joinEndpoint(value.root, {
+      client: "codex",
+      clientTaskId: "codex-task-recovered",
+      surface: "codex_desktop",
+    })).endpoint;
+    expect(replacement.retiredAt ?? null).toBeNull();
+    const summary = await busSummary(value.root);
+    expect(summary.setupState).toBe("ready");
+    expect(summary.endpoints).toBe(2);
+
+    // The fresh endpoint actually works: it can open a thread to the surviving peer.
+    const sent = await sendBusMessage(value.root, {
+      endpointId: replacement.endpointId,
+      clientTaskId: "codex-task-recovered",
+      threadKind: "question",
+      messageKind: "question",
+      severity: "medium",
+      body: "The recovered endpoint verifies the boundary",
+      refs: { ciRun: "ci-recovered" },
+      idempotencyKey: "recovered-question-1",
+    });
+    expect(sent.toEndpoint).toBe(value.reviewer.endpointId);
+  });
+
+  it("passes through zero active endpoints to a valid single-endpoint waiting_for_peer", async () => {
+    const root = await mkdtemp(join(tmpdir(), "bus-solo-replace-"));
+    extraDirs.push(root);
+    await initProject(root, { name: "bus-solo-replace" });
+    await initializeBus(root);
+    const solo = (await joinEndpoint(root, {
+      client: "codex",
+      clientTaskId: "codex-solo-incumbent",
+      surface: "codex_desktop",
+    })).endpoint;
+    expect((await busSummary(root)).setupState).toBe("waiting_for_peer");
+
+    // Replacing the sole incumbent leaves zero active endpoints transiently.
+    await retireEndpointOnDisk(root, solo.endpointId);
+    const transient = await busSummary(root);
+    expect(transient.endpoints).toBe(0);
+    expect(transient.setupState).toBe("disconnected");
+
+    // A fresh join reaches a valid single-endpoint waiting_for_peer.
+    await joinEndpoint(root, {
+      client: "codex",
+      clientTaskId: "codex-solo-fresh",
+      surface: "codex_desktop",
+    });
+    const recovered = await busSummary(root);
+    expect(recovered.endpoints).toBe(1);
+    expect(recovered.setupState).toBe("waiting_for_peer");
+  });
+});
+
 describe("Storybloq Bus hooks", () => {
   it("parses full hook context with request-scoped identity", async () => {
     const stream = new PassThrough();
@@ -366,6 +511,18 @@ describe("Storybloq Bus hooks", () => {
       endpointId: value.implementer.endpointId,
       clientTaskId: value.implementerTaskId,
     });
+    expect(await claimBusStopDelivery(value.root, input, "codex")).toBeNull();
+  });
+
+  it("fails open (no block) when the pending cursor read throws under lock", async () => {
+    const value = await fixture();
+    await setBusHookPolicy(value.root, ["codex"], true);
+    await sendToImplementer(value, 1);
+    // Break the runtime layout AFTER endpoint resolution succeeds: findEndpointForTask
+    // still resolves the endpoint, but pendingMailboxCursor asserts the layout under
+    // the endpoint lock and throws. The Stop hook must treat that throw as fail-open.
+    await rm(join(value.root, ".story", "bus", "mailboxes", value.implementer.endpointId, "pending"), { recursive: true });
+    const input = { session_id: value.implementerTaskId, cwd: value.root, stop_hook_active: false };
     expect(await claimBusStopDelivery(value.root, input, "codex")).toBeNull();
   });
 

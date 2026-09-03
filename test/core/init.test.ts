@@ -28,7 +28,7 @@ describe("initProject", () => {
     expect(existsSync(join(testRoot, ".story", "notes"))).toBe(true);
     expect(existsSync(join(testRoot, ".story", "lessons"))).toBe(true);
     expect(result.created).toHaveLength(7);
-    // /prime skill scaffolding removed — setup-skill replaces it
+    // /prime skill scaffolding removed -- setup-skill replaces it
     expect(result.created).not.toContain(".claude/skills/prime/SKILL.md");
     expect(existsSync(join(testRoot, ".claude", "skills", "prime", "SKILL.md"))).toBe(false);
   });
@@ -142,6 +142,12 @@ describe("initProject", () => {
   // quarantine); machine-local IPC, never team-visible.
   it("STORY_GITIGNORE_ENTRIES includes channel-inbox/ (ISS-754)", () => {
     expect(STORY_GITIGNORE_ENTRIES).toContain("channel-inbox/");
+  });
+
+  // ISS-947: .story/servers/ holds machine-local MCP registration pid files;
+  // every registration dirtied porcelain without this entry.
+  it("STORY_GITIGNORE_ENTRIES includes servers/ (ISS-947)", () => {
+    expect(STORY_GITIGNORE_ENTRIES).toContain("servers/");
   });
 
   it("init writes .story/.gitignore containing every ephemeral entry (ISS-754 coverage lock)", async () => {

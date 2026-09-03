@@ -1,4 +1,9 @@
 import { normalizeRiskLevel, requiredRounds, type RiskLevel } from "./review-depth.js";
+import {
+  effectiveReviewEffort,
+  effortCodeReviewMaxRounds,
+  type ReviewEffortState,
+} from "./review-effort.js";
 import type { EventEntry, FullSessionState } from "./session-types.js";
 
 export const DEFAULT_CODE_REVIEW_MAX_ROUNDS = 12;
@@ -50,21 +55,78 @@ export function effectiveCodeReviewMaxRounds(
   return configured === 0 ? 0 : Math.max(configured, requiredRounds(riskLevel(risk)));
 }
 
-// Fork: optional PLAN_REVIEW landing cap. Unlike CODE_REVIEW (default 12),
-// this defaults to 0 (disabled) so base behavior is unchanged unless a project
-// opts in via recipeOverrides.stages.PLAN_REVIEW.maxReviewRounds.
-export function configuredPlanReviewMaxRounds(stages: StageConfigMap): number {
-  const raw = stages?.PLAN_REVIEW?.maxReviewRounds;
-  if (typeof raw !== "number" || !Number.isFinite(raw) || raw <= 0) return 0;
-  return Math.max(1, Math.floor(raw));
+/**
+ * The CODE_REVIEW cap actually in force, dial included.
+ *
+ * ONE function, because there are two readers of this number and they must not
+ * disagree: the stage decides routing with it, and the diagnostics derive
+ * `atOrPastCap`, the non-converging gate, the landable gate, the
+ * `scope_expanded` threshold, and the figure rendered to a person in the health
+ * model and the session report. If only the stage became effort-aware, a light
+ * session would route on 4 while every one of those still said 12.
+ *
+ * `explicitKnobs` comes from STATE rather than the resolved recipe on purpose.
+ * Both carry it, but the recipe object is built by hand in a number of stage
+ * tests without a `reviewEffort` key, and `test/` is excluded from tsconfig, so
+ * reading it there would be a runtime TypeError rather than a compile error.
+ * The state field is optional everywhere and absent reads as "not project-set".
+ */
+export function dialCodeReviewMaxRounds(
+  state: ReviewEffortState & {
+    readonly resolvedReviewEffort?: { readonly explicitKnobs?: { readonly codeReviewMaxRounds?: boolean } | null } | null;
+  },
+  stages: StageConfigMap,
+  risk: string | null | undefined,
+): number {
+  return effortCodeReviewMaxRounds(
+    effectiveReviewEffort(state, "CODE_REVIEW"),
+    riskLevel(risk),
+    configuredCodeReviewMaxRounds(stages),
+    state.resolvedReviewEffort?.explicitKnobs?.codeReviewMaxRounds === true,
+  );
 }
 
-export function effectivePlanReviewMaxRounds(
-  risk: string | null | undefined,
+/**
+ * The round at or after which a change-request verdict may land WITHOUT its fix
+ * being re-reviewed.
+ *
+ * Today's forced landing (code-review.ts) sends a change request at the cap
+ * straight to FINALIZE when nothing critical is unresolved: no fix, no
+ * re-review. At standard's cap of 12 that is rare enough to have gone
+ * unnoticed for a long time (filed as its own issue, deliberately unchanged
+ * here). At light's cap of 4 it would be COMMON, and it would quietly break the
+ * one review rule that holds at every level: a change request gets fixed and
+ * the fix gets looked at.
+ *
+ * So at light the cap stops being a landing point and becomes a routing point.
+ * The round that hits it routes to IMPLEMENT like any other change request, and
+ * the fix gets exactly one graceful re-review round -- during which landing is
+ * permitted again, whatever that round says. The bound is cap + 1 = 5, still
+ * nowhere near standard's 12.
+ *
+ * NOT applied when the cap is PROJECT-set. The dial narrows within what a
+ * project asked for and never past it; a project that wrote
+ * `maxReviewRounds: 4` gets landing at 4, because a grace round would be the
+ * dial overriding an explicit knob -- the one thing the precedence order says
+ * it may never do.
+ *
+ * Shared with the stage for the same reason `dialCodeReviewMaxRounds` is: the
+ * stage routes on this number and `analyzeSessionDiagnostics` derives
+ * `atOrPastCap` from it. If only the stage learned about the grace round, every
+ * light session would spend that round being reported as landable-but-stuck
+ * while it did exactly what it was told to do.
+ */
+export function codeReviewLandingFloor(
+  state: Parameters<typeof dialCodeReviewMaxRounds>[0],
   stages: StageConfigMap,
+  risk: string | null | undefined,
 ): number {
-  const configured = configuredPlanReviewMaxRounds(stages);
-  return configured === 0 ? 0 : Math.max(configured, requiredRounds(riskLevel(risk)));
+  const cap = dialCodeReviewMaxRounds(state, stages, risk);
+  // 0 is "unlimited" and negatives cannot occur; either way there is no cap to
+  // extend, and forced landing never runs.
+  if (cap <= 0) return cap;
+  if (state.resolvedReviewEffort?.explicitKnobs?.codeReviewMaxRounds === true) return cap;
+  return effectiveReviewEffort(state, "CODE_REVIEW") === "light" ? cap + 1 : cap;
 }
 
 function isActiveSession(state: FullSessionState): boolean {
@@ -110,7 +172,7 @@ export function analyzeSessionDiagnostics(
     ?? null;
   const lastMajorCount = lastReviewVerdict?.majorCount ?? lastCodeReview?.majorCount ?? null;
   const risk = state.ticket?.realizedRisk ?? state.ticket?.risk ?? "low";
-  const maxReviewRounds = effectiveCodeReviewMaxRounds(risk, state.resolvedStages);
+  const maxReviewRounds = dialCodeReviewMaxRounds(state, state.resolvedStages, risk);
   const codeReviewRounds = codeReviews.length;
   const codeReviewBacktracks = countCodeReviewBacktracks(events.events);
   const ticketAgeMs = parseTimeMs(state.ticketStartedAt, nowMs);
@@ -121,7 +183,13 @@ export function analyzeSessionDiagnostics(
   const legacyBlockingCriticalCount = lastUnresolvedCriticalCount ?? lastCriticalCount;
   const reviewLoopState = state.state === "IMPLEMENT" || state.state === "CODE_REVIEW";
   const nonRejectVerdict = lastVerdict !== null && lastVerdict !== "reject";
-  const atOrPastCap = maxReviewRounds > 0 && codeReviewRounds >= maxReviewRounds;
+  // The FLOOR, not the cap: at light the cap is a routing point and the round
+  // after it is the landing point, so a session mid-grace-round is not stuck.
+  // `maxReviewRounds` stays the reported figure -- the grace round is an
+  // exception to landing, not a bigger cap, and telling a reader 5 when the
+  // configured number is 4 would be the lie this whole dial exists to avoid.
+  const landingFloor = codeReviewLandingFloor(state, state.resolvedStages, risk);
+  const atOrPastCap = landingFloor > 0 && codeReviewRounds >= landingFloor;
   const landingDecision = state.landingDecision ?? null;
   const trustedNoBlockingLanding = landingDecision?.stage === "CODE_REVIEW" &&
     landingDecision.reason === "max_review_rounds_no_blocking";

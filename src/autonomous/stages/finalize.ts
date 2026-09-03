@@ -1,12 +1,239 @@
 import type { WorkflowStage, StageResult, StageAdvance, StageContext } from "./types.js";
-import type { GuideReportInput } from "../session-types.js";
-import { gitDiffCachedNames, gitHead, gitDiffTreeNames, gitResolveCommit, gitRevListAncestryPath } from "../git-inspector.js";
+import type { GuideReportInput, FullSessionState } from "../session-types.js";
+import { gitDiffCachedNames, gitHead, gitDiffTreeNames, gitResolveCommit, gitRevListAncestryPath, gitCommitterEmail, gitUserEmail, gitParentOf, gitTreeOf, gitWriteTree } from "../git-inspector.js";
+import { parseClaimEpoch } from "../claim-preflight.js";
+import { effectiveReviewEffort, effortDisclosureLine, normalizeReviewEffortSource } from "../review-effort.js";
 import { checkBusShip } from "../../bus/store.js";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { resolveOrReadFrozenGateStatus, renderUnresolvedHold, renderGateAckHold } from "./gate-enforcement.js";
+import { findGateAck } from "../../core/gate-ack-loader.js";
+import { PRECOMMIT_ACK_GATE_NAME, type GateAckPin } from "../../models/gate-ack.js";
+import { arrangementGateRiskWarnings } from "../../core/arrangement-bounds.js";
 
 /**
- * FINALIZE stage — 3-checkpoint sub-machine for staging, pre-commit, and commit.
+ * The commit from which the CURRENT item must produce a new, validated commit
+ * (ISS-922). Initialized at item pick; reset when drift invalidates the epoch.
+ *
+ * NOT expectedHead: that records the last OBSERVED head, and park,
+ * resume-drift and checkout all legitimately advance it -- onto the very
+ * commit FINALIZE has not yet seen. That is what closed all three exits from
+ * this stage and stranded a session with no supported recovery.
+ *
+ * NOT mergeBase either: it is the fork point from main for the first item, so
+ * on a feature branch it sits behind HEAD before any work exists, which would
+ * fire the already-committed shortcut against a pre-existing branch commit.
+ *
+ * The fallback chain covers session state written by an older CLI, which
+ * carries no itemBaseHead. diagnoseStrandedCommit() makes the refusal
+ * actionable when that older state is itself already poisoned.
+ */
+function itemBaseline(state: FullSessionState): string | undefined {
+  return state.git.itemBaseHead ?? state.git.expectedHead ?? state.git.initHead;
+}
+
+/**
+ * Does `candidate` LOOK like this item's work commit, stranded by a baseline a
+ * pre-fix CLI advanced onto it? (ISS-922.)
+ *
+ * DIAGNOSIS ONLY. This never causes the guide to accept a commit. It decides
+ * whether the refusal can name a specific likely commit and the steps to
+ * confirm it, or has to stay generic. That limit is deliberate and was the
+ * outcome of review: the evidence available here cannot separate a stranded
+ * work commit from a pre-existing branch tip.
+ *
+ * Why not heal automatically. A pre-fix state records only that expectedHead
+ * moved, never which writer moved it. Parking moved it (the bug). But so did
+ * the pre-fix checkout writer, which promotes expectedHead alone and leaves
+ * mergeBase behind -- identical in every observable respect. If a session
+ * adopts an existing branch whose tip already contains this item's ledger
+ * update from an earlier session, every check below passes on a commit this
+ * session neither produced nor reviewed. Auto-accepting would mark the item
+ * shipped on unreviewed work; refusing costs one operator step, which the
+ * message spells out. A false completion is the worse failure, so this fails
+ * closed by construction rather than by having enough evidence.
+ *
+ * LEGACY ONLY, enforced as the first condition. A session written by this CLI
+ * has an itemBaseHead that means exactly one thing, so "candidate equals the
+ * baseline" is already conclusive there and nothing needs diagnosing. Running
+ * these checks on such a session would actively misread a pre-existing commit
+ * as the item's work -- for instance the commit that FILED this item, if HEAD
+ * sat on it when the item was picked, since that commit descends from initHead
+ * and does modify the item's ledger file.
+ *
+ * The remaining conditions each refuse cases the others admit:
+ *   - mergeBase on the candidate is the pre-fix foreign-drift writer's
+ *     signature; that writer moved mergeBase and expectedHead together.
+ *   - Ancestry membership refuses a candidate on unrelated or orphan history,
+ *     which the tree check alone would accept.
+ *   - Direct tree evidence refuses a merge commit, which ancestry alone would
+ *     accept (ISS-923).
+ *
+ * The itemBaseHead and initHead guards are also what keep this off the paths
+ * whose fixtures mock git thinly -- they short-circuit before any git call.
+ */
+type StrandedDiagnosis = "likely_stranded" | "not_attributable" | "git_error";
+
+async function diagnoseStrandedCommit(
+  ctx: StageContext,
+  candidate: string,
+  artifactPath: string,
+): Promise<StrandedDiagnosis> {
+  if (ctx.state.git.itemBaseHead !== undefined) return "not_attributable";
+
+  const initHead = ctx.state.git.initHead;
+  if (!initHead || initHead === candidate) return "not_attributable";
+  if (ctx.state.git.mergeBase === candidate) return "not_attributable";
+
+  const candidates = await gitRevListAncestryPath(ctx.root, initHead, candidate, artifactPath);
+  if (!candidates?.ok) return "git_error";
+  if (!candidates.data.includes(candidate)) return "not_attributable";
+
+  const tree = await gitDiffTreeNames(ctx.root, candidate);
+  if (!tree?.ok) return "git_error";
+  return tree.data.includes(artifactPath) ? "likely_stranded" : "not_attributable";
+}
+
+/**
+ * The tail of a FINALIZE refusal: what the operator should do about a commit
+ * the guide will not record for them. Kept in one place so both refusal paths
+ * make the same promise about what has and has not been verified (local git
+ * only -- nothing here checks a remote).
+ */
+function strandedEscape(
+  sessionId: string,
+  diagnosis: StrandedDiagnosis,
+  candidate: string | null,
+): string[] {
+  if (diagnosis === "git_error") {
+    return [
+      "Git could not be queried, so this is NOT a statement that the work is uncommitted.",
+      `Check the repository yourself, then either commit and report the hash, or end the session with \`storybloq session stop ${sessionId}\`.`,
+    ];
+  }
+  const short = candidate ? candidate.slice(0, 7) : "the commit";
+  if (diagnosis === "likely_stranded" && candidate) {
+    return [
+      `This session's state predates the ISS-922 fix, and commit ${short} both descends from the session start and modifies this item's ledger file. It may be this item's work, stranded by a baseline an older CLI advanced onto it.`,
+      `It is NOT recorded automatically: a pre-existing branch tip is indistinguishable from that here. Confirm with \`git show ${short}\`.`,
+      `If it IS this item's work, push it if needed, then end the session with \`storybloq session stop ${sessionId}\` -- the commit stays in local git either way.`,
+    ];
+  }
+  return [
+    `If you believe the work is already committed, confirm it with \`git show ${short}\`, push it if needed, then end the session with \`storybloq session stop ${sessionId}\` -- the commit stays in local git either way.`,
+  ];
+}
+
+/**
+ * ISS-982: handleCommit's fast path (reported hash equals or prefixes HEAD)
+ * previously accepted a re-report with zero further validation -- an agent
+ * re-confirming the exact hash a refused auto-detect fast-forward had
+ * already observed took this path and bypassed both the ancestry-path
+ * enumeration and the artifact-tree check entirely. This decides whether
+ * `commitHash` can be attributed to THIS session before the fast path
+ * accepts it.
+ *
+ * Five-way split by CURRENT ITEM KIND, not epoch presence (R4-F2): FINALIZE's
+ * ticket-completion write and the issue-pick path both leave a prior item's
+ * `claimEpoch` sitting in state, unwritten, so selecting the check by
+ * "epoch present" reads a stale identity into an unrelated commit's check.
+ *
+ * Every unavailable or malformed signal fails CLOSED -- a deliberate
+ * asymmetry with `provenOwnership` (ISS-913), which fails closed on a
+ * malformed epoch for a different, already-covered reason. Treating
+ * unavailable evidence as a match here would silently reopen the gap this
+ * exists to close.
+ *
+ * Returns the refusal detail rather than throwing/returning a boolean alone,
+ * so the caller's refusal message can name the actual reason.
+ */
+async function checkCommitAttribution(
+  ctx: StageContext,
+  commitHash: string,
+): Promise<{ readonly attributable: boolean; readonly detail: string }> {
+  const state = ctx.state;
+  const ticket = state.ticket;
+  const currentIssue = state.currentIssue;
+
+  // Outcome 1: contradictory shape (both a current ticket and a current
+  // issue at once) should never occur and is not disambiguated by
+  // preferring one field -- fail closed unconditionally, before any
+  // identity signal is even read.
+  if (ticket && currentIssue) {
+    return {
+      attributable: false,
+      detail: "session state carries both a current ticket and a current issue at once, which should never happen",
+    };
+  }
+
+  // Outcomes 2/3: ticket mode. A ticket-mode session is supposed to have a
+  // valid, matching claim epoch; not having one does NOT fall back to the
+  // heuristic below -- that would readmit the exact stale-identity gap this
+  // check exists to close.
+  if (ticket) {
+    const rawEpoch = (state as Record<string, unknown>).claimEpoch;
+    const epoch = rawEpoch !== undefined && rawEpoch !== null ? parseClaimEpoch(rawEpoch) : null;
+    if (!epoch || epoch.ticketId !== ticket.id || !epoch.user) {
+      return {
+        attributable: false,
+        detail: "no valid claim epoch matching the current ticket is available to attribute this commit",
+      };
+    }
+    const committer = await gitCommitterEmail(ctx.root, commitHash);
+    if (!committer.ok) {
+      return {
+        attributable: false,
+        detail: `could not read commit ${commitHash.slice(0, 7)}'s committer (${committer.message ?? "git error"})`,
+      };
+    }
+    if (committer.data !== epoch.user) {
+      return {
+        attributable: false,
+        detail: `commit ${commitHash.slice(0, 7)}'s committer (${committer.data || "unknown"}) does not match the claim identity (${epoch.user})`,
+      };
+    }
+    return { attributable: true, detail: "" };
+  }
+
+  // Outcomes 4/5: issue mode, or neither item present. Neither shape has a
+  // claim model, so both fall back to the SAME heuristic -- committer
+  // against the live git identity -- explicitly heuristic-only, not
+  // session-bound proof. Any residual `claimEpoch` (left behind by a
+  // just-completed ticket) is ignored unconditionally here.
+  const committer = await gitCommitterEmail(ctx.root, commitHash);
+  if (!committer.ok) {
+    return {
+      attributable: false,
+      detail: `could not read commit ${commitHash.slice(0, 7)}'s committer (${committer.message ?? "git error"})`,
+    };
+  }
+  const liveEmail = await gitUserEmail(ctx.root);
+  if (!liveEmail) {
+    return {
+      attributable: false,
+      detail: "the local git identity (user.email) could not be resolved",
+    };
+  }
+  if (committer.data !== liveEmail) {
+    return {
+      attributable: false,
+      detail: `commit ${commitHash.slice(0, 7)}'s committer (${committer.data || "unknown"}) does not match the local git identity (${liveEmail}) -- heuristic only`,
+    };
+  }
+  return { attributable: true, detail: "" };
+}
+
+/** The ledger file this item's commit must contain, or null outside item work. */
+function itemArtifactPath(state: FullSessionState): string | null {
+  const ticketId = state.ticket?.id;
+  if (ticketId) return `.story/tickets/${ticketId}.json`;
+  const issueId = state.currentIssue?.id;
+  if (issueId) return `.story/issues/${issueId}.json`;
+  return null;
+}
+
+/**
+ * FINALIZE stage -- 3-checkpoint sub-machine for staging, pre-commit, and commit.
  *
  * Checkpoints (tracked via state.finalizeCheckpoint):
  * 1. files_staged → verify staged files, overlap detection (ISS-025)
@@ -19,7 +246,7 @@ import { join } from "node:path";
  * enter(): Instruction to stage files.
  * report(): Process checkpoint actions via retry (sub-steps) and advance (commit done).
  *
- * HIGHEST RISK extraction — copied verbatim from handleReportFinalize.
+ * HIGHEST RISK extraction -- copied verbatim from handleReportFinalize.
  */
 export class FinalizeStage implements WorkflowStage {
   readonly id = "FINALIZE";
@@ -38,7 +265,7 @@ export class FinalizeStage implements WorkflowStage {
     // ISS-105/ISS-106: Detect pre-existing commit before instructing staging.
     // Agents in the issue-fix pipeline typically commit before reporting back,
     // so HEAD has already advanced. Skip the staging ceremony entirely.
-    const previousHead = ctx.state.git.expectedHead ?? ctx.state.git.initHead;
+    const previousHead = itemBaseline(ctx.state);
     if (previousHead) {
       const headResult = await gitHead(ctx.root);
       if (headResult.ok && headResult.data.hash !== previousHead) {
@@ -47,8 +274,13 @@ export class FinalizeStage implements WorkflowStage {
         const ticketId = ctx.state.ticket?.id;
         if (ticketId) {
           const ticketPath = `.story/tickets/${ticketId}.json`;
-          if (treeResult.ok && !treeResult.data.includes(ticketPath)) {
-            // Commit exists but missing ticket file -- fall through to staging instruction
+          // ISS-982/R2-F1: `!treeResult.ok` must ALSO fall through, not just a
+          // confirmed miss -- the original `treeResult.ok && !includes` gate
+          // was fail-OPEN on a git error (false && x is false, taking the
+          // proceed branch with an unverified tree).
+          if (!treeResult.ok || !treeResult.data.includes(ticketPath)) {
+            // Commit exists but missing ticket file, or the tree could not be
+            // verified -- fall through to staging instruction.
           } else {
             ctx.writeState({ finalizeCheckpoint: "precommit_passed" });
             return this.handleCommit(ctx, { completedAction: "commit_done", commitHash: headResult.data.hash });
@@ -57,8 +289,10 @@ export class FinalizeStage implements WorkflowStage {
         const issueId = ctx.state.currentIssue?.id;
         if (issueId) {
           const issuePath = `.story/issues/${issueId}.json`;
-          if (treeResult.ok && !treeResult.data.includes(issuePath)) {
-            // Commit exists but missing issue file -- fall through to staging instruction
+          // ISS-982/R2-F1: same fail-open fix as the ticket branch above.
+          if (!treeResult.ok || !treeResult.data.includes(issuePath)) {
+            // Commit exists but missing issue file, or the tree could not be
+            // verified -- fall through to staging instruction.
           } else {
             ctx.writeState({ finalizeCheckpoint: "precommit_passed" });
             return this.handleCommit(ctx, { completedAction: "commit_done", commitHash: headResult.data.hash });
@@ -82,13 +316,31 @@ export class FinalizeStage implements WorkflowStage {
         ]
       : [];
 
+    // T-461: FINALIZE is the last point before the work becomes a commit, so a
+    // level below standard is stated here rather than left in a session file.
+    // `off` gets its own sentence because it is a different claim: not "this
+    // was reviewed less" but "no review verdict exists for this commit", which
+    // is what someone reading the history later needs to know.
+    const finalizeEffort = effectiveReviewEffort(ctx.state, "CODE_REVIEW");
+    const effortCopy = finalizeEffort === "off"
+      ? ["", `${effortDisclosureLine(ctx.state, "CODE_REVIEW")} Review stages were skipped for this item; no review verdict exists for this commit.`]
+      : finalizeEffort === "light"
+        ? ["", `${effortDisclosureLine(ctx.state, "CODE_REVIEW")} This item was reviewed at a lower depth than the project default.`]
+        : [];
+
     // ISS-099: Single combined instruction -- stage, verify, commit in one round-trip
     return {
       instruction: [
         "# Finalize",
         "",
-        "Code review passed. Time to commit.",
+        // T-461: an `off` item has no verdict to have passed, and saying it
+        // passed beside the sentence saying no verdict exists would hand the
+        // reader two contradictory claims at the commit boundary.
+        finalizeEffort === "off"
+          ? "Review stages were skipped. Time to commit."
+          : "Code review passed. Time to commit.",
         ...landingCopy,
+        ...effortCopy,
         "",
         "1. Run `git reset` to clear the staging area (ensures no stale files from prior operations)",
         ctx.state.ticket ? `2. Update ticket ${ticketLabel(ctx)} status to "complete" in .story/` : "",
@@ -109,7 +361,7 @@ export class FinalizeStage implements WorkflowStage {
     const action = report.completedAction;
     const checkpoint = ctx.state.finalizeCheckpoint;
 
-    // ISS-031: Already committed — advance regardless of action (re-entry guard)
+    // ISS-031: Already committed -- advance regardless of action (re-entry guard)
     if (checkpoint === "committed") {
       return { action: "advance" };
     }
@@ -154,15 +406,7 @@ export class FinalizeStage implements WorkflowStage {
     if (checkpoint === "staged" || checkpoint === "staged_override") {
       return {
         action: "retry",
-        instruction: [
-          "Files staged. Now commit.",
-          "",
-          ctx.state.ticket
-            ? `Commit with message: "feat: <description> (${ticketLabel(ctx)})"`
-            : "Commit with a descriptive message.",
-          "",
-          'Call me with completedAction: "commit_done" and include the commitHash.',
-        ].join("\n"),
+        instruction: await nowCommitInstruction(ctx, "Files staged. Now commit."),
       };
     }
 
@@ -170,15 +414,25 @@ export class FinalizeStage implements WorkflowStage {
     if (!stagedResult.ok || stagedResult.data.length === 0) {
       // ISS-046: Check if agent already committed (staging area empty because commit happened)
       const headResult = await gitHead(ctx.root);
-      const previousHead = ctx.state.git.expectedHead ?? ctx.state.git.initHead;
+      const previousHead = itemBaseline(ctx.state);
       if (headResult.ok && previousHead && headResult.data.hash !== previousHead) {
-        // HEAD advanced — agent committed before reporting files_staged
+        // HEAD advanced -- agent committed before reporting files_staged
         // Validate commit contains ticket/issue file if applicable
         const treeResult = await gitDiffTreeNames(ctx.root, headResult.data.hash);
+        // ISS-982/R2-F1: a git error here must NOT silently fall through to
+        // "commit is valid" -- hoisted into its own diagnostic rather than
+        // reusing the ticket/issue "amend the commit" message, which would
+        // misdescribe a git error as a missing file.
+        if (!treeResult.ok) {
+          return {
+            action: "retry",
+            instruction: `Commit detected (${headResult.data.hash.slice(0, 7)}) but its contents could not be verified (git error: ${treeResult.message ?? "unknown"}). Verify the commit yourself, then report completedAction: "commit_done" with the hash again.`,
+          };
+        }
         const ticketId = ctx.state.ticket?.id;
         if (ticketId) {
           const ticketPath = `.story/tickets/${ticketId}.json`;
-          if (treeResult.ok && !treeResult.data.includes(ticketPath)) {
+          if (!treeResult.data.includes(ticketPath)) {
             return {
               action: "retry",
               instruction: `Commit detected (${headResult.data.hash.slice(0, 7)}) but ticket file ${ticketPath} is not in the commit. Amend the commit to include it: \`git add ${ticketPath} && git commit --amend --no-edit\`, then report completedAction: "commit_done" with the new hash.`,
@@ -189,21 +443,45 @@ export class FinalizeStage implements WorkflowStage {
         const earlyIssueId = ctx.state.currentIssue?.id;
         if (earlyIssueId) {
           const issuePath = `.story/issues/${earlyIssueId}.json`;
-          if (treeResult.ok && !treeResult.data.includes(issuePath)) {
+          if (!treeResult.data.includes(issuePath)) {
             return {
               action: "retry",
               instruction: `Commit detected (${headResult.data.hash.slice(0, 7)}) but issue file ${issuePath} is not in the commit. Amend the commit to include it: \`git add ${issuePath} && git commit --amend --no-edit\`, then report completedAction: "commit_done" with the new hash.`,
             };
           }
         }
-        // Commit is valid — fast-forward checkpoint so handleCommit accepts it
+        // Commit is valid -- fast-forward checkpoint so handleCommit accepts it
         ctx.writeState({ finalizeCheckpoint: "precommit_passed" });
         return this.handleCommit(ctx, { ...report, commitHash: headResult.data.hash });
       }
-      return { action: "retry", instruction: 'No files are staged. Stage your changes and call me again with completedAction: "files_staged".' };
+      // ISS-922: a session parked by a pre-fix CLI can arrive here with its
+      // baseline already promoted onto the unreported work commit, so the
+      // check above sees no advance and there is nothing left to stage. Ask
+      // the candidate-specific question directly before dead-ending.
+      // ISS-922: a session parked by a pre-fix CLI can arrive here with its
+      // baseline already promoted onto an unreported commit, so there is
+      // nothing left to stage. Diagnose that shape to make the refusal
+      // actionable -- but never act on it; see diagnoseStrandedCommit.
+      const strandedPath = itemArtifactPath(ctx.state);
+      let stagedDiagnosis: StrandedDiagnosis = headResult.ok ? "not_attributable" : "git_error";
+      if (headResult.ok && strandedPath) {
+        stagedDiagnosis = await diagnoseStrandedCommit(ctx, headResult.data.hash, strandedPath);
+      }
+      return {
+        action: "retry",
+        instruction: [
+          'No files are staged. Stage your changes and call me again with completedAction: "files_staged".',
+          previousHead ? `(Nothing new was found against baseline ${previousHead.slice(0, 7)}.)` : "",
+          ...strandedEscape(
+            ctx.state.sessionId,
+            stagedDiagnosis,
+            headResult.ok ? headResult.data.hash : null,
+          ),
+        ].filter(Boolean).join("\n"),
+      };
     }
 
-    // ISS-025 + ISS-063: Overlap detection — block staging of pre-existing untracked files.
+    // ISS-025 + ISS-063: Overlap detection -- block staging of pre-existing untracked files.
     // Exclude the current session's ticket and issue files from overlap (the guide picked
     // this work, so its .story/ files are expected even if untracked at session start).
     const baselineUntracked = ctx.state.git.baseline?.untrackedPaths ?? [];
@@ -260,15 +538,7 @@ export class FinalizeStage implements WorkflowStage {
 
     return {
       action: "retry",
-      instruction: [
-        "Files staged. Now commit.",
-        "",
-        ctx.state.ticket
-          ? `Commit with message: "feat: <description> (${ticketLabel(ctx)})"`
-          : "Commit with a descriptive message.",
-        "",
-        'Call me with completedAction: "commit_done" and include the commitHash.',
-      ].join("\n"),
+      instruction: await nowCommitInstruction(ctx, "Files staged. Now commit."),
     };
   }
 
@@ -283,7 +553,7 @@ export class FinalizeStage implements WorkflowStage {
     // Verify staged set is still intact after hooks
     const stagedResult = await gitDiffCachedNames(ctx.root);
     if (!stagedResult.ok || stagedResult.data.length === 0) {
-      ctx.writeState({ finalizeCheckpoint: null });
+      ctx.writeState({ finalizeCheckpoint: null, finalizedItem: null });
       return { action: "retry", instruction: 'Pre-commit hooks appear to have cleared the staging area. Re-stage your changes and call me with completedAction: "files_staged".' };
     }
 
@@ -301,7 +571,7 @@ export class FinalizeStage implements WorkflowStage {
           (f: string) => baselineUntracked.includes(f) && f !== sessionTicketPath && f !== sessionIssuePath,
         );
         if (overlap.length > 0) {
-          ctx.writeState({ finalizeCheckpoint: null });
+          ctx.writeState({ finalizeCheckpoint: null, finalizedItem: null });
           return { action: "retry", instruction: `Pre-commit hooks staged pre-existing untracked files: ${overlap.join(", ")}. Unstage them and re-stage, then call with completedAction: "files_staged".` };
         }
       }
@@ -335,15 +605,7 @@ export class FinalizeStage implements WorkflowStage {
 
     return {
       action: "retry",
-      instruction: [
-        "Pre-commit passed. Now commit.",
-        "",
-        ctx.state.ticket
-          ? `Commit with message: "feat: <description> (${ticketLabel(ctx)})"`
-          : "Commit with a descriptive message.",
-        "",
-        'Call me with completedAction: "commit_done" and include the commitHash.',
-      ].join("\n"),
+      instruction: await nowCommitInstruction(ctx, "Pre-commit passed. Now commit."),
     };
   }
 
@@ -375,15 +637,24 @@ export class FinalizeStage implements WorkflowStage {
       };
     }
     const fullHead = headResult.data.hash;
-    const previousHead = ctx.state.git.expectedHead ?? ctx.state.git.initHead;
+    const previousHead = itemBaseline(ctx.state);
     const initHead = ctx.state.git.initHead;
     const reportedHash = commitHash.toLowerCase();
 
     let normalizedHash: string;
+    // ISS-982: the fast path below (reported hash equals or prefixes HEAD)
+    // skips the ancestry-path enumeration and artifact-tree check the slow
+    // path runs -- reporting the exact hash a refused auto-detect
+    // fast-forward already observed takes this path unconditionally. The
+    // attribution check after the ISS-925 guard is scoped to this path only;
+    // the slow path already proves session-ancestry membership independently.
+    let tookFastPath: boolean;
 
     if (fullHead === reportedHash || fullHead.startsWith(reportedHash)) {
       normalizedHash = fullHead;
+      tookFastPath = true;
     } else {
+      tookFastPath = false;
       const resolvedResult = await gitResolveCommit(ctx.root, reportedHash);
       if (!resolvedResult.ok) {
         return {
@@ -439,7 +710,90 @@ export class FinalizeStage implements WorkflowStage {
     }
 
     if (previousHead && normalizedHash === previousHead) {
-      return { action: "retry", instruction: `No new commit detected: reported hash ${normalizedHash.slice(0, 7)} equals session baseline. Create a commit first, then report the new hash.` };
+      // ISS-922: a pre-fix CLI may have promoted the baseline onto this very
+      // commit, so "equals the baseline" can be an artefact of the poisoning
+      // rather than evidence that no work landed. That possibility is
+      // DIAGNOSED, never acted on -- see diagnoseStrandedCommit for why the
+      // evidence cannot be made sufficient.
+      const strandedPath = itemArtifactPath(ctx.state);
+      const commitDiagnosis = strandedPath
+        ? await diagnoseStrandedCommit(ctx, normalizedHash, strandedPath)
+        : "not_attributable";
+      // ISS-922: always a refusal. The diagnosis only decides how specific the
+      // instructions can be, never whether the commit is recorded.
+      return {
+        action: "retry",
+        instruction: [
+          `No new commit detected: reported hash ${normalizedHash.slice(0, 7)} equals the current item's baseline.`,
+          "Commit the work, then report the new hash.",
+          ...strandedEscape(ctx.state.sessionId, commitDiagnosis, normalizedHash),
+        ].join("\n"),
+      };
+    }
+
+    // ISS-982: attribution check, fast path only, override-gated. The
+    // identity-resolution work runs whenever the fast path was taken; the
+    // refusal itself is a SEPARATE, single conditional below it (kept apart
+    // so a mutant that deletes only the refusal cannot silently disable the
+    // resolution work too).
+    let attributionRefusal: string | null = null;
+    if (tookFastPath) {
+      const attribution = await checkCommitAttribution(ctx, normalizedHash);
+      if (!attribution.attributable) attributionRefusal = attribution.detail;
+    }
+    const overrideRequested = report.overrideAttribution === true;
+
+    if (attributionRefusal !== null && !overrideRequested) {
+      return {
+        action: "retry",
+        instruction: [
+          `Commit ${normalizedHash.slice(0, 7)} could not be attributed to this session: ${attributionRefusal}.`,
+          'If this is genuinely your work, report again with the same completedAction: "commit_done", the same commitHash, and overrideAttribution: true.',
+        ].join("\n"),
+      };
+    }
+
+    // T-474 (ISS-1049: generalized to cover an issue-fix session too, closing
+    // the section 7 / ISS-1032-shaped descope this used to carry as
+    // ticket-only). This is the load-bearing check: it runs AFTER
+    // attribution passes and BEFORE finalizeCheckpoint is ever written as
+    // "committed", inside the single convergence point every
+    // commit-acceptance path funnels through (confirmed by direct trace:
+    // FINALIZE's two `handleStage` branches and `handlePrecommit` all either
+    // call `handleCommit` directly or lead to a later `report()` call that
+    // does; the two auto-detect fast-forwards in `enter()` and
+    // `handleStage`'s ISS-046 branch also call it directly).
+    const finalizingWorkItem = ctx.state.ticket ?? ctx.state.currentIssue;
+    if (finalizingWorkItem) {
+      const gateStatus = await resolveOrReadFrozenGateStatus(ctx);
+      if (gateStatus.status === "unresolved") {
+        return { action: "retry", instruction: renderUnresolvedHold(gateStatus.reason) };
+      }
+      if (gateStatus.status === "gated") {
+        const gate = gateStatus.gates.find((g) => g.name === PRECOMMIT_ACK_GATE_NAME);
+        if (gate) {
+          const parentResult = await gitParentOf(ctx.root, normalizedHash);
+          if (!parentResult.ok) {
+            return { action: "retry", instruction: `Cannot determine commit ${normalizedHash.slice(0, 7)}'s parent (${parentResult.message}). Escalate -- do not treat as approved.` };
+          }
+          const treeResult = await gitTreeOf(ctx.root, normalizedHash);
+          if (!treeResult.ok) {
+            return { action: "retry", instruction: `Cannot determine commit ${normalizedHash.slice(0, 7)}'s tree (${treeResult.message}). Escalate -- do not treat as approved.` };
+          }
+          const pin: GateAckPin = { kind: "tree-digest", parentSha: parentResult.data, treeId: treeResult.data };
+          const lookup = findGateAck(ctx.root, {
+            arrangementId: gateStatus.arrangementId,
+            gateName: gate.name,
+            ticketRef: finalizingWorkItem.id,
+            pin,
+            expectedAckRole: gate.ackRole,
+          });
+          if (lookup.status !== "valid") {
+            // commit_done REFUSED -- finalizeCheckpoint never reaches "committed".
+            return { action: "retry", instruction: renderGateAckHold(lookup, gate) };
+          }
+        }
+      }
     }
 
     // ISS-084: Issue-fix mode -- record resolved issue, route through COMPLETE
@@ -449,21 +803,50 @@ export class FinalizeStage implements WorkflowStage {
       const issueDisplayId = (currentIssue as Record<string, unknown>).displayId as string | undefined;
       ctx.writeState({
         finalizeCheckpoint: "committed",
+        // T-450 step 7a: recorded in the SAME write that clears currentIssue
+        // below, because after this write nothing else identifies the item.
+        finalizedItem: { kind: "issue", id: currentIssue.id, commitHash: normalizedHash },
         resolvedIssues: [...(ctx.state.resolvedIssues ?? []), currentIssue.id],
         resolvedIssueDisplayIds: {
           ...(ctx.state.resolvedIssueDisplayIds ?? {}),
           ...(issueDisplayId ? { [currentIssue.id]: issueDisplayId } : {}),
         },
+        // T-461: recorded here, beside resolvedIssues, so the list only ever
+        // describes issues that actually resolved. currentReviewEffort is
+        // overwritten by the next pick, so a skipped review has to be captured
+        // durably or its disclosure is lost the moment the session moves on.
+        resolvedIssuesMeta: [
+          ...(ctx.state.resolvedIssuesMeta ?? []).filter((m) => m.id !== currentIssue.id),
+          {
+            id: currentIssue.id,
+            // NORMALIZED, not copied. Both fields are permissive persisted
+            // strings, so a damaged session could otherwise write "corrupt"
+            // into a durable audit record that a person later reads as the
+            // level this issue was actually reviewed at. These record what
+            // GOVERNED the review, which is what the normalizers return.
+            reviewEffort: effectiveReviewEffort(ctx.state, "CODE_REVIEW"),
+            source: normalizeReviewEffortSource(ctx.state.currentReviewEffortSource),
+          },
+        ],
+        // ISS-982: append-only audit trail, written in the SAME state write
+        // as the checkpoint (durable in the all-or-nothing application
+        // sense per ISS-958, not crash-durable). Written unconditionally,
+        // whether or not a mismatch was ever detected.
+        commitAttributionAudits: [
+          ...(ctx.state.commitAttributionAudits ?? []),
+          { commitHash: normalizedHash, itemKind: "issue" as const, itemId: currentIssue.id, overrideRequested, at: new Date().toISOString() },
+        ],
         currentIssue: null,
         ticketStartedAt: null,
         git: {
           ...ctx.state.git,
           mergeBase: fullHead,
           expectedHead: fullHead,
+          itemBaseHead: fullHead,
         },
       });
 
-      ctx.appendEvent("commit", { commitHash: normalizedHash, issueId: currentIssue.id });
+      ctx.appendEvent("commit", { commitHash: normalizedHash, issueId: currentIssue.id, attributionOverrideRequested: overrideRequested });
 
       return { action: "goto", target: "COMPLETE" };
     }
@@ -479,24 +862,49 @@ export class FinalizeStage implements WorkflowStage {
           realizedRisk: ctx.state.ticket.realizedRisk,
           startedAt: ctx.state.ticketStartedAt ?? undefined,
           completedAt: new Date().toISOString(),
+          // T-461: pinned here because the top-level field is overwritten by
+          // the next pick. CODE_REVIEW is the stage whose level a reader of a
+          // completed item cares about, and it is the level the commit was
+          // actually reviewed at.
+          reviewEffort: effectiveReviewEffort(ctx.state, "CODE_REVIEW"),
         }
       : undefined;
 
     ctx.writeState({
       finalizeCheckpoint: "committed",
+      // T-450 step 7a: same write that clears `ticket` below. The no-item
+      // re-entry shape is recorded as `none` rather than left null, because
+      // null is indistinguishable from a state written before this field and
+      // would send the reader into the legacy fallback, which would name an
+      // OLDER completed item as the one this checkpoint committed.
+      finalizedItem: completedTicket
+        ? { kind: "ticket" as const, id: completedTicket.id, commitHash: normalizedHash }
+        : { kind: "none" as const, commitHash: normalizedHash },
       completedTickets: completedTicket
         ? [...ctx.state.completedTickets, completedTicket]
         : ctx.state.completedTickets,
+      // ISS-982: same append-only audit trail as the issue path above.
+      commitAttributionAudits: [
+        ...(ctx.state.commitAttributionAudits ?? []),
+        {
+          commitHash: normalizedHash,
+          itemKind: completedTicket ? ("ticket" as const) : ("none" as const),
+          itemId: completedTicket ? completedTicket.id : null,
+          overrideRequested,
+          at: new Date().toISOString(),
+        },
+      ],
       ticket: undefined,
       ticketStartedAt: null,
       git: {
         ...ctx.state.git,
         mergeBase: fullHead,
         expectedHead: fullHead,
+        itemBaseHead: fullHead,
       },
     });
 
-    ctx.appendEvent("commit", { commitHash: normalizedHash, ticketId: completedTicket?.id });
+    ctx.appendEvent("commit", { commitHash: normalizedHash, ticketId: completedTicket?.id, attributionOverrideRequested: overrideRequested });
 
     return { action: "advance" };
   }
@@ -504,6 +912,62 @@ export class FinalizeStage implements WorkflowStage {
 
 function ticketLabel(ctx: StageContext): string {
   return ctx.state.ticket?.displayId ?? ctx.state.ticket?.id ?? "unknown";
+}
+
+/**
+ * T-474 (ISS-1049: generalized to an issue-fix session too): courtesy check,
+ * NOT load-bearing -- the real check runs inside `handleCommit`, after the
+ * commit already exists. This computes the SAME kind of pin from the
+ * currently staged tree and withholds "Now commit" if the gate status is
+ * unresolved or no valid ack exists yet, so the agent isn't sent to commit
+ * only to be rejected after the fact. When a valid ack carries `deltas`,
+ * appends them here -- the only point in the pre-commit flow where rendering
+ * deltas is still timely, since `handleCommit` runs AFTER the commit already
+ * exists (R3-FIX 5's pre-commit half). Any git failure here falls through to
+ * the ordinary instruction: the load-bearing check at `handleCommit` still
+ * runs regardless.
+ */
+async function nowCommitInstruction(ctx: StageContext, headline: string): Promise<string> {
+  const base = [
+    headline,
+    "",
+    ctx.state.ticket
+      ? `Commit with message: "feat: <description> (${ticketLabel(ctx)})"`
+      : "Commit with a descriptive message.",
+    "",
+    'Call me with completedAction: "commit_done" and include the commitHash.',
+  ];
+
+  const finalizingWorkItem = ctx.state.ticket ?? ctx.state.currentIssue;
+  if (!finalizingWorkItem) return base.join("\n");
+  const gateStatus = await resolveOrReadFrozenGateStatus(ctx);
+  if (gateStatus.status === "unresolved") return renderUnresolvedHold(gateStatus.reason);
+  if (gateStatus.status !== "gated") return base.join("\n");
+  const gate = gateStatus.gates.find((g) => g.name === PRECOMMIT_ACK_GATE_NAME);
+  if (!gate) {
+    // ISS-1050 interim: this arrangement is gated but has no pre-commit-ack --
+    // the ONLY case `arrangementGateRiskWarnings` can find something to say,
+    // since a pre-commit-ack gate found above would already have covered it.
+    const warnings = arrangementGateRiskWarnings(gateStatus.gates);
+    return warnings.length === 0 ? base.join("\n") : [...base, "", ...warnings].join("\n");
+  }
+
+  const headResult = await gitHead(ctx.root);
+  if (!headResult.ok) return base.join("\n");
+  const treeResult = await gitWriteTree(ctx.root);
+  if (!treeResult.ok) return base.join("\n");
+  const pin: GateAckPin = { kind: "tree-digest", parentSha: headResult.data.hash, treeId: treeResult.data };
+  const lookup = findGateAck(ctx.root, {
+    arrangementId: gateStatus.arrangementId,
+    gateName: gate.name,
+    ticketRef: finalizingWorkItem.id,
+    pin,
+    expectedAckRole: gate.ackRole,
+  });
+  if (lookup.status !== "valid") return renderGateAckHold(lookup, gate);
+  return lookup.ack.deltas
+    ? [...base, "", "## Pen-approved pre-commit-ack deltas (binding, non-mutating)", "", lookup.ack.deltas].join("\n")
+    : base.join("\n");
 }
 
 async function busShipBlockers(ctx: StageContext): Promise<string[]> {

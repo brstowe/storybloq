@@ -67,6 +67,12 @@ describe("FINALIZE Storybloq Bus gate", () => {
     const fixture = await createBusFixture("finalize-bus-fresh-checkout");
     fixtures.push(fixture);
     await rm(join(fixture.root, ".story", "bus"), { recursive: true });
+    // T-428: a genuinely fresh checkout (bus enabled in committed config, never set
+    // up here) has neither a runtime NOR deletion-evidence -- evidence is gitignored,
+    // so a clone never receives it. Removing both models that L-031 fresh state.
+    // Deleting an EVIDENCED runtime is `runtime_lost` (covered by the partial-runtime
+    // case below and deletion-evidence.test.ts), which correctly blocks finalize.
+    await rm(join(fixture.root, ".story", ".bus-evidence.json"), { force: true });
     const sessionDir = join(fixture.root, ".story", "sessions", state().sessionId);
     await mkdir(sessionDir, { recursive: true });
 
@@ -80,10 +86,50 @@ describe("FINALIZE Storybloq Bus gate", () => {
       .rejects.toMatchObject({ code: "ENOENT" });
   });
 
+  /**
+   * T-461 phase 4: FINALIZE is the last point before the work becomes a commit,
+   * so a level below standard is stated in the prose rather than left in a
+   * session file nobody opens. `off` gets its own sentence because it is a
+   * different claim: not "reviewed less" but "no review verdict exists for this
+   * commit", which is what someone reading the history later needs.
+   */
+  it("states a below-standard level in the finalize prose", async () => {
+    const fixture = await createBusFixture("finalize-effort-prose");
+    fixtures.push(fixture);
+    await rm(join(fixture.root, ".story", "bus"), { recursive: true });
+    await rm(join(fixture.root, ".story", ".bus-evidence.json"), { force: true });
+    const sessionDir = join(fixture.root, ".story", "sessions", state().sessionId);
+    await mkdir(sessionDir, { recursive: true });
+
+    const enter = async (overrides: Partial<FullSessionState>) => {
+      const result = await new FinalizeStage().enter(
+        new StageContext(fixture.root, sessionDir, { ...state(), ...overrides } as FullSessionState, recipe()),
+      );
+      return (result as { instruction: string }).instruction;
+    };
+
+    expect(await enter({ currentReviewEffort: "light", currentReviewEffortSource: "size-mapped" } as Partial<FullSessionState>))
+      .toContain("Review effort: light (size-mapped). This item was reviewed at a lower depth than the project default.");
+
+    const off = await enter({ currentReviewEffort: "off", currentReviewEffortSource: "item" } as Partial<FullSessionState>);
+    expect(off).toContain("Review effort: off (item). Review stages were skipped for this item; no review verdict exists for this commit.");
+    // An off item has no verdict to have passed. Saying it passed beside the
+    // sentence saying no verdict exists would hand the reader two
+    // contradictory claims at the commit boundary.
+    expect(off).toContain("Review stages were skipped. Time to commit.");
+    expect(off).not.toContain("Code review passed");
+
+    // standard says nothing, so the instruction is what it was before the dial.
+    const standard = await enter({});
+    expect(standard).not.toContain("Review effort:");
+    expect(standard).toContain("Code review passed. Time to commit.");
+    expect(standard).toContain("# Finalize");
+  });
+
   it("blocks a partially present Bus runtime without recreating it", async () => {
     const fixture = await createBusFixture("finalize-bus-partial-runtime");
     fixtures.push(fixture);
-    const pending = join(fixture.root, ".story", "bus", "mailboxes", "reviewer", "pending");
+    const pending = join(fixture.root, ".story", "bus", "mailboxes", fixture.a.endpointId, "pending");
     await rm(pending, { recursive: true });
     const sessionDir = join(fixture.root, ".story", "sessions", state().sessionId);
     await mkdir(sessionDir, { recursive: true });

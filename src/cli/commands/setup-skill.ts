@@ -11,6 +11,13 @@ import {
   PRECOMPACT_SUBCOMMAND,
   SESSIONSTART_SUBCOMMAND,
   STOP_SUBCOMMAND,
+  LIMITSTOP_SUBCOMMAND,
+  STOPFAILURE_MATCHER,
+  LIMIT_SESSIONSTART_MATCHER,
+  PRESENCE_BIN_NAME,
+  PRESENCE_SUBCOMMAND,
+  PRESENCE_HOOK_TIMEOUT_SECONDS,
+  PRESENCE_HOOK_TYPES,
   STORYBLOQ_LEGACY_BASENAMES,
   formatHookCommand,
   migrateLegacyHookVariants,
@@ -26,6 +33,10 @@ export {
   PRECOMPACT_SUBCOMMAND,
   SESSIONSTART_SUBCOMMAND,
   STOP_SUBCOMMAND,
+  PRESENCE_BIN_NAME,
+  PRESENCE_SUBCOMMAND,
+  PRESENCE_HOOK_TIMEOUT_SECONDS,
+  PRESENCE_HOOK_TYPES,
   STORYBLOQ_LEGACY_BASENAMES,
   formatHookCommand,
   migrateLegacyHookVariants,
@@ -215,6 +226,41 @@ export function resolveStorybloqBin(): string | null {
   return null;
 }
 
+/**
+ * Resolves the `storybloq-presence` bin (ISS-1022).
+ *
+ * Looks beside the resolved `storybloq` bin first, because npm installs both
+ * bins of the same package into the same directory, and that sibling is the
+ * one guaranteed to be the SAME version as the CLI that is registering the
+ * hook. Only then falls back to a PATH walk, which could otherwise pick up a
+ * presence bin from a different install.
+ */
+export function resolvePresenceBin(storybloqBin?: string | null): string | null {
+  const isWindows = process.platform === "win32";
+  const exts = isWindows
+    ? (process.env.PATHEXT ?? ".EXE;.CMD;.BAT;.COM").split(";").filter(Boolean)
+    : [""];
+
+  const sibling = storybloqBin ?? resolveStorybloqBin();
+  if (sibling) {
+    for (const ext of exts) {
+      const candidate = join(dirname(sibling), PRESENCE_BIN_NAME + ext);
+      if (isExecutableFile(candidate)) return candidate;
+    }
+  }
+
+  const pathEnv = process.env.PATH ?? "";
+  for (const dir of pathEnv.split(pathDelimiter)) {
+    if (!dir) continue;
+    for (const ext of exts) {
+      const candidate = join(dir, PRESENCE_BIN_NAME + ext);
+      if (isExecutableFile(candidate)) return candidate;
+    }
+  }
+
+  return null;
+}
+
 function isExecutableFile(path: string): boolean {
   try {
     accessSync(path, fsConstants.X_OK);
@@ -300,6 +346,14 @@ async function registerHook(
   hookEntry: HookEntry,
   settingsPath?: string,
   matcher?: string,
+  opts?: {
+    /**
+     * T-424: scope the exists-check to the target matcher group. Needed when
+     * the SAME command is deliberately registered under two matcher groups
+     * (session resume-prompt under "compact" and "resume").
+     */
+    scopeIdempotencyToMatcher?: boolean;
+  },
 ): Promise<"registered" | "exists" | "skipped"> {
   const path = settingsPath ?? join(homedir(), ".claude", "settings.json");
 
@@ -309,7 +363,7 @@ async function registerHook(
     try {
       raw = await readFile(path, "utf-8");
     } catch {
-      process.stderr.write(`Could not read ${path} — skipping hook registration.\n`);
+      process.stderr.write(`Could not read ${path} -- skipping hook registration.\n`);
       return "skipped";
     }
   }
@@ -319,11 +373,11 @@ async function registerHook(
   try {
     settings = JSON.parse(raw) as Record<string, unknown>;
     if (typeof settings !== "object" || settings === null || Array.isArray(settings)) {
-      process.stderr.write(`${path} is not a JSON object — skipping hook registration.\n`);
+      process.stderr.write(`${path} is not a JSON object -- skipping hook registration.\n`);
       return "skipped";
     }
   } catch {
-    process.stderr.write(`${path} contains invalid JSON — skipping hook registration.\n`);
+    process.stderr.write(`${path} contains invalid JSON -- skipping hook registration.\n`);
     process.stderr.write("  Fix the file manually or delete it to reset.\n");
     return "skipped";
   }
@@ -331,7 +385,7 @@ async function registerHook(
   // Type guard: hooks must be object
   if ("hooks" in settings) {
     if (typeof settings.hooks !== "object" || settings.hooks === null || Array.isArray(settings.hooks)) {
-      process.stderr.write(`${path} has unexpected hooks format — skipping hook registration.\n`);
+      process.stderr.write(`${path} has unexpected hooks format -- skipping hook registration.\n`);
       return "skipped";
     }
   } else {
@@ -343,7 +397,7 @@ async function registerHook(
   // Type guard: hook type must be array
   if (hookType in hooks) {
     if (!Array.isArray(hooks[hookType])) {
-      process.stderr.write(`${path} has unexpected hooks.${hookType} format — skipping hook registration.\n`);
+      process.stderr.write(`${path} has unexpected hooks.${hookType} format -- skipping hook registration.\n`);
       return "skipped";
     }
   } else {
@@ -351,14 +405,16 @@ async function registerHook(
   }
 
   const hookArray = hooks[hookType] as unknown[];
+  const targetMatcher = matcher ?? "";
 
-  // Idempotency: scan for existing command (defensive — skip malformed entries)
+  // Idempotency: scan for existing command (defensive -- skip malformed entries)
   const hookCommand = hookEntry.command;
   if (hookCommand) {
     for (const group of hookArray) {
       if (typeof group !== "object" || group === null) continue;
       const g = group as MatcherGroup;
       if (!Array.isArray(g.hooks)) continue;
+      if (opts?.scopeIdempotencyToMatcher && (g.matcher ?? "") !== targetMatcher) continue;
       for (const entry of g.hooks) {
         if (isHookWithCommand(entry, hookCommand)) return "exists";
       }
@@ -366,7 +422,6 @@ async function registerHook(
   }
 
   // Find existing matcher group with valid hooks array, or create one
-  const targetMatcher = matcher ?? "";
   let appended = false;
   for (const group of hookArray) {
     if (typeof group !== "object" || group === null) continue;
@@ -431,6 +486,248 @@ export async function registerStopHook(
   const bin = binPath ?? resolveStorybloqBin() ?? "storybloq";
   const command = formatHookCommand(bin, STOP_SUBCOMMAND);
   return registerHook("Stop", { type: "command", command, async: true }, settingsPath);
+}
+
+/**
+ * Registers the five session-presence hooks (ISS-1022).
+ *
+ * All five are SYNCHRONOUS. `async: true` would hand ordering to whichever
+ * process happened to finish first, and there is nothing in a hook payload a
+ * record could use to reconstruct the true order afterwards -- so Claude Code's
+ * own event sequencing is the only sound source, and running synchronously is
+ * how it is inherited. Each carries an explicit 5s timeout because the client
+ * default is 600s, which on a per-tool-call hook is a ten-minute stall rather
+ * than a safety net.
+ *
+ * Every matcher is empty: presence must see every tool and every SessionStart
+ * source, `fork` included.
+ *
+ * Returns a per-hook-type result map, or null when the presence bin cannot be
+ * resolved (an older install, or a PATH the CLI cannot see) -- in which case
+ * nothing is registered rather than a command that would fail on every event.
+ */
+export async function registerPresenceHooks(
+  settingsPath?: string,
+  binPath?: string | null,
+): Promise<Record<string, "registered" | "exists" | "skipped"> | null> {
+  // An explicitly-passed null means the CALLER already tried to resolve and
+  // failed. Falling back to a second resolution attempt there would register a
+  // bin the caller deliberately rejected; only an omitted argument resolves.
+  const bin = binPath === undefined ? resolvePresenceBin() : binPath;
+  if (!bin) return null;
+  const command = formatHookCommand(bin, PRESENCE_SUBCOMMAND);
+  const results: Record<string, "registered" | "exists" | "skipped"> = {};
+  for (const hookType of PRESENCE_HOOK_TYPES) {
+    results[hookType] = await registerHook(
+      hookType,
+      { type: "command", command, timeout: PRESENCE_HOOK_TIMEOUT_SECONDS },
+      settingsPath,
+    );
+  }
+  return results;
+}
+
+/** Removes every presence hook registration (ISS-1022 opt-out / uninstall). */
+export async function removePresenceHooks(
+  settingsPath?: string,
+  binPath?: string | null,
+): Promise<void> {
+  const bin = binPath === undefined ? resolvePresenceBin() : binPath;
+  if (!bin) return;
+  const command = formatHookCommand(bin, PRESENCE_SUBCOMMAND);
+  for (const hookType of PRESENCE_HOOK_TYPES) {
+    await removeHook(hookType, command, settingsPath);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// T-424: limit-stop hooks (StopFailure + SessionStart "resume" group)
+// ---------------------------------------------------------------------------
+
+/** Does a SessionStart matcher (a source regex) already cover `source`? Empty matcher matches everything. */
+function matcherCoversSource(matcher: string | undefined, source: string): boolean {
+  const m = matcher ?? "";
+  if (m === "") return true;
+  try {
+    return new RegExp(`^(?:${m})$`).test(source);
+  } catch {
+    // A matcher we cannot compile cannot be PROVEN to cover `source`. Treat it
+    // as non-covering so a valid hook is still installed -- a `|`-split
+    // fallback would read `rate_limit|[` as covering `rate_limit` and suppress
+    // installation of a working hook. A redundant entry is harmless; a
+    // silently-missing one is not.
+    return false;
+  }
+}
+
+/**
+ * Registers the StopFailure hook (usage-limit stop detection). Narrow matcher:
+ * only rate_limit stops matter; overloaded/server_error are seconds-scale.
+ */
+export async function registerLimitStopFailureHook(
+  settingsPath?: string,
+  binPath?: string,
+): Promise<"registered" | "exists" | "skipped"> {
+  const bin = binPath ?? resolveStorybloqBin() ?? "storybloq";
+  const command = formatHookCommand(bin, LIMITSTOP_SUBCOMMAND);
+  const path = settingsPath ?? join(homedir(), ".claude", "settings.json");
+
+  // Coverage-aware idempotency: an existing group whose matcher COVERS
+  // rate_limit (e.g. "" or "rate_limit|server_error") already fires our
+  // command -- adding the exact-matcher group would double-fire it. An
+  // unrelated matcher (server_error only) does NOT cover it, and must not
+  // suppress installing the rate_limit group this feature needs.
+  if (existsSync(path)) {
+    try {
+      const settings = JSON.parse(await readFile(path, "utf-8")) as Record<string, unknown>;
+      const hooks = settings?.hooks as Record<string, unknown> | undefined;
+      const hookArray = hooks && Array.isArray(hooks.StopFailure) ? (hooks.StopFailure as unknown[]) : [];
+      for (const group of hookArray) {
+        if (typeof group !== "object" || group === null) continue;
+        const g = group as MatcherGroup;
+        if (!Array.isArray(g.hooks)) continue;
+        if (!matcherCoversSource(g.matcher, STOPFAILURE_MATCHER)) continue;
+        for (const entry of g.hooks) {
+          if (isHookWithCommand(entry, command)) return "exists";
+        }
+      }
+    } catch {
+      // Unreadable settings: fall through; registerHook applies its own guards.
+    }
+  }
+
+  return registerHook("StopFailure", { type: "command", command }, settingsPath, STOPFAILURE_MATCHER, {
+    scopeIdempotencyToMatcher: true,
+  });
+}
+
+/**
+ * Registers the SessionStart "resume" matcher group (same resume-prompt
+ * command as the "compact" group). Skipped when an existing group carrying
+ * our command already covers source "resume" (e.g. the Bus-broadened
+ * "startup|resume|clear|compact" matcher) -- a second group would double-fire.
+ */
+export async function registerLimitSessionStartHook(
+  settingsPath?: string,
+  binPath?: string,
+): Promise<"registered" | "exists" | "skipped"> {
+  const bin = binPath ?? resolveStorybloqBin() ?? "storybloq";
+  const command = formatHookCommand(bin, SESSIONSTART_SUBCOMMAND);
+  const path = settingsPath ?? join(homedir(), ".claude", "settings.json");
+
+  if (existsSync(path)) {
+    try {
+      const settings = JSON.parse(await readFile(path, "utf-8")) as Record<string, unknown>;
+      const hooks = settings?.hooks as Record<string, unknown> | undefined;
+      const hookArray = hooks && Array.isArray(hooks.SessionStart) ? (hooks.SessionStart as unknown[]) : [];
+      for (const group of hookArray) {
+        if (typeof group !== "object" || group === null) continue;
+        const g = group as MatcherGroup;
+        if (!Array.isArray(g.hooks)) continue;
+        if (!matcherCoversSource(g.matcher, "resume")) continue;
+        for (const entry of g.hooks) {
+          if (isHookWithCommand(entry, command)) return "exists";
+        }
+      }
+    } catch {
+      // Unreadable settings: fall through; registerHook applies its own guards.
+    }
+  }
+
+  return registerHook(
+    "SessionStart",
+    { type: "command", command },
+    settingsPath,
+    LIMIT_SESSIONSTART_MATCHER,
+    { scopeIdempotencyToMatcher: true },
+  );
+}
+
+/**
+ * Matcher-scoped hook removal: removes `command` ONLY from the group with the
+ * given matcher (removeHook strips it from every group, which would also
+ * delete the "compact" resume-prompt entry).
+ */
+export async function removeHookFromMatcherGroup(
+  hookType: string,
+  command: string,
+  matcher: string,
+  settingsPath?: string,
+): Promise<"removed" | "not_found" | "skipped"> {
+  const path = settingsPath ?? join(homedir(), ".claude", "settings.json");
+
+  let raw = "{}";
+  if (existsSync(path)) {
+    try {
+      raw = await readFile(path, "utf-8");
+    } catch {
+      return "skipped";
+    }
+  }
+
+  let settings: Record<string, unknown>;
+  try {
+    settings = JSON.parse(raw) as Record<string, unknown>;
+    if (typeof settings !== "object" || settings === null || Array.isArray(settings)) return "skipped";
+  } catch {
+    return "skipped";
+  }
+
+  if (!("hooks" in settings) || typeof settings.hooks !== "object" || settings.hooks === null) return "not_found";
+  const hooks = settings.hooks as Record<string, unknown>;
+  if (!(hookType in hooks) || !Array.isArray(hooks[hookType])) return "not_found";
+
+  const hookArray = hooks[hookType] as unknown[];
+  let removed = false;
+  for (const group of hookArray) {
+    if (typeof group !== "object" || group === null) continue;
+    const g = group as MatcherGroup;
+    if ((g.matcher ?? "") !== matcher || !Array.isArray(g.hooks)) continue;
+    const before = g.hooks.length;
+    g.hooks = g.hooks.filter((entry) => !isHookWithCommand(entry, command));
+    if (g.hooks.length < before) removed = true;
+  }
+  if (!removed) return "not_found";
+
+  try {
+    await atomicWriteFollowingSymlink(path, JSON.stringify(settings, null, 2) + "\n");
+  } catch {
+    return "skipped";
+  }
+  return "removed";
+}
+
+/**
+ * Idempotent reconcile of the limit-stop hooks against the global kill switch.
+ * Called from housekeeping on every non-skipped CLI invocation and from the
+ * skill auto-refresh (unconditionally, NOT count-gated -- the legacy sweep
+ * only renames/removes existing entries and can never install an absent hook
+ * type, so upgrades would otherwise never reach the installed base).
+ *
+ * Enabled  -> ensure StopFailure + SessionStart "resume" group registered.
+ * Disabled -> ensure both removed (the "compact" group is untouched).
+ */
+export async function ensureLimitHooksRegistered(
+  settingsPath?: string,
+  binPath?: string,
+): Promise<{ changed: boolean; action: "installed" | "removed" | "unchanged" }> {
+  const bin = binPath ?? resolveStorybloqBin();
+  if (!bin) return { changed: false, action: "unchanged" };
+
+  const { isLimitResumeGloballyDisabled } = await import("../../core/limit-ledger.js");
+  if (isLimitResumeGloballyDisabled()) {
+    const stopCmd = formatHookCommand(bin, LIMITSTOP_SUBCOMMAND);
+    const sessionCmd = formatHookCommand(bin, SESSIONSTART_SUBCOMMAND);
+    const r1 = await removeHook("StopFailure", stopCmd, settingsPath);
+    const r2 = await removeHookFromMatcherGroup("SessionStart", sessionCmd, LIMIT_SESSIONSTART_MATCHER, settingsPath);
+    const changed = r1 === "removed" || r2 === "removed";
+    return { changed, action: changed ? "removed" : "unchanged" };
+  }
+
+  const r1 = await registerLimitStopFailureHook(settingsPath, bin);
+  const r2 = await registerLimitSessionStartHook(settingsPath, bin);
+  const changed = r1 === "registered" || r2 === "registered";
+  return { changed, action: changed ? "installed" : "unchanged" };
 }
 
 export const CLAUDE_BUS_SESSION_START_MATCHER = "startup|resume|clear|compact";
@@ -535,6 +832,68 @@ export async function enableClaudeBusHooks(
 }
 
 /**
+ * D4 read-only Claude base-hook inspector. Verifies ~/.claude/settings.json is
+ * readable, well-formed, and already carries the base SessionStart (resume) and
+ * Stop (hook-status) Storybloq hooks that `enableClaudeBusHooks` upgrades to
+ * guarded live delivery. Never writes. Bus setup calls this in preflight so a
+ * live Claude setup cannot mutate Bus state and then fail at hook enablement.
+ */
+export async function claudeBaseHooksPresent(
+  settingsPath: string = join(homedir(), ".claude", "settings.json"),
+): Promise<{ ok: boolean; reason?: string }> {
+  if (!existsSync(settingsPath)) {
+    return { ok: false, reason: `${settingsPath} does not exist` };
+  }
+  let raw: string;
+  try {
+    raw = await readFile(settingsPath, "utf-8");
+  } catch {
+    return { ok: false, reason: `${settingsPath} is not readable` };
+  }
+  let settings: unknown;
+  try {
+    settings = JSON.parse(raw);
+  } catch {
+    return { ok: false, reason: `${settingsPath} is not valid JSON` };
+  }
+  if (typeof settings !== "object" || settings === null || Array.isArray(settings)) {
+    return { ok: false, reason: `${settingsPath} is malformed` };
+  }
+  const hooks = (settings as Record<string, unknown>).hooks;
+  if (typeof hooks !== "object" || hooks === null || Array.isArray(hooks)) {
+    return { ok: false, reason: "Claude base hooks are not configured" };
+  }
+  const hookMap = hooks as Record<string, unknown>;
+  const hasBaseHook = (hookType: string, subcommand: string): boolean => {
+    const groups = hookMap[hookType];
+    if (!Array.isArray(groups)) return false;
+    for (const group of groups) {
+      if (typeof group !== "object" || group === null) continue;
+      const g = group as MatcherGroup;
+      if (!Array.isArray(g.hooks)) continue;
+      for (const entry of g.hooks) {
+        if (typeof entry !== "object" || entry === null) continue;
+        const e = entry as HookEntry;
+        if (e.type !== "command" || typeof e.command !== "string") continue;
+        const parsed = parseHookCommand(e.command);
+        if (parsed === null) continue;
+        if (!STORYBLOQ_LEGACY_BASENAMES.has(parsed.binBasename)) continue;
+        if (parsed.rest === subcommand) return true;
+      }
+    }
+    return false;
+  };
+  const missing = [
+    hasBaseHook("SessionStart", SESSIONSTART_SUBCOMMAND) ? null : "SessionStart",
+    hasBaseHook("Stop", STOP_SUBCOMMAND) ? null : "Stop",
+  ].filter((value): value is string => value !== null);
+  if (missing.length > 0) {
+    return { ok: false, reason: `missing base Claude hook(s): ${missing.join(", ")}` };
+  }
+  return { ok: true };
+}
+
+/**
  * Removes a hook command from settings.json. Used for migration (ISS-032).
  */
 export async function removeHook(
@@ -595,6 +954,20 @@ export async function removeHook(
 
 export interface SetupSkillOptions {
   skipHooks?: boolean;
+  /**
+   * ISS-834: skip handleSetupCodex's own skill-directory copy (both the
+   * primary `~/.agents/skills/story/` write and the `~/.codex/skills/story/`
+   * compat refresh). For a Codex install already managed by the
+   * `storybloq` marketplace plugin (which ships its own skill copy via
+   * `skills: "./skills/"` in its plugin.json), running the npm installer's
+   * copy step too would create a duplicate, competing skill provider.
+   * Has no effect on `handleSetupClaude` -- Claude Code's skill path is
+   * unrelated to the Codex plugin and stays unchanged, per ISS-834's own
+   * "Claude Code install path unchanged" instruction. Rejected as a usage
+   * error when combined with `client: "claude"` (see `handleSetup`), since
+   * there is no Claude-side copy step for it to skip.
+   */
+  skipSkill?: boolean;
 }
 
 export type SetupClient = "claude" | "codex" | "all";
@@ -668,7 +1041,7 @@ function pruneEmptyMatcherGroups(
  * 3. Optionally registers PreCompact hook in ~/.claude/settings.json
  * 4. Prints success message
  *
- * Idempotent — safe to re-run (overwrites with latest).
+ * Idempotent -- safe to re-run (overwrites with latest).
  */
 async function handleSetupClaude(options: SetupSkillOptions = {}): Promise<void> {
   const { skipHooks = false } = options;
@@ -698,7 +1071,7 @@ async function handleSetupClaude(options: SetupSkillOptions = {}): Promise<void>
   const skillContent = await readFile(join(srcSkillDir, "SKILL.md"), "utf-8");
   await writeFile(join(skillDir, "SKILL.md"), skillContent, "utf-8");
 
-  const supportFiles = ["setup-flow.md", "autonomous-mode.md", "reference.md", "federation-setup.md", "orchestrator-mode.md", "bus-mode.md"];
+  const supportFiles = ["setup-flow.md", "autonomous-mode.md", "reference.md", "federation-setup.md", "orchestrator-mode.md", "triage-mode.md", "bus-mode.md", "session-guard-fallback.md"];
   const writtenFiles = ["SKILL.md"];
   const missingFiles: string[] = [];
   for (const filename of supportFiles) {
@@ -748,7 +1121,7 @@ async function handleSetupClaude(options: SetupSkillOptions = {}): Promise<void>
     process.stderr.write("  This may indicate a corrupt installation. Try: npm install -g @storybloq/storybloq@latest\n");
   }
 
-  // Attempt MCP registration — requires both `storybloq` and `claude` in PATH.
+  // Attempt MCP registration -- requires both `storybloq` and `claude` in PATH.
   let mcpRegistered = false;
   let cliInPath = false;
   try {
@@ -775,7 +1148,7 @@ async function handleSetupClaude(options: SetupSkillOptions = {}): Promise<void>
         log("  MCP server already registered globally");
       } else if (isNotFound) {
         log("");
-        log("MCP registration skipped — `claude` CLI not found in PATH.");
+        log("MCP registration skipped -- `claude` CLI not found in PATH.");
         log("  To register manually: claude mcp add storybloq -s user -- storybloq --mcp");
       } else {
         log("");
@@ -785,14 +1158,14 @@ async function handleSetupClaude(options: SetupSkillOptions = {}): Promise<void>
     }
   } else {
     log("");
-    log("MCP registration skipped — `storybloq` not found in PATH.");
+    log("MCP registration skipped -- `storybloq` not found in PATH.");
     log("Install globally first, then register MCP:");
     log("  npm install -g @storybloq/storybloq@latest");
     log("  claude mcp add storybloq -s user -- storybloq --mcp");
   }
 
   // Hook registration (ISS-032: hook-driven compaction; ISS-560: absolute bin path)
-  // Gate on `resolveStorybloqBin()` — Claude Code hooks run under a shell
+  // Gate on `resolveStorybloqBin()` -- Claude Code hooks run under a shell
   // whose PATH may differ from this process's at install time (nvm/fnm
   // switches mid-session). Baking the absolute path into the command string
   // removes that dependency.
@@ -820,7 +1193,7 @@ async function handleSetupClaude(options: SetupSkillOptions = {}): Promise<void>
     const precompactResult = await registerPreCompactHook(undefined, resolvedBin);
     switch (precompactResult) {
       case "registered":
-        log("  PreCompact hook registered — session compact preparation before context compaction");
+        log("  PreCompact hook registered -- session compact preparation before context compaction");
         break;
       case "exists":
         log("  PreCompact hook already configured");
@@ -832,7 +1205,7 @@ async function handleSetupClaude(options: SetupSkillOptions = {}): Promise<void>
     const sessionStartResult = await registerSessionStartHook(undefined, resolvedBin);
     switch (sessionStartResult) {
       case "registered":
-        log("  SessionStart hook registered — resume prompt after compaction");
+        log("  SessionStart hook registered -- resume prompt after compaction");
         break;
       case "exists":
         log("  SessionStart hook already configured");
@@ -844,7 +1217,7 @@ async function handleSetupClaude(options: SetupSkillOptions = {}): Promise<void>
     const stopResult = await registerStopHook(undefined, resolvedBin);
     switch (stopResult) {
       case "registered":
-        log("  Stop hook registered — status.json updated after every Claude response");
+        log("  Stop hook registered -- status.json updated after every Claude response");
         break;
       case "exists":
         log("  Stop hook already configured");
@@ -852,11 +1225,37 @@ async function handleSetupClaude(options: SetupSkillOptions = {}): Promise<void>
       case "skipped":
         break;
     }
+
+    // ISS-1022: session presence. Five synchronous hooks from the slim
+    // `storybloq-presence` bin. Silently skipped on an install that predates
+    // that bin -- registering a command that does not exist would fail on
+    // every tool call.
+    const presenceResults = await registerPresenceHooks(undefined, resolvePresenceBin(resolvedBin));
+    if (presenceResults === null) {
+      log("  Presence hooks skipped -- `storybloq-presence` binary not found (update the CLI)");
+    } else {
+      const registered = Object.values(presenceResults).filter((r) => r === "registered").length;
+      if (registered > 0) {
+        log(`  Presence hooks registered (${registered}/${PRESENCE_HOOK_TYPES.length}) -- live sessions appear in the Storybloq app`);
+      } else {
+        log("  Presence hooks already configured");
+      }
+    }
+
+    // T-424: limit-stop hooks honor the global kill switch (removed when disabled).
+    const limitHooks = await ensureLimitHooksRegistered(undefined, resolvedBin);
+    if (limitHooks.action === "installed") {
+      log("  StopFailure hook registered - usage-limit stops auto-resume at reset");
+    } else if (limitHooks.action === "removed") {
+      log("  StopFailure hook removed - usage-limit auto-resume is disabled globally");
+    } else {
+      log("  StopFailure hook already configured (or disabled globally)");
+    }
   } else if (skipHooks) {
     log("  Hook registration skipped (--skip-hooks)");
   } else {
     log("");
-    log("Hook registration skipped — `storybloq` binary not found.");
+    log("Hook registration skipped -- `storybloq` binary not found.");
     log("Install globally first, then re-run setup-skill:");
     log("  npm install -g @storybloq/storybloq@latest");
     log("  storybloq setup-skill");
@@ -899,6 +1298,9 @@ export const CODEX_READ_ONLY_APPROVAL_TOOLS = [
   "storybloq_recommend",
   "storybloq_export",
   "storybloq_session_report",
+  // T-446: read-only, runs on every invocation as part of Step 0.5. Without it
+  // Codex prompts for approval before the guard on every single session.
+  "storybloq_session_guard",
   "storybloq_bus_poll",
   "storybloq_bus_thread_get",
   "storybloq_node_list",
@@ -918,11 +1320,19 @@ function codexHome(): string {
   return process.env.CODEX_HOME ?? join(homedir(), ".codex");
 }
 
-function codexHooksPath(): string {
+/** ISS-1091 (F10): exported for the e2e acceptance probe's audited-path list. */
+export function codexHooksPath(): string {
   return join(codexHome(), "hooks.json");
 }
 
-function codexConfigPath(): string {
+/**
+ * ISS-1091 (F10): exported for the e2e acceptance probe's audited-path list.
+ * Note this duplicates skill-version-marker.ts's own `codexConfigPath` -- both
+ * compute the identical path independently; see
+ * test/helpers/e2e-acceptance-probe.test.ts for the pinned-equal assertion
+ * documenting that duplication.
+ */
+export function codexConfigPath(): string {
   return join(codexHome(), "config.toml");
 }
 
@@ -1402,53 +1812,59 @@ export async function refreshExistingCodexHooks(
 }
 
 async function handleSetupCodex(options: SetupSkillOptions = {}): Promise<void> {
-  const { skipHooks = false } = options;
+  const { skipHooks = false, skipSkill = false } = options;
 
-  let srcSkillDir: string;
-  try {
-    srcSkillDir = resolveSkillSourceDir();
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : String(err);
-    process.stderr.write(`Error: ${message}\n`);
-    process.stderr.write("This may indicate a corrupt installation. Try: npm install -g @storybloq/storybloq@latest\n");
-    process.exitCode = 1;
-    return;
-  }
-
-  // Primary Codex skill artifact: leave unwrapped so a total failure propagates
-  // to the top-level handler and sets a non-zero exit (parity with
-  // handleSetupClaude's primary writes). The no-setup self-heal path has its own
-  // non-fatal guard in autoRefreshSkillIfStale, so this does not affect it.
-  const skillDir = join(homedir(), ".agents", "skills", "story");
-  const existed = existsSync(join(skillDir, "SKILL.md"));
-  const writtenFiles = await copyDirRecursive(srcSkillDir, skillDir);
-  log(`${existed ? "Updated" : "Installed"} $story skill at ${skillDir}/`);
-  log(`  ${writtenFiles.join(" + ")} written`);
-
-  const compatSkillDir = join(codexHome(), "skills", "story");
   let compatRefreshSucceeded = false;
-  if (existsSync(join(compatSkillDir, "SKILL.md"))) {
+  if (!skipSkill) {
+    let srcSkillDir: string;
     try {
-      const compatFiles = await copyDirRecursive(srcSkillDir, compatSkillDir);
-      compatRefreshSucceeded = true;
-      log(`  Refreshed existing Codex skill copy at ${compatSkillDir}/ (${compatFiles.length} files)`);
+      srcSkillDir = resolveSkillSourceDir();
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      process.stderr.write(`Warning: Codex skill copy refresh failed: ${msg}\n`);
+      const message = err instanceof Error ? err.message : String(err);
+      process.stderr.write(`Error: ${message}\n`);
+      process.stderr.write("This may indicate a corrupt installation. Try: npm install -g @storybloq/storybloq@latest\n");
+      process.exitCode = 1;
+      return;
     }
+
+    // Primary Codex skill artifact: leave unwrapped so a total failure propagates
+    // to the top-level handler and sets a non-zero exit (parity with
+    // handleSetupClaude's primary writes). The no-setup self-heal path has its own
+    // non-fatal guard in autoRefreshSkillIfStale, so this does not affect it.
+    const skillDir = join(homedir(), ".agents", "skills", "story");
+    const existed = existsSync(join(skillDir, "SKILL.md"));
+    const writtenFiles = await copyDirRecursive(srcSkillDir, skillDir);
+    log(`${existed ? "Updated" : "Installed"} $story skill at ${skillDir}/`);
+    log(`  ${writtenFiles.join(" + ")} written`);
+
+    const compatSkillDir = join(codexHome(), "skills", "story");
+    if (existsSync(join(compatSkillDir, "SKILL.md"))) {
+      try {
+        const compatFiles = await copyDirRecursive(srcSkillDir, compatSkillDir);
+        compatRefreshSucceeded = true;
+        log(`  Refreshed existing Codex skill copy at ${compatSkillDir}/ (${compatFiles.length} files)`);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        process.stderr.write(`Warning: Codex skill copy refresh failed: ${msg}\n`);
+      }
+    }
+  } else {
+    log("  Skill install skipped (--skip-skill)");
   }
 
-  try {
-    const { writeSkillMarker } = await import("../../core/skill-version-marker.js");
-    const pkgJson = JSON.parse(
-      await readFile(join(dirname(fileURLToPath(import.meta.url)), "..", "package.json"), "utf-8")
-    ) as { version?: string };
-    if (pkgJson.version) {
-      writeSkillMarker(pkgJson.version, "codex");
-      if (compatRefreshSucceeded) writeSkillMarker(pkgJson.version, "codexCompat");
+  if (!skipSkill) {
+    try {
+      const { writeSkillMarker } = await import("../../core/skill-version-marker.js");
+      const pkgJson = JSON.parse(
+        await readFile(join(dirname(fileURLToPath(import.meta.url)), "..", "package.json"), "utf-8")
+      ) as { version?: string };
+      if (pkgJson.version) {
+        writeSkillMarker(pkgJson.version, "codex");
+        if (compatRefreshSucceeded) writeSkillMarker(pkgJson.version, "codexCompat");
+      }
+    } catch {
+      // Marker write is best-effort; skill still works without it.
     }
-  } catch {
-    // Marker write is best-effort; skill still works without it.
   }
 
   let cliInPath = false;
@@ -1598,6 +2014,17 @@ export async function handleSetup(options: SetupOptions = {}): Promise<void> {
   const client = options.client ?? "all";
   if (!["claude", "codex", "all"].includes(client)) {
     process.stderr.write(`Invalid client "${client}". Expected claude, codex, or all.\n`);
+    process.exitCode = 1;
+    return;
+  }
+
+  // ISS-834: --skip-skill only has an effect on handleSetupCodex; silently
+  // accepting it with --client claude would imply an effect it does not
+  // have. Reject rather than no-op.
+  if (client === "claude" && options.skipSkill) {
+    process.stderr.write(
+      '--skip-skill has no effect with --client claude; omit it or use --client codex/--client all.\n',
+    );
     process.exitCode = 1;
     return;
   }

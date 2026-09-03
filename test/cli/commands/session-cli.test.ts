@@ -1,5 +1,5 @@
 /**
- * T-251: `storybloq session` CLI — list, show, repair, delete.
+ * T-251: `storybloq session` CLI -- list, show, repair, delete.
  *
  * Exercises the four new CLI handlers against real on-disk .story/ trees.
  * Real git only in tests that need finished-orphan classification.
@@ -34,6 +34,7 @@ import {
   writeSessionSync,
 } from "../../../src/autonomous/session.js";
 import { deriveWorkspaceId, type FullSessionState } from "../../../src/autonomous/session-types.js";
+import { scanSessionSummaries } from "../../../src/core/session-scan.js";
 
 // ---------------------------------------------------------------------------
 // Fixture helpers
@@ -204,7 +205,7 @@ function plantFinishedOrphan(root: string, sessionId: string): { dir: string; co
   const commitHash = commitOnMain(root, "fix_iss_999");
   const dir = plantSession(root, {
     sessionId,
-    leaseMinutesAgo: 180, // 3 hours ago — past the 60-minute orphan buffer
+    leaseMinutesAgo: 180, // 3 hours ago -- past the 60-minute orphan buffer
     mode: "auto",
     targetWork: [issueId],
   });
@@ -275,7 +276,12 @@ describe("T-251 session list", () => {
     const active1 = "aaaa1111-0000-0000-0000-000000000001";
     const active2 = "aaaa2222-0000-0000-0000-000000000001";
     const completed = "cccc3333-0000-0000-0000-000000000001";
-    const superseded = "ssss4444-0000-0000-0000-000000000001";
+    // Was "ssss4444-...", which is not valid hex, so this record failed schema
+    // validation and `listAllSessions` dropped it. The assertion below then
+    // passed because the session was UNREADABLE, not because the status filter
+    // worked -- and nothing said so, which is the concealment ISS-897 fixes,
+    // reproduced inside this suite's own fixture.
+    const superseded = "bbbb4444-0000-0000-0000-000000000001";
     plantSession(root, { sessionId: active1, status: "active", leaseMinutesAgo: -30 });
     plantSession(root, { sessionId: active2, status: "active", leaseMinutesAgo: 120 });
     plantSession(root, { sessionId: completed, status: "completed" });
@@ -287,6 +293,13 @@ describe("T-251 session list", () => {
     expect(out).toContain(active2);
     expect(out).not.toContain(completed);
     expect(out).not.toContain(superseded);
+
+    // Proves the two absences above are the FILTER at work rather than either
+    // record being unreadable: both come back when nothing is filtered.
+    const all = await handleSessionList(root, { status: "all", format: "text" });
+    expect(all).toContain(completed);
+    expect(all).toContain(superseded);
+    expect(all).not.toContain("corrupt");
   });
 
   // Test 3
@@ -310,7 +323,7 @@ describe("T-251 session list", () => {
     expect(first).toHaveProperty("mode");
   });
 
-  // Test 4 — bulk discovery containment
+  // Test 4 -- bulk discovery containment
   it("listIgnoresSymlinkEscape: UUID-named symlink outside sessionsRoot is not surfaced by list", async () => {
     const root = setupRoot();
     const real = "66666666-6666-6666-6666-666666666666";
@@ -455,7 +468,7 @@ describe("T-251 session repair", () => {
     const dir = plantSession(root, {
       sessionId: id,
       status: "active",
-      leaseMinutesAgo: -30, // fresh — lease not expired
+      leaseMinutesAgo: -30, // fresh -- lease not expired
     });
     const stateBefore = readFileSync(join(dir, "state.json"), "utf-8");
 
@@ -482,7 +495,7 @@ describe("T-251 session repair", () => {
     // No-op write to bump revision.
     writeSessionSync(dir, { ...current });
 
-    // Now the under-lock revision mismatch path should fire — but because candidate
+    // Now the under-lock revision mismatch path should fire -- but because candidate
     // collection re-reads outside the lock, the new write is seen before mutation.
     // The handler must detect that the current revision doesn't match the previously
     // scanned revision and skip. We assert by comparing state remains active OR by
@@ -558,7 +571,7 @@ describe("T-251 session repair", () => {
     expect(after2.terminationReason).toBe("admin_recovery");
   });
 
-  // Test 15 — bulk discovery containment
+  // Test 15 -- bulk discovery containment
   it("repairAllSkipsSymlinkEscape: repair --all drops symlink-escape candidates before write", async () => {
     const root = setupRoot();
     writeTicket(root, "T-502", "open");
@@ -726,5 +739,126 @@ describe("T-251 session delete", () => {
     // Should not throw from parse attempts.
     await handleSessionDelete(root, id, { yes: true });
     expect(existsSync(dir)).toBe(false);
+  });
+
+  /**
+   * The permanent regression form of a check that was, until now, only ever
+   * run once by hand (ISS-945): `describeAddressableAgedAnomaly`'s advice text
+   * promises that `storybloq session delete <id> --yes` removes a bare,
+   * `state.json`-less session directory. `deleteAllowsCorruptSession` above
+   * proves deletion tolerates a garbage FILE; it says nothing about a
+   * directory with no file in it at all, which is `readSession(res.dir) ===
+   * null` rather than a parse failure, and `handleSessionDelete` treats that
+   * shape differently (skips the "is active" check entirely rather than
+   * finding it inactive). Age is irrelevant to whether delete itself
+   * succeeds -- the window only gates what advice text gets PRINTED -- so this
+   * directory is deliberately left fresh; unaged/aged is a distinction for the
+   * corruptRemedy tests, not for this one.
+   */
+  it("deleteRemovesBareStateJsonLessDirectory: no state.json at all, not merely an unparsable one", async () => {
+    const root = setupRoot();
+    const id = "eeee0006-0000-0000-0000-000000000001";
+    const dir = join(root, ".story", "sessions", id);
+    mkdirSync(dir, { recursive: true });
+    expect(existsSync(dir)).toBe(true);
+    expect(existsSync(join(dir, "state.json"))).toBe(false);
+
+    const result = await handleSessionDelete(root, id, { yes: true });
+
+    expect(existsSync(dir)).toBe(false);
+    expect(result).toContain("deleted");
+  });
+});
+
+describe("ISS-911: leaseState and Compact columns", () => {
+  /**
+   * The guard's whole matrix turns on live vs resumable-expired, and the list
+   * used to print only a relative expiry -- so the reader INFERRED the state,
+   * and operator 4 inferred it wrong during a live recovery (N-097). The state
+   * is now printed in the guard's own vocabulary, derived by the SAME function
+   * the scanner uses, so this surface and the guard cannot drift. Population
+   * membership additionally needs compactPending (session-scan's three-input
+   * rule), which rendered nowhere; it gets a column too.
+   */
+  it("prints the guard vocabulary: live for a future lease, expired+pending for a parked COMPACT session", async () => {
+    const root = setupRoot();
+    const live = "11119111-0000-0000-0000-000000000001";
+    const parked = "22229111-0000-0000-0000-000000000002";
+    plantSession(root, { sessionId: live, status: "active", leaseMinutesAgo: -30 });
+    plantSession(root, {
+      sessionId: parked,
+      status: "active",
+      state: "COMPACT",
+      compactPending: true,
+      leaseMinutesAgo: 120,
+    });
+
+    const out = await handleSessionList(root, { status: "all", format: "text" });
+
+    expect(out).toContain("LeaseState");
+    expect(out).toContain("Compact");
+    // Exact cells, not substring presence: "live" appears inside session ids
+    // and "-" appears everywhere, so only positional assertions prove the
+    // columns render what they claim. Columns join on two spaces; values
+    // with inner single spaces (the relative lease) survive the split.
+    const cells = (id: string): string[] =>
+      out.split("\n").find((l) => l.startsWith(id))!.trim().split(/\s{2,}/);
+    expect(cells(live)[4]).toBe("live");
+    expect(cells(live)[5]).toBe("-");
+    expect(cells(parked)[4]).toBe("expired");
+    expect(cells(parked)[5]).toBe("pending");
+  });
+
+  it("emits leaseState and compactPending in json, agreeing with the scanner for the same session", async () => {
+    const root = setupRoot();
+    const id = "33339111-0000-0000-0000-000000000003";
+    plantSession(root, {
+      sessionId: id,
+      status: "active",
+      state: "COMPACT",
+      compactPending: true,
+      leaseMinutesAgo: 120,
+    });
+
+    const out = await handleSessionList(root, { status: "all", format: "json" });
+    const row = JSON.parse(out).sessions.find((s: { sessionId: string }) => s.sessionId === id);
+    expect(row.leaseState).toBe("expired");
+    expect(row.compactPending).toBe(true);
+
+    // The no-drift pin: the scanner classifies the SAME session identically.
+    // This is the filing's core requirement -- sourced from the same
+    // computation the typed guard uses, so CLI and guard cannot diverge.
+    // The parked fixture is COMPACT + compactPending + expired, so the scanner
+    // files it under resumableSessions; search both populations so the pin
+    // does not depend on which side of that split the fixture lands.
+    const scan = scanSessionSummaries(root);
+    const summary = [...scan.activeSessions, ...scan.resumableSessions].find(
+      (s) => s.sessionId === id,
+    );
+    expect(summary).toBeTruthy();
+    expect(summary!.leaseState).toBe(row.leaseState);
+    expect(summary!.compactPending).toBe(row.compactPending);
+  });
+
+  it("renders '-' in both new columns for a damaged row, composing with ISS-897's annotation", async () => {
+    const root = setupRoot();
+    const id = "44449111-0000-0000-0000-000000000004";
+    const dir = plantSession(root, { sessionId: id, status: "active", leaseMinutesAgo: -30 });
+    // startedAt: null is the post-ISS-907 damage vector: a required field
+    // where null still means damage, so the strict reader rejects the file.
+    const file = join(dir, "state.json");
+    const raw = JSON.parse(readFileSync(file, "utf-8")) as Record<string, unknown>;
+    writeFileSync(file, JSON.stringify({ ...raw, startedAt: null }));
+
+    const out = await handleSessionList(root, { status: "all", format: "text" });
+    const row = out.split("\n").find((l) => l.startsWith(id) && l.includes("corrupt"));
+    expect(row).toBeTruthy();
+    // A damaged row asserts nothing it did not establish: the lease state was
+    // never read, so both cells are exactly "-", not "missing" or a guess --
+    // "missing" would claim the FILE said so, and the file was never read.
+    const cols = row!.trim().split(/\s{2,}/);
+    expect(cols[1]).toBe("corrupt");
+    expect(cols[4]).toBe("-");
+    expect(cols[5]).toBe("-");
   });
 });

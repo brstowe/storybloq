@@ -36,6 +36,8 @@ async function runCli(): Promise<void> {
   const { hideBin } = await import("yargs/helpers");
   const { ExitCode, formatError } = await import("../core/output-formatter.js");
   const { writeOutput } = await import("./run.js");
+  const { configureRawMode, checkRawMode, rawRejectionPending, RAW_REJECTION_EXIT } = await import("./raw-mode.js");
+  const { takeArrayOptionError, resetArrayOptionError } = await import("./array-options.js");
   const {
     registerInitCommand,
     registerBusCommand,
@@ -51,6 +53,11 @@ async function runCli(): Promise<void> {
     registerRecapCommand,
     registerExportCommand,
     registerNoteCommand,
+    registerArrangementCommand,
+    registerRulingCommand,
+    registerGateAckCommand,
+    registerLandingsCommand,
+    registerEarmarkCommand,
     registerLessonCommand,
     registerKnowledgeCommand,
     registerRecommendCommand,
@@ -61,6 +68,9 @@ async function runCli(): Promise<void> {
     registerSetupCommand,
     registerSetupSkillCommand,
     registerHookStatusCommand,
+    registerHookBusToolCommand,
+    registerWakerRunCommand,
+    registerLimitStatusCommand,
     registerConfigCommand,
     registerSessionCommand,
     registerRepairCommand,
@@ -92,7 +102,7 @@ async function runCli(): Promise<void> {
   // a background update check so the next invocation's banner is fresh.
   if (!shouldSkipHousekeeping(dispatchedArgv)) {
     const { preCommandHousekeeping } = await import("./housekeeping.js");
-    await preCommandHousekeeping(version);
+    await preCommandHousekeeping(version, dispatchedArgv);
   }
 
   class HandledError extends Error {
@@ -119,10 +129,44 @@ async function runCli(): Promise<void> {
     .demandCommand(1, "Specify a command. Run with --help for available commands.")
     .help()
     .fail((msg, err) => {
+      // Array-option policies run in yargs coerce callbacks. yargs wraps whatever
+      // they throw in its own YError, discarding the class and its code, so an
+      // `err instanceof CliValidationError` test here would never match and the
+      // rethrow below would report user input as io_error. takeArrayOptionError
+      // recovers the original by message. Scoped to array options only: every
+      // other error class, including plain Errors from .check(), keeps its path.
+      const arrayOptionError = err ? takeArrayOptionError(msg ?? "") : null;
+      if (arrayOptionError) {
+        writeOutput(formatError(arrayOptionError.code, arrayOptionError.message, errorFormat));
+        process.exitCode = ExitCode.USER_ERROR;
+        throw new HandledError();
+      }
       if (err) throw err;
       writeOutput(formatError("invalid_input", msg ?? "Unknown error", errorFormat));
       process.exitCode = ExitCode.USER_ERROR;
       throw new HandledError();
+    })
+    // ISS-910: --raw is only meaningful for the JSON envelope, and raw mode is
+    // armed here, before any handler runs. Commands that never registered
+    // --raw parse it as undefined (and strict mode rejects it outright), so
+    // this is inert for them.
+    //
+    // The misuse is reported HERE rather than through .check() or a rethrow:
+    // a .check() failure reaches .fail() with a truthy err, which the shared
+    // handler rethrows into the io_error catch-all -- the wrong code for user
+    // input. Printing here and throwing HandledError gives the correct
+    // invalid_input envelope exactly once, because handleUnexpectedError
+    // early-returns on HandledError. Adding a branch to .fail() instead would
+    // perturb the pinned handling of a CliValidationError raised inside an
+    // async handler, which double-printed when tried (ISS-886 boundary tests).
+    .middleware((argv) => {
+      const problem = checkRawMode(argv as { raw?: unknown; format?: unknown });
+      if (problem !== true) {
+        writeOutput(formatError("invalid_input", problem, errorFormat));
+        process.exitCode = ExitCode.USER_ERROR;
+        throw new HandledError();
+      }
+      configureRawMode((argv as { raw?: unknown }).raw, (argv as { format?: unknown }).format);
     });
 
   cli = registerInitCommand(cli);
@@ -132,6 +176,11 @@ async function runCli(): Promise<void> {
   cli = registerTicketCommand(cli);
   cli = registerIssueCommand(cli);
   cli = registerNoteCommand(cli);
+  cli = registerArrangementCommand(cli);
+  cli = registerRulingCommand(cli);
+  cli = registerGateAckCommand(cli);
+  cli = registerLandingsCommand(cli);
+  cli = registerEarmarkCommand(cli);
   cli = registerLessonCommand(cli);
   cli = registerKnowledgeCommand(cli);
   cli = registerHandoverCommand(cli);
@@ -157,6 +206,9 @@ async function runCli(): Promise<void> {
   cli = registerSetupCommand(cli);
   cli = registerSetupSkillCommand(cli);
   cli = registerHookStatusCommand(cli);
+  cli = registerHookBusToolCommand(cli);
+  cli = registerWakerRunCommand(cli);
+  cli = registerLimitStatusCommand(cli);
   cli = registerConfigCommand(cli);
   cli = registerNodeCommand(cli);
   cli = registerSessionCommand(cli);
@@ -170,9 +222,21 @@ async function runCli(): Promise<void> {
   }
 
   try {
+    // Bound the array-option error slot to this parse: clear before so no stale
+    // entry can be matched, and after so nothing outlives the parse that set it.
+    resetArrayOptionError();
     await cli.parseAsync().catch(handleUnexpectedError);
   } catch (err: unknown) {
     handleUnexpectedError(err);
+  } finally {
+    resetArrayOptionError();
+  }
+
+  // ISS-910: a raw-mode rejection must survive the command runner's own exit
+  // code assignment, which happens after writeOutput; escalate here, once,
+  // after the whole parse.
+  if (rawRejectionPending()) {
+    process.exitCode = RAW_REJECTION_EXIT;
   }
 
   // ISS-570 G1: banner is the last thing the CLI does, after the command's

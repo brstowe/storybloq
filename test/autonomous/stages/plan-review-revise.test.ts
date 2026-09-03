@@ -24,6 +24,7 @@ function makeState(overrides: Partial<FullSessionState> = {}): FullSessionState 
     terminationReason: null, waitingForRetry: false, lastGuideCall: now, startedAt: now, guideCallCount: 3,
     config: { maxTicketsPerSession: 0, compactThreshold: "high", reviewBackends: ["codex", "agent"] },
     ticket: { id: "T-001", title: "Test ticket", claimed: true, risk: "low" },
+    frozenGate: { status: "ungated" },
     filedDeferrals: [], pendingDeferrals: [], deferralsUnfiled: false,
     ...overrides,
   } as FullSessionState;
@@ -38,7 +39,7 @@ function makeRecipe(): ResolvedRecipe {
   };
 }
 
-describe("PlanReviewStage — ISS-048 revise routing", () => {
+describe("PlanReviewStage -- ISS-048 revise routing", () => {
   let testRoot: string;
   let sessionDir: string;
   const stage = new PlanReviewStage();
@@ -72,6 +73,38 @@ describe("PlanReviewStage — ISS-048 revise routing", () => {
     if (advance.action === "retry") {
       expect(advance.instruction).toContain("SQL injection");
     }
+  });
+
+  /**
+   * T-461: a retry instruction is what processAdvance returns VERBATIM -- it
+   * never calls enter() -- so the round it describes is the one round whose
+   * effort would otherwise go undisclosed and un-asked-for. Round 1 of a light
+   * review would ask for a quick pass and every round after it would silently
+   * ask for a standard one.
+   */
+  it("carries the level and the depth ask into the retry, not just into enter()", async () => {
+    const retryFor = async (state: Partial<FullSessionState>) => {
+      const ctx = new StageContext(testRoot, sessionDir, makeState(state), makeRecipe());
+      const advance = await stage.report(ctx, {
+        completedAction: "plan_review_round",
+        verdict: "request_changes",
+        findings: [{ id: "f1", severity: "major", category: "correctness", description: "x", disposition: "open" }],
+      });
+      return advance.action === "retry" ? advance.instruction : "";
+    };
+
+    const light = await retryFor({
+      currentReviewEffort: "light",
+      currentReviewEffortSource: "size-mapped",
+    } as Partial<FullSessionState>);
+    expect(light).toContain("Review effort: light (size-mapped). Request a quick pass");
+
+    // standard adds the disclosure and nothing else, which keeps its depth
+    // wording identical to what shipped before the dial.
+    const standard = await retryFor({});
+    expect(standard).toContain("Review effort: standard (legacy).");
+    expect(standard).not.toContain("quick pass");
+    expect(standard).not.toContain("deliberate");
   });
 
   it("reject verdict goes back to PLAN", async () => {

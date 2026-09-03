@@ -8,6 +8,8 @@ import {
   IssueIdSchema,
   TicketIdSchema,
   ConflictEntrySchema,
+  EarmarkSchema,
+  RulingIdSchema,
 } from "./types.js";
 
 const SOURCE_HASH_PATTERN = /^[a-f0-9]{64}$/i;
@@ -93,13 +95,13 @@ export const IssueSchema = z
     discoveredDate: DateSchema,
     resolvedDate: DateSchema.nullable(),
     relatedTickets: z.array(TicketIdSchema),
-    // Optional fields — older issues may omit these
+    // Optional fields -- older issues may omit these
     order: z.number().int().optional(),
     phase: z.string().nullable().optional(),
     // Optional ref into roadmap.projects; only meaningful while the issue's
     // phase matches the project's phase
     project: z.string().nullable().optional(),
-    // Attribution fields — unused in v1
+    // Attribution fields -- unused in v1
     createdBy: z.string().nullable().optional(),
     assignedTo: z.string().nullable().optional(),
     lastModifiedBy: z.string().nullable().optional(),
@@ -113,6 +115,14 @@ export const IssueSchema = z
     deletedAt: z.string().optional(),
     deletedBy: z.string().optional(),
     _conflicts: z.array(ConflictEntrySchema).optional(),
+    // T-475: pick-exclusion state, distinct from assignedTo (legacy free-text
+    // attribution). Issues carry no claimedBySession/claim field at all (no
+    // per-session acquisition state exists to match an `assigned` earmark's
+    // holder against) -- validate's staleness check treats every `assigned`
+    // issue earmark as stale-eligible past threshold for exactly this reason.
+    earmark: EarmarkSchema.nullable().optional(),
+    // T-476: rulings this issue cites -- see TicketSchema's citesRulings.
+    citesRulings: z.array(RulingIdSchema).optional(),
   })
   .passthrough();
 

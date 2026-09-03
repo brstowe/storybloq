@@ -3,9 +3,20 @@ import { nextTicket, nextTickets, blockedTickets, currentPhase } from "../../cor
 import { nextTicketID, nextOrder, allocateTeamTicketId } from "../../core/id-allocation.js";
 import { reserveDisplayId } from "../../core/remote-refs.js";
 import { resolveAndNormalizeTicketRef, RefResolutionError } from "../../core/ref-normalization.js";
-import { clearClaimOnComplete, buildClaim, canClaim } from "../../core/claims.js";
+import {
+  clearClaimOnComplete,
+  guardCompletedTicketMutation,
+  hasClaimMaterial,
+  buildClaim,
+  canClaim,
+  type CompletionGuardOptions,
+} from "../../core/claims.js";
+import type { ClaimEpoch } from "../../autonomous/claim-reconciliation.js";
+import { clearSameSessionEarmark } from "../../core/earmarks.js";
 import { validateProject } from "../../core/validation.js";
 import { ProjectState } from "../../core/project-state.js";
+import { loadCitationContext } from "../../core/ruling-loader.js";
+import { citationMapFor, resolveEntityCitations, resolveCitesRulingsInput } from "../../core/ruling.js";
 import {
   withProjectLock,
   writeTicketUnlocked,
@@ -30,8 +41,8 @@ import {
 import type { Ticket } from "../../models/ticket.js";
 import {
   todayISO,
-  normalizeArrayOption,
   CliValidationError,
+  assertUpdateHasFields,
 } from "../helpers.js";
 import type { CommandContext, CommandResult } from "../types.js";
 import {
@@ -70,6 +81,7 @@ const TICKET_CORE_METADATA_KEYS = new Set([
   "createdAt",
   "deletedAt",
   "deletedBy",
+  "citesRulings",
 ]);
 
 // --- Read Handlers ---
@@ -106,7 +118,8 @@ export function handleTicketList(
     tickets = tickets.filter((t) => t.type === filters.type);
   }
 
-  return { output: formatTicketList(tickets, ctx.format) };
+  const rulingCtx = loadCitationContext(ctx.root);
+  return { output: formatTicketList(tickets, ctx.format, citationMapFor(tickets, rulingCtx)) };
 }
 
 export function handleTicketGet(
@@ -129,7 +142,8 @@ export function handleTicketGet(
       errorCode: "not_found",
     };
   }
-  return { output: formatTicket(result.item, ctx.state, ctx.format) };
+  const rulingCtx = loadCitationContext(ctx.root);
+  return { output: formatTicket(result.item, ctx.state, ctx.format, resolveEntityCitations(result.item, rulingCtx)) };
 }
 
 export function handleTicketMetaGet(
@@ -171,20 +185,23 @@ export function handleTicketNext(
   includeParked: boolean = false,
 ): CommandResult {
   if (count <= 1) {
-    // Existing path — unchanged behavior, uses nextTicket (early-stop at blocked phase)
+    // Existing path -- unchanged behavior, uses nextTicket (early-stop at blocked phase)
     const outcome = nextTicket(ctx.state, { includeParked });
     const exitCode = outcome.kind === "found" ? ExitCode.OK : ExitCode.USER_ERROR;
-    return { output: formatNextTicketOutcome(outcome, ctx.state, ctx.format), exitCode };
+    const citedRulings = outcome.kind === "found" ? resolveEntityCitations(outcome.ticket, loadCitationContext(ctx.root)) : [];
+    return { output: formatNextTicketOutcome(outcome, ctx.state, ctx.format, citedRulings), exitCode };
   }
-  // Multi-candidate path — continues across blocked phases
-  const outcome = nextTickets(ctx.state, count, { includeParked });
+  // Multi-candidate path -- continues across blocked phases
+  const outcome = nextTickets(ctx.state, count, new Set(), { includeParked });
   const exitCode = outcome.kind === "found" ? ExitCode.OK : ExitCode.USER_ERROR;
-  return { output: formatNextTicketsOutcome(outcome, ctx.state, ctx.format), exitCode };
+  const citedRulingsByTicketId =
+    outcome.kind === "found" ? citationMapFor(outcome.candidates.map((c) => c.ticket), loadCitationContext(ctx.root)) : new Map();
+  return { output: formatNextTicketsOutcome(outcome, ctx.state, ctx.format, citedRulingsByTicketId), exitCode };
 }
 
 export function handleTicketBlocked(ctx: CommandContext): CommandResult {
   const blocked = blockedTickets(ctx.state);
-  return { output: formatBlockedTickets(blocked, ctx.state, ctx.format) };
+  return { output: formatBlockedTickets(blocked, ctx.state, ctx.format, citationMapFor(blocked, loadCitationContext(ctx.root))) };
 }
 
 // --- Write Handlers ---
@@ -335,6 +352,7 @@ export async function handleTicketCreate(
     blockedBy: string[];
     parentTicket: string | null;
     project?: string | null;
+    citesRuling?: string[];
   },
   format: string,
   root: string,
@@ -344,6 +362,10 @@ export async function handleTicketCreate(
       "invalid_input",
       `Unknown ticket type "${args.type}": must be one of ${TICKET_TYPES.join(", ")}`,
     );
+  }
+  const citesRulingsResolution = resolveCitesRulingsInput(args.citesRuling, undefined);
+  if (!citesRulingsResolution.ok) {
+    throw new CliValidationError("invalid_input", citesRulingsResolution.message);
   }
 
   let createdTicket: Ticket | undefined;
@@ -394,6 +416,8 @@ export async function handleTicketCreate(
       blockedBy: resolvedBlockedBy,
       parentTicket: resolvedParent,
       ...(args.project != null && { project: args.project }),
+      ...(citesRulingsResolution.citesRulings !== undefined && citesRulingsResolution.citesRulings.length > 0
+        && { citesRulings: citesRulingsResolution.citesRulings }),
     };
 
     validatePostWriteState(ticket, state, true);
@@ -406,6 +430,58 @@ export async function handleTicketCreate(
     return { output: JSON.stringify(successEnvelope(createdTicket), null, 2) };
   }
   return { output: `Created ticket ${displayIdOf(createdTicket)}: ${createdTicket.title}` };
+}
+
+/**
+ * Assembles the identity a completion is authorized against (T-442).
+ *
+ * `completingUser` comes from git; the veto set comes from the LOCAL active
+ * session record. Neither is read off the ticket: `claimedBySession` there names
+ * the current ledger winner, not the caller, so deriving the owner from it would
+ * be circular. `--force` is the administrative bypass, expressed as a fully
+ * permissive guard rather than a branch around it, so there is one code path.
+ */
+async function resolveCompletionGuard(
+  root: string,
+  ticket: Ticket,
+  force: boolean,
+): Promise<CompletionGuardOptions> {
+  if (force) {
+    return { completingUser: ticket.claim?.user ?? null, activeEpochs: [], authorized: true };
+  }
+
+  let completingUser: string | null = null;
+  try {
+    const { gitUserEmail } = await import("../../autonomous/git-inspector.js");
+    completingUser = await gitUserEmail(root);
+  } catch {
+    // Identity unavailable counts as unproven, not as permission.
+  }
+
+  const activeEpochs: ClaimEpoch[] = [];
+  try {
+    const { findActiveSessionFull } = await import("../../autonomous/session.js");
+    const active = findActiveSessionFull(root);
+    // Only status "active" records veto. Archived and superseded ones retain a
+    // stale epoch for the ticket forever, and scanning them would block every
+    // later legitimate claimant.
+    const epoch = active && active.state.status === "active"
+      ? (active.state as Record<string, unknown>).claimEpoch as ClaimEpoch | undefined
+      : undefined;
+    if (epoch) activeEpochs.push(epoch);
+  } catch (err) {
+    // An unreadable or malformed session store is NOT proof that no session is
+    // running. Treating it as an empty veto set would let a completion clear a
+    // live session's claim on email evidence alone, which is the exact ISS-784
+    // harm. Fail closed and require the explicit administrative bypass.
+    throw new CliValidationError(
+      "invalid_input",
+      `Cannot verify ticket ownership: local session state could not be read (${err instanceof Error ? err.message : String(err)}). ` +
+      "Re-run with --force to complete anyway.",
+    );
+  }
+
+  return { completingUser, activeEpochs };
 }
 
 export async function handleTicketUpdate(
@@ -421,10 +497,18 @@ export async function handleTicketUpdate(
     crossNodeBlockedBy?: string[] | null;
     parentTicket?: string | null;
     project?: string | null;
+    citesRuling?: string[];
+    clearCitesRulings?: boolean;
   },
   format: string,
   root: string,
+  force = false,
 ): Promise<CommandResult> {
+  assertUpdateHasFields(
+    updates,
+    "ticket",
+    "status, title, type, phase, order, description, blockedBy, crossNodeBlockedBy, parentTicket, citesRuling, clearCitesRulings",
+  );
   if (updates.status && !TICKET_STATUSES.includes(updates.status as TicketStatus)) {
     throw new CliValidationError(
       "invalid_input",
@@ -436,6 +520,10 @@ export async function handleTicketUpdate(
       "invalid_input",
       `Unknown ticket type "${updates.type}": must be one of ${TICKET_TYPES.join(", ")}`,
     );
+  }
+  const citesRulingsResolution = resolveCitesRulingsInput(updates.citesRuling, updates.clearCitesRulings);
+  if (!citesRulingsResolution.ok) {
+    throw new CliValidationError("invalid_input", citesRulingsResolution.message);
   }
 
   let updatedTicket: Ticket | undefined;
@@ -494,10 +582,104 @@ export async function handleTicketUpdate(
       ...(updates.crossNodeBlockedBy !== undefined && { crossNodeBlockedBy: updates.crossNodeBlockedBy ?? undefined }),
       ...(updates.parentTicket !== undefined && { parentTicket: resolvedParent }),
       ...projectChange,
+      ...(citesRulingsResolution.citesRulings !== undefined && { citesRulings: citesRulingsResolution.citesRulings }),
       ...statusChanges,
     };
 
-    const finalTicket = clearClaimOnComplete(ticket);
+    const isNoOpUpdate = JSON.stringify(ticket) === JSON.stringify(existing);
+
+    // T-442 / ISS-784 / ISS-981: a completion must not clear a claim the caller
+    // cannot prove is theirs, and neither may a REOPEN bypass that guard.
+    // clearClaimOnComplete cannot cover the reopen direction itself: it returns
+    // early whenever the CANDIDATE's status is not "complete", which is exactly
+    // what a reopen produces. It does still cover a candidate that STAYS
+    // complete while carrying contradictory claim material (ISS-913), which is
+    // the mechanism that keeps a claim-bearing ticket's fields protected below.
+    // This is deliberately NOT limited to tickets that still carry claim
+    // material: ISS-981's own filing names the claim-free case -- the common
+    // shape, since a successful completion strips claim keys -- as the defect
+    // ("no claim, no --force" reopens a session's just-completed work).
+    // `--force` is the escape for a claim-free ticket, since there is no
+    // identity left to prove ownership against; a claim-bearing one must still
+    // match it. Identity comes from git and from the LOCAL active session
+    // record, never from the ticket being updated -- that value identifies the
+    // current ledger winner, so using it to authorize would authorize the very
+    // party it is meant to exclude.
+    //
+    // SCOPE (1.9.0): the guard covers the REOPEN direction only, not every edit
+    // of a complete ticket. ISS-981's stated defect is that a reopen "erases its
+    // completion date" and undoes a session's work; a title or description edit
+    // erases nothing and steals nothing. Guarding those too made a routine human
+    // correction on a finished ticket fail with "cannot prove ownership" against
+    // a ticket that, post-completion, carries no ownership to prove -- a
+    // breaking change with no integrity gain. Reopening still fails closed.
+    const isReopen =
+      existing.status === "complete" &&
+      statusChanges.status !== undefined &&
+      statusChanges.status !== "complete";
+
+    // Gathering ownership evidence costs a git identity lookup and a session
+    // scan, and resolveCompletionGuard fails closed by throwing rather than
+    // guessing when it cannot complete them. Resolve it only when something
+    // will actually consult the result: a reopen, an explicit --force, or a
+    // candidate still carrying claim material for clearClaimOnComplete to
+    // authorize. `hasClaimMaterial` is imported rather than re-derived so this
+    // cannot drift from the early return it mirrors.
+    //
+    // Scoped as an optimization, NOT as a fix for an observed failure. The
+    // throw is real but no trigger was demonstrated: findActiveSessionFull
+    // catches its own readdir and parse failures and returns null, so a
+    // malformed session record and a chmod 000 sessions directory both take the
+    // ordinary path. The realistic remaining trigger is a failed dynamic import
+    // or an unexpected internal error. Not consulting evidence no verdict needs
+    // is right on its own terms; do not read this as a reproduced bug.
+    const needsOwnershipEvidence = force || (!isNoOpUpdate && (isReopen || hasClaimMaterial(ticket)));
+    const guard: CompletionGuardOptions = needsOwnershipEvidence
+      ? await resolveCompletionGuard(root, existing, force)
+      : { completingUser: null, activeEpochs: [] };
+
+    if (!isNoOpUpdate && isReopen) {
+      const { authorized } = guardCompletedTicketMutation(existing, guard);
+      if (!authorized) {
+        throw new CliValidationError(
+          "invalid_input",
+          `Cannot reopen ${displayIdOf(existing)}: it is complete and this caller cannot prove ownership` +
+            (guard.completingUser === null ? " (git user.email is not configured)" : "") +
+            `. If that is intended, re-run with --force.`,
+        );
+      }
+    }
+
+    // A genuine no-op never needs to prove anything -- and must not, since
+    // `clearClaimOnComplete` has no no-op awareness of its own: called
+    // unconditionally, it would independently reproduce the exact rejection
+    // `isNoOpUpdate` was meant to exempt above (ISS-981 [R5-F1] correction),
+    // because a no-op's `ticket` is content-identical to `existing` and so
+    // yields the identical verdict either guard would compute.
+    const completion = isNoOpUpdate ? { rejected: false as const, ticket } : clearClaimOnComplete(ticket, guard);
+    if (completion.rejected) {
+      throw new CliValidationError(
+        "invalid_input",
+        `Cannot complete ${displayIdOf(ticket)}: it is claimed by ` +
+          `${ticket.claim?.user ?? "another session"} and this caller cannot prove ownership` +
+          (guard.completingUser === null ? " (git user.email is not configured)" : "") +
+          `. Completing it would take the ticket from a session still working on it. ` +
+          `If that is intended, re-run with --force.`,
+      );
+    }
+    let finalTicket = completion.ticket;
+    // Section 5 (completion, new seam): `clearClaimOnComplete` just stripped
+    // `existing.claimedBySession` above -- an `assigned` earmark that named
+    // that exact session was the normal worked state (R5) and is now
+    // orphaned by the claim it was co-located with, which is one of R5's two
+    // invalid split states if left behind. Scoped to a genuine, non-no-op
+    // completion that actually had a matching claim to strip; an earmark
+    // that never matched `existing.claimedBySession` was already invalid
+    // independently of this write and is left for `validate` to flag.
+    if (!isNoOpUpdate && finalTicket.status === "complete" && existing.claimedBySession) {
+      const { item: completedWithEarmark } = clearSameSessionEarmark(finalTicket, existing.claimedBySession);
+      finalTicket = completedWithEarmark;
+    }
     validatePostWriteState(finalTicket, state, false);
     await writeTicketUnlocked(finalTicket, root);
     updatedTicket = finalTicket;

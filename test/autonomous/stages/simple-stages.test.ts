@@ -2,7 +2,7 @@
  * T-137: Tests for the 5 simple extracted stages.
  * Tests enter() and report() contracts, type discrimination, behavioral equivalence.
  */
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -14,6 +14,23 @@ import { CompleteStage } from "../../../src/autonomous/stages/complete.js";
 import { HandoverStage } from "../../../src/autonomous/stages/handover.js";
 import { PickTicketStage } from "../../../src/autonomous/stages/pick-ticket.js";
 import type { FullSessionState } from "../../../src/autonomous/session-types.js";
+
+/**
+ * ISS-922: PICK_TICKET now establishes the item's finalization baseline from a
+ * FRESH head and fails closed if it cannot, because a cached value is exactly
+ * what cannot establish a baseline after unobserved drift. Session start
+ * already refuses a project without git (guide.ts), so a real gitHead failure
+ * is an anomaly, not a supported mode -- these fixtures previously relied on
+ * it failing in a non-repository tmpdir. Partial mock: only gitHead is
+ * replaced, everything else in the module stays real.
+ */
+vi.mock("../../../src/autonomous/git-inspector.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../../src/autonomous/git-inspector.js")>()),
+  gitHead: vi.fn().mockResolvedValue({ ok: true, data: { hash: "abc123", branch: "main" } }),
+  // "abc123" is this file's own baseline, so PICK gets a resolvable head
+  // while FINALIZE still sees HEAD === baseline and behaves as before.
+}));
+
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -59,6 +76,7 @@ function makeState(overrides: Partial<FullSessionState> = {}): FullSessionState 
     filedDeferrals: [],
     pendingDeferrals: [],
     deferralsUnfiled: false,
+    frozenGate: { status: "ungated" },
     ...overrides,
   } as FullSessionState;
 }
@@ -124,7 +142,7 @@ describe("ImplementStage", () => {
     const ctx = new StageContext(testRoot, sessionDir, state, makeRecipe());
     const advance = await stage.report(ctx, { completedAction: "implementation_done" });
     expect(advance.action).toBe("advance");
-    // T-139: ImplementStage no longer hardcodes next stage instruction —
+    // T-139: ImplementStage no longer hardcodes next stage instruction --
     // the pipeline walker calls nextStage.enter() instead.
     expect("result" in advance).toBe(false);
   });
@@ -215,7 +233,7 @@ describe("PlanStage", () => {
     const planContent = "# Same Plan\n\nNothing changed.";
     writeFileSync(join(sessionDir, "plan.md"), planContent, "utf-8");
 
-    // Compute the expected hash (DJB2 — must match guide.ts simpleHash: & 0xffffffff + base 36)
+    // Compute the expected hash (DJB2 -- must match guide.ts simpleHash: & 0xffffffff + base 36)
     let hash = 5381;
     for (let i = 0; i < planContent.length; i++) {
       hash = ((hash << 5) + hash + planContent.charCodeAt(i)) & 0xffffffff;

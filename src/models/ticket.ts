@@ -8,7 +8,9 @@ import {
   TicketIdSchema,
   ConflictEntrySchema,
   ClaimSchema,
+  EarmarkSchema,
   CROCKFORD_CLASS,
+  RulingIdSchema,
 } from "./types.js";
 
 // ISS-703: canonical-ID char class derived from the single CROCKFORD_CLASS source.
@@ -31,13 +33,13 @@ export const TicketSchema = z
     completedDate: DateSchema.nullable(),
     blockedBy: z.array(TicketIdSchema),
     parentTicket: TicketIdSchema.nullable().optional(),
-    // Attribution fields — unused in v1, baked in to avoid future migration
+    // Attribution fields -- unused in v1, baked in to avoid future migration
     createdBy: z.string().nullable().optional(),
     assignedTo: z.string().nullable().optional(),
     lastModifiedBy: z.string().nullable().optional(),
     updatedDate: DateSchema.nullable().optional(),
     updatedAt: TimestampSchema,
-    // ISS-027: Autonomous session ownership — set when ticket claimed as inprogress
+    // ISS-027: Autonomous session ownership -- set when ticket claimed as inprogress
     claimedBySession: z.string().nullable().optional(),
     crossNodeBlockedBy: z.array(z.string().regex(CROSS_NODE_REF_REGEX, "Cross-node ref must match node:ID format")).optional(),
     displayId: z.string().optional(),
@@ -49,6 +51,14 @@ export const TicketSchema = z
     deletedBy: z.string().optional(),
     _conflicts: z.array(ConflictEntrySchema).optional(),
     claim: ClaimSchema.optional(),
+    // T-475: pick-exclusion state, distinct from claimedBySession/claim above
+    // and from assignedTo (legacy free-text attribution) -- neither reads nor
+    // writes either of those fields.
+    earmark: EarmarkSchema.nullable().optional(),
+    // T-476: rulings this ticket cites. Read integration resolves each id to
+    // its CURRENT state at render time (src/core/ruling.ts) -- this array
+    // never stores the ruling's text or a superseded/stale flag itself.
+    citesRulings: z.array(RulingIdSchema).optional(),
   })
   .passthrough();
 

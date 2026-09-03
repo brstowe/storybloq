@@ -20,12 +20,13 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { compareVersionStrings } from "./team-capabilities.js";
 
 const MARKER_FILE = ".storybloq-version";
 
 export type SkillInstallTarget = "claude" | "codex" | "codexCompat";
 
-interface SkillTargetInfo {
+export interface SkillTargetInfo {
   readonly id: SkillInstallTarget;
   readonly client: "claude" | "codex";
   readonly dir: string;
@@ -60,11 +61,12 @@ function targetInfo(target: SkillInstallTarget): SkillTargetInfo {
   }
 }
 
-function skillTargets(): readonly SkillTargetInfo[] {
+/** ISS-1091 (F10): exported so the e2e acceptance probe's audited-path list can enumerate targets by walking this, instead of hand-duplicating the id list. */
+export function skillTargets(): readonly SkillTargetInfo[] {
   return [targetInfo("claude"), targetInfo("codex"), targetInfo("codexCompat")];
 }
 
-function skillDir(target: SkillInstallTarget = "claude"): string {
+export function skillDir(target: SkillInstallTarget = "claude"): string {
   return targetInfo(target).dir;
 }
 
@@ -94,15 +96,49 @@ export function writeSkillMarker(version: string, target: SkillInstallTarget = "
   }
 }
 
+/**
+ * ISS-1091 (R4, round-3 final form): the auto-refresh path must never
+ * downgrade. A missing or genuinely unparseable marker is treated as stale
+ * (today's behavior, unchanged). Otherwise a non-plain (prerelease/build-
+ * tagged) RUNNING version fails closed -- it never refreshes anything,
+ * since refreshing FROM a plain marker TO an unshippable local prerelease
+ * is never correct. A plain running version compares against the marker's
+ * numeric core: strictly newer refreshes, strictly older never refreshes
+ * (closes the round-3 blocker: a plain CLI must not refresh backward over
+ * an intentionally-installed newer prerelease), and an equal core refreshes
+ * only when the marker itself carried a prerelease/build suffix (a release
+ * finalizing its own prerelease).
+ */
+export function shouldRefresh(runningVersion: string, marker: string | null): boolean {
+  const PLAIN = /^\d+\.\d+\.\d+$/;
+  const CORE_MATCH = /^(\d+\.\d+\.\d+)([-+].*)?$/;
+  if (marker === null) return true; // no marker: today's behavior, unchanged
+  if (!PLAIN.test(runningVersion)) return false; // non-plain running version: fail closed, never refresh
+  const parsed = CORE_MATCH.exec(marker);
+  if (!parsed) return true; // marker has no parseable numeric core at all: genuinely malformed, normalize
+  const core = parsed[1]!;
+  const hadSuffix = parsed[2] !== undefined; // marker itself was a prerelease/build-tagged variant
+  const cmp = compareVersionStrings(runningVersion, core); // safe: both sides are plain x.y.z here
+  if (cmp > 0) return true; // running strictly newer than the marker's core: refresh
+  if (cmp < 0) return false; // running strictly older than the marker's core: never refresh
+  return hadSuffix; // same core: refresh only if the marker was itself a prerelease finalizing to this exact release
+}
+
 /** True when the skill dir exists AND the marker is stale or missing. */
 export function isSkillStale(runningVersion: string, target: SkillInstallTarget = "claude"): boolean {
   if (!runningVersion || runningVersion === "0.0.0-dev") return false;
   if (!existsSync(join(skillDir(target), "SKILL.md"))) return false; // no skill dir = not stale, just uninstalled
   const marker = readSkillMarker(target);
-  return marker !== runningVersion;
+  return shouldRefresh(runningVersion, marker);
 }
 
-function codexConfigPath(): string {
+/**
+ * ISS-1091 (F10): exported for the e2e acceptance probe's audited-path list.
+ * Note this duplicates setup-skill.ts's own `codexConfigPath` -- both compute
+ * the identical path independently; see test/helpers/e2e-acceptance-probe.test.ts
+ * for the pinned-equal assertion documenting that duplication.
+ */
+export function codexConfigPath(): string {
   return join(process.env.CODEX_HOME ?? join(homedir(), ".codex"), "config.toml");
 }
 
@@ -146,7 +182,14 @@ async function refreshCodexConfigIfPresent(): Promise<void> {
  * a UX degradation, not a blocker. The user's original command still
  * runs.
  */
-export async function autoRefreshSkillIfStale(runningVersion: string): Promise<boolean> {
+export async function autoRefreshSkillIfStale(
+  runningVersion: string,
+  opts: { reconcileLimitHooks?: boolean } = {},
+): Promise<boolean> {
+  // Default true for ordinary upgrades; a `setup --skip-hooks` invocation
+  // passes false so the version refresh does not install limit hooks the user
+  // explicitly opted out of.
+  const reconcileLimitHooks = opts.reconcileLimitHooks !== false;
   const staleTargets = skillTargets().filter((target) => isSkillStale(runningVersion, target.id));
   if (staleTargets.length === 0) return false;
 
@@ -241,6 +284,28 @@ export async function autoRefreshSkillIfStale(runningVersion: string): Promise<b
           `storybloq: legacy hook sweep or register failed (non-fatal): ${sweepMsg}\n` +
           `  Run 'storybloq setup --client all' manually to retry.\n`,
         );
+      }
+
+      // T-424: reconcile the limit-stop hooks (not count-gated: the legacy
+      // sweep only touches existing entries and can never install an absent
+      // hook type, so upgrades would otherwise never add StopFailure to the
+      // installed base). Honors the global kill switch (disabled => removed)
+      // AND a `setup --skip-hooks` opt-out (reconcileLimitHooks === false).
+      if (reconcileLimitHooks) {
+        try {
+          const { ensureLimitHooksRegistered } = await import("../cli/commands/setup-skill.js");
+          const limitHooks = await ensureLimitHooksRegistered(undefined, bin);
+          if (limitHooks.action === "installed") {
+            process.stderr.write("storybloq: registered limit-stop auto-resume hooks on version advance\n");
+          } else if (limitHooks.action === "removed") {
+            process.stderr.write("storybloq: removed limit-stop hooks (auto-resume disabled globally)\n");
+          }
+        } catch (limitErr: unknown) {
+          const limitMsg = limitErr instanceof Error ? limitErr.message : String(limitErr);
+          process.stderr.write(
+            `storybloq: limit-stop hook reconcile failed (non-fatal): ${limitMsg}\n`,
+          );
+        }
       }
     }
 
