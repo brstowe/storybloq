@@ -191,6 +191,9 @@ const ARRANGEMENT_RULES: Record<string, MergeRule> = {
   treeProtocol: { kind: "hard-conflict" },
   reviewBounds: { kind: "hard-conflict" },
   unreachability: { kind: "hard-conflict" },
+  currentCoordinationSessionId: { kind: "hard-conflict" },
+  communicationReceipts: { kind: "hard-conflict" },
+  coordinationCheckpoint: { kind: "hard-conflict" },
 };
 
 const RULES_BY_TYPE: Record<string, Record<string, MergeRule>> = {

@@ -512,3 +512,66 @@ function parseDiffNumstat(out: string): DiffStats {
 
   return { filesChanged, insertions, deletions, totalLines: insertions + deletions };
 }
+
+/**
+ * T-495: commits touching one path, with their committer dates.
+ *
+ * The window filter is applied by the CALLER in JavaScript, not by
+ * `--since`/`--until`. Those options walk history with a heuristic that can
+ * stop early on non-linear history, so a commit inside the window can be
+ * missed; and a date that came out of a config file would reach the argv of a
+ * git invocation. Neither is acceptable for a check whose whole job is to
+ * detect a change that a week's verdict then depends on. Listing every commit
+ * for one path and comparing instants in memory has neither problem.
+ */
+export async function gitLogTouchingPath(
+  cwd: string,
+  path: string,
+): Promise<GitResult<readonly { hash: string; committedAt: string }[]>> {
+  if (path.startsWith("-")) {
+    return { ok: false, reason: "invalid_ref", message: `Refusing path that reads as an option: ${path}` };
+  }
+  // `--full-history` is REQUIRED, not a refinement. A path-limited `git log`
+  // applies history simplification by default: at a merge that is TREESAME for
+  // this path to one parent, git can skip the other parent entirely, hiding a
+  // branch that changed REVIEW.md and restored it before the merge. Filtering
+  // dates afterwards cannot recover a commit the walk never emitted, so the
+  // check would report a clean count over history it did not look at. Codex
+  // found it.
+  return git(cwd, ["log", "--full-history", "--format=%H %cI", "--", path], (out) =>
+    out
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => l.length > 0)
+      .map((l) => {
+        const sp = l.indexOf(" ");
+        return sp === -1
+          ? { hash: l, committedAt: "" }
+          : { hash: l.slice(0, sp), committedAt: l.slice(sp + 1) };
+      }),
+  );
+}
+
+/**
+ * Whether one path differs from what git has recorded.
+ *
+ * An UNTRACKED file counts as dirty. The question this answers is whether the
+ * bytes on disk are the ones the repository can account for, and an untracked
+ * REVIEW.md is exactly as unaccounted for as a modified one.
+ */
+export async function gitPathDirty(cwd: string, path: string): Promise<GitResult<boolean>> {
+  if (path.startsWith("-")) {
+    return { ok: false, reason: "invalid_ref", message: `Refusing path that reads as an option: ${path}` };
+  }
+  // BOTH FLAGS MATTER. `git status` omits ignored files by default, so an
+  // untracked REVIEW.md covered by `.gitignore` or a global ignore rule prints
+  // nothing and reads as clean, which contradicts the rule this function
+  // states. `--untracked-files=all` keeps an untracked file visible when it
+  // sits under an untracked directory that would otherwise be collapsed to the
+  // directory name.
+  return git(
+    cwd,
+    ["status", "--porcelain", "--ignored=matching", "--untracked-files=all", "--", path],
+    (out) => out.split("\n").some((l) => l.trim().length > 0),
+  );
+}

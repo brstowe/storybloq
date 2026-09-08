@@ -160,6 +160,23 @@ async function parentPid(pid: number): Promise<number | null> {
   return null;
 }
 
+/**
+ * ISS-1166: which Codex surface a `codex` ancestor command line belongs to.
+ *
+ * With the app-server daemon running (the wake tier's prerequisite), a Codex
+ * CLI thread's tool shells are children of `codex app-server --listen unix://…`:
+ * that is the DAEMON, reachable over its control socket, and its threads are
+ * wake-capable. The ChatGPT.app-hosted server is also `codex app-server` but is
+ * started WITHOUT `--listen`, so no external process can reach it. The presence
+ * of the standalone `--listen` flag is the distinguisher; matching `app-server`
+ * alone classified every daemon-hosted CLI thread as desktop and made
+ * `bus setup --wake idle` unreachable exactly when the daemon it needs was up.
+ */
+export function codexSurfaceForCommand(command: string): BusSurface {
+  if (!/\bapp-server\b/.test(command)) return "codex_cli";
+  return /(?:^|\s)--listen(?:=|\s|$)/.test(command) ? "codex_cli" : "codex_desktop";
+}
+
 async function findClientProcess(client: BusClient): Promise<{ surface: BusSurface | null; process: ProcessCandidate | null }> {
   let pid = process.ppid;
   for (let depth = 0; depth < 8 && pid > 1; depth++) {
@@ -167,7 +184,7 @@ async function findClientProcess(client: BusClient): Promise<{ surface: BusSurfa
     const command = candidate?.command ?? "";
     if (client === "codex" && /(?:^|[/ ])codex(?: |$)/i.test(command)) {
       return {
-        surface: /\bapp-server\b/.test(command) ? "codex_desktop" : "codex_cli",
+        surface: codexSurfaceForCommand(command),
         process: candidate,
       };
     }

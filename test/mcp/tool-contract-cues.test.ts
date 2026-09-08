@@ -33,6 +33,8 @@ interface ContractCue {
 }
 
 const CONTRACT_CUES: readonly ContractCue[] = [
+  { tool: "storybloq_arrangement_coordinate", kind: "constraint", cue: "only the bound pen may write" },
+  { tool: "storybloq_arrangement_coordinate", kind: "constraint", cue: "current session/revision" },
   { tool: "nodeParam (shared param, 8 tools)", kind: "constraint", cue: "(orchestrator only)" },
   { tool: "nodeParam (shared param, 8 tools)", kind: "selection", cue: "Operate on this node's .story/" },
   { tool: "storybloq_autonomous_guide", kind: "constraint", cue: "(severity 'suggestion' is exempt)" },
@@ -308,14 +310,55 @@ describe("tool description contract (T-460)", () => {
     // assign/release) plus board-labeling and collision-preflight behavior,
     // measured at 51,711 bytes -- a deliberate, necessary growth (every one
     // of those tools needed federation awareness per ISS-1074/1076's own
-    // acceptance criteria), not a prose bloat to trim. This ceiling leaves
-    // ~500 bytes of headroom and fails once an edit gives back more than
-    // that. Raising it is a deliberate act that belongs in a commit message,
-    // which is the point. Deliberately NO lower bound: the cues above are
-    // what protect against over-trimming, and a floor would fail an honest
-    // future trim for being too good.
+    // acceptance criteria), not a prose bloat to trim; T-488 added nine
+    // optional provenance inputs to the autonomous_guide report object
+    // (reviewer/implementer model, tier, source, evidence, plus a backend turn
+    // id), measured at 52,692 bytes. That last growth is FIELD SURFACE, not
+    // prose: the descriptions were cut to two short lines precisely because of
+    // this ratchet, and the full guidance lives in autonomous-mode.md and
+    // `storybloq reference`, which are read once by whoever needs them rather
+    // than shipped to every client on every tools/list. The nine cannot be
+    // reduced further without losing something true -- dropping `source` would
+    // record an unpinned session default as an explicit pin, which is the exact
+    // fabrication the ticket exists to prevent. ISS-1115 added four optional
+    // provenance fields to the same report finding object (dispositionReason,
+    // origin, originClass, sinceRound), measured at 53,302 bytes. Same
+    // character as T-488's growth and trimmed the same way first: the initial
+    // descriptions restated the whole originClass taxonomy and gave back 381
+    // bytes when cut, because that taxonomy already ships in the round context
+    // packet's ORIGIN_RULE -- mandatory payload, every round, all three
+    // reviewer routes. What remains is the field surface itself and cannot go
+    // without losing the item's mechanism: a reviewer cannot label a re-raise
+    // through a schema that does not declare the field, and an undeclared key
+    // is stripped by the SDK before the stage ever sees it. T-494 added two
+    // optional fields to the lens-review pair -- `target` on prepare and
+    // `citedRulingsUndelivered` on synthesize -- measured at 53,975 bytes.
+    // Field surface again, and the same undeclared-key argument is not an
+    // analogy here but the actual defect being fixed: a synthesize schema with
+    // no way to receive the delivery map let a review that never saw its item's
+    // rulings reach approve, because the SDK stripped the key the handler was
+    // ready to read. Trimmed first, as the ratchet intends: both descriptions
+    // were cut to the sentence that is not already in review-lenses.md and
+    // `storybloq reference`, giving back 208 bytes, and neither can go further
+    // without losing which field to echo or when it stops being optional.
+    // ISS-1155 adds one typed coordination operation union and optional get
+    // format, measured below 61 KB. Most growth is required field surface
+    // (identities, fences, evidence and assignment events), not descriptions;
+    // its description was trimmed before raising this explicit budget.
+    // This ceiling leaves ~500 bytes of headroom and fails once an edit gives
+    // back more than that. Raising it is a deliberate act that belongs in a
+    // commit message, which is the point. Deliberately NO lower bound: the cues
+    // above are what protect against over-trimming, and a floor would fail an
+    // honest future trim for being too good.
+    // FORK: this fork registers four tools upstream does not --
+    // storybloq_phase_update and storybloq_project_list/create/update (phase
+    // state + roadmap projects). They are field surface, not prose: the
+    // ceiling is raised by what they actually measure rather than by trimming
+    // upstream's descriptions to hide them. Measured at 65,294 bytes against
+    // upstream's 61,500 ceiling; the same ~500 bytes of headroom is kept, so
+    // this stays a ratchet and raising it again remains a deliberate act.
     const bytes = Buffer.byteLength(await emittedPayload(), "utf8");
-    expect(bytes).toBeLessThan(52_200);
+    expect(bytes).toBeLessThan(65_800);
   });
 
   it("still advertises every tool, so the trim cut prose and not surface", async () => {
@@ -340,6 +383,11 @@ describe("tool description contract (T-460)", () => {
     // storybloq_session_milestone (74 -> 75); no _list tool, matching the
     // arrangement/gate-ack/earmark precedent -- a milestone is a field on
     // the caller's own presence record, not a standalone enumerable entity.
-    expect(result.tools.length).toBe(75);
+    // ISS-1155 adds one coordinated operation tool (75 -> 76).
+    // FORK: +4 -- storybloq_phase_update (phase state: pending/paused/skipped)
+    // and storybloq_project_list/create/update (roadmap projects). No
+    // _project_delete tool, per the house policy that destructive operations
+    // stay CLI-only (76 -> 80).
+    expect(result.tools.length).toBe(80);
   });
 });

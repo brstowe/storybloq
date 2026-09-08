@@ -33,6 +33,12 @@ This file is referenced from SKILL.md for `/story auto` / `$story auto`, review,
 
 The fix-then-re-review rule holds at every level. At `off` no review runs, so no change request can exist and the rule is vacuously satisfied; at `light` the landing rule below is what keeps it true under a lower cap.
 
+### Recording what actually ran
+
+When you report a review round or `implementation_done`, you may name the model and tier behind it: `reviewerModel` / `reviewerTier` on a review round, `implementerModel` / `implementerTier` with `implementation_done`. Every one of these is optional and NONE of them is ever inferred. A round reported without them records `source: "unknown"`, `evidence: "none"`, which is a truthful record; a guessed model name is not, because it reads as a fact to whoever analyses the session later. `reviewerSource` and `implementerSource` are separate fields for a reason: naming a model does NOT say how that model came to be chosen, so a round that supplies a model and no source records the model with `source: "unknown"` rather than being read as a deliberate pin. Send `explicit-pin` or `session-default` only when you actually know which it was, because the pinned count is what a reader would use to ask whether pinning changes outcomes, and rounds nobody pinned inflate it.
+
+What you pass is recorded as INTENT, not as execution. A pin you sent is stored with `evidence: "configured"`, and only a value a backend itself reported back may be sent as `reviewerEvidence: "observed"`. The distinction is the whole point of the field: a dispatcher can say what it asked for, and nothing in the record may claim that is what ran unless something observed it. The implementer pin is recorded against the item's own attempt, so a later item in the same session cannot inherit it -- the case this closes is item B's plan review, which runs BEFORE B's first implement and would otherwise be attributed to item A's model.
+
 **Frontend design:** If the current ticket involves UI, frontend, components, layouts, or styling, read `design/design.md` in the same directory as the skill file for design principles. Load the relevant platform reference from `design/references/`. Apply the priority order (clarity > hierarchy > platform correctness > accessibility > state completeness) during both planning and implementation.
 
 ## Precedence: task-aware active-session guard
@@ -90,11 +96,20 @@ Before any guide call that could start, resume, or cancel a session, run SKILL.m
 - Compact/resume preserves targetWork -- the session continues where it left off
 - If all remaining targets are blocked by items outside the list, session ends with an explanation
 
+**Project targets:** a targetWork entry may be a project id from roadmap.projects
+(e.g. `/story auto tigris` -> `"targetWork": ["tigris"]`). The guide expands it
+in place to the project's remaining leaf tickets (in `order` sequence) followed
+by its open issues -- only items whose phase matches the project's phase count.
+Completed members are skipped like any other done target; a project with no
+assigned items is a hard error. Mixed lists work: `"targetWork": ["tigris", "T-099"]`.
+Pass the project id verbatim -- do NOT pre-expand it yourself.
+
 **Use when:**
 - Triaging a specific set of high-priority items
 - Breaking up work into focused sprints
 - Working through a dependency chain in order
 - Fixing a cascade of related issues
+- Driving a project (roadmap.projects grouping) to completion end-to-end
 
 ## Parking an item at the plan gate
 
@@ -112,6 +127,8 @@ From `PLAN` or `PLAN_REVIEW`, report:
 
 The guide releases the claim, records your reason on the item, returns it to `open`,
 and moves this session to the next item. The rest of a targeted queue is preserved.
+
+In a duet, where a pen commissions the gates and a worker executes them, the pen is the dispatcher and the pins above are how it says what it commissioned. It passes the reviewer pin with the round it asked for and the implementer pin with the work it handed down, and both land as `configured` -- a pen naming the tier it dispatched is stating what it intended, which is exactly what a later reader needs and exactly what must not be confused with what executed. A pen that does not know what ran passes nothing, and the round records unknown rather than the pen's own model.
 
 | | `park_item` | `skip_ticket` |
 |---|---|---|
@@ -153,6 +170,26 @@ The autonomous guide supports four execution tiers. Same guide, same handlers, d
 3. On plan review approve: session ends automatically. On revise/reject: revise plan, re-review
 4. The approved plan is saved in `.story/sessions/<id>/plan.md`
 
+### `/story plan <project-id>` -- Project-level planning
+
+"Help me plan the tigris project." Produces ONE plan document covering the whole
+project. This is a document-writing flow, NOT an autonomous session -- do not
+call `storybloq_autonomous_guide` for it (plan mode's ticketId requirement is
+deliberate; project planning happens outside the state machine).
+
+1. Resolve the project: `storybloq_project_list` (or `storybloq project list`) --
+   confirm the id exists and note its phase. If the arg matches no project, treat
+   the command as single-ticket plan mode instead.
+2. Gather the members: `storybloq_ticket_list` with `project: "<id>"` (and
+   `storybloq_issue_list` with `project: "<id>"`). Read each member's description;
+   read `storybloq_handover_latest` and any lessons digest for context.
+3. Write `.story/plans/project-<id>.md` covering: goal of the project, member
+   inventory (tickets in order + issues), sequencing and dependencies (blockedBy
+   edges within the project, cross-project blockers), shared design decisions,
+   risks, and a recommended `/story auto <project-id>` execution order.
+4. Present a summary and offer the follow-up: `/story auto <project-id>` to
+   execute the plan.
+
 ### `/story guided T-XXX` (deprecated -- alias for targeted auto)
 
 Use `/story auto T-XXX` instead. A single-ticket targeted auto session is equivalent. The guide handler still accepts `mode: "guided"` for backward compatibility but routes to the same targeted auto path.
@@ -161,6 +198,10 @@ Use `/story auto T-XXX` instead. A single-ticket targeted auto session is equiva
 - Require a `ticketId` -- no ad-hoc review without a ticket in V1
 - Use the same review process as auto mode (same backends, same adaptive depth)
 - Can be cancelled with `action: "cancel"` at any point
+
+### The review contract (REVIEW.md)
+
+A project may declare a review contract in REVIEW.md: named principles, each with a blocking class, plus an "Outside this contract" line naming what it does not cover. Contract PROJECTION and enforcement are not wired: the projection helpers exist and are covered by tests, but nothing in CODE_REVIEW or PLAN_REVIEW calls them, no projection is persisted, and no severity or verdict is changed by the contract. The file is not inert, though, and the difference matters. Lens prompts already receive REVIEW.md as raw text (head-truncated), so it already shapes what reviewers report. `storybloq validate` is the only production consumer of the PARSED contract, and it parses it to warn when review backends are configured and the file is absent or unparseable -- which is where a project learns its checklist-style REVIEW.md declares no classes at all. Wiring the evaluation and recording it is workstream G; until that lands, do not report a measured session, an observation week, or a contract projection, because none was produced. Do not write or repair a project's REVIEW.md mid-review either: report the warning and let the setup flow propose one.
 
 ### Code-review landing cap
 
@@ -177,6 +218,22 @@ Three rounds past the effective cap, the session STOPS working on that item. It 
 It ends the session rather than moving to the next item because the parked item's work is still uncommitted in the working tree, and nothing re-checks the tree mid-session; ending puts it in front of the start-of-session dirty-tree guard instead of letting the next item build on top of it. An item released back to `open` can be picked again once a person has dealt with the tree.
 
 `maxReviewRounds: 0` disables the ceiling along with the cap, deliberately: a project that turned the cap off explicitly did not ask for a bound three rounds later. Rounds are counted per ticket and survive both a plan redirect and a compaction recovery, either of which clears the review history the cap's own round number is derived from. The issue-fix path and PLAN_REVIEW have no ceiling yet (ISS-1032, ISS-1031).
+
+### Federation inheritance (lessons + notes)
+
+A federation **node** absorbs the orchestrator root's lessons and notes at read time. The node's lesson digest (CLI, MCP, and the autonomous context digest) merges the root's ACTIVE lessons, and `note list`/`note get` include the root's notes — all marked with a `[root] ` title prefix. Inherited items are read-only from the node: reinforce or edit them at the orchestrator. Local ids always win a collision.
+
+Discovery is automatic when the node lives inside the orchestrator's directory tree (the orchestrator's `nodes` map must claim the node's path). For nodes outside the tree, set `federationRoot: "<path to orchestrator root>"` in the node's `.story/config.json`; set `federationRoot: false` to opt out entirely. Standalone projects are unaffected.
+
+Curation rule of thumb: knowledge that applies to more than one node (platform behavior, shared stack patterns, process lessons) belongs at the orchestrator root; only node-specific implementation knowledge lives in the node.
+
+### Storyknow knowledge packs (attached knowledge)
+
+Above the federation root sits an optional third layer: **storyknow packs** — standalone knowledge-only repos holding `K-NNN` entries shared across clients/projects (e.g. a `shopify` pack). A project attaches packs via the config key `knowledge: ["<name-or-path>"]` (bare names resolve under `$STORYKNOW_HOME`, default `~/dev/storyknow`). Federation nodes also absorb the packs attached at their orchestrator root, so a federation attaches once at the root.
+
+Attached knowledge appears in every lesson digest marked `[<pack>] ` and is read-only from the consumer. The digest layers are: local lessons → `[root]` inherited → `[<pack>]` attached. Curation ladder: node-specific → node; client-wide → federation root; stack/platform-generic → pack.
+
+To move a proven local lesson into a pack, use `storybloq lesson promote L-NNN --to <pack>` (the pack gains a K-entry carrying the reinforcement count and an origin stamp; the local lesson is superseded with a pointer). Promotion is a deliberate curation act — during LESSON_CAPTURE keep creating lessons locally, and if a lesson is clearly stack-generic rather than project-specific, note it as a promotion candidate in the handover instead of promoting mid-session. Pack entries themselves are managed inside the pack directory with the `storybloq knowledge` command family.
 
 ## Review findings and dispositions
 

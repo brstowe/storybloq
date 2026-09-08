@@ -16,7 +16,7 @@ import { readdirSafe, verifyContainment, verifyDirIdentity } from "./readdir-saf
  * `fstat` before ever reading, so an oversized file costs one stat call, not
  * a full read.
  */
-const ARRANGEMENT_MAX_BYTES = 65_536;
+export const ARRANGEMENT_MAX_BYTES = 65_536;
 
 /**
  * Fail-safe, SYNCHRONOUS read of every arrangement on disk (T-473).
@@ -142,6 +142,9 @@ export async function writeArrangementUnlocked(
   await mkdir(dirname(targetPath), { recursive: true });
   await guardPath(targetPath, wrapDir);
   const json = serializeJSON(parsed);
+  if (Buffer.byteLength(json) > ARRANGEMENT_MAX_BYTES) {
+    throw new ProjectLoaderError("invalid_input", "Arrangement exceeds 65536-byte capacity");
+  }
   if (options?.createOnly) {
     await atomicCreate(targetPath, json);
   } else {

@@ -413,6 +413,53 @@ export interface ReviewRecord {
   /** T-461: the effort level this round ran at. Absent on pre-dial records. */
   readonly effort?: string;
   readonly timestamp: string;
+
+  // ── T-488 Run A: the same spine the artifact carries ────────────────────
+  // The record and the artifact must AGREE on these; that agreement is the
+  // whole point, and it is what acceptance 2 asserts. All optional: an absent
+  // value means the record predates the field.
+  readonly workItemId?: string;
+  readonly reviewAttemptId?: string;
+  readonly itemAttemptId?: string;
+  readonly backendRunId?: string;
+  readonly backendTurnId?: string;
+  readonly normalizerVersion?: number;
+  readonly generation?: number;
+  readonly payloadConsistent?: boolean;
+  readonly reviewerIdentity?: RecordProvenance;
+  readonly implementer?: RecordProvenance;
+  //
+  // The four fields below are BARE STRINGS on the record, not the enums the
+  // writer uses, and that is the same T-328 rule `verdict` and `effort` already
+  // follow two lines up. This interface describes what a PERSISTED record may
+  // hold, and a persisted file can hold a value from a newer build or a hand
+  // edit; narrowing it here would only mean the type lies about a session that
+  // still exists on disk. The WRITE side stays strict: `ReviewRoundIdentity` in
+  // review-identity.ts is the enum-typed source every write flows through, so a
+  // typo cannot reach a record even though a record can carry one.
+  readonly kind?: string;
+  readonly backendRunIdKind?: string;
+  readonly backend?: string;
+  /** Absent means the artifact's existence is UNKNOWN, never that it exists. */
+  readonly artifactStatus?: string;
+}
+
+/**
+ * What we know about the model behind a round, and how well we know it.
+ *
+ * `evidence` is the field that does the work. `observed` means the backend
+ * reported what actually executed; `configured` means someone asked for it and
+ * nothing confirmed it ran. Recording a configured pin as observed is the
+ * single error this whole structure exists to prevent, and a fabricated model
+ * name is worse than an absent one.
+ */
+export interface RecordProvenance {
+  readonly model?: string;
+  readonly tier?: string;
+  readonly effort?: string;
+  /** Bare strings for the persisted-read reason above; the writer's are enums. */
+  readonly source: string;
+  readonly evidence: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -429,6 +476,81 @@ export interface Finding {
   readonly description: string;
   readonly disposition: "open" | "addressed" | "contested" | "deferred";
   readonly recommendedNextState?: "PLAN" | "IMPLEMENT";
+  /**
+   * T-488: the severity EXACTLY as the reviewer reported it, before
+   * `normalizeSeverity`.
+   *
+   * Additive, never a replacement. `severity` keeps its normalized value
+   * because the ISS-035 approve guard, the ISS-823 `blocking` projection and
+   * the ISS-1114 empty-verdict predicate all read it -- re-pointing it would be
+   * a gate-behavior change wearing a telemetry ticket's clothes.
+   *
+   * Worth recording even though the normalizer only maps `blocking`: it also
+   * trims and lowercases, and the reviewers' actual vocabulary (`high`,
+   * `important`, `nitpick`, `note`) passes straight through into a field whose
+   * declared type says it cannot. `rawSeverity` is what lets a reader see that.
+   */
+  readonly rawSeverity?: string;
+
+  /**
+   * T-487: the principle of the project's declared review contract this
+   * finding violates, lowercase as the contract names it.
+   *
+   * Optional and never defaulted. ABSENT is the only way to say "names no
+   * principle": `projectDecision` reads a missing value as the empty string,
+   * so a blank stored here would be indistinguishable from absence at exactly
+   * the seam that decides whether the finding is capped -- and the number the
+   * report-only week exists to produce is how often a reviewer names one, so a
+   * reviewer that tried and produced nothing must not read as one that did.
+   */
+  readonly principle?: string;
+
+  // ── ISS-1115 D4: provenance, on axes SEPARATE from `disposition` ─────────
+  // `disposition` says where a finding STANDS (open/addressed/contested/
+  // deferred) and is unchanged by this run. These say where it CAME FROM.
+  // Separate fields because they answer separate questions: a pre-existing
+  // defect can be newly noticed, and a defect this diff introduced can be one
+  // an earlier round already raised.
+  //
+  // Enums here because this is the WRITE side. The persisted artifact reads
+  // them back through the bare-string readers in review-identity.ts, per the
+  // T-328 rule that an enum on a persisted field does not drop a bad value, it
+  // makes the whole session unreadable.
+
+  /**
+   * Why this disposition was chosen. Its one load-bearing job in Run A is
+   * splitting `deferred` into `owner-accepted-risk` and `valid-deferred`,
+   * which the disposition enum cannot express and which are not the same
+   * thing: one is a risk someone chose to carry, the other is a real defect
+   * waiting on a later change. Free text; nothing depends on it yet.
+   */
+  readonly dispositionReason?: string;
+
+  /**
+   * Relative to the PR base. Absent means unknown, and READS as `introduced`.
+   *
+   * BARE STRING, like every persisted field here, and the comment above says so
+   * while an earlier version of this declaration was a union anyway. The union
+   * was wrong twice over: T-328's rule is that an enum on a persisted field
+   * does not drop a bad value, it makes the whole session unreadable; and a
+   * union here would make the three-way `originClass` read below unreachable
+   * from any typed path, since the type would forbid the unrecognised value
+   * that the guard exists to catch. Vocabulary is enforced on the WRITE side
+   * (the MCP tool schema and the native codex output schema) and interpreted by
+   * the readers in review-identity.ts.
+   */
+  readonly origin?: string;
+
+  /** Relative to prior rounds. `reintroduced` blocks regardless of disposition. */
+  readonly originClass?: string;
+
+  /**
+   * The round `unchanged` refers to. A SEPARATE number, deliberately: encoding
+   * it as `unchanged-since-round-4` would put a parameter inside an enum value,
+   * give the field an unbounded value space nobody can enumerate, and force
+   * every reader to parse an integer out of a string.
+   */
+  readonly sinceRound?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -835,6 +957,52 @@ function preprocessLegacyPendingEscalationShape(val: unknown): unknown {
   return legacyShaped ? null : val;
 }
 
+/**
+ * T-488 Run A: provenance as it persists.
+ *
+ * Every member is permissive on read, for the T-328 reason this file already
+ * applies to `currentReviewEffort`: this schema gates PERSISTED session reads,
+ * so an enum here does not drop a corrupt value, it makes the whole session
+ * unreadable and the resume fails. This block is pure audit -- nothing resumes
+ * work from it -- so damage must cost the DISCLOSURE and never the session.
+ * `.catch(undefined)` on the object is what enforces that one level up.
+ */
+const RecordProvenanceSchema = z.object({
+  model: forgiveNull(z.string()),
+  tier: forgiveNull(z.string()),
+  effort: forgiveNull(z.string()),
+  source: z.string(),
+  evidence: z.string(),
+}).optional().catch(undefined);
+
+/**
+ * The T-488 identity spine, shared by the plan and code review arrays.
+ *
+ * ONE definition rather than two copies, for the reason ISS-1114 established
+ * and this ticket exists to fix: two stages maintaining the same concept by
+ * parallel edit is how two spellings of it appear.
+ *
+ * All optional and all additive. Absent means the record predates the field,
+ * which is a different observation from a known-empty one -- and for
+ * `artifactStatus` that difference is the field's entire purpose.
+ */
+const REVIEW_RECORD_IDENTITY_FIELDS = {
+  workItemId: forgiveNull(z.string()),
+  kind: forgiveNull(z.string()).catch(undefined),
+  reviewAttemptId: forgiveNull(z.string()),
+  itemAttemptId: forgiveNull(z.string()),
+  backendRunId: forgiveNull(z.string()),
+  backendRunIdKind: forgiveNull(z.string()).catch(undefined),
+  backendTurnId: forgiveNull(z.string()),
+  backend: forgiveNull(z.string()).catch(undefined),
+  normalizerVersion: forgiveNull(z.number()).catch(undefined),
+  generation: forgiveNull(z.number()).catch(undefined),
+  payloadConsistent: forgiveNull(z.boolean()).catch(undefined),
+  reviewerIdentity: RecordProvenanceSchema,
+  implementer: RecordProvenanceSchema,
+  artifactStatus: forgiveNull(z.string()).catch(undefined),
+} as const;
+
 export const SessionStateSchema = z.object({
   schemaVersion: z.literal(CURRENT_SESSION_SCHEMA_VERSION),
   sessionId: z.string().uuid(),
@@ -888,6 +1056,7 @@ export const SessionStateSchema = z.object({
   // Review tracking
   reviews: z.object({
     plan: z.array(z.object({
+      ...REVIEW_RECORD_IDENTITY_FIELDS,
       round: z.number(),
       reviewer: z.string(),
       verdict: z.string(),
@@ -905,6 +1074,7 @@ export const SessionStateSchema = z.object({
       timestamp: z.string(),
     })).default([]),
     code: z.array(z.object({
+      ...REVIEW_RECORD_IDENTITY_FIELDS,
       round: z.number(),
       reviewer: z.string(),
       verdict: z.string(),
@@ -1462,6 +1632,188 @@ export const SessionStateSchema = z.object({
   ),
 
   /**
+   * ISS-1114: every repair attempt spent on a contradictory review payload.
+   *
+   * A reviewer that returns `revise` or `request_changes` with zero findings
+   * has stated a defect and supplied nothing to act on. The gate sends a repair
+   * instruction and does NOT count the round, because the round produced no
+   * reviewable result. That correction has to leave a trace: an uncounted round
+   * is invisible to `reviews.code`, to the verdict artifacts and to the events
+   * log, so without this field a reviewer could burn arbitrary wall time and
+   * spend while the record showed a clean two-round review.
+   *
+   * ACCUMULATING, not a per-round slot. T-432 counts these after the fact, and
+   * a slot keyed by the current round would erase the history it needs. Growth
+   * is bounded: at most `REPAIR_ATTEMPT_CAP` entries per round, and rounds are
+   * bounded by the hard ceiling that this same mechanism escalates into.
+   *
+   * `round` is the PENDING ORDINAL, never `reviews.<stage>.length + 1`. Both
+   * arrays are cleared mid-run (`reviews.plan` on every reject, `reviews.code`
+   * on a plan redirect), so an array-derived number restarts at 1 in a new
+   * generation and would let attempts banked before the reset count against a
+   * fresh round. See `pendingRoundOrdinal` for the derivation and for why its
+   * no-counter fallback is 1 rather than the array length.
+   *
+   * Identity-scoped by `workItemId` + `kind` + `stage`, the same invariant
+   * `codeReviewRoundCounter` holds: a record belonging to another item is not a
+   * smaller count, it is NO count.
+   */
+  reviewRepairAttempts: z.array(z.object({
+    workItemId: z.string(),
+    kind: z.enum(["ticket", "issue"]),
+    stage: z.enum(["code", "plan"]),
+    round: z.number().int().positive(),
+    attempt: z.number().int().positive(),
+    verdict: z.string(),
+    reviewer: z.string(),
+    at: z.string(),
+    /**
+     * The interval for THIS attempt: measured from the previous matching
+     * attempt, or from `currentReviewStartedAt` for the first one.
+     *
+     * Deliberately not `now - currentReviewStartedAt`. The guard returns
+     * `retry` without clearing that field, so measuring from it would report
+     * cumulative round time on every attempt and the eventual valid verdict
+     * artifact would report the same span a third time. Chaining gives real
+     * per-attempt intervals with no extra state.
+     */
+    attemptDurationMs: z.number().int().nonnegative(),
+    /**
+     * WHICH repair this attempt was, so two different repairs cannot spend each
+     * other's budget.
+     *
+     * Absent means the empty-verdict repair, which is the only kind that
+     * existed when this array was introduced, so every record written before
+     * ISS-1115 reads correctly without migration. `"provenance"` is the
+     * metadata repair added here: it has its own bound of one, and counting it
+     * against the empty-verdict cap of two would let a labelling problem park
+     * an item that had never returned an empty verdict at all.
+     */
+    trigger: z.string().optional(),
+  })).default([]),
+
+  /**
+   * T-488 D4: the current attempt at the current work item.
+   *
+   * `itemAttemptId` is what makes rounds of ONE attempt joinable to each other
+   * and to the model that implemented for them. It is NOT derived from
+   * `claimEpoch`: that is ownership, and it is re-established on a re-claim, so
+   * it would change mid-attempt.
+   *
+   * `generation` lives here and is THE generation -- one number, incremented by
+   * a PLAN redirect, used by the artifact path and `reviewGenerationHistory`
+   * alike. A second counter could disagree with the first, and that
+   * disagreement is unrecoverable in exactly the way this ticket exists to
+   * prevent. One number serves both stages correctly because the redirect
+   * clears `reviews.plan` and `reviews.code` in the SAME write, so both stages
+   * restart their numbering at the same moment.
+   *
+   * ABSENT `generation` means UNINITIALIZED, which is not 0. The distinction is
+   * load-bearing: the legacy directory scan runs only on absence. Firing it on
+   * a valid 0 would also fire on round 2 of an ordinary attempt, which has just
+   * written its own r1 at generation 0, advancing the generation with no
+   * redirect anywhere.
+   */
+  itemAttempt: z.object({
+    id: z.string(),
+    workItemId: z.string(),
+    kind: z.enum(["ticket", "issue"]),
+    startedAt: z.string(),
+    generation: forgiveNull(z.number()).catch(undefined),
+  }).nullable().default(null).catch(null),
+
+  /**
+   * T-488 D7: what implemented for THIS attempt, bound to the attempt itself.
+   *
+   * The binding is the fix, not decoration. A session runs up to
+   * `maxTicketsPerSession` items, and item B's PLAN_REVIEW runs BEFORE B's
+   * first IMPLEMENT -- so a session-level field would still hold A's model and
+   * a naive snapshot would attach it to B's round. Reading it through
+   * `implementerForRound` makes that impossible by construction rather than by
+   * ordering luck.
+   */
+  implementer: z.object({
+    itemAttemptId: z.string(),
+    model: forgiveNull(z.string()),
+    tier: forgiveNull(z.string()),
+    effort: forgiveNull(z.string()),
+    source: z.string(),
+    evidence: z.string(),
+  }).nullable().default(null).catch(null),
+
+  /**
+   * T-488 D3: a review round that has been ACCEPTED but whose sinks are not
+   * all durable yet.
+   *
+   * A bare id would not have been enough. It does not preserve the payload,
+   * the subject, the generation or the provenance across a crash, and "clear
+   * once all three sinks succeed" is unsatisfiable because `appendEvent`
+   * swallows its own errors and can never report success.
+   *
+   * So the whole accepted round is persisted BEFORE any sink write, and a
+   * replay carrying the same payload reconstructs the identical round instead
+   * of minting a new one. The sinks are idempotent by id: the state record is
+   * upserted by `reviewAttemptId`, never blindly pushed, so a replay cannot
+   * double-count a round. Events stay best-effort and MAY duplicate -- that is
+   * the stated contract, not an oversight; readers deduplicate by
+   * `reviewAttemptId`.
+   *
+   * Cleared once the durable sinks (state record and artifact) have succeeded
+   * and event delivery has been ATTEMPTED.
+   */
+  pendingReviewAttempt: z.object({
+    reviewAttemptId: z.string(),
+    itemAttemptId: forgiveNull(z.string()),
+    workItemId: forgiveNull(z.string()),
+    kind: forgiveNull(z.string()).catch(undefined),
+    stage: z.string(),
+    round: z.number(),
+    generation: z.number(),
+    /**
+     * Pins the payload this round was accepted for.
+     *
+     * A replay whose fingerprint MATCHES is the same round and reuses this
+     * envelope wholesale. A replay whose fingerprint differs is a new verdict:
+     * the envelope is superseded rather than reused, because reusing it would
+     * file a reviewer's new verdict under an old round's identity.
+     */
+    payloadFingerprint: z.string(),
+    verdict: z.string(),
+    reviewer: z.string(),
+    summary: z.string(),
+    findings: z.array(z.record(z.unknown())).default([]),
+    reviewerIdentity: RecordProvenanceSchema,
+    implementer: RecordProvenanceSchema,
+    backend: forgiveNull(z.string()).catch(undefined),
+    backendRunId: forgiveNull(z.string()),
+    backendRunIdKind: forgiveNull(z.string()).catch(undefined),
+    backendTurnId: forgiveNull(z.string()),
+    normalizerVersion: forgiveNull(z.number()).catch(undefined),
+    payloadConsistent: forgiveNull(z.boolean()).catch(undefined),
+    decidedAt: z.string(),
+  }).nullable().default(null).catch(null),
+
+  /**
+   * T-488 D9: what a PLAN redirect used to destroy.
+   *
+   * `code-review.ts`'s redirect branch clears `reviews`, `lensReviewHistory`
+   * and `ticket.realizedRisk`. Its own comment already says that is right for a
+   * replan and wrong for a session about to end: the lens history is what a
+   * handover has left to say WHY sixty rounds went nowhere. Appended BEFORE the
+   * clear, so the clear itself is unchanged.
+   *
+   * Park and complete never clear this array.
+   */
+  reviewGenerationHistory: z.array(z.object({
+    itemAttemptId: forgiveNull(z.string()),
+    generation: z.number(),
+    realizedRisk: forgiveNull(z.string()),
+    lensReviewHistory: z.array(z.record(z.unknown())).default([]),
+    endedAt: z.string(),
+    reason: z.string(),
+  })).catch([]).default([]),
+
+  /**
    * T-470: a ceiling escalation that has been DECIDED but not finished.
    *
    * Persisting the ceiling round and filing its findings is not atomic. If
@@ -1505,6 +1857,34 @@ export const SessionStateSchema = z.object({
     reason: z.string(),
     unresolvedCritical: z.number(),
     unresolvedMajor: z.number(),
+    /**
+     * ISS-1114: WHAT fired, not what the ceiling was.
+     *
+     * OPTIONAL, and absent means `round-ceiling`. Every record written before
+     * this field existed was a round-ceiling park, so an absent value is not
+     * missing data, it is the original meaning preserved: no persisted record
+     * changes meaning and no migration is needed.
+     *
+     * `empty-verdict` is the ISS-1114 park: a reviewer returned a
+     * change-requesting verdict with no findings, and kept doing so after the
+     * repair instruction was sent `repairAttempts` times. `scope-drift` mirrors
+     * the plan-side enum and is reserved there for the same not-yet-promoted
+     * signal; it is never written here.
+     *
+     * The session report BRANCHES on this. A round-ceiling park and an
+     * empty-verdict park have different causes, and the round-ceiling copy
+     * ("stopped at round N of a ceiling of M", "the ceiling is what ends the
+     * loop") is false for an empty-verdict stop, which can happen on round 1.
+     */
+    trigger: z.enum(["round-ceiling", "scope-drift", "empty-verdict"]).optional(),
+    /**
+     * How many times the repair instruction was sent before this park.
+     *
+     * Optional because only the `empty-verdict` trigger produces it. Present on
+     * that trigger so the report can say the reviewer was asked and did not
+     * comply, which is what separates a stuck reviewer from a one-off.
+     */
+    repairAttempts: z.number().int().nonnegative().optional(),
     decidedAt: z.string(),
     /**
      * The outstanding findings this escalation exists to file.
@@ -1519,6 +1899,21 @@ export const SessionStateSchema = z.object({
       severity: z.string(),
       category: z.string(),
       description: z.string(),
+      /**
+       * ISS-1115. Zod STRIPS undeclared keys, so before these three lines a
+       * finding's provenance survived exactly as long as the process did: the
+       * escalation was recorded with the label that made it a blocker, and the
+       * resume that read it back got the finding with the evidence removed.
+       * The park record then showed an `addressed` finding filed as
+       * outstanding with nothing saying why -- and the resume path is the one
+       * that files these as ledger issues.
+       *
+       * Bare strings, not enums, per T-328: an enum on a persisted field does
+       * not drop a corrupt value, it makes the whole session unreadable.
+       */
+      originClass: z.string().optional(),
+      origin: z.string().optional(),
+      sinceRound: z.number().int().nonnegative().optional(),
     })).default([]),
     /**
      * Fingerprints of the findings THIS escalation is filing.
@@ -1576,7 +1971,14 @@ export const SessionStateSchema = z.object({
     displayId: z.string().optional(),
     round: z.number().int().nonnegative(),
     ceiling: z.number().int().nonnegative(),
-    trigger: z.enum(["round-ceiling", "scope-drift"]),
+    // ISS-1114 APPENDS `empty-verdict`. `scope-drift` keeps its position and
+    // its reserved, never-fired meaning: the enum is extended, not reordered.
+    trigger: z.enum(["round-ceiling", "scope-drift", "empty-verdict"]),
+    /**
+     * ISS-1114: how many times the repair instruction was sent before this
+     * park. Optional because only the `empty-verdict` trigger produces it.
+     */
+    repairAttempts: z.number().int().nonnegative().optional(),
     reason: z.string(),
     unresolvedCritical: z.number().int().nonnegative(),
     unresolvedMajor: z.number().int().nonnegative(),
@@ -1595,6 +1997,21 @@ export const SessionStateSchema = z.object({
       severity: z.string(),
       category: z.string(),
       description: z.string(),
+      /**
+       * ISS-1115. Zod STRIPS undeclared keys, so before these three lines a
+       * finding's provenance survived exactly as long as the process did: the
+       * escalation was recorded with the label that made it a blocker, and the
+       * resume that read it back got the finding with the evidence removed.
+       * The park record then showed an `addressed` finding filed as
+       * outstanding with nothing saying why -- and the resume path is the one
+       * that files these as ledger issues.
+       *
+       * Bare strings, not enums, per T-328: an enum on a persisted field does
+       * not drop a corrupt value, it makes the whole session unreadable.
+       */
+      originClass: z.string().optional(),
+      origin: z.string().optional(),
+      sinceRound: z.number().int().nonnegative().optional(),
     })).default([]),
     fingerprints: z.array(z.string()).default([]),
     completed: z.boolean().default(false),
@@ -2415,6 +2832,42 @@ export interface GuideReportInput {
   readonly notes?: string;
   readonly reviewer?: string;  // ISS-102: actual reviewer backend used (overrides computed nextReviewer)
   readonly reviewId?: string;  // ISS-720: lens reviewId from prepare/synthesize; joins to verification telemetry to record the path actually taken
+
+  // ── T-488 Run A: what actually ran, when the caller can say ─────────────
+  // Every one of these is OPTIONAL and none is ever guessed. A dispatcher that
+  // pinned a model can say so; a caller that cannot say anything leaves them
+  // absent and the round records `source: "unknown"`, `evidence: "none"`.
+  // Absent beats wrong: a fabricated model name is worse than no model name,
+  // because it reads as a fact.
+  /** The model the reviewer ran on, if the caller knows it. */
+  readonly reviewerModel?: string;
+  /** The tier the reviewer ran at (pen/hands/inspector), if known. */
+  readonly reviewerTier?: string;
+  /** How the caller knows: an explicit pin, or the session default. */
+  readonly reviewerSource?: "explicit-pin" | "session-default";
+  /**
+   * Whether the backend REPORTED what executed, or the caller is quoting what
+   * it asked for.
+   *
+   * A configured pin is evidence of intent, never of execution. `observed` is
+   * only for a value the backend itself returned -- codex-bridge labels those
+   * `runtime_session_record`, against `bridge_selection` for a configured one.
+   */
+  readonly reviewerEvidence?: "observed" | "configured";
+  /**
+   * A backend turn/request id, if any backend ever supplies one.
+   *
+   * Today none do (verified in codex-claude-bridge: the review result exposes
+   * `session_id` and per-model `evidence`, and no turn id exists to propagate).
+   * The field is here so the join becomes possible the day a backend adds one,
+   * without another schema round.
+   */
+  readonly reviewerTurnId?: string;
+  /** The model IMPLEMENT ran on, reported with `implementation_done`. */
+  readonly implementerModel?: string;
+  readonly implementerTier?: string;
+  readonly implementerSource?: "explicit-pin" | "session-default";
+  readonly implementerEvidence?: "observed" | "configured";
 }
 
 /**

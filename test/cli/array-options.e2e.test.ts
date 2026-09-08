@@ -62,7 +62,7 @@ function expectRejected(res: { code: number; out: string }, messagePart?: string
   if (messagePart !== undefined) expect(err.message).toContain(messagePart);
 }
 
-function newProject(prefix: string, type: "npm" | "orchestrator" = "npm"): string {
+function newProject(prefix: string, type: "npm" | "orchestrator" | "knowledge" = "npm"): string {
   const dir = mkdtempSync(join(tmpdir(), `${prefix}-`));
   const init = run(dir, "init", "--name", prefix, "--type", type);
   expect(init.code, init.out).toBe(0);
@@ -329,7 +329,7 @@ interface Coverage {
   /** Registration key, matching registrationKey() from the inventory module. */
   key: string;
   /** Project type for `init`. Node commands require an orchestrator project. */
-  type?: "npm" | "orchestrator";
+  type?: "npm" | "orchestrator" | "knowledge";
   /** Exercises the registration and asserts the parsed value landed correctly. */
   check: (dir: string) => void;
 }
@@ -512,6 +512,30 @@ const MATRIX: Coverage[] = [
       expect(byDisplayId(dir, "lessons", "L-001").tags).toEqual(["a", "b"]);
       expectRejected(run(dir, "lesson", "update", "L-001", "--tags", "--format", "json"));
       expect(byDisplayId(dir, "lessons", "L-001").tags).toEqual(["a", "b"]);
+    },
+  },
+  {
+    // FORK: storyknow knowledge packs. `knowledge` commands only resolve
+    // inside a pack, so these rows init with --type knowledge.
+    key: "knowledge create --tags",
+    type: "knowledge",
+    check: (dir) => {
+      const res = run(dir, "knowledge", "create", "--title", "t", "--content", "c",
+        "--context", "x", "--source", "manual", "--tags", "a,b");
+      expect(res.code, res.out).toBe(0);
+      expect(byDisplayId(dir, "knowledge", "K-001").tags).toEqual(["a", "b"]);
+    },
+  },
+  {
+    key: "knowledge update --tags",
+    type: "knowledge",
+    check: (dir) => {
+      expect(run(dir, "knowledge", "create", "--title", "t", "--content", "c",
+        "--context", "x", "--source", "manual", "--tags", "old").code).toBe(0);
+      expect(run(dir, "knowledge", "update", "K-001", "--tags", "a,b").code).toBe(0);
+      expect(byDisplayId(dir, "knowledge", "K-001").tags).toEqual(["a", "b"]);
+      expectRejected(run(dir, "knowledge", "update", "K-001", "--tags", "--format", "json"));
+      expect(byDisplayId(dir, "knowledge", "K-001").tags).toEqual(["a", "b"]);
     },
   },
   {
@@ -698,6 +722,24 @@ const MATRIX: Coverage[] = [
       const id = (byDisplayId(dir, "issues", "ISS-001").id) as string;
       const res = run(dir, "issue", "update", id, "--cites-ruling", rulingId);
       expect(res.code, res.out).toBe(0);
+      expect(byDisplayId(dir, "issues", "ISS-001").citesRulings).toEqual([rulingId]);
+    },
+  },
+  {
+    // T-494: `--cites` binds the new ruling to the items it governs, in the
+    // same transaction that writes the ruling. Split-list like every other row
+    // here, so a comma-joined value must land as two separate citations.
+    key: "ruling create --cites",
+    check: (dir) => {
+      seedTickets(dir, 1);
+      seedIssue(dir);
+      const res = run(dir, "ruling", "create",
+        "--text", "verbatim text", "--attribution", "owner-direct", "--date", "2026-08-28",
+        "--client-task-id", "e2e-test-session",
+        "--cites", "T-001,ISS-001", "--format", "json");
+      expect(res.code, res.out).toBe(0);
+      const rulingId = (JSON.parse(res.out) as { data: { id: string } }).data.id;
+      expect(byDisplayId(dir, "tickets", "T-001").citesRulings).toEqual([rulingId]);
       expect(byDisplayId(dir, "issues", "ISS-001").citesRulings).toEqual([rulingId]);
     },
   },

@@ -433,7 +433,15 @@ describe("scope-drift telemetry through the stage (advisory only)", () => {
       expect(round1.advance.instruction).not.toContain("Scope-drift signal");
     }
 
-    const round2 = await reportRound(round1.ctx.state, "revise", introducedFindings);
+    // Labelled, because ISS-1115 requires `originClass` from round 2 and an
+    // unlabelled round 2 is bounced once for a metadata repair BEFORE the drift
+    // telemetry is computed. That ordering is deliberate -- a payload that
+    // cannot be acted on as reported is refused before the round is recorded --
+    // and this pair is also the control for it: with the labels present, the
+    // drift advisory reaches the reviewer exactly as it did before the gate
+    // existed. Identical descriptions, so the drift fractions are unchanged.
+    const round2Findings = introducedFindings.map((f) => ({ ...f, originClass: "unchanged", sinceRound: 1 }));
+    const round2 = await reportRound(round1.ctx.state, "revise", round2Findings);
     expect(round2.advance.action).toBe("retry"); // never changes routing
     if (round2.advance.action === "retry") {
       expect(round2.advance.instruction).toContain("Scope-drift signal (advisory)");
@@ -449,10 +457,24 @@ describe("scope-drift telemetry through the stage (advisory only)", () => {
    * drift history or emit a hint. `isRevise && nextAction === "PLAN_REVIEW"`
    * already excludes a landing round from the drift gate; this pins it.
    */
+  // ISS-1114: this case reached the clean-findings landing path with `[]`
+  // findings, which is now a contradictory payload that is repaired rather than
+  // honored -- an empty change-request landing at IMPLEMENT is precisely the
+  // false landing that guard exists to stop. The empty array was only the
+  // MECHANISM for reaching the landing path, not the subject: this test is
+  // about drift not being computed on a landing round. It now lands with a
+  // single non-blocking finding, which takes the identical branch (no
+  // unresolved critical or major, roundNum >= minRounds) while remaining a
+  // coherent verdict. The finding's vocabulary is drawn from the baseline so it
+  // cannot manufacture a drift signal of its own.
   it("does not compute drift for a revise round that lands via the clean-findings path", async () => {
     writeFileSync(join(sDir, "plan.md"), PLAN_TEXT);
     const baseline = activeBaseline(["RetryQueue", "SyncEngine", "ConfigLoader"], PLAN_TEXT);
-    const { advance, ctx } = await reportRound(makeState({ planReviewBaseline: baseline }), "revise", []);
+    const { advance, ctx } = await reportRound(
+      makeState({ planReviewBaseline: baseline }),
+      "revise",
+      [{ severity: "minor", category: "style", description: "RetryQueue naming could be clearer", disposition: "open" }],
+    );
     expect(advance.action).toBe("advance");
     expect(ctx.state.planReviewDriftHistory).toBeNull();
   });

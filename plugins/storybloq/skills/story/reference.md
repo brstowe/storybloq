@@ -293,11 +293,59 @@ Reinforce a lesson: increment count and update lastValidated
 storybloq lesson reinforce <id> [--format json|md]
 ```
 
+### lesson promote
+Promote a lesson into an attached storyknow knowledge pack (fork). The pack gains a K-entry (reinforcement count carried, origin stamped); the local lesson is superseded with a pointer.
+
+```
+storybloq lesson promote <id> --to <pack-name-or-path> [--force] [--format json|md]
+```
+
 ### lesson delete
 Delete a lesson
 
 ```
 storybloq lesson delete <id> [--hard] [--format json|md]
+```
+
+### knowledge (storyknow packs, fork)
+Manage shared K-NNN knowledge entries inside a knowledge pack (a project created with `storybloq init --type knowledge`). Consumer projects attach packs via the `knowledge: ["<name-or-path>"]` config key (bare names resolve under `$STORYKNOW_HOME`, default `~/dev/storyknow`); attached entries appear in `lesson digest` marked `[<pack>]`. `knowledge digest` is dual-mode: inside a pack it digests the pack's own entries; inside a consumer project it digests all attached knowledge.
+
+```
+storybloq knowledge list [--status <s>] [--tag <t>] [--source <src>] [--format json|md]
+storybloq knowledge get <id> [--format json|md]
+storybloq knowledge digest [--format json|md]
+storybloq knowledge create --title <t> --content <c> --context <ctx> --source <src> [--tags <tags>] [--supersedes <id>]
+storybloq knowledge update <id> [--title <t>] [--content <c>] [--context <ctx>] [--tags <tags>] [--status <s>]
+storybloq knowledge reinforce <id>
+storybloq knowledge delete <id>
+```
+
+### ruling list
+List owner-ruling attestation records
+
+```
+storybloq ruling list [--scope-tag <tag>] [--superseded] [--format json|md]
+```
+
+### ruling get
+Get a ruling by ID
+
+```
+storybloq ruling get <id> [--format json|md]
+```
+
+### ruling create
+Record a ruling verbatim and cite it from the tickets or issues it binds
+
+```
+storybloq ruling create --text <text> --attribution <source> --date <YYYY-MM-DD> [--scope-tag <tag>] [--cites <item>] [--format json|md]
+```
+
+### ruling supersede
+Supersede a ruling: link an existing one with --with, or record a new superseding ruling
+
+```
+storybloq ruling supersede <id> (--with <id> | --text <text> --attribution <source> --date <YYYY-MM-DD>) [--scope-tag <tag>] [--format json|md]
 ```
 
 ### validate
@@ -660,9 +708,13 @@ The base tools below are registered in full mode (inside a .story/ project). The
 - **storybloq_lesson_create** (title, content, context, source, tags?, supersedes?) - Create lesson
 - **storybloq_lesson_update** (id, title?, content?, context?, tags?, status?, supersedes?) - Update lesson
 - **storybloq_lesson_reinforce** (id) - Reinforce lesson: increment count and update lastValidated
+- **storybloq_ruling_list** (scopeTag?, superseded?) - List rulings, optionally filtered by scope tag or superseded state
+- **storybloq_ruling_get** (id) - Get a ruling by ID
+- **storybloq_ruling_create** (text, attribution, date, scopeTags?, cites?) - Record a ruling verbatim; cites adds its id to each named ticket or issue in the same transaction
+- **storybloq_ruling_supersede** (id, with?, text?, attribution?, date?, scopeTags?) - Supersede a ruling: link an existing one with `with`, or record a new superseding ruling
 - **storybloq_selftest** - Integration smoke test: create/update/delete cycle
-- **storybloq_review_lenses_prepare** (stage, diff, changedFiles, ticketDescription?, reviewRound?, priorDeferrals?, sessionId?) - Prepare multi-lens review on @storybloq/lenses: activation, secrets gate, context packaging, complete lens prompts
-- **storybloq_review_lenses_synthesize** (stage?, lensResults, activeLenses, skippedLenses, reviewRound?, reviewId?, diff?, changedFiles?, sessionId?) - Run the @storybloq/lenses merger pipeline programmatically over raw lens outputs; returns the ReviewVerdict envelope (no merger agent)
+- **storybloq_review_lenses_prepare** (stage, diff, changedFiles, ticketDescription?, reviewRound?, priorDeferrals?, sessionId?, target?) - Prepare multi-lens review on @storybloq/lenses: activation, secrets gate, context packaging, cited-ruling delivery, complete lens prompts
+- **storybloq_review_lenses_synthesize** (stage?, lensResults, activeLenses, skippedLenses, reviewRound?, reviewId?, diff?, changedFiles?, sessionId?, citedRulingsUndelivered?) - Run the @storybloq/lenses merger pipeline programmatically over raw lens outputs; returns the ReviewVerdict envelope (no merger agent). Echo prepare's citedRulingsUndelivered here; without a sessionId it is the only route a delivery hold has
 - **storybloq_review_lenses_judge** (reviewVerdict, convergenceHistory?) - Deterministic three-value verdict mapping over the synthesize ReviewVerdict plus convergence history (no judge agent)
 - **storybloq_autonomous_guide** (sessionId?, action, mode?, ticketId?, clientTaskId?, takeover?, reviewEffort?) - Autonomous session orchestrator -- call at every decision point to drive PICK_TICKET through COMPLETE
 - **storybloq_session_guard** (clientTaskId?) - Session ownership verdict: is anything running, and may I write? Reads only .story/sessions/, no ledger load. Also registered in degraded mode
@@ -690,6 +742,34 @@ With no .story/ project on the path, the MCP server starts degraded and register
 - **storybloq_status** -- returns setup guidance instead of a project summary
 
 Destructive, admin, and git-integration workflows (delete, reconcile, conflicts, resolve, merge-driver, team, gc, repair, config, feedback) are CLI-only in both modes; see the CLI Commands section above.
+
+## Review verdict artifacts
+
+Every review round writes a JSON artifact to `.story/sessions/<sessionId>/telemetry/reviews/`. The filename is `<target>-<stage>-r<round>.json`, and `-g<generation>` is appended once a round belongs to a generation above the first. The generation is a SUFFIX so the `*-code-r*.json` glob external readers already use keeps matching; it is also carried in the payload, so no reader has to parse a filename to know it.
+
+A generation opens whenever the round numbering restarts -- a plan redirect out of code review, or a plan-review reject. Before generations existed, the restarted rounds reproduced existing filenames and were silently dropped; artifacts under one target can therefore still be a mixture of two generations that predate this field.
+
+### Joining a round to what produced it
+
+`backendRunId` carries the backend's own run id and `backendRunIdKind` says what that id is the id OF, which is what decides how precisely a round can be joined:
+
+| `backendRunIdKind` | scope of the run id | join is `exact` when |
+|---|---|---|
+| `codex-session` | a thread spanning many turns | `backendTurnId` is also present |
+| `agent-dispatch` | one dispatch, already a single turn | always -- the dispatch id is turn-precise |
+| `lens-review` | one review invocation | always -- the review id is the invocation |
+
+A `backendTurnId` without its parent `backendRunId` joins nothing and reads as `none`, and so does a record carrying neither. ABSENCE IS NEVER READ AS `exact`. Join quality is deliberately not a stored field: it is derived from these ids on every read, because a stored copy can contradict the ids it summarizes.
+
+`reviewAttemptId` identifies one round across all three of its sinks (the state record, this artifact, and the events log); `itemAttemptId` identifies one attempt at one work item across every round of it. Events are best-effort and may duplicate after a crash, so deduplicate by `reviewAttemptId`.
+
+`generation` has TWO readings and `itemAttemptId` is what tells them apart. Where `itemAttemptId` is present, the generation is attempt-scoped lineage: it advances when a redirect restarts the round numbering, so rounds of one attempt at different generations are different rounds and counting distinct generations counts replans. Where `itemAttemptId` is ABSENT, the round had no work item, there is no lineage for the number to describe, and the generation is only a filename discriminator. Rounds with no work item all share the `unknown` filename stem, so two unrelated sequences can meet at one path and one of them is advanced to avoid overwriting the other. Do not count generations as attempts on records that carry no `itemAttemptId`.
+
+### Reading absent values
+
+Every field in this spine is optional, and an absent one means the value was not recorded -- never that it was measured and came back empty. Absence does NOT date a record: a round written today omits `backendRunId` and `backendTurnId` when the backend supplied none, and omits `workItemId` and `itemAttemptId` when the round had no work item at all, so an absent field is not evidence that the record predates the field. Three cases are worth naming because they are easy to misread. An absent `normalizerVersion` means the severities may not be normalized at all, so a `blocking` severity is possible. An absent `artifactStatus` means the artifact's existence is UNKNOWN; it never means the artifact is missing, and it never means one exists. And `reviewerIdentity.evidence` distinguishes what was OBSERVED to run from what was merely CONFIGURED to run -- a pin recorded as `configured` is evidence of intent and never of execution, which is why `unknown`/`none` is a valid and preferred record rather than a guessed model name.
+
+`payloadConsistent` records whether a verdict agreed with the findings it carried. Reading its rate needs care: change-requesting verdicts with zero findings are now repaired before they become rounds, so they are counted in `reviewRepairAttempts` instead. Those are two separate populations and must never be summed.
 
 ## /story design
 
@@ -736,6 +816,10 @@ Poll or coordinate through the current task-bound local Bus endpoint. Peer conte
 ```
 
 Read `bus-mode.md` for setup, endpoint binding, authority boundaries, acknowledgments, deterministic convergence, and the v1 no-wake boundary.
+
+## /story duet
+
+Coordinate an owner-paired manager and worker with a proved return route and durable assignments. Read `duet-mode.md`. `/story duet` (Codex: `$story duet`) is a skill route, not a CLI command; it does not create tasks or enable Bus.
 
 ## Common Workflows
 

@@ -10,9 +10,19 @@
  */
 
 import { readFileSync, existsSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 import type { Stage } from "@storybloq/lenses";
 import { resolveAndValidate } from "./path-safety.js";
+import { appendContractDelivery } from "../principle-policy-report.js";
+
+/**
+ * Separate budgets on purpose. Sharing one would let the contract evict rules
+ * content, which is the failure this split exists to prevent. See ISS-1125 for
+ * why the RULES.md number is what it is and why it is not raised here.
+ */
+const RULES_BUDGET = 2000;
+const REVIEW_BUDGET = 3000;
 
 // ── Per-lens file routing ──────────────────────────────────────
 
@@ -53,14 +63,108 @@ export function packageContext(opts: {
   ticketDescription: string;
   projectRoot: string;
   tokenBudgetPerLens: number;
+  /**
+   * T-495: where to record what contract text this leg handed the lenses, and
+   * under which round. All three are optional and nothing is written unless
+   * `sessionDir` and `sessionId` are both present -- this function is called
+   * from paths that have no session at all.
+   */
+  sessionDir?: string;
+  sessionId?: string;
+  roundNum?: number;
 }): PackagedContext {
   const { stage, diff, changedFiles, activeLenses, ticketDescription, projectRoot, tokenBudgetPerLens } = opts;
 
-  // Read project rules
+  // Read project rules.
+  //
+  // The 2000-character slice on RULES.md is PRE-EXISTING and is not fixed here:
+  // it silently truncates (this repo's RULES.md is 3497 bytes, so lenses have
+  // never seen its last three sections), and both halves of that defect, the
+  // missing marker and the too-small budget, are ISS-1125.
+  //
+  // What matters at THIS seam is that REVIEW.md does not make it worse.
+  // Appending the contract into the same 2000 characters would evict rules text
+  // that is already being lost, under a change whose whole purpose is to give
+  // reviewers more context. So the contract gets its OWN budget, and its
+  // truncation says so rather than cutting in silence.
   const rulesPath = join(projectRoot, "RULES.md");
-  const projectRules = existsSync(rulesPath)
-    ? readFileSync(rulesPath, "utf-8").slice(0, 2000)
+  const rulesText = existsSync(rulesPath)
+    ? readFileSync(rulesPath, "utf-8").slice(0, RULES_BUDGET)
     : "(no RULES.md found)";
+
+  // T-495: ONE read, and every delivery field below is derived from THIS
+  // snapshot. Re-reading the file to hash it made the record describe a
+  // possibly different version of REVIEW.md from the one in the prompt; Codex
+  // found it. The hash is taken from the same bytes that produced the text.
+  const reviewPath = join(projectRoot, "REVIEW.md");
+  let reviewText = "";
+  let reviewSourceChars: number | null = null;
+  let reviewSourceBytes: number | null = null;
+  let reviewContentHash: string | null = null;
+  /** Characters of REVIEW.md ITSELF that reached the prompt, notice excluded. */
+  let reviewDeliveredChars: number | null = null;
+  let reviewTruncated = false;
+  if (existsSync(reviewPath)) {
+    try {
+      const bytes = readFileSync(reviewPath);
+      const raw = bytes.toString("utf-8");
+      // Text, ungated. Nothing here parses REVIEW.md or acts on its headings:
+      // a checklist-style REVIEW.md is useful review guidance even when it
+      // declares no structure at all, so the reviewer gets the file as written.
+      reviewTruncated = raw.length > REVIEW_BUDGET;
+      reviewText = reviewTruncated
+        ? `${raw.slice(0, REVIEW_BUDGET)}\n\n[REVIEW.md truncated at ${REVIEW_BUDGET} characters]`
+        : raw;
+      reviewSourceChars = raw.length;
+      reviewSourceBytes = bytes.byteLength;
+      reviewContentHash = createHash("sha256").update(bytes).digest("hex");
+      // The rendered text carries a truncation NOTICE that is not contract
+      // content, so `reviewText.length` overstates what was delivered and is not
+      // comparable to `sourceChars` or `truncatedAtChars`. Measured on the slice.
+      reviewDeliveredChars = reviewTruncated ? REVIEW_BUDGET : raw.length;
+    } catch { /* unreadable contract is an absent contract */ }
+  }
+
+  const projectRules = reviewText === ""
+    ? rulesText
+    : `${rulesText}\n\n## REVIEW.md (quality contract)\n\n${reviewText}`;
+
+  // T-495: the lens leg's delivery observation.
+  //
+  // TRUNCATION IS ITS OWN SIGNAL HERE, never a hash mismatch. This route cuts
+  // INSIDE the file at `REVIEW_BUDGET`, so a lens can be asked to name a
+  // principle whose section it was never shown. The hash recorded is of the
+  // SOURCE, because that is what identifies which contract this was; the
+  // truncation fields say how much of it arrived. Hashing the delivered slice
+  // instead would make every truncated round look like a different contract and
+  // lose the fact that it was the right one, cut short.
+  //
+  // This leg can never be key-bound: it carries no target and no generation
+  // (`prepare.ts:122`), so its binding is `weak` and it is INELIGIBLE for every
+  // delivery-bound metric. The record is written anyway, because a weak
+  // observation that is counted and not used is evidence about coverage, while
+  // no observation at all is indistinguishable from a leg that never ran.
+  if (opts.sessionDir !== undefined && opts.sessionId !== undefined) {
+    const included = reviewText !== "";
+    appendContractDelivery(opts.sessionDir, {
+      sessionId: opts.sessionId,
+      target: null,
+      itemAttemptId: null,
+      stage: stage === "PLAN_REVIEW" ? "plan" : "code",
+      generation: null,
+      roundNum: opts.roundNum ?? 0,
+      leg: "lens",
+      reviewMdIncluded: included,
+      omissionReason: included ? null : "no-review-md",
+      contentHash: included ? reviewContentHash : null,
+      sourceChars: reviewSourceChars,
+      sourceBytes: reviewSourceBytes,
+      deliveredChars: included ? reviewDeliveredChars : null,
+      truncated: included && reviewTruncated,
+      truncatedAtChars: included && reviewTruncated ? REVIEW_BUDGET : null,
+      timestamp: new Date().toISOString(),
+    });
+  }
 
   // Build file contents map (with path traversal + symlink protection)
   const fileContents = new Map<string, string>();

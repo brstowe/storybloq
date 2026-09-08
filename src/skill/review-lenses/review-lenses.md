@@ -56,10 +56,26 @@ Call `storybloq_review_lenses_prepare` with:
   "diff": "<full diff text>",
   "changedFiles": ["src/foo.ts", "src/bar.ts"],
   "ticketDescription": "T-XXX: description of the ticket (or 'Manual review -- brief description' if no ticket)",
+  "target": "T-XXX",
   "reviewRound": 1,
   "priorDeferrals": []
 }
 ```
+
+`target` is the ticket or issue under review, and it is what makes the item's
+cited rulings reach every lens. Pass it whenever the review is about an item.
+Inside an autonomous session `sessionId` supplies it instead, so a call that
+already passes `sessionId` does not need it. Omit both and the lenses review
+without the decisions that bind the item, which is a defensible thing to do for
+a review that is about no item and a silent context loss for one that is not.
+
+If prepare returns a non-empty `metadata.citedRulingsUndelivered`, echo it back
+to `storybloq_review_lenses_synthesize` as `citedRulingsUndelivered`. On a review
+with a `sessionId` this is optional (prepare persisted it and synthesize reads it
+back); on a review WITHOUT one it is required, because there is nowhere on disk
+for prepare to have written it, and an unechoed map means the verdict hold that
+should stop an incomplete review silently does not exist. Echoing it can only add
+a hold, never clear one.
 
 For rounds 2+, increment `reviewRound` and pass issueKeys of findings you intentionally deferred:
 ```json
@@ -249,3 +265,7 @@ _Findings the pipeline dropped (below confidence floor, evidence unverified) or 
 - **REJECT** -- At least one blocking finding survived the pipeline (alwaysBlock categories, corroborated blocking severity).
 - **Pre-existing findings** are excluded from filing pressure but still appear in the verdict findings; they are auto-filed as issues by synthesize.
 - Severity vocabulary: the package uses `blocking | major | minor | suggestion`. Report `blocking` as `critical` in user-facing output.
+
+### The review contract (REVIEW.md)
+
+If the project has a REVIEW.md declaring principles, name the one a finding violates in the finding's optional `principle` field: `@storybloq/lenses@0.5.0` widened `LensFindingSchema` and `MergedFindingSchema` to carry it. The lens prompt receives only the FIRST 3000 CHARACTERS of REVIEW.md, head-truncated, so a project that pushed its principles below that line has asked you to name one from a list you were never shown -- say so in the finding rather than guessing a principle name. Naming none is a legitimate answer and the correct one when the contract did not reach you. Nothing consumes those names during a review yet: the contract evaluator has no production caller, computes nothing at review time and persists nothing, and wiring it up is workstream G. So a named principle changes no severity and no verdict today; it costs the finding nothing, and it is what makes the later measurement possible. Do not describe a review as measured against a contract on that basis.

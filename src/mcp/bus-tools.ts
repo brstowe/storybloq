@@ -8,8 +8,8 @@ import {
   hopsRemainingFor,
   pollBus,
   pollV1,
-  redeliverBusMessage,
-  sendBusMessage,
+  redeliverBusMessageWithWake,
+  sendBusMessageWithWake,
   updateBusThread,
   updateV1Thread,
   BusError,
@@ -100,7 +100,9 @@ export function registerBusTools(server: McpServer, pinnedRoot: string, onCall?:
       inReplyTo: MessageIdSchema.nullable().optional(),
       idempotencyKey: z.string().min(1).max(128),
     },
-  }, (args) => invoke(() => sendBusMessage(pinnedRoot, {
+    // sendBusMessageWithWake, NOT sendBusMessage: both send surfaces run the
+    // wake tier, or it is live on one and dead on the other.
+  }, (args) => invoke(() => sendBusMessageWithWake(pinnedRoot, {
     endpointId: args.endpointId,
     clientTaskId: args.clientTaskId,
     threadId: args.threadId,
@@ -122,7 +124,10 @@ export function registerBusTools(server: McpServer, pinnedRoot: string, onCall?:
       predecessorThreadId: ThreadIdSchema.describe("The hop-capped thread"),
       refusedEntryHash: RefusedEntryHashSchema.describe("entryHash of the hop-cap automatic park entry on the predecessor thread"),
     },
-  }, (args) => invoke(() => redeliverBusMessage(pinnedRoot, {
+    // redeliverBusMessageWithWake, NOT redeliverBusMessage: a redelivery commits
+    // real mail, and the message it carries was parked, so nothing woke the peer
+    // for it the first time (ISS-1131).
+  }, (args) => invoke(() => redeliverBusMessageWithWake(pinnedRoot, {
     endpointId: args.endpointId,
     clientTaskId: args.clientTaskId,
     predecessorThreadId: args.predecessorThreadId,

@@ -26,12 +26,16 @@ import {
   listV1Endpoints,
   pollBus,
   pollV1,
-  redeliverBusMessage,
+  redeliverBusMessageWithWake,
   refreshEndpointForSessionStart,
+  updateEndpoint,
   retireEndpoint,
   runtimeLostError,
   describeDeliveryTiers,
-  sendBusMessage,
+  describeWakeTier,
+  resolveWakePolicyUpdate,
+  wakePolicyRefusal,
+  sendBusMessageWithWake,
   setBusHookPolicy,
   updateBusThread,
   updateV1Thread,
@@ -44,6 +48,7 @@ import {
   WAIT_TIMEOUT_MIN_SECONDS,
   type BusClient,
   type BusDeliveryCapabilities,
+  type BusParticipantSummary,
   type BusDoctorResult,
   type BusEndpoint,
   type BusHookPolicy,
@@ -356,6 +361,25 @@ function deliveryLabel(caps: BusDeliveryCapabilities): string {
   return `delivery: ${describeDeliveryTiers(caps)}`;
 }
 
+// T-489: append the wake tier to the delivery label when any participant enables
+// it. `describeWakeTier` is the single source of wake wording, sibling to
+// `describeDeliveryTiers`, so the tier name cannot drift between the two.
+// Deliberately reported per PARTICIPANT rather than as a project-wide fact,
+// because the policy lives on the endpoint: a two-client Bus can have exactly one
+// wakeable side, and flattening that would overstate coverage.
+function deliveryLabelWithWake(
+  caps: BusDeliveryCapabilities,
+  participants: readonly BusParticipantSummary[],
+): string {
+  const tiers = new Set<string>();
+  for (const participant of participants) {
+    const tier = describeWakeTier(participant.wakePolicy);
+    if (tier !== null) tiers.add(tier);
+  }
+  if (tiers.size === 0) return deliveryLabel(caps);
+  return `${deliveryLabel(caps)} + ${[...tiers].sort().join(" + ")}`;
+}
+
 function renderReadiness(setupState: BusSummary["setupState"]): string {
   switch (setupState) {
     case "ready": return "Bus ready.";
@@ -559,6 +583,41 @@ async function collectAutoAttachAdvisories(root: string, nowMs: number): Promise
   }
 }
 
+/**
+ * ISS-1153: the wake lines.
+ *
+ * Two rules the wording carries rather than the data: the ratio is a LOWER BOUND
+ * (an observation is written only when a poll folds the wake's thread, so an
+ * unobserved request may still have been polled), and it is an OBSERVATION rather
+ * than proof the wake caused the poll. Both go in the sentence a reader sees,
+ * because a bare percentage is read as neither.
+ *
+ * A null half prints nothing, or says "no wake entries recorded" in words. It never
+ * prints zeros: zeroes would assert the wake tier ran and never succeeded.
+ */
+function renderWakeLines(wake: BusSummary["wake"]): string[] {
+  const lines: string[] = [];
+  if (wake.entries === null) {
+    lines.push("Wake: no wake entries recorded.");
+  } else {
+    const { requested, pollObserved, failed, observedPerRequested } = wake.entries;
+    const parts = [`${requested} requested`];
+    parts.push(observedPerRequested === null
+      ? `${pollObserved} recorded as polled (no recorded requests to measure against)`
+      : `${pollObserved} recorded as polled (${pollObserved} of ${requested} recorded requests; a lower bound, and an observation, not proof the wake caused the poll)`);
+    if (failed.length > 0) {
+      const total = failed.reduce((sum, item) => sum + item.count, 0);
+      parts.push(`${total} failed (${failed.map((item) => `${item.reason} ${item.count}`).join(", ")})`);
+    }
+    lines.push(`Wake: ${parts.join(", ")}.`);
+  }
+  if (wake.lastOutcomes !== null) {
+    lines.push(`Wake (last outcome per endpoint, not a count of attempts): ${
+      wake.lastOutcomes.map((item) => `${item.result} ${item.endpoints}`).join(", ")}.`);
+  }
+  return lines;
+}
+
 function renderStatusMarkdown(summary: BusSummary): string {
   if (summary.setupState === "disabled") {
     // T-428: surface the config-revert diagnostic (carried in nextActions) rather
@@ -581,7 +640,8 @@ function renderStatusMarkdown(summary: BusSummary): string {
   const connected = summary.participants.length > 0
     ? `${joinLabels(summary.participants.map((participant) => clientLabel(participant.surface)))} connected`
     : "no clients connected";
-  return `Bus: ${state}; ${connected}; ${deliveryLabel(summary.deliveryCapabilities)}.`;
+  const base = `Bus: ${state}; ${connected}; ${deliveryLabelWithWake(summary.deliveryCapabilities, summary.participants)}.`;
+  return [base, ...renderWakeLines(summary.wake)].join("\n");
 }
 
 // ISS-871: canonical UUID shape for the pre-mutation --replace preflight (joinEndpoint
@@ -593,6 +653,19 @@ interface BusSetupArgs {
   readonly taskId?: string;
   readonly surface?: BusSurface;
   readonly delivery: "live" | "poll";
+  // T-489 idle-wake tier. OPTIONAL and UNDEFAULTED, because omitted and explicit
+  // `never` are different intents: omitted preserves whatever the endpoint has, so
+  // a rerun of setup cannot silently downgrade an endpoint someone deliberately
+  // set to `idle`; explicit `never` is a decision and DISABLES it. Collapsing the
+  // two into a default would make `--wake never` a no-op, leaving waking on.
+  readonly wake?: "never" | "idle";
+  // T-489 section 14. NO SESSION HAS A SELF-KNOWN ADDRESS: both ends learn the
+  // name only by reading `ListAgents`, so this is supplied by the agent as an
+  // OBSERVATION at setup and is never something the session knew about itself.
+  readonly sessionName?: string;
+  // The socket path that actually carries the message. Not derivable from the
+  // name, so it is captured separately.
+  readonly transportAddress?: string;
   readonly forceArchive: boolean;
   // ISS-871: endpoint id of a proven-offline incumbent to replace with this task's endpoint.
   readonly replace?: string;
@@ -914,6 +987,16 @@ async function runBusSetup(root: string, args: BusSetupArgs): Promise<BusSetupRe
     throw new BusError("invalid_input", "Cannot determine the client surface safely; pass --surface explicitly");
   }
 
+  // ISS-1132: a wake policy the gates can never honour is refused HERE, inside the
+  // zero-mutation preflight, rather than stored and then silently skipped on every
+  // send. Nothing else validates it: `resolveWakePolicyUpdate` only diffs values.
+  // Both `client` and `surface` are already resolved above, so this costs no
+  // lookup and a refused setup mutates nothing.
+  const wakeRefusal = wakePolicyRefusal(client, surface, args.wake);
+  if (wakeRefusal !== null) {
+    throw new BusError("invalid_input", wakeRefusal);
+  }
+
   const runtimeKind = await classifyBusRuntime(root);
   if (runtimeKind === "v1") {
     await preflightV1Drain(root, taskId, args.forceArchive);
@@ -1011,6 +1094,33 @@ async function runBusSetup(root: string, args: BusSetupArgs): Promise<BusSetupRe
   } else {
     endpoint = joined.endpoint;
     completedSteps.push("join-endpoint");
+  }
+
+  // T-489: record the wake tier on the endpoint. Written only when it actually
+  // differs, so a rerun without --wake neither churns the record nor silently
+  // downgrades an endpoint someone deliberately set to `idle`... which is exactly
+  // why the CLI default is not applied blindly: `--wake never` is an explicit
+  // choice, an omitted flag is not.
+  const nextWakePolicy = resolveWakePolicyUpdate(endpoint.wakePolicy, args.wake);
+  if (nextWakePolicy !== null) {
+    endpoint = await updateEndpoint(root, endpoint.endpointId, (current) => ({
+      ...current,
+      wakePolicy: nextWakePolicy,
+    }));
+    completedSteps.push("set-wake-policy");
+  }
+
+  // T-489 section 14. Recorded ONLY when the caller supplies an observation.
+  // Unavailable stays null and is never guessed, and storing a name is never
+  // treated as proof of reachability: the sender must see an actual `ListAgents`
+  // match before it nudges, or report the route as unavailable.
+  if (args.sessionName !== undefined || args.transportAddress !== undefined) {
+    endpoint = await updateEndpoint(root, endpoint.endpointId, (current) => ({
+      ...current,
+      ...(args.sessionName !== undefined ? { clientSessionName: args.sessionName } : {}),
+      ...(args.transportAddress !== undefined ? { clientTransportAddress: args.transportAddress } : {}),
+    }));
+    completedSteps.push("record-session-address");
   }
 
   // ISS-871/ISS-872: succession outcome + eager materialization. `replaced` is derived
@@ -1155,6 +1265,93 @@ function renderSetupMarkdown(result: BusSetupResult): string {
   return lines.join("\n");
 }
 
+/**
+ * ISS-1132: a per-endpoint view of the wake tier.
+ *
+ * `bus status` already reports the wake TIER per participant, which answers "is
+ * anyone wakeable" but not "why did MY wake not fire". The last outcome is read
+ * from the ENDPOINT rather than from the thread `wake` entries, because
+ * `wakeAfterSend` returns before appending an entry on every skip: the thread
+ * sink holds only `requested` and `failed:*`, and none of the nine skip reasons,
+ * which are precisely the diagnostic cases. The endpoint fields carry every
+ * outcome except `no-attempt`.
+ */
+interface BusEndpointListRow {
+  readonly endpointId: string;
+  readonly client: BusEndpoint["client"];
+  readonly surface: BusEndpoint["surface"];
+  readonly wakePolicy: BusEndpoint["wakePolicy"];
+  /**
+   * STATIC client and surface eligibility ONLY.
+   *
+   * True means the gates would not reject this endpoint on client or surface
+   * grounds. It says NOTHING about daemon version, socket reachability, thread
+   * ownership, or whether a wake would actually succeed, which is why it is named
+   * `wakeSupported` and not `wakeReady`. Computed from the LITERAL "idle": passing
+   * the stored policy would report every opted-out endpoint as supported, because
+   * the helper accepts `never` for any client.
+   */
+  readonly wakeSupported: boolean;
+  readonly clientSessionName: string | null;
+  readonly retiredAt: string | null;
+  readonly lastWakeAt: string | null;
+  readonly lastWakeResult: string | null;
+}
+
+interface BusEndpointListResult {
+  readonly endpoints: BusEndpointListRow[];
+  readonly findings: string[];
+}
+
+async function collectEndpointList(root: string): Promise<BusEndpointListResult> {
+  const listed = await listEndpoints(root);
+  return {
+    // Retired endpoints are INCLUDED. Every other caller filters them out, but a
+    // listing that inherited that filter would show an empty fleet to someone
+    // whose endpoint was retired, which is the absence-reading-as-a-zero shape
+    // this command exists to remove. They are listed and marked instead.
+    endpoints: listed.endpoints.map((endpoint) => ({
+      endpointId: endpoint.endpointId,
+      client: endpoint.client,
+      surface: endpoint.surface,
+      wakePolicy: endpoint.wakePolicy,
+      wakeSupported: wakePolicyRefusal(endpoint.client, endpoint.surface, "idle") === null,
+      clientSessionName: endpoint.clientSessionName ?? null,
+      retiredAt: endpoint.retiredAt ?? null,
+      lastWakeAt: endpoint.lastWakeAt ?? null,
+      lastWakeResult: endpoint.lastWakeResult ?? null,
+    })),
+    findings: listed.findings,
+  };
+}
+
+function renderEndpointList(result: BusEndpointListResult): string {
+  const lines: string[] = [];
+  if (result.findings.length > 0) {
+    // Surfaced BEFORE the rows: a corrupt record is dropped from the list, so a
+    // silent finding would render as a smaller fleet than the registry holds.
+    lines.push("Registry findings:");
+    for (const finding of result.findings) lines.push(`  ${finding}`);
+    lines.push("");
+  }
+  if (result.endpoints.length === 0) {
+    lines.push("No endpoints.");
+    return lines.join("\n");
+  }
+  for (const row of result.endpoints) {
+    const retired = row.retiredAt === null ? "" : ` (retired ${row.retiredAt})`;
+    // "last wake" says LAST-ONLY: this is one outcome, never a history.
+    const when = row.lastWakeAt === null ? "" : ` at ${row.lastWakeAt}`;
+    lines.push(`endpoint ${row.endpointId}${retired}`);
+    lines.push(`  client: ${row.client} (${row.surface})`);
+    lines.push(`  wake policy: ${row.wakePolicy}`);
+    lines.push(`  wake supported: ${row.wakeSupported ? "yes" : "no"} (client and surface only)`);
+    lines.push(`  session name: ${row.clientSessionName ?? "absent"}`);
+    lines.push(`  last wake: ${row.lastWakeResult === null ? "absent" : `${row.lastWakeResult}${when}`}`);
+  }
+  return lines.join("\n");
+}
+
 export function registerBusCommand(yargs: Argv): Argv {
   return yargs.command(
     "bus",
@@ -1191,6 +1388,19 @@ export function registerBusCommand(yargs: Argv): Argv {
             describe: "Client surface when process ancestry cannot determine it",
           })
           .option("delivery", { type: "string", choices: ["live", "poll"] as const, default: "live" })
+          .option("wake", {
+            type: "string",
+            choices: ["never", "idle"] as const,
+            describe: "Idle-wake tier for a Codex endpoint; omitted preserves the current policy, `never` disables it",
+          })
+          .option("session-name", {
+            type: "string",
+            describe: "This session's address AS OBSERVED IN ListAgents (name plus ref); never self-known",
+          })
+          .option("transport-address", {
+            type: "string",
+            describe: "Socket path that carries messages to this session, when known",
+          })
           .option("replace", {
             type: "string",
             describe: "Endpoint id of a proven-offline incumbent to replace with this task's endpoint",
@@ -1207,6 +1417,9 @@ export function registerBusCommand(yargs: Argv): Argv {
             taskId: argv["task-id"] as string | undefined,
             surface: argv.surface as BusSurface | undefined,
             delivery: (argv.delivery as "live" | "poll" | undefined) ?? "live",
+            wake: argv.wake as "never" | "idle" | undefined,
+            sessionName: argv["session-name"] as string | undefined,
+            transportAddress: argv["transport-address"] as string | undefined,
             replace: argv.replace as string | undefined,
             forceArchive: argv["force-archive"] === true,
           }), renderSetupMarkdown, (result) => result.setupState === "invalid");
@@ -1241,6 +1454,11 @@ export function registerBusCommand(yargs: Argv): Argv {
               taskId: argv["task-id"] as string | undefined,
               surface: argv.surface as BusSurface | undefined,
               delivery: "live",
+              // Auto-attach never TOUCHES the wake tier: turning on auto-attach is a
+              // decision about ATTACHING, not about letting a peer start turns in
+              // this session, and it must not silently disable a tier the user
+              // enabled on purpose either. Undefined preserves.
+              wake: undefined,
               replace: undefined,
               forceArchive: argv["force-archive"] === true,
             }),
@@ -1368,7 +1586,15 @@ export function registerBusCommand(yargs: Argv): Argv {
               argv.reason as string,
             ), (endpoint) => `Retired endpoint ${endpoint.endpointId}: ${endpoint.retiredReason}`);
           },
-        ).demandCommand(1, "Specify: retire"),
+        ).command(
+          "list",
+          "List endpoints with their wake configuration and last wake outcome",
+          (y3) => formatOption(y3),
+          async (argv) => {
+            const format = formatValue(argv.format);
+            await runBus(format, collectEndpointList, renderEndpointList);
+          },
+        ).demandCommand(1, "Specify: list, retire"),
         () => {},
       )
       .command(
@@ -1465,7 +1691,9 @@ export function registerBusCommand(yargs: Argv): Argv {
           await runBus(format, async (root) => {
             const values = argv as Record<string, unknown>;
             const owned = await resolveOwnedEndpoint(root, identityFrom(values));
-            const sent = await sendBusMessage(root, {
+            // sendBusMessageWithWake, NOT sendBusMessage: the wake tier runs on
+            // the user-facing send path or it does not run at all.
+            const sent = await sendBusMessageWithWake(root, {
               endpointId: owned.endpointId,
               clientTaskId: owned.taskId,
               threadId: values.thread as string | undefined,
@@ -1480,10 +1708,15 @@ export function registerBusCommand(yargs: Argv): Argv {
             });
             return deprecation ? { ...sent, deprecation } : sent;
           }, (result) => {
+            // The wake line is APPENDED, never folded into the send sentence: what
+            // the wake did is a separate fact from whether the mail committed, and
+            // a reader must not have to infer one from the other.
+            const wake = typeof result.wake === "string" ? `\nWake: ${result.wake}.` : "";
             const summary = result.parked
               ? `Thread ${result.threadId} parked at hop ${result.hopCount}.${result.nextAction ? ` Redeliver with: storybloq bus redeliver --predecessor-thread ${result.nextAction.predecessorThreadId} --refused-entry-hash ${result.nextAction.refusedEntryHash}` : ""}`
               : `${result.replayed ? "Replayed" : "Sent"} message ${result.messageId} in thread ${result.threadId}.`;
-            return deprecation ? `${deprecation}\n${summary}` : summary;
+            const body = `${summary}${wake}`;
+            return deprecation ? `${deprecation}\n${body}` : body;
           });
         },
       )
@@ -1498,7 +1731,10 @@ export function registerBusCommand(yargs: Argv): Argv {
           await runBus(format, async (root) => {
             const values = argv as Record<string, unknown>;
             const owned = await resolveOwnedEndpoint(root, identityFrom(values));
-            return redeliverBusMessage(root, {
+            // redeliverBusMessageWithWake, NOT redeliverBusMessage: a redelivery
+            // commits real mail, and the message it carries was PARKED, so
+            // nothing woke the peer for it the first time (ISS-1131).
+            return redeliverBusMessageWithWake(root, {
               endpointId: owned.endpointId,
               clientTaskId: owned.taskId,
               predecessorThreadId: values["predecessor-thread"] as string,
@@ -1510,7 +1746,11 @@ export function registerBusCommand(yargs: Argv): Argv {
               : result.replaySource === "receipt"
                 ? " (replayed from your own existing receipt)"
                 : "";
-            return `Redelivered onto thread ${result.threadId} as message ${result.messageId}${via}.`;
+            // APPENDED, never folded in, exactly as `bus send` does it: what the
+            // wake did and whether the mail committed are different facts, and a
+            // reader must not have to infer one from the other.
+            const wake = typeof result.wake === "string" ? `\nWake: ${result.wake}.` : "";
+            return `Redelivered onto thread ${result.threadId} as message ${result.messageId}${via}.${wake}`;
           });
         },
       )

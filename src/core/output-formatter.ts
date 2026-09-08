@@ -1,3 +1,5 @@
+import { computeIssueFlow, formatIssueFlow, ISSUE_FLOW_SEMANTICS } from "./issue-flow.js";
+import type { DuetRoute, DuetView } from "./duet-coordination.js";
 import { displayIdOf } from "./resolver.js";
 import type { OutputFormat, ErrorCode } from "../models/types.js";
 import type { FederationState, FederationNodeEntry } from "../federation/state.js";
@@ -317,20 +319,63 @@ export function fencedBlock(content: string, lang?: string): string {
  * unconditional anti-laundering caveat, as a human reading `ticket get`.
  */
 export function formatCitedRulingsSection(resolutions: readonly CitationResolution[]): string {
-  if (resolutions.length === 0) return "";
+  return formatCitedRulingsSectionBounded(resolutions, Number.POSITIVE_INFINITY).text;
+}
+
+/** What a bounded render produced, and what it had to leave out. */
+export interface BoundedCitedRulings {
+  readonly text: string;
+  /** Rulings whose TEXT was replaced by a marker. Metadata is never dropped. */
+  readonly truncatedIds: readonly string[];
+}
+
+/**
+ * T-494: the ONE renderer, with an optional bound on ruling TEXT.
+ *
+ * Two tiers, because they fail differently. Id, status, stale label,
+ * attribution, recorder and date are ALWAYS present and never truncated: that
+ * is what makes a ruling's existence undeniable even when its text will not
+ * fit. Only TEXT is subject to the budget, and a dropped text is replaced by a
+ * marker naming how to fetch it, never by a silent slice.
+ *
+ * The bound is on text and NOT on the rendered block on purpose. Slicing the
+ * rendered block would cut mid-ruling and delete every id, caveat and status
+ * after the cut, which is precisely the guarantee this exists to provide.
+ *
+ * Inclusion is all-or-nothing per ruling and in CITATION ORDER: a ruling's text
+ * goes in only if the running total still fits after adding it. Best-fit
+ * packing would reorder rulings by length, and citation order is the order the
+ * recorder chose.
+ */
+export function formatCitedRulingsSectionBounded(
+  resolutions: readonly CitationResolution[],
+  textBudget: number,
+): BoundedCitedRulings {
+  if (resolutions.length === 0) return { text: "", truncatedIds: [] };
+  const truncatedIds: string[] = [];
+  let spent = 0;
   const lines = resolutions.map((resolution) => {
     const rendered = renderCitation(resolution);
     if (rendered.status === "resolved" && rendered.current) {
       const staleNote = rendered.stale ? ` (superseded by ${rendered.current.id})` : "";
+      const body = escapeMarkdownInline(rendered.current.text);
+      // Measured on the ESCAPED text, which is what actually lands in the
+      // block: escaping expands, so budgeting the raw text would under-count.
+      const fits = spent + body.length <= textBudget;
+      if (fits) spent += body.length;
+      else truncatedIds.push(rendered.current.id);
+      const head = fits
+        ? `- **${escapeMarkdownInline(rendered.citedId)}**${staleNote}: "${body}"`
+        : `- **${escapeMarkdownInline(rendered.citedId)}**${staleNote}: [text truncated, read with ruling_get ${rendered.current.id}]`;
       return [
-        `- **${escapeMarkdownInline(rendered.citedId)}**${staleNote}: "${escapeMarkdownInline(rendered.current.text)}"`,
+        head,
         `  ${rendered.current.attribution}, recorded by ${rendered.current.recordedBy.client}/${rendered.current.recordedBy.id} on ${rendered.current.date}`,
         `  > ${rendered.current.caveat}`,
       ].join("\n");
     }
     return `- **${escapeMarkdownInline(rendered.citedId)}**: ${rendered.warning ?? rendered.status}`;
   });
-  return `\n\n## Cited Rulings\n\n${lines.join("\n")}`;
+  return { text: `\n\n## Cited Rulings\n\n${lines.join("\n")}`, truncatedIds };
 }
 
 /** T-476: JSON-safe embedding for a citing item's resolved rulings. */
@@ -597,7 +642,7 @@ function arrangementsSection(arrangements: StatusArrangements): string[] {
   for (const a of arrangements.items) {
     const parties = a.parties.map((p) => `${p.role} (${p.client})`).join(", ");
     lines.push(
-      `- ${escapeMarkdownInline(a.id)} [${a.lifecycle}] -- bounds: ${escapeMarkdownInline(a.bounds.join(", "))}; parties: ${escapeMarkdownInline(parties)}`,
+      `- ${escapeMarkdownInline(a.id)} [${a.lifecycle}] -- bounds: ${escapeMarkdownInline(a.bounds.join(", "))}; parties: ${escapeMarkdownInline(parties)}${a.route ? `; communication: ${escapeMarkdownInline(a.route.status)}${a.route.mode ? ` (${escapeMarkdownInline(a.route.mode)})` : ""}` : ""}`,
     );
   }
   for (const w of arrangements.warnings) {
@@ -608,6 +653,7 @@ function arrangementsSection(arrangements: StatusArrangements): string[] {
 
 /** Active-only projection of an Arrangement for status display (T-473). */
 export interface StatusArrangementSummary {
+  readonly route?: DuetRoute;
   readonly id: string;
   readonly lifecycle: ArrangementLifecycle;
   readonly bounds: readonly string[];
@@ -617,6 +663,33 @@ export interface StatusArrangementSummary {
 export interface StatusArrangements {
   readonly items: readonly StatusArrangementSummary[];
   readonly warnings: readonly string[];
+}
+
+/**
+ * T-432: the 30-day issue-flow window, computed once over the records the
+ * project load already parsed.
+ *
+ * `new Date()` lives HERE and nowhere deeper: `computeIssueFlow` takes `now` as
+ * a parameter so its behaviour at a window boundary is testable, and a function
+ * that reads the clock internally is not.
+ *
+ * RETURNS NULL WHEN THE RECORDS ARE NOT THERE, and the caller then prints the
+ * plain open count with no window at all. Several callers here pass a partial
+ * state carrying only the counts, and the previous line survived that because
+ * `activeIssueCount` is a number while this reads the array. The fix is not a
+ * defensive default: printing `+0 opened / -0 resolved` over records we never
+ * saw is a fabricated zero, which is the one thing this whole ticket exists to
+ * prevent. No records, no window.
+ */
+function statusIssueFlow(state: ProjectState): ReturnType<typeof computeIssueFlow> | null {
+  if (!Array.isArray(state.activeIssues)) return null;
+  return computeIssueFlow(state.activeIssues, 30, new Date());
+}
+
+/** The md line: the window when we have the records, the plain count when not. */
+function issueLine(state: ProjectState): string {
+  const flow = statusIssueFlow(state);
+  return flow === null ? `Issues: ${state.activeIssueCount} open` : formatIssueFlow(flow);
 }
 
 export function formatStatus(
@@ -649,6 +722,16 @@ export function formatStatus(
     openTickets: state.leafTicketCount - state.completeLeafTicketCount,
     blockedTickets: state.blockedCount,
     openIssues: state.activeIssueCount,
+    // T-432: the same numbers the md line prints, so the two cannot disagree.
+    // `semantics` travels WITH them because "opened / resolved" is a balance of
+    // record dates, not a backlog delta, and a consumer reading only the numbers
+    // would have no way to know that.
+    issueFlow: (() => {
+      const flow = statusIssueFlow(state);
+      // NULL, not a zeroed object: a consumer must be able to tell "no
+      // issues opened in 30 days" from "the window could not be computed".
+      return flow === null ? null : { ...flow, semantics: ISSUE_FLOW_SEMANTICS };
+    })(),
     activeNotes: state.activeNoteCount,
     archivedNotes: state.archivedNoteCount,
     activeLessons: state.activeLessonCount,
@@ -709,7 +792,7 @@ export function formatStatus(
     `# ${escapeMarkdownInline(state.config.project)}`,
     "",
     `Tickets: ${state.completeLeafTicketCount}/${state.leafTicketCount} complete, ${state.blockedCount} blocked`,
-    `Issues: ${state.activeIssueCount} open`,
+    issueLine(state),
     `Notes: ${state.activeNoteCount} active, ${state.archivedNoteCount} archived`,
     `Lessons: ${state.activeLessonCount} active, ${state.deprecatedLessonCount} deprecated`,
     `Handovers: ${state.handoverFilenames.length}`,
@@ -811,6 +894,17 @@ export function formatFederatedStatus(
   // T-473: appended last, matching `formatStatus`'s placement, same reasons.
   arrangements: StatusArrangements = { items: [], warnings: [] },
 ): string {
+  // NO ISSUE-FLOW LINE HERE, deliberately, and this comment is the plan's
+  // "or an explicit comment saying why not".
+  //
+  // The window is computed from `discoveredDate` and `resolvedDate` on issue
+  // RECORDS. This function receives `FederationState` and `Config`, never a
+  // `ProjectState`, and a federated node reaches it as a scan summary carrying
+  // `issueCount` and `openIssues` -- COUNTS, not dated records. A window cannot
+  // be derived from a count, and summing per-node counts into a "+N opened"
+  // would be a fabricated number of exactly the kind this whole ticket exists to
+  // prevent. Delivering it properly means re-scanning each node's issue files,
+  // which is a separate change and is not in this cut.
   const sanitizedNodes = fedState.nodes.map((node) => ({
     name: node.name,
     rawPath: node.rawPath,
@@ -1556,9 +1650,10 @@ export function formatArrangement(
   arrangement: Arrangement,
   format: OutputFormat,
   citedRulings: readonly CitationResolution[] = [],
+  coordination?: DuetView,
 ): string {
   if (format === "json") {
-    return JSON.stringify(successEnvelope({ ...arrangement, citedRulings: citedRulingsForJson(citedRulings) }), null, 2);
+    return JSON.stringify(successEnvelope({ ...arrangement, citedRulings: citedRulingsForJson(citedRulings), ...(coordination && { state: coordination.state, route: coordination.route }) }), null, 2);
   }
   const parties = arrangement.parties.map((p) => `${p.role} (${p.client})`).join(", ");
   const lines: string[] = [
@@ -1568,7 +1663,27 @@ export function formatArrangement(
     `Parties: ${escapeMarkdownInline(parties)}`,
     `Unreachability (irreversible): ${arrangement.unreachability.onIrreversibleWork}`,
   ];
+  if (coordination) lines.push("", ...duetCoordinationLines(coordination));
   return lines.join("\n") + formatCitedRulingsSection(citedRulings);
+}
+
+function duetCoordinationLines(view: DuetView): string[] {
+  const safe = (text: string) => escapeMarkdownDocumentStrict(sanitizeDisplayText(text));
+  const lines = [`Communication: ${safe(view.route.status)}${view.route.mode ? ` (${safe(view.route.mode)})` : ""}`];
+  if (view.route.reason) lines.push(safe(view.route.reason));
+  if (view.state) {
+    lines.push(`Coordination session: ${safe(view.state.start.sessionId)}; revision: ${view.state.revision}`, `Handshake nonce: ${safe(view.state.nonce)}`);
+    for (const assignment of view.state.assignments.slice(0, 20)) {
+      lines.push(`- ${safe(assignment.input.id)}: ${safe(assignment.status)}; ${safe(assignment.input.scope.slice(0, 240))}`);
+    }
+    if (view.state.assignments.length > 20) lines.push(`(${view.state.assignments.length - 20} more assignments)`);
+    lines.push("Full runtime, events, obligations and cursors: arrangement get with format json. Route readiness does not grant write authority.");
+  }
+  return lines;
+}
+
+export function formatDuetCoordination(view: DuetView, format: OutputFormat): string {
+  return format === "json" ? JSON.stringify(successEnvelope(view), null, 2) : formatArrangement(view.arrangement, format, [], view);
 }
 
 export function formatArrangementList(
@@ -1989,6 +2104,10 @@ export function formatInitResult(
   if (result.warnings.length > 0) {
     lines.push("", `Warning: ${result.warnings.length} corrupt file(s) found. Run \`storybloq validate\` to inspect.`);
   }
+  // T-487: REVIEW.md is deliberately NOT written here. A review contract nobody
+  // agreed to is worse than none, so the setup flow proposes it and the user
+  // edits or rejects it before it lands. Say so, or its absence reads as a bug.
+  lines.push("", "Note: REVIEW.md (the review contract) is not created here. Run the storybloq skill and it proposes one you can edit before it lands.");
   lines.push("", "Tip: Run `storybloq setup --client all` to install the Storybloq skill, MCP, and hooks.");
   return lines.join("\n");
 }
@@ -2061,11 +2180,16 @@ export function formatRecap(
     lines.push("No snapshot found. Run `storybloq snapshot` to enable session diffs.");
     lines.push("");
     lines.push(`Tickets: ${state.completeLeafTicketCount}/${state.leafTicketCount} complete, ${state.blockedCount} blocked`);
-    lines.push(`Issues: ${state.activeIssueCount} open`);
+    lines.push(issueLine(state));
   } else {
     lines.push(`# ${escapeMarkdownInline(state.config.project)} -- Recap`);
     lines.push("");
     lines.push(`Since snapshot: ${recap.snapshot.createdAt}`);
+    // The SAME line status prints, on BOTH recap branches. It was wired only
+    // into the no-snapshot fallback below, so the branch a reader actually
+    // reaches -- the one with a snapshot -- never showed it, and the plan
+    // recorded the line as delivered on the strength of the other branch.
+    lines.push(issueLine(state));
     if (recap.partial) {
       lines.push("**Note:** Snapshot was taken from a project with integrity warnings. Diff may be incomplete.");
     }
@@ -2218,7 +2342,27 @@ export function formatRecap(
     lines.push(`- **Recently cleared:** ${actions.recentlyClearedBlockers.map(escapeMarkdownInline).join(", ")}`);
   }
 
-  if (!actions.nextTicket && actions.highSeverityIssues.length === 0 && actions.recentlyClearedBlockers.length === 0) {
+  // ISSUE-FLOW NUDGE. Fires on the RECORD-DATE BALANCE and says so in the same
+  // breath, because the two are not the same claim: a single `resolvedDate`
+  // cannot represent a close-reopen-close cycle and a deleted issue leaves no
+  // record at all, so this balance and the open backlog can move in opposite
+  // directions. Asserting backlog growth here would be a claim the records do
+  // not support.
+  //
+  // NULL means the issue records were not available to this caller, and that is
+  // NOT a balance of zero: no line, no nudge.
+  const nudgeFlow = statusIssueFlow(state);
+  const nudged = nudgeFlow !== null && nudgeFlow.net > 0;
+  if (nudged) {
+    lines.push(
+      `- **Issue flow:** ${nudgeFlow.opened} opened / ${nudgeFlow.resolved} resolved `
+      + `in the last ${nudgeFlow.windowDays}d by record date (net +${nudgeFlow.net}). `
+      + "That is a balance of record dates among retained issues, NOT a change in "
+      + "the open backlog.",
+    );
+  }
+
+  if (!actions.nextTicket && actions.highSeverityIssues.length === 0 && actions.recentlyClearedBlockers.length === 0 && !nudged) {
     lines.push("- No urgent actions.");
   }
 
@@ -2624,6 +2768,35 @@ export function formatReference(
   lines.push("Destructive, admin, and git-integration workflows (delete, reconcile, conflicts, resolve, merge-driver, team, gc, repair, config, feedback) are CLI-only in both modes; see the CLI Commands section above.");
 
   lines.push("");
+  lines.push("## Review verdict artifacts");
+  lines.push("");
+  lines.push("Every review round writes a JSON artifact to `.story/sessions/<sessionId>/telemetry/reviews/`. The filename is `<target>-<stage>-r<round>.json`, and `-g<generation>` is appended once a round belongs to a generation above the first. The generation is a SUFFIX so the `*-code-r*.json` glob external readers already use keeps matching; it is also carried in the payload, so no reader has to parse a filename to know it.");
+  lines.push("");
+  lines.push("A generation opens whenever the round numbering restarts -- a plan redirect out of code review, or a plan-review reject. Before generations existed, the restarted rounds reproduced existing filenames and were silently dropped; artifacts under one target can therefore still be a mixture of two generations that predate this field.");
+  lines.push("");
+  lines.push("### Joining a round to what produced it");
+  lines.push("");
+  lines.push("`backendRunId` carries the backend's own run id and `backendRunIdKind` says what that id is the id OF, which is what decides how precisely a round can be joined:");
+  lines.push("");
+  lines.push("| `backendRunIdKind` | scope of the run id | join is `exact` when |");
+  lines.push("|---|---|---|");
+  lines.push("| `codex-session` | a thread spanning many turns | `backendTurnId` is also present |");
+  lines.push("| `agent-dispatch` | one dispatch, already a single turn | always -- the dispatch id is turn-precise |");
+  lines.push("| `lens-review` | one review invocation | always -- the review id is the invocation |");
+  lines.push("");
+  lines.push("A `backendTurnId` without its parent `backendRunId` joins nothing and reads as `none`, and so does a record carrying neither. ABSENCE IS NEVER READ AS `exact`. Join quality is deliberately not a stored field: it is derived from these ids on every read, because a stored copy can contradict the ids it summarizes.");
+  lines.push("");
+  lines.push("`reviewAttemptId` identifies one round across all three of its sinks (the state record, this artifact, and the events log); `itemAttemptId` identifies one attempt at one work item across every round of it. Events are best-effort and may duplicate after a crash, so deduplicate by `reviewAttemptId`.");
+  lines.push("");
+  lines.push("`generation` has TWO readings and `itemAttemptId` is what tells them apart. Where `itemAttemptId` is present, the generation is attempt-scoped lineage: it advances when a redirect restarts the round numbering, so rounds of one attempt at different generations are different rounds and counting distinct generations counts replans. Where `itemAttemptId` is ABSENT, the round had no work item, there is no lineage for the number to describe, and the generation is only a filename discriminator. Rounds with no work item all share the `unknown` filename stem, so two unrelated sequences can meet at one path and one of them is advanced to avoid overwriting the other. Do not count generations as attempts on records that carry no `itemAttemptId`.");
+  lines.push("");
+  lines.push("### Reading absent values");
+  lines.push("");
+  lines.push("Every field in this spine is optional, and an absent one means the value was not recorded -- never that it was measured and came back empty. Absence does NOT date a record: a round written today omits `backendRunId` and `backendTurnId` when the backend supplied none, and omits `workItemId` and `itemAttemptId` when the round had no work item at all, so an absent field is not evidence that the record predates the field. Three cases are worth naming because they are easy to misread. An absent `normalizerVersion` means the severities may not be normalized at all, so a `blocking` severity is possible. An absent `artifactStatus` means the artifact's existence is UNKNOWN; it never means the artifact is missing, and it never means one exists. And `reviewerIdentity.evidence` distinguishes what was OBSERVED to run from what was merely CONFIGURED to run -- a pin recorded as `configured` is evidence of intent and never of execution, which is why `unknown`/`none` is a valid and preferred record rather than a guessed model name.");
+  lines.push("");
+  lines.push("`payloadConsistent` records whether a verdict agreed with the findings it carried. Reading its rate needs care: change-requesting verdicts with zero findings are now repaired before they become rounds, so they are counted in `reviewRepairAttempts` instead. Those are two separate populations and must never be summed.");
+
+  lines.push("");
   lines.push("## /story design");
   lines.push("");
   lines.push("Evaluate frontend code against platform-specific design best practices.");
@@ -2669,6 +2842,10 @@ export function formatReference(
   lines.push("```");
   lines.push("");
   lines.push("Read `bus-mode.md` for setup, endpoint binding, authority boundaries, acknowledgments, deterministic convergence, and the v1 no-wake boundary.");
+  lines.push("");
+  lines.push("## /story duet");
+  lines.push("");
+  lines.push("Coordinate an owner-paired manager and worker with a proved return route and durable assignments. Read `duet-mode.md`. `/story duet` (Codex: `$story duet`) is a skill route, not a CLI command; it does not create tasks or enable Bus.");
   lines.push("");
   lines.push("## Common Workflows");
   lines.push("");

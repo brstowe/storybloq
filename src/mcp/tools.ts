@@ -17,6 +17,7 @@ import { TARGET_WORK_INPUT_REGEX, LENS_FINDING_DISPOSITIONS, OwnerGoneCandidateT
 import { CLIENT_TASK_ID_PATTERN } from "../autonomous/client-profile.js";
 import { evaluateSessionGuard } from "../core/session-guard.js";
 import { findActiveSessionMinimal, readSessionResilient, sessionDir, isLeaseExpired, withSessionLock } from "../autonomous/session.js";
+import { citationsForReviewTarget } from "../autonomous/cited-rulings.js";
 import { withStalenessNote } from "../autonomous/binary-staleness.js";
 import { touchLastMcpCallFile } from "../autonomous/liveness.js";
 import { registerBusTools } from "./bus-tools.js";
@@ -134,7 +135,9 @@ import {
   handleArrangementCreate,
   handleArrangementUpdate,
 } from "../cli/commands/arrangement.js";
-import { ARRANGEMENT_ROLES, ARRANGEMENT_LIFECYCLE, type ArrangementParty } from "../models/arrangement.js";
+import { ARRANGEMENT_ROLES, ARRANGEMENT_LIFECYCLE, ArrangementPartySchema, type ArrangementParty } from "../models/arrangement.js";
+import { DuetOperationSchema } from "../models/duet.js";
+import { handleDuetCoordinate } from "../cli/commands/duet.js";
 // T-476 section 11: unlike T-473/T-474, the ratified plan calls for all four
 // verbs on MCP (`storybloq_ruling_{create,get,list,supersede}`) -- citation
 // resolution is meant to be discoverable without shelling out to the CLI.
@@ -323,7 +326,16 @@ export async function runMcpWriteTool(
       };
     }
 
-    const text = boardLabel ? `${result.output}\n\nBoard: ${boardLabel}` : result.output;
+    let text = boardLabel ? `${result.output}\n\nBoard: ${boardLabel}` : result.output;
+    // ISS-1117: unlike runMcpReadTool, this pipeline never surfaced
+    // handler-produced `CommandResult.warnings` to the MCP caller -- a
+    // write handler's warning (e.g. arrangement create's identityAnchor
+    // shape warning) would reach here and then be silently dropped. Mirrors
+    // runMcpReadTool's own `handlerWarnings` prefix block.
+    const handlerWarnings = result.warnings ?? [];
+    if (handlerWarnings.length > 0) {
+      text = `Warning: ${handlerWarnings.join("; ")}\n\n${text}`;
+    }
     return { content: [{ type: "text", text }] };
   } catch (err: unknown) {
     if (err instanceof ProjectLoaderError) {
@@ -809,7 +821,7 @@ export function registerAllTools(rawServer: McpServer, pinnedRoot: string): void
       phase: z.string().optional().describe("Phase ID (defaults to the current working phase if omitted)"),
       description: z.string().optional().describe("Ticket description"),
       blockedBy: z.array(TicketRefSchema).optional().describe("IDs of blocking tickets"),
-      parentTicket: TicketRefSchema.optional().describe("Parent ticket ID (makes this a sub-ticket)"),
+      parentTicket: TicketRefSchema.optional().describe("Makes this a sub-ticket"),
       project: z.string().optional().describe("Project ID to assign (must belong to the ticket's phase)"),
       citesRuling: z.array(RulingIdSchema).optional().describe("Ruling IDs this ticket cites"),
       node: nodeParam,
@@ -959,9 +971,9 @@ export function registerAllTools(rawServer: McpServer, pinnedRoot: string): void
       components: z.array(z.string()).optional(),
       relatedTickets: z.array(TicketRefSchema).optional(),
       location: z.array(z.string()).optional().describe("File locations"),
-      sourceRefs: z.array(IssueSourceRefInputSchema).optional().describe("Replacement structured source provenance"),
+      sourceRefs: z.array(IssueSourceRefInputSchema).optional().describe("Replaces existing source refs"),
       order: z.number().int().optional().describe("New sort order"),
-      phase: z.string().nullable().optional().describe("New phase ID (null to clear)"),
+      phase: z.string().nullable().optional().describe("Phase ID; null clears the phase"),
       project: z.string().nullable().optional().describe("Project ID to assign (must belong to the issue's phase; null to clear)"),
       citesRuling: z.array(RulingIdSchema).optional().describe("Replaces existing cited rulings. Mutually exclusive with clearCitesRulings."),
       clearCitesRulings: z.boolean().optional().describe("Clear all cited rulings"),
@@ -1081,6 +1093,10 @@ export function registerAllTools(rawServer: McpServer, pinnedRoot: string): void
   ));
 
   // --- Arrangement tools ---
+  server.registerTool("storybloq_arrangement_coordinate", {
+    description: "Persist pen-observed duet state. Requires current session/revision; only the bound pen may write. Receipt evidence is attributed, not authentication.",
+    inputSchema: { operation: DuetOperationSchema },
+  }, async (args) => ({ ...await runMcpWriteTool(pinnedRoot, (root, format) => handleDuetCoordinate(args.operation, format, root)) }));
   // No storybloq_arrangement_list (amendment A3): storybloq_status's
   // activeArrangements summary covers MCP-side discovery. CLI `arrangement
   // list` stays for scripting.
@@ -1089,23 +1105,16 @@ export function registerAllTools(rawServer: McpServer, pinnedRoot: string): void
     description: "Get a duet/wave arrangement by ID",
     inputSchema: {
       id: ArrangementIdSchema.describe("e.g. a-[canonical]"),
+      format: z.enum(["md", "json"]).optional().describe("JSON includes the full coordination runtime; Markdown is bounded"),
     },
-  }, (args) => runMcpReadTool(pinnedRoot, (ctx) => handleArrangementGet(args.id, ctx)));
+  }, (args) => runMcpReadTool(pinnedRoot, (ctx) => handleArrangementGet(args.id, ctx), undefined, args.format ?? "md"));
 
   server.registerTool("storybloq_arrangement_create", {
-    description: "Create a new arrangement (duet/wave party charter). Authentication is out of scope: identityAnchor is a name to match, not a credential.",
+    description: "Create a new arrangement (duet/wave party charter). Authentication is out of scope: identityAnchor is a name to match, not a credential -- it must be the client task id (CLAUDE_CODE_SESSION_ID / CODEX_THREAD_ID), never a display name.",
     inputSchema: {
       bounds: z.array(z.string()).min(1).describe("Ticket/issue refs, display-form or canonical"),
       parties: z
-        .array(
-          z.object({
-            role: z.enum(ARRANGEMENT_ROLES),
-            client: z.enum(["claude", "codex"]),
-            identityAnchor: z.string().min(1).max(128),
-            modelTier: z.string().max(64).optional(),
-            provenanceLogRef: z.string().max(1024).optional(),
-          }),
-        )
+        .array(ArrangementPartySchema)
         .min(2)
         .describe("Exactly one pen and one worker party"),
       onIrreversibleWork: z.enum(["hold", "escalate"]),
@@ -1167,6 +1176,11 @@ export function registerAllTools(rawServer: McpServer, pinnedRoot: string): void
       attribution: z.enum(RULING_ATTRIBUTIONS),
       date: z.string().min(1).describe("Date the ruling was made (YYYY-MM-DD)"),
       scopeTags: z.array(z.string()).optional().describe("Free-form tags for filtering, e.g. duet-mode, N-108"),
+      cites: z.array(z.string()).optional().describe(
+        "Ticket or issue refs this ruling binds. Adds the new ruling id to each item's citesRulings, which is how " +
+        "the ruling reaches an agent working the item. Unions with existing citations; never replaces them. An " +
+        "unresolvable ref refuses the whole create.",
+      ),
       clientTaskId: z.string().max(128).optional().describe("Caller identity, if not inferable from the environment"),
     },
   }, (args) => runMcpWriteTool(pinnedRoot, (root, format) =>
@@ -1176,6 +1190,7 @@ export function registerAllTools(rawServer: McpServer, pinnedRoot: string): void
         attribution: args.attribution,
         date: args.date,
         scopeTags: args.scopeTags ?? [],
+        cites: args.cites,
         clientTaskId: args.clientTaskId,
       },
       format,
@@ -1829,7 +1844,7 @@ export function registerAllTools(rawServer: McpServer, pinnedRoot: string): void
       mode: z.enum(["auto", "review", "plan", "guided"]).optional().describe("Execution tier (start action only): auto=full autonomous, review=code review only, plan=plan+review, guided=single ticket"),
       reviewEffort: z.enum(["off", "light", "standard", "thorough"]).optional().describe("Start action only. Default: mapped per item from type and risk. Per-item reviewEffort metadata still wins; explicit project stage knobs always win."),
       ticketId: z.string().optional().describe("Ticket ID for tiered modes (review, plan, guided). Required for non-auto modes."),
-      targetWork: z.array(z.string().regex(TARGET_WORK_INPUT_REGEX)).max(150).optional().describe("For start action only: array of T-XXX / ISS-XXX IDs and/or project ids (from roadmap.projects) to work on in order -- a project id expands to its remaining tickets and issues. Empty or omitted = standard auto mode."),
+      targetWork: z.array(z.string().regex(TARGET_WORK_INPUT_REGEX)).max(150).optional().describe("Start action only. T-XXX and ISS-XXX IDs in work order, and/or project ids (from roadmap.projects) -- a project id expands to its remaining tickets and issues. Empty or omitted = standard auto mode."),
       report: z.object({
         completedAction: z.string(),
         ticketId: z.string().optional().describe("For ticket_picked"),
@@ -1878,6 +1893,58 @@ export function registerAllTools(rawServer: McpServer, pinnedRoot: string): void
             "'deferred' = valid but out of scope, AUTO-FILES a storybloq issue " +
             "(severity 'suggestion' is exempt).",
           ),
+          // ISS-1115 D4: provenance, on axes separate from `disposition`.
+          // Optional so round 1 and every existing caller are unaffected.
+          //
+          // DELIBERATELY TERSE. The full taxonomy, and the rule that
+          // `reintroduced` still blocks, ship in the round context packet's
+          // ORIGIN_RULE, which is in the mandatory payload of EVERY round on
+          // all three reviewer routes and survives every budget. Restating it
+          // here cost ~1KB on a tools/list payload sent to every client on
+          // every connection, to tell a reviewer in advance what it is told
+          // again at the moment it reports. See T-460's ratchet below.
+          // T-487: the principle this finding violates, per the project's
+          // review contract. TOLERANT ON PURPOSE, and the shape matters.
+          //
+          // A `z.string().min(1)` here, or a bare `.transform` on a string
+          // schema, REJECTS the value before it can be normalized -- and a
+          // rejection at this boundary is a -32602 for the WHOLE report, so a
+          // reviewer sending `principle: ""` would cost a review round over a
+          // cosmetic slip. `z.preprocess` over `unknown` absorbs instead:
+          // non-strings and blanks become absent, everything else is trimmed
+          // and lowercased to match how `projectDecision` keys the contract.
+          principle: z.preprocess(
+            (v) => {
+              if (typeof v !== "string") return undefined;
+              const trimmed = v.trim().toLowerCase();
+              return trimmed === "" ? undefined : trimmed;
+            },
+            z.string().optional(),
+          ).describe(
+            "The review-contract principle this finding violates, lowercase. " +
+            "Omit it when no principle fits; omitting is how you say 'names none'.",
+          ),
+          // T-487: `lensIdsOf` in review-contract.ts reads `contributingLenses`
+          // and nothing else, and this object has no `.passthrough()`, so
+          // without this key the array is STRIPPED here and a merged lens
+          // finding reaches the contract evaluator with no lens ids at all.
+          // Coverage then falls back to category (the unreliable half) and the
+          // config exemption keyed on lens ids silently stops matching. Same
+          // additive fix ISS-724 made for `lens`, for the same reason.
+          contributingLenses: z.array(z.string()).optional(),
+          dispositionReason: z.string().optional().describe(
+            "Why this disposition; for 'deferred', 'owner-accepted-risk' or 'valid-deferred'.",
+          ),
+          origin: z.enum(["introduced", "pre-existing"]).optional().describe(
+            "Did this diff introduce the defect? Absent is read as 'introduced'.",
+          ),
+          originClass: z.enum(["new", "reintroduced", "unchanged", "introduced-by-fix"])
+            .optional().describe(
+              "Relation to earlier rounds. 'reintroduced' STILL BLOCKS; it is not an amnesty.",
+            ),
+          sinceRound: z.number().int().positive().optional().describe(
+            "With originClass 'unchanged': the round it has been unchanged since.",
+          ),
           // ISS-717: previously omitted from this schema, so the SDK stripped it
           // and the PLAN-redirect guard in the review stages was unreachable.
           recommendedNextState: z.enum(["PLAN", "IMPLEMENT"]).optional().describe(
@@ -1888,6 +1955,25 @@ export function registerAllTools(rawServer: McpServer, pinnedRoot: string): void
         reviewerSessionId: z.string().optional().describe("Codex session ID"),
         reviewer: z.string().optional().describe("Actual reviewer backend used, e.g. 'agent' when codex was unavailable"),
         reviewId: z.string().optional().describe("From review_lenses_prepare/synthesize; pass on lens-backed review_round reports (ISS-720)."),
+        // T-488 provenance. Optional, never inferred: with none supplied the
+        // round records source "unknown", evidence "none", which is truthful.
+        //
+        // Deliberately NEARLY UNDESCRIBED, under the T-460 rule these fields
+        // would otherwise break: every byte here is paid on every tools/list by
+        // every client, and the full guidance already lives in
+        // autonomous-mode.md and `storybloq reference`, which are read once by
+        // whoever needs it rather than shipped to everyone forever.
+        reviewerModel: z.string().optional().describe("Model the reviewer ran on, if known. Omit rather than guess."),
+        reviewerTier: z.string().optional(),
+        reviewerSource: z.enum(["explicit-pin", "session-default"]).optional(),
+        reviewerEvidence: z.enum(["observed", "configured"]).optional().describe(
+          "'observed' only if the backend reported what ran; a pin you sent is 'configured'.",
+        ),
+        reviewerTurnId: z.string().optional(),
+        implementerModel: z.string().optional().describe("Model IMPLEMENT ran on; pass with implementation_done."),
+        implementerTier: z.string().optional(),
+        implementerSource: z.enum(["explicit-pin", "session-default"]).optional(),
+        implementerEvidence: z.enum(["observed", "configured"]).optional(),
         notes: z.string().optional(),
       }).optional().describe("Required for report action"),
     },
@@ -1906,6 +1992,26 @@ export function registerAllTools(rawServer: McpServer, pinnedRoot: string): void
     });
   });
 
+  /**
+   * T-494: the item a lens review is about, from the session's own state.
+   *
+   * Read resiliently and best-effort: a session that cannot be read is not a
+   * reason to refuse a review, it is a reason to deliver no citations, which is
+   * the same outcome as a review that names no item.
+   */
+  function sessionItemRef(dir: string | undefined): string | undefined {
+    if (!dir) return undefined;
+    try {
+      // No assertion on the parsed state: the real type is what makes a rename
+      // of either field a compile error here rather than a silent stop to
+      // delivery, which is the failure this whole scope exists to fix.
+      const state = readSessionResilient(dir);
+      return state?.ticket?.id ?? state?.currentIssue?.id ?? undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   // ── T-189: Multi-lens review MCP tools ─────────────────────
 
   server.registerTool("storybloq_review_lenses_prepare", {
@@ -1918,14 +2024,37 @@ export function registerAllTools(rawServer: McpServer, pinnedRoot: string): void
       reviewRound: z.number().int().min(1).optional(),
       priorDeferrals: z.array(z.string()).optional().describe("issueKeys of findings deferred in prior rounds"),
       sessionId: z.string().uuid().optional().describe("Persists the round's cache and anchoring artifact for synthesize. Pass the same sessionId, reviewRound, and returned reviewId to synthesize."),
+      target: z.string().optional().describe("Ticket or issue under review; its cited rulings reach every lens. Defaults to the session's item."),
     },
-  }, (args) => {
+  }, async (args) => {
     try {
       const { dir: sDir, unknownId } = resolveGatedSessionDir(args.sessionId);
       if (unknownId) {
         return { content: [{ type: "text" as const, text: withStalenessNote(`Error: session ${unknownId} not found or corrupt`) }], isError: true };
       }
-      const result = handlePrepare({ ...args, projectRoot: pinnedRoot, sessionDir: sDir });
+      // T-494: the delivery wiring. `handlePrepare` accepts resolved citations
+      // but resolves nothing itself, so without this the lens prompts carry no
+      // rulings, the undelivered set is always empty, and the verdict hold can
+      // never fire -- the whole mechanism would be inert in production while
+      // its unit tests passed. The target is named explicitly or taken from the
+      // session's current item.
+      const target = args.target ?? sessionItemRef(sDir);
+      const citations = target ? await citationsForReviewTarget(pinnedRoot, target) : null;
+      const result = handlePrepare({
+        ...args,
+        projectRoot: pinnedRoot,
+        sessionDir: sDir,
+        ...(citations?.kind === "resolved" ? { citedRulings: citations.citations } : {}),
+        // A NAMED target whose citations could not be resolved is reported,
+        // never swallowed. It goes THROUGH handlePrepare rather than being
+        // attached to the returned payload here, so the reason reaches the lens
+        // prompts and the round's metadata by one route instead of reaching
+        // only the agent that made the call. It is reported rather than thrown
+        // because a lens review is context packaging, not an acceptance gate:
+        // refusing would stop a review the reviewer can still perform. A review
+        // that names no item at all owes no rulings and is silent.
+        ...(citations?.kind === "unavailable" ? { citedRulingsUnavailable: citations.reason } : {}),
+      });
       return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
     } catch (err) {
       const msg = err instanceof Error ? err.message.replace(/\/[^\s]+/g, "<path>") : "unknown error";
@@ -1950,6 +2079,7 @@ export function registerAllTools(rawServer: McpServer, pinnedRoot: string): void
       diff: z.string().optional().describe("Without it, findings are not evidence-anchored (unless prepare persisted an artifact) and not classified introduced vs pre-existing."),
       changedFiles: z.array(z.string()).optional(),
       sessionId: z.string().uuid().optional().describe("Enables anchoring against prepare's artifact and dedup of auto-filed pre-existing issues across rounds."),
+      citedRulingsUndelivered: z.record(z.string(), z.array(z.string())).optional().describe("Echo prepare's metadata field. Required without sessionId, or the delivery hold is lost."),
     },
   }, async (args) => {
     try {
@@ -1982,6 +2112,13 @@ export function registerAllTools(rawServer: McpServer, pinnedRoot: string): void
           skippedLenses: args.skippedLenses,
           reviewRound: args.reviewRound ?? 1,
           reviewId: args.reviewId ?? "unknown",
+          // T-494: the ONLY route a delivery failure has on a sessionless
+          // review. With a sessionId, prepare persisted it and synthesize reads
+          // it back from harness meta; without one there is nothing on disk, so
+          // an unechoed map means the hold silently does not exist. Synthesize
+          // UNIONS this with whatever it read, so echoing it can only ever add
+          // a hold, never clear one.
+          ...(args.citedRulingsUndelivered ? { citedRulingsUndelivered: args.citedRulingsUndelivered } : {}),
         },
         projectRoot: pinnedRoot,
         sessionId: args.sessionId,

@@ -1061,6 +1061,11 @@ describe("setup-skill", () => {
     expect(tsContent).toContain('"orchestrator-mode.md"');
     expect(tsContent).toContain('"triage-mode.md"');
     expect(tsContent).toContain('"bus-mode.md"');
+    expect(tsContent).toContain('"duet-mode.md"');
+    // T-487: setup-flow.md reads this template at emission time. Left out of
+    // the allow-list it would simply not be installed, and the setup flow would
+    // report a missing file instead of writing a review contract.
+    expect(tsContent).toContain('"review-contract-template.md"');
   });
 
   it("setup-skill.ts handles subdirectory skills with copyDirRecursive", async () => {
@@ -2518,6 +2523,24 @@ describe("--skip-skill (ISS-834)", () => {
     const { handleSetup } = await import("../../../src/cli/commands/setup-skill.js");
     await handleSetup({ client: "codex", skipHooks: true });
     expect(existsSync(codexSkillMd())).toBe(true);
+  });
+
+  it.each(["claude", "codex"] as const)("installs the duet guide for %s into an isolated home (ISS-1155, ISS-1144)", async (client) => {
+    if (process.platform === "win32") return;
+    // Seed the legacy Codex copy so its refresh is verified too. All setup
+    // destinations and executable discovery are isolated by this fixture.
+    const compatDir = join(tempDir, ".codex", "skills", "story");
+    await mkdir(compatDir, { recursive: true });
+    await writeFile(join(compatDir, "SKILL.md"), "old skill", "utf-8");
+    const { handleSetup } = await import("../../../src/cli/commands/setup-skill.js");
+    await handleSetup({ client, skipHooks: true });
+    const installed = join(tempDir, client === "claude" ? ".claude" : ".agents", "skills", "story", "duet-mode.md");
+    expect(existsSync(installed), `${client} setup omitted duet-mode.md`).toBe(true);
+    const source = await readFile(join(PROJECT_ROOT, "src", "skill", "duet-mode.md"), "utf-8");
+    expect(await readFile(installed, "utf-8")).toBe(source);
+    if (client === "codex") {
+      expect(await readFile(join(compatDir, "duet-mode.md"), "utf-8")).toBe(source);
+    }
   });
 
   it("--client claude is unaffected by skipSkill (D1 regression guard)", async () => {

@@ -238,10 +238,57 @@ export const COMMANDS: readonly CommandEntry[] = [
     usage: "storybloq lesson reinforce <id> [--format json|md]",
   },
   {
+    // Fork: storyknow knowledge packs.
+    name: "lesson promote",
+    description: "Promote a lesson into an attached storyknow knowledge pack (fork). The pack gains a K-entry (reinforcement count carried, origin stamped); the local lesson is superseded with a pointer.",
+    usage: "storybloq lesson promote <id> --to <pack-name-or-path> [--force] [--format json|md]",
+    flags: ["--to", "--force"],
+  },
+  {
     name: "lesson delete",
     description: "Delete a lesson",
     usage: "storybloq lesson delete <id> [--hard] [--format json|md]",
     flags: ["--hard"],
+  },
+  {
+    // Fork: storyknow knowledge packs. One entry documents the whole subcommand
+    // group -- the pack/consumer split is the thing a reader needs, not seven
+    // near-identical headings.
+    name: "knowledge (storyknow packs, fork)",
+    description: 'Manage shared K-NNN knowledge entries inside a knowledge pack (a project created with `storybloq init --type knowledge`). Consumer projects attach packs via the `knowledge: ["<name-or-path>"]` config key (bare names resolve under `$STORYKNOW_HOME`, default `~/dev/storyknow`); attached entries appear in `lesson digest` marked `[<pack>]`. `knowledge digest` is dual-mode: inside a pack it digests the pack\'s own entries; inside a consumer project it digests all attached knowledge.',
+    usage: [
+      "storybloq knowledge list [--status <s>] [--tag <t>] [--source <src>] [--format json|md]",
+      "storybloq knowledge get <id> [--format json|md]",
+      "storybloq knowledge digest [--format json|md]",
+      "storybloq knowledge create --title <t> --content <c> --context <ctx> --source <src> [--tags <tags>] [--supersedes <id>]",
+      "storybloq knowledge update <id> [--title <t>] [--content <c>] [--context <ctx>] [--tags <tags>] [--status <s>]",
+      "storybloq knowledge reinforce <id>",
+      "storybloq knowledge delete <id>",
+    ].join("\n"),
+  },
+  {
+    name: "ruling list",
+    description: "List owner-ruling attestation records",
+    usage: "storybloq ruling list [--scope-tag <tag>] [--superseded] [--format json|md]",
+    flags: ["--scope-tag", "--superseded"],
+  },
+  {
+    name: "ruling get",
+    description: "Get a ruling by ID",
+    usage: "storybloq ruling get <id> [--format json|md]",
+    flags: [],
+  },
+  {
+    name: "ruling create",
+    description: "Record a ruling verbatim and cite it from the tickets or issues it binds",
+    usage: "storybloq ruling create --text <text> --attribution <source> --date <YYYY-MM-DD> [--scope-tag <tag>] [--cites <item>] [--format json|md]",
+    flags: ["--text", "--attribution", "--date", "--scope-tag", "--cites"],
+  },
+  {
+    name: "ruling supersede",
+    description: "Supersede a ruling: link an existing one with --with, or record a new superseding ruling",
+    usage: "storybloq ruling supersede <id> (--with <id> | --text <text> --attribution <source> --date <YYYY-MM-DD>) [--scope-tag <tag>] [--format json|md]",
+    flags: ["--with", "--text", "--attribution", "--date", "--scope-tag"],
   },
   {
     name: "validate",
@@ -539,9 +586,13 @@ export const MCP_TOOLS: readonly McpToolEntry[] = [
   { name: "storybloq_lesson_create", description: "Create lesson", params: ["title", "content", "context", "source", "tags?", "supersedes?"] },
   { name: "storybloq_lesson_update", description: "Update lesson", params: ["id", "title?", "content?", "context?", "tags?", "status?", "supersedes?"] },
   { name: "storybloq_lesson_reinforce", description: "Reinforce lesson: increment count and update lastValidated", params: ["id"] },
+  { name: "storybloq_ruling_list", description: "List rulings, optionally filtered by scope tag or superseded state", params: ["scopeTag?", "superseded?"] },
+  { name: "storybloq_ruling_get", description: "Get a ruling by ID", params: ["id"] },
+  { name: "storybloq_ruling_create", description: "Record a ruling verbatim; cites adds its id to each named ticket or issue in the same transaction", params: ["text", "attribution", "date", "scopeTags?", "cites?"] },
+  { name: "storybloq_ruling_supersede", description: "Supersede a ruling: link an existing one with `with`, or record a new superseding ruling", params: ["id", "with?", "text?", "attribution?", "date?", "scopeTags?"] },
   { name: "storybloq_selftest", description: "Integration smoke test: create/update/delete cycle" },
-  { name: "storybloq_review_lenses_prepare", description: "Prepare multi-lens review on @storybloq/lenses: activation, secrets gate, context packaging, complete lens prompts", params: ["stage", "diff", "changedFiles", "ticketDescription?", "reviewRound?", "priorDeferrals?", "sessionId?"] },
-  { name: "storybloq_review_lenses_synthesize", description: "Run the @storybloq/lenses merger pipeline programmatically over raw lens outputs; returns the ReviewVerdict envelope (no merger agent)", params: ["stage?", "lensResults", "activeLenses", "skippedLenses", "reviewRound?", "reviewId?", "diff?", "changedFiles?", "sessionId?"] },
+  { name: "storybloq_review_lenses_prepare", description: "Prepare multi-lens review on @storybloq/lenses: activation, secrets gate, context packaging, cited-ruling delivery, complete lens prompts", params: ["stage", "diff", "changedFiles", "ticketDescription?", "reviewRound?", "priorDeferrals?", "sessionId?", "target?"] },
+  { name: "storybloq_review_lenses_synthesize", description: "Run the @storybloq/lenses merger pipeline programmatically over raw lens outputs; returns the ReviewVerdict envelope (no merger agent). Echo prepare's citedRulingsUndelivered here; without a sessionId it is the only route a delivery hold has", params: ["stage?", "lensResults", "activeLenses", "skippedLenses", "reviewRound?", "reviewId?", "diff?", "changedFiles?", "sessionId?", "citedRulingsUndelivered?"] },
   { name: "storybloq_review_lenses_judge", description: "Deterministic three-value verdict mapping over the synthesize ReviewVerdict plus convergence history (no judge agent)", params: ["reviewVerdict", "convergenceHistory?"] },
   { name: "storybloq_autonomous_guide", description: "Autonomous session orchestrator -- call at every decision point to drive PICK_TICKET through COMPLETE", params: ["sessionId?", "action", "mode?", "ticketId?", "clientTaskId?", "takeover?", "reviewEffort?"] },
   { name: "storybloq_session_guard", description: "Session ownership verdict: is anything running, and may I write? Reads only .story/sessions/, no ledger load. Also registered in degraded mode", params: ["clientTaskId?"] },

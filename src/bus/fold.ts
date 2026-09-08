@@ -146,6 +146,21 @@ async function readRedeliverMarker(
 // otherwise satisfying every structural/content/authorship check above,
 // could report markerState "verified" and disposition "redelivered",
 // incorrectly clearing a critical refusal at the ship gate.
+export type AutomaticParkTriggerClassification = "hop_cap" | "duplicate_fingerprint" | "unknown";
+
+/**
+ * Classifies an automatic park's trigger, never normalizing an absent or
+ * unrecognized value to a specific cause (ISS-1161). Callers gate on
+ * `automatic === true` themselves before calling this -- it interprets the
+ * TRIGGER only, given a park already known to be automatic.
+ */
+export function classifyAutomaticParkTrigger(
+  trigger: string | undefined,
+): AutomaticParkTriggerClassification {
+  if (trigger === "hop_cap" || trigger === "duplicate_fingerprint") return trigger;
+  return "unknown";
+}
+
 export async function verifiedSuccessorState(
   paths: BusPaths,
   marker: z.infer<typeof BusRedeliverMarkerSchema>,

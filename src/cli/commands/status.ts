@@ -11,6 +11,7 @@ import type { LimitStopSummary } from "../../core/limit-ledger.js";
 import { busSummary } from "../../bus/store.js";
 import { BusError } from "../../bus/errors.js";
 import { loadArrangementsSafe } from "../../core/arrangement-loader.js";
+import { readDuetCoordination } from "../../core/duet-coordination.js";
 import { TICKET_ID_REGEX, TICKET_CANONICAL_ID_REGEX, ISSUE_ID_REGEX, ISSUE_CANONICAL_ID_REGEX } from "../../models/types.js";
 import { sanitizeDisplayText } from "../../core/display-text.js";
 import type { ProjectState } from "../../core/project-state.js";
@@ -141,6 +142,7 @@ async function buildStatusArrangements(root: string, state: ProjectState): Promi
   }
   return {
     items: active.map((a) => ({
+      route: readDuetCoordination(root, a).route,
       id: a.id,
       lifecycle: a.lifecycle,
       bounds: a.bounds,

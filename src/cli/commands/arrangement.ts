@@ -1,13 +1,13 @@
 import { withProjectLock, writeTicketUnlocked, writeIssueUnlocked, loadProject } from "../../core/project-loader.js";
 import { loadArrangementsSafe, writeArrangementUnlocked } from "../../core/arrangement-loader.js";
 import { isArrangementConflicted } from "../../core/arrangement-authority.js";
+import { handleDuetGet } from "./duet.js";
 import { earmarkMatchesArrangement } from "../../core/earmarks.js";
 import { generateCanonicalId } from "../../core/canonical-id.js";
 import { summarizeZodIssues, describeSchemaIssues } from "../../core/zod-issues.js";
 import { resolveNodeRoot } from "../../mcp/node-resolution.js";
 import { withOrchestratorAndItemLocks } from "../../core/orchestrator-item-lock.js";
 import {
-  formatArrangement,
   formatArrangementList,
   formatArrangementCreateResult,
   formatArrangementUpdateResult,
@@ -21,7 +21,7 @@ import {
   type ArrangementLifecycle,
   type ArrangementParty,
 } from "../../models/arrangement.js";
-import { TICKET_ID_REGEX, TICKET_CANONICAL_ID_REGEX, ISSUE_ID_REGEX, ISSUE_CANONICAL_ID_REGEX, type OutputFormat } from "../../models/types.js";
+import { TICKET_ID_REGEX, TICKET_CANONICAL_ID_REGEX, ISSUE_ID_REGEX, ISSUE_CANONICAL_ID_REGEX, looksLikeClientTaskId, type OutputFormat } from "../../models/types.js";
 import { CROSS_NODE_REF_CAPTURE_REGEX } from "../../models/ticket.js";
 import { CliValidationError } from "../helpers.js";
 import type { CommandContext, CommandResult } from "../types.js";
@@ -137,16 +137,7 @@ export function handleArrangementList(
 }
 
 export function handleArrangementGet(id: string, ctx: CommandContext): CommandResult {
-  const { arrangements } = loadArrangementsSafe(ctx.root);
-  const arrangement = arrangements.find((a) => a.id === id);
-  if (!arrangement) {
-    return {
-      output: formatError("not_found", `Arrangement ${id} not found`, ctx.format),
-      exitCode: ExitCode.USER_ERROR,
-      errorCode: "not_found",
-    };
-  }
-  return { output: formatArrangement(arrangement, ctx.format) };
+  return handleDuetGet(id, ctx);
 }
 
 // --- Write handlers ---
@@ -189,7 +180,17 @@ export async function handleArrangementCreate(
   });
 
   if (!created) throw new Error("Arrangement not created");
-  return { output: formatArrangementCreateResult(created, format) };
+  // ISS-1117: a regex-valid identityAnchor that does not look like a real
+  // client task id (e.g. a session display name) can never resolve against
+  // an OwnerTask -- warn, don't reject, since no name-to-id registry exists
+  // to validate against.
+  const anchorWarnings = created.parties
+    .filter((party) => !looksLikeClientTaskId(party.identityAnchor))
+    .map((party) => `party ${party.role} (${party.client}): identityAnchor does not look like a client task id`);
+  return {
+    output: formatArrangementCreateResult(created, format),
+    ...(anchorWarnings.length > 0 && { warnings: anchorWarnings }),
+  };
 }
 
 /**

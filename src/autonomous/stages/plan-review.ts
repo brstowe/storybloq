@@ -1,4 +1,6 @@
 import { readFileSync } from "node:fs";
+import { citationsForReviewTarget } from "../cited-rulings.js";
+import { guardPlanNamesCitedRulings } from "../plan-pin-guard.js";
 import { join } from "node:path";
 import { releaseSessionClaim } from "../../core/claims.js";
 import { clearSameSessionEarmark } from "../../core/earmarks.js";
@@ -7,13 +9,50 @@ import type { WorkflowStage, StageResult, StageAdvance, StageContext } from "./t
 import { buildLensHistoryUpdate } from "./types.js";
 import type { GuideReportInput, FullSessionState } from "../session-types.js";
 import { PARK_ACTION, parkCurrentTicket, parkHintLines } from "./park.js";
-import { REVIEW_VERDICTS, REVIEW_VERDICTS_PROSE, normalizeSeverity } from "../session-types.js";
+import { REVIEW_VERDICTS, REVIEW_VERDICTS_PROSE } from "../session-types.js";
 import { normalizeRiskLevel, requiredRounds, nextReviewer } from "../review-depth.js";
 import { effectiveReviewEffort, effortDisclosureLine, effortMinRounds } from "../review-effort.js";
 import { accumulateVerificationCounters } from "../lens-harness/verification-log.js";
-import { writeReviewVerdict, readReviewVerdict, buildTier1Verdict, classifyLensReviewPath, type ReviewVerdictArtifact } from "../review-verdict.js";
-import { decidePlanCeiling } from "./plan-review-ceiling.js";
+import {
+  buildTier1Verdict,
+  classifyLensReviewPath,
+  computeContentHash,
+  verdictFilename,
+  type ReviewVerdictArtifact,
+} from "../review-verdict.js";
+import { reportRound } from "../principle-policy-report.js";
+import { readContractWindow } from "../../core/review-stats-window.js";
+import {
+  eventIdentity,
+  identityFields,
+  normalizeFindings,
+  prepareReviewRound,
+  upsertReviewRecord,
+  writeRoundArtifact,
+  type ItemAttempt,
+  type ReviewRoundIdentity,
+  type ReviewSubject,
+} from "../review-identity.js";
+import { decidePlanCeiling, planReviewHardCeiling } from "./plan-review-ceiling.js";
+import {
+  EMPTY_CHANGE_REQUEST_INSTRUCTION,
+  REPAIR_ATTEMPT_CAP,
+  isEmptyChangeRequest,
+  pendingRoundOrdinal,
+  countRepairAttempts,
+  buildRepairAttempt,
+  emptyVerdictParkReason,
+} from "./review-repair.js";
 import { outstandingCeilingFindings } from "./code-review-ceiling.js";
+import { buildReviewContextPacket } from "../review-context-packet.js";
+import { evaluateProvenanceGate, roundBlockerPredicate } from "../review-identity.js";
+
+/**
+ * Plan review's packet budget. Smaller than code review's because the subject
+ * it shares an instruction with is a plan rather than a diff, and the plan text
+ * itself is not in this payload.
+ */
+const PLAN_REVIEW_CONTEXT_PACKET_BUDGET = 16000;
 import {
   buildRound1Baseline,
   hashPlanContent,
@@ -239,12 +278,42 @@ async function handleCheckGateAck(ctx: StageContext, ticketId: string | undefine
     expectedAckRole: gate.ackRole,
   });
   if (lookup.status === "valid") {
-    // ISS-1050 full fix: `planRead.bytes` above is already fresh -- the only
-    // intervening step since that read is the synchronous `findGateAck` call,
-    // so no await could have raced a plan.md edit past this point. Blocking
-    // on a snapshot-write failure here (rather than advancing without a pin)
-    // is D1: a gated landing must never fail open.
-    const snapshot = await writePlanSnapshot(ctx.dir, planRead.bytes);
+    // T-494 SITE A. This path both PINS the plan and, in plan mode, completes
+    // on it, so the citation guard runs before either. The gate-ack lookup
+    // above is a read, so a refusal here consumes no ack and writes nothing.
+    const guardA = await guardPlanNamesCitedRulings(
+      ctx.root,
+      ctx.state.ticket?.id ?? ctx.state.currentIssue?.id,
+      planRead.bytes.toString("utf-8"),
+    );
+    if (!guardA.ok) return { action: "retry", instruction: guardA.instruction };
+
+    // T-494 reopens the ISS-1050 window and closes it again. The guard above
+    // awaits (it loads the ledger and resolves the citation chain), so
+    // `planRead.bytes` is no longer the freshest possible read and the
+    // original reasoning here -- that only a synchronous `findGateAck` sat
+    // between the read and the snapshot -- no longer holds. The re-read
+    // restores it: the bytes judged are the bytes pinned, and a plan edited
+    // while its citations were being checked is refused rather than pinned
+    // unjudged. Same shape and same refusal as the landing-branch recheck.
+    const rereadA = readBoundedRegularFile(join(ctx.dir, "plan.md"), PLAN_ACK_MAX_BYTES);
+    if (rereadA.status !== "ok") {
+      return {
+        action: "retry",
+        instruction: `Cannot re-read plan.md after checking its cited rulings: ${rereadA.reason}. Escalate -- do not treat as approved.`,
+      };
+    }
+    if (sha256Bytes(rereadA.bytes) !== pending.pinSha256) {
+      resetPlanReviewGenerationState(ctx, { clearPendingPlanAck: true });
+      return {
+        action: "retry",
+        instruction: "plan.md changed while its cited rulings were being checked; that review no longer applies to the current content, and its history has been cleared. Submit a fresh PLAN_REVIEW report for the current plan.",
+      };
+    }
+
+    // Blocking on a snapshot-write failure here (rather than advancing
+    // without a pin) is D1: a gated landing must never fail open.
+    const snapshot = await writePlanSnapshot(ctx.dir, rereadA.bytes);
     if (snapshot.status !== "ok") {
       return {
         action: "retry",
@@ -448,20 +517,68 @@ export class PlanReviewStage implements WorkflowStage {
     }
 
     const bridgeCodex = currentStorybloqClient() === "claude" && reviewer === "codex";
+
+    // ── ISS-1115: the round context packet, plan stage ──────────────────────
+    //
+    // The code stage was wired first and this one was left cold, behind a green
+    // suite, because the edit meant to wire it threw before writing and the
+    // stage tests passed anyway. Both stages are acceptance for this item.
+    //
+    // THE SUBJECT HERE IS THE PLAN, NOT A DIFF. There is no `diffCommand` on
+    // this path and no "Pass the FULL unified diff" anchor; an earlier plan
+    // claimed both stages shared that anchor, which was asserted without
+    // opening this file. So the capture directive names plan.md.
+    const planCaptureDirective = [
+      "Review the plan at `.story/sessions/<session>/plan.md` (the session dir",
+      "for this run). Pass the FULL plan text to the reviewer; do not summarize",
+      "or truncate it.",
+    ].join(" ");
+
+    // T-494: the rulings this item cites reach the reviewer through the packet's
+    // mandatory payload. Resolved fresh from disk here, never from the snapshot
+    // on session state.
+    const planTarget = ctx.state.ticket?.id ?? ctx.state.currentIssue?.id ?? "unknown";
+    const planCitations = await citationsForReviewTarget(ctx.root, planTarget);
+
+    const planContextPacket = buildReviewContextPacket({
+      sessionDir: ctx.dir,
+      projectRoot: ctx.root,
+      target: planTarget,
+      ...(planCitations.kind === "resolved"
+        ? { citedRulings: planCitations.citations }
+        : { citedRulingsUnavailable: planCitations.reason }),
+      stage: "plan",
+      generation: ctx.state.itemAttempt?.generation ?? 0,
+      roundNum,
+      budget: PLAN_REVIEW_CONTEXT_PACKET_BUDGET,
+      captureDirective: planCaptureDirective,
+      planReviews: ctx.state.reviews.plan,
+      // T-495: see the code stage. The key is complete or it is not a key.
+      sessionId: ctx.state.sessionId,
+      itemAttemptId: ctx.state.itemAttempt?.id ?? null,
+    });
+
     return {
       instruction: [
         `# Plan Review -- Round ${roundNum} of ${Math.max(minRounds, roundNum)} minimum`,
         "",
         disclosure,
         "",
+        planContextPacket.text,
+        "",
         `Run a plan review using **${reviewer}**.`,
         "",
         [
           bridgeCodex
-            ? "Call `review_plan` MCP tool with the plan content."
-            : "Launch a code review agent to review the plan.",
+            // The handoff, stated rather than implied: this instruction goes to
+            // the IMPLEMENTING agent, which then composes the backend request.
+            // Saying "with the plan content" alone left the packet behind.
+            ? "Call `review_plan` MCP tool, passing BOTH the context above and the full plan content."
+            : "Launch a code review agent to review the plan, giving it the context above and the full plan content.",
           reviewDepthLine(effort, "plan", reviewer, ctx.state.config),
         ].filter(Boolean).join(" "),
+        "",
+        "Name the principle this finding violates in `principle`, lowercase, exactly as the review contract in the Context section names it. Omit the field when the project declares no contract, when no principle fits, or when you would have to reach for one. Omitting is a legitimate answer; guessing is not.",
         "",
         "When done, call `storybloq_autonomous_guide` with:",
         '```json',
@@ -555,12 +672,16 @@ export class PlanReviewStage implements WorkflowStage {
     }
 
     // Record review round
-    const planReviews = [...ctx.state.reviews.plan];
-    const roundNum = planReviews.length + 1;
+    let planReviews = [...ctx.state.reviews.plan];
+    // T-488: array-derived, and correct only for a NEW round. A replay takes
+    // its round from the durable envelope instead. See code-review.ts for the
+    // full reasoning; it is one mechanism shared by both stages.
+    const arrayRound = planReviews.length + 1;
     // ISS-726: canonicalize severity up front so the critical/major
     // contradiction guard and per-severity counts cannot be bypassed by a
     // miscased value.
-    const findings = (report.findings ?? []).map((f) => ({ ...f, severity: normalizeSeverity(f.severity) }));
+    // T-488: the same pass records the severity the reviewer actually reported.
+    const findings = normalizeFindings(report.findings ?? []);
     const backends = reviewBackendsForStage("PLAN_REVIEW", ctx.state);
     // T-461: recorded per ROUND, not read back from the session, because the
     // top-level pin is overwritten by the next pick and a ticket that ran at
@@ -571,23 +692,51 @@ export class PlanReviewStage implements WorkflowStage {
     const reviewerBackend = report.reviewer
       ?? (computedReviewer === "codex" && report.notes && /codex\b.*\b(unavail|limit|failed|down|error|usage)/i.test(report.notes) ? "agent" : null)
       ?? computedReviewer;
-    const unresolvedCriticalCount = findings.filter(
-      (f) => f.severity === "critical" &&
-        f.disposition !== "addressed" && f.disposition !== "deferred",
-    ).length;
-    planReviews.push({
-      round: roundNum,
-      reviewer: reviewerBackend,
-      verdict,
-      findingCount: findings.length,
-      criticalCount: findings.filter((f) => f.severity === "critical").length,
-      unresolvedCriticalCount,
-      majorCount: findings.filter((f) => f.severity === "major").length,
-      suggestionCount: findings.filter((f) => f.severity === "suggestion").length,
-      codexSessionId: report.reviewerSessionId,
-      effort: roundEffort,
-      timestamp: new Date().toISOString(),
+
+    const repairTicketIdForProvenance = ctx.state.ticket?.id;
+
+    // ── ISS-1115 3.3a: the provenance gate, EVALUATED ──────────────────────
+    //
+    // Evaluated here, acted on further down. Same split as the code stage, for
+    // the same reason: every landing count below depends on the verdict, so
+    // computing it after them leaves the counts a round out of step with the
+    // gate that judges them.
+    const provRoundOrdinal = pendingRoundOrdinal(
+      ctx.state.planReviewRoundCounter && repairTicketIdForProvenance
+        && ctx.state.planReviewRoundCounter.ticketId === repairTicketIdForProvenance
+        ? ctx.state.planReviewRoundCounter.completedRounds
+        : null,
+    );
+    const provenanceRepairKey = repairTicketIdForProvenance ? {
+      workItemId: repairTicketIdForProvenance,
+      kind: "ticket" as const,
+      stage: "plan" as const,
+      round: provRoundOrdinal,
+      trigger: "provenance" as const,
+    } : null;
+    // At or past the ceiling the gate asks for nothing and marks the round
+    // unresolved instead, so it escalates rather than landing.
+    const atPlanCeiling = provRoundOrdinal >= planReviewHardCeiling();
+    const provenanceGate = evaluateProvenanceGate({
+      roundNum: provRoundOrdinal,
+      backend: reviewerBackend,
+      findings,
+      repairSpent: provenanceRepairKey
+        ? countRepairAttempts(ctx.state.reviewRepairAttempts, provenanceRepairKey) >= 1
+        : false,
+      atCeiling: atPlanCeiling,
     });
+    // THE ROUND'S BLOCKING PREDICATE. See the code stage for why the gate's
+    // `unresolved` verdict has to reach the counts rather than being computed
+    // and dropped.
+    const isBlockingFinding = roundBlockerPredicate(provenanceGate);
+    const unresolvedCriticalCount = findings.filter(
+      (f) => f.severity === "critical" && isBlockingFinding(f),
+    ).length;
+    // T-488: the record is built and UPSERTED after the artifact sink runs.
+    // The artifact is the only sink that can detect a generation collision, so
+    // no other sink may record a generation it has not verified; and an upsert
+    // by `reviewAttemptId` is what stops a replayed round double-counting.
 
     // ISS-098: Detect codex unavailability from agent notes
     // ISS-110: Store timestamp instead of just boolean for TTL-based expiry
@@ -600,13 +749,105 @@ export class PlanReviewStage implements WorkflowStage {
     const minRounds = effortMinRounds(effectiveReviewEffort(ctx.state, "PLAN_REVIEW"), risk);
     // ISS-073: Only count unresolved findings (open/contested) as contradictory with approve
     const hasCriticalOrMajor = findings.some(
-      (f) => (f.severity === "critical" || f.severity === "major") &&
-        f.disposition !== "addressed" && f.disposition !== "deferred",
+      (f) => (f.severity === "critical" || f.severity === "major") && isBlockingFinding(f),
     );
 
+    // ISS-1115: the ceiling approve that is neither honoured nor bounced.
+    //
+    // Once the gate gives up at the ceiling, its findings block, so an
+    // `approve` payload contradicts itself and the guard below would bounce it.
+    // At the ceiling that bounce is a TRAP: the retry returns before the round
+    // is recorded, before the artifact is written and before the escalation
+    // runs, so a reviewer repeating the same payload loops forever and only
+    // `stuckRetryCount` moves. The previous behaviour was the opposite failure
+    // -- the round landed and the ceiling park exempts the landing action, so
+    // no human was summoned either. Both lose the stop the ceiling exists to
+    // force, so the round is CONSUMED and RECORDED with the reviewer's actual
+    // verdict, and routed to a non-landing action so the park fires. Codex
+    // found both halves of this, in review rounds 2 and 3.
+    const provenanceStrandedApprove = verdict === "approve"
+      && provenanceGate.kind === "unresolved" && atPlanCeiling;
+
     // Guard contradictory approve + critical/major (ISS-035)
-    if (verdict === "approve" && hasCriticalOrMajor) {
+    if (verdict === "approve" && hasCriticalOrMajor && !provenanceStrandedApprove) {
       return { action: "retry", instruction: "Contradictory review payload: verdict is 'approve' but critical/major findings are present. Re-run the review or correct the verdict." };
+    }
+
+    // ISS-1114: the mirror guard. On THIS stage the consequence is a false
+    // landing rather than a wasted round, and that is the sharper harm. The
+    // ladder below runs `verdict === "approve" || (!hasCriticalOrMajor &&
+    // roundNum >= minRounds)` BEFORE `isRevise`, and an empty change-request has
+    // no critical or major findings, so from `minRounds` onward it routes
+    // straight to IMPLEMENT: the plan is treated as approved on the strength of
+    // a review that requested changes and named none. `minRounds` never exceeds
+    // 3, so this is reachable on round 2 or 3 of an ordinary ticket.
+    //
+    // Placed before the artifact write below, so a repaired round writes no
+    // artifact and is not counted -- same position and same three consequences
+    // as the code stage.
+    const emptyChangeRequest = isEmptyChangeRequest(verdict, findings);
+    // Plan review is ticket-scoped: `escalatePlanCeiling` parks tickets only.
+    // With no ticket there is no identity to scope an attempt to, so the guard
+    // falls through unchanged rather than keying a record on `undefined`.
+    const repairTicketId = ctx.state.ticket?.id;
+    if (emptyChangeRequest && repairTicketId) {
+      const counter = ctx.state.planReviewRoundCounter;
+      const matching = counter && counter.ticketId === repairTicketId ? counter.completedRounds : null;
+      const repairKey = {
+        workItemId: repairTicketId,
+        kind: "ticket" as const,
+        stage: "plan" as const,
+        round: pendingRoundOrdinal(matching),
+      };
+      const alreadySpent = countRepairAttempts(ctx.state.reviewRepairAttempts, repairKey);
+
+      if (alreadySpent >= REPAIR_ATTEMPT_CAP) {
+        // Parks through the EXISTING plan-side helper, unmodified. That helper
+        // targets PICK_TICKET rather than HANDOVER and handles tickets only;
+        // both are preserved deliberately. The trigger records what fired, not
+        // where the item goes, and forking a crash-safe path on a condition it
+        // was not written for would be a wider change than this ticket.
+        const label = ctx.state.ticket?.displayId ?? repairTicketId;
+        ctx.writeState({
+          pendingPlanCeilingEscalation: {
+            ticketId: repairTicketId,
+            ...(ctx.state.ticket?.displayId ? { displayId: ctx.state.ticket.displayId } : {}),
+            round: repairKey.round,
+            ceiling: planReviewHardCeiling(),
+            trigger: "empty-verdict" as const,
+            repairAttempts: alreadySpent,
+            reason: emptyVerdictParkReason({
+              stageLabel: "Plan",
+              round: repairKey.round,
+              label,
+              reviewer: reviewerBackend,
+              attempts: alreadySpent,
+            }),
+            unresolvedCritical: 0,
+            unresolvedMajor: 0,
+            decidedAt: new Date().toISOString(),
+            findings: [],
+            fingerprints: [],
+            completed: false,
+          },
+        } as Partial<FullSessionState>);
+        return await escalatePlanCeiling(ctx);
+      }
+
+      ctx.writeState({
+        reviewRepairAttempts: [
+          ...(ctx.state.reviewRepairAttempts ?? []),
+          buildRepairAttempt({
+            key: repairKey,
+            existing: ctx.state.reviewRepairAttempts,
+            verdict,
+            reviewer: reviewerBackend,
+            reviewStartedAt: ctx.state.currentReviewStartedAt,
+            nowMs: Date.now(),
+          }),
+        ],
+      } as Partial<FullSessionState>);
+      return { action: "retry", instruction: EMPTY_CHANGE_REQUEST_INSTRUCTION };
     }
 
     // T-263: Build and write review verdict artifact
@@ -625,7 +866,76 @@ export class PlanReviewStage implements WorkflowStage {
     // only when the backend is lenses.
     const lensReviewId = reviewerBackend === "lenses" ? report.reviewId : undefined;
     const reviewerPath = lensReviewId ? classifyLensReviewPath(ctx.dir, lensReviewId) : undefined;
-    const artifact: ReviewVerdictArtifact = {
+
+    // ── ISS-1115 3.3a: the provenance gate ─────────────────────────────────
+    //
+    // Same gate, same position and same reasons as the code stage: beside the
+    // empty-verdict repair, before the round is recorded, so a refused payload
+    // leaves no envelope to replay. Both stages call the one evaluator, because
+    // a guard that answers differently per stage is a guard with two meanings.
+    //
+    // The exemption for lenses lives INSIDE the evaluator, not around this
+    // call. Plan review has a lens backend too (`reviewer === "lenses"`, and
+    // its report path is this one), so guarding the call site here would leave
+    // the fleet-stopping case to be rediscovered per stage.
+    // AND IT NEVER PREEMPTS AN ESCALATION. An item at or past its round ceiling
+    // is on its way to a human, and delaying that to ask for metadata would put
+    // a labelling concern ahead of the stop the ceiling exists to force. The
+    // unlabelled findings still reach the escalation; they simply reach it
+    // without labels, which is the right trade at the point where a person
+    // takes over. Found by the ceiling suites when this gate was first wired
+    // one step too early.
+    if (provenanceGate.kind === "repair" && provenanceRepairKey) {
+      // Persist first, then retry: a crash between the two must not lose the
+      // evidenced findings, and must not silently refund the bound either.
+      ctx.writeState({
+        reviewRepairAttempts: [
+          ...(ctx.state.reviewRepairAttempts ?? []),
+          buildRepairAttempt({
+            key: provenanceRepairKey,
+            existing: ctx.state.reviewRepairAttempts,
+            verdict,
+            reviewer: reviewerBackend,
+            reviewStartedAt: ctx.state.currentReviewStartedAt,
+            nowMs: Date.now(),
+          }),
+        ],
+      } as Partial<FullSessionState>);
+      return { action: "retry", instruction: provenanceGate.instruction };
+    }
+
+    // ── T-488: the round's identity, made durable before any sink ──────────
+    //
+    // After every payload guard, so a refused payload leaves no envelope to be
+    // replayed; before the routing ladder, so a replay routes on the round
+    // number it was ACCEPTED at rather than a fresh array-derived one.
+    //
+    // Plan review is ticket-scoped -- `escalatePlanCeiling` handles tickets
+    // only -- so an issue subject cannot arise here. With no ticket there is no
+    // subject at all, and the identity fields are written NEITHER way rather
+    // than filled with a placeholder.
+    const reviewSubject: ReviewSubject | null = ctx.state.ticket
+      ? { workItemId: ctx.state.ticket.id, kind: "ticket" }
+      : null;
+    const prepared = prepareReviewRound(ctx, {
+      stage: "plan",
+      subject: reviewSubject,
+      target,
+      verdict,
+      reviewer: reviewerBackend,
+      summary,
+      findings: findings as unknown as readonly Record<string, unknown>[],
+      arrayRound,
+      report,
+      effort: roundEffort,
+      nowIso: new Date().toISOString(),
+    });
+    const roundNum = prepared.round;
+
+    // Rebuilt per generation: a collision changes the identity block, and the
+    // artifact must carry the generation it is actually written at, because
+    // `generation` is part of the content hash.
+    const buildPlanArtifact = (identityForRound: ReviewRoundIdentity): ReviewVerdictArtifact => ({
       target,
       stage: "plan",
       round: roundNum,
@@ -642,21 +952,81 @@ export class PlanReviewStage implements WorkflowStage {
       ...(lensReviewId ? { reviewId: lensReviewId } : {}),
       ...(reviewerPath ? { reviewerPath } : {}),
       effort: roundEffort,
-    };
-    const writeResult = writeReviewVerdict(ctx.dir, artifact);
-
-    if (writeResult.status === "skipped") {
-      return { action: "retry", instruction: "Review artifact write failed (lock contention or I/O error). Re-report your review verdict." };
+      // ISS-1115 3.3b: an exempt round SAYS it was exempt. Absent on every
+      // round that was actually required to label.
+      ...(provenanceGate.kind === "exempt"
+        ? { provenanceExemption: provenanceGate.reason }
+        : {}),
+      // And a round whose gate GAVE UP says so, for the same reason. A round
+      // that was checked and a round that was asked and never answered land
+      // identically in the record otherwise.
+      ...(provenanceGate.kind === "unresolved"
+        ? { provenanceUnresolved: provenanceGate.reasons }
+        : {}),
+      ...identityFields(identityForRound),
+    });
+    const artifactResult = writeRoundArtifact(ctx, {
+      identity: prepared.identity,
+      envelope: prepared.envelope,
+      attempt: (ctx.state.itemAttempt ?? null) as ItemAttempt | null,
+      buildArtifact: buildPlanArtifact,
+    });
+    if (artifactResult.kind === "retry") {
+      // No round is recorded against a generation the artifact sink could not
+      // verify. That is why the artifact goes first.
+      return { action: "retry", instruction: artifactResult.instruction };
     }
+    const identity = artifactResult.identity;
+    const tier1Verdict = buildTier1Verdict(artifactResult.artifact);
 
-    let tier1Verdict = buildTier1Verdict(artifact);
-    if (writeResult.status === "exists") {
-      const recovered = readReviewVerdict(ctx.dir, writeResult.contentHash);
-      if (!recovered) {
-        return { action: "retry", instruction: "Review artifact recovery failed (content mismatch). Re-report your review verdict." };
-      }
-      tier1Verdict = buildTier1Verdict(recovered);
-    }
+    planReviews = upsertReviewRecord(planReviews, {
+      round: roundNum,
+      reviewer: reviewerBackend,
+      verdict,
+      findingCount: findings.length,
+      criticalCount,
+      unresolvedCriticalCount,
+      majorCount,
+      suggestionCount,
+      codexSessionId: report.reviewerSessionId,
+      effort: roundEffort,
+      timestamp: new Date().toISOString(),
+      ...identityFields(identity),
+      artifactStatus: artifactResult.artifactStatus,
+    });
+
+    // T-495: the report-only measurement, after the upsert and before any
+    // `writeState`. See the code stage for why the order is load-bearing.
+    //
+    // `stageNextAction` is NULL here and that is the truth at this site, not a
+    // gap: `nextAction` is computed further down (`plan-review.ts:1005`), after
+    // this write. Recording a landing this site cannot know would be a
+    // fabricated field, so no metric reads one.
+    reportRound({
+      sessionDir: ctx.dir,
+      projectRoot: ctx.root,
+      windowBaselineHash: readContractWindow(ctx.root)?.baselineHash ?? null,
+      sessionId: ctx.state.sessionId,
+      itemId: target,
+      target,
+      itemAttemptId: identity.itemAttemptId ?? null,
+      reviewAttemptId: identity.reviewAttemptId,
+      artifactFileName: verdictFilename(target, "plan", roundNum, identity.generation),
+      artifactContentHash: computeContentHash(artifactResult.artifact),
+      stage: "plan",
+      round: roundNum,
+      generation: identity.generation,
+      backend: reviewerBackend,
+      leg: reviewerBackend === "lenses" ? "lens" : "packet",
+      findings,
+      isRoundBlocker: isBlockingFinding,
+      baselineHasCriticalOrMajor: hasCriticalOrMajor,
+      // BOTH stages compute this, byte-identically. An earlier draft of the
+      // ruling had it absent at the plan stage and passed `false`, which would
+      // have reported every plan round as having no unresolved critical.
+      baselineHasUnresolvedCritical: unresolvedCriticalCount > 0,
+      stageNextAction: null,
+    });
 
     // ISS-598/ISS-1031, Gate-1 ratified ordering: the landing check runs
     // BEFORE isRevise, restoring the clean-landing path ISS-048's ordering
@@ -677,7 +1047,11 @@ export class PlanReviewStage implements WorkflowStage {
     const isRevise = verdict === "revise" || verdict === "request_changes";
 
     let nextAction: "PLAN" | "IMPLEMENT" | "PLAN_REVIEW";
-    if (isReject) {
+    if (provenanceStrandedApprove) {
+      // NOT `IMPLEMENT`: decidePlanCeiling exempts it, and an exempt action is
+      // exactly how this round escaped escalation before.
+      nextAction = "PLAN_REVIEW";
+    } else if (isReject) {
       nextAction = "PLAN";
     } else if (verdict === "approve" || (!hasCriticalOrMajor && roundNum >= minRounds)) {
       nextAction = "IMPLEMENT";
@@ -767,6 +1141,27 @@ export class PlanReviewStage implements WorkflowStage {
     }
 
     // reject: clear plan review history. revise: preserve history.
+    //
+    // T-488: this is the SECOND array-clearing event in the codebase, after the
+    // code stage's PLAN redirect, and it opens the same numbering epoch --
+    // `roundNum` restarts at 1 and the next round reproduces an existing
+    // artifact filename. It is not left to chance: the artifact sink identifies
+    // the occupant of that path, sees an attempt that is not this one, and
+    // advances the generation before writing. The bumped generation persists on
+    // `itemAttempt`, so the whole post-reject epoch numbers consistently rather
+    // than only the one round that collided.
+    //
+    // There is deliberately NO explicit generation increment here, and a reader
+    // looking for one to match the code-side redirect should find this instead
+    // of a gap. The asymmetry is intentional. Enumerating clearing sites is a
+    // strategy that already failed: this site survived three plan-review
+    // rounds, a scoped re-review and two byte-reviews without being named. A
+    // guard that fires on the OBSERVED condition does not depend on anyone
+    // having found every site, including sites added later by someone who never
+    // reads this ticket, so the guard is the primary mechanism. The explicit
+    // increment at the code-side redirect exists for RETENTION -- the history
+    // append has to know the boundary at the moment it appends -- not for
+    // collision avoidance, which the guard already covers here and there.
     const reviewsForWrite = isReject
       ? { ...ctx.state.reviews, plan: [] as typeof planReviews }
       : { ...ctx.state.reviews, plan: planReviews };
@@ -784,6 +1179,15 @@ export class PlanReviewStage implements WorkflowStage {
       lastReviewVerdict: tier1Verdict,
       currentReviewStartedAt: null,
       planGateNonApprovals: nonApprovals,
+      // T-488: the state record has landed, so the envelope has done its job.
+      // Cleared in the SAME write as the record, for the reason set out at
+      // length at the matching site in `code-review.ts`: holding it longer
+      // makes a genuine second round carrying an identical payload look like a
+      // replay of the first, and the upsert would then replace that round
+      // rather than append to it. On a REJECT the array is emptied here too,
+      // so a stale envelope would additionally collide at round 1 and open a
+      // generation nothing asked for.
+      pendingReviewAttempt: null,
     };
     if (ceilingDecision.counter) stateUpdate.planReviewRoundCounter = ceilingDecision.counter;
     if (driftHistoryForTicket) stateUpdate.planReviewDriftHistory = driftHistoryForTicket;
@@ -804,7 +1208,7 @@ export class PlanReviewStage implements WorkflowStage {
     // state write must still leave both filing paths durably queued.
     if (ceilingDecision.shouldPark) {
       await ctx.fileDeferredFindings(findings, "plan");
-      const outstanding = outstandingCeilingFindings(findings);
+      const outstanding = outstandingCeilingFindings(findings, isBlockingFinding);
       const escalationFingerprints = await ctx.queueFindingsAsIssues(outstanding, "plan");
       const driftHistoryForFirstCheck = driftHistoryForTicket
         ?? (ctx.state.planReviewDriftHistory?.ticketId === ticketId ? ctx.state.planReviewDriftHistory : null);
@@ -818,7 +1222,7 @@ export class PlanReviewStage implements WorkflowStage {
         reason: `Plan review reached its hard ceiling of ${ceilingDecision.ceiling} rounds without an approvable plan.`,
         unresolvedCritical: unresolvedCriticalCount,
         unresolvedMajor: findings.filter(
-          (f) => f.severity === "major" && f.disposition !== "addressed" && f.disposition !== "deferred",
+          (f) => f.severity === "major" && isBlockingFinding(f),
         ).length,
         // Gate-1 ratification condition (b): even though drift itself never
         // routes to park while advisory, a ceiling park must not silently
@@ -853,11 +1257,19 @@ export class PlanReviewStage implements WorkflowStage {
 
     accumulateVerificationCounters({ sessionDir: ctx.dir, state: ctx.state, writeState: ctx.writeState.bind(ctx) });
 
+    // After the write, for the reason set out in full at the matching emit in
+    // `code-review.ts`: moving it above would close the lost-event window, and
+    // it would cost the `rev` stamp, which `appendEvent` takes from the state
+    // revision that `writeState` has just advanced.
     ctx.appendEvent("plan_review", {
       round: roundNum,
       verdict,
       findingCount: findings.length,
       effort: roundEffort,
+      // T-488 D11: the item ids that 422 local review events did not carry.
+      // Best-effort delivery is unchanged, so a replay may emit a second event;
+      // readers deduplicate by `reviewAttemptId`.
+      ...eventIdentity(identity),
     });
 
     // Gate-1 ratification condition (b): full data for an offline
@@ -951,6 +1363,56 @@ export class PlanReviewStage implements WorkflowStage {
         // second read would only add a redundant TOCTOU window, not close one.
         landedPlanBytes = recheck.bytes;
       }
+      // T-494 SITES B AND C. The guard runs before ANY path that accepts a
+      // plan, and the two here are accepted differently: the plan-mode branch
+      // below FINALIZES on the plan without writing a snapshot at all, while
+      // the landing below it PINS one. Anchoring the guard to the snapshot
+      // write would cover the landing and miss the completion entirely -- an
+      // ungated plan-only session reaches that branch with `landedPlanBytes`
+      // still null and ends without ever meeting a guard. When there is no
+      // snapshot, `plan.md` on disk IS the artifact of record, and a session
+      // that finalizes as `completed` blesses whatever it holds.
+      //
+      // So the ungated fresh read is hoisted ABOVE the mode check (it used to
+      // sit below it, serving only the landing) and both paths continue from
+      // the same guarded, re-read bytes.
+      if (!landedPlanBytes) {
+        const finalRead = readBoundedRegularFile(join(ctx.dir, "plan.md"), PLAN_ACK_MAX_BYTES);
+        if (finalRead.status !== "ok") {
+          return {
+            action: "retry",
+            instruction: `Cannot read plan.md to check its cited rulings: ${finalRead.reason}. Escalate -- do not treat as approved.`,
+          };
+        }
+        landedPlanBytes = finalRead.bytes;
+      }
+      const guardBC = await guardPlanNamesCitedRulings(
+        ctx.root,
+        ctx.state.ticket?.id ?? ctx.state.currentIssue?.id,
+        landedPlanBytes.toString("utf-8"),
+      );
+      if (!guardBC.ok) return { action: "retry", instruction: guardBC.instruction };
+
+      // The same window ISS-1050 closed, reopened by the guard's own I/O and
+      // closed again. The comment on the read this replaced said it sat
+      // immediately before the advance so the snapshot captures exactly what
+      // is about to be implemented; the guard's await would have put ledger
+      // loading in between, so the bytes are re-read and compared here.
+      const guardedRead = readBoundedRegularFile(join(ctx.dir, "plan.md"), PLAN_ACK_MAX_BYTES);
+      if (guardedRead.status !== "ok") {
+        return {
+          action: "retry",
+          instruction: `Cannot re-read plan.md after checking its cited rulings: ${guardedRead.reason}. Escalate -- do not treat as approved.`,
+        };
+      }
+      if (sha256Bytes(guardedRead.bytes) !== sha256Bytes(landedPlanBytes)) {
+        return {
+          action: "retry",
+          instruction: "plan.md changed while its cited rulings were being checked; the checked content is not the current content. Re-report the same check to retry against the current plan.",
+        };
+      }
+      landedPlanBytes = guardedRead.bytes;
+
       // T-135: Plan mode exits after plan review approval
       if (ctx.state.mode === "plan") {
         ctx.finalizeSession({
@@ -972,20 +1434,6 @@ export class PlanReviewStage implements WorkflowStage {
             transitionedFrom: "PLAN_REVIEW",
           },
         } as StageAdvance;
-      }
-      // ISS-1050 full fix (SITE 2 / ungated TOCTOU close): no plan-ack gate
-      // validated this round, so `landedPlanBytes` is still null -- a fresh
-      // read immediately before advancing, so the snapshot captures exactly
-      // what is about to be implemented rather than the round's earlier read.
-      if (!landedPlanBytes) {
-        const finalRead = readBoundedRegularFile(join(ctx.dir, "plan.md"), PLAN_ACK_MAX_BYTES);
-        if (finalRead.status !== "ok") {
-          return {
-            action: "retry",
-            instruction: `Cannot read plan.md to snapshot the approved plan: ${finalRead.reason}. Escalate -- do not treat as approved.`,
-          };
-        }
-        landedPlanBytes = finalRead.bytes;
       }
       // D1: never fail open -- a snapshot write failure blocks the transition
       // rather than advancing to IMPLEMENT with no pin.

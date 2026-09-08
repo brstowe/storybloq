@@ -570,6 +570,33 @@ Show a preview of the generated content to the user. Only write after explicit a
 
 Same sanitization and preview rules as CLAUDE.md. Only write after explicit approval.
 
+**REVIEW.md generation:** REVIEW.md is the project's review contract. Verification backends read it and ordinary coding sessions do not. `storybloq init` does not write it: a contract nobody agreed to is worse than no contract, so it is proposed here and the user edits or rejects it before it lands. `storybloq validate` warns when review backends are configured and REVIEW.md is absent or unparseable, so a project set up without one sees that warning until it writes one.
+
+Ask this separately from the CLAUDE.md/RULES.md question -- three files do not fit in four options. Use `AskUserQuestion`:
+- question: "Write REVIEW.md, the contract your reviewers read?"
+- header: "Review"
+- options:
+  - "Write it (Recommended)" -- six principles with default blocking classes, yours to edit
+  - "Write it, then set exclusions" -- same file, then fill the Outside line together
+  - "Skip" -- reviewers fall back to whatever they infer
+
+**Write `review-contract-template.md` verbatim.** Read it from the same directory as this skill file (if
+it is not found, tell the user to run `storybloq setup --client all`). The six definitions in it are fixed
+wording. What a project changes is the blocking classes, the Outside line, and whatever repository detail
+it adds BELOW the principles. Do not paraphrase it and do not reorder it: the lens backend receives only
+the first 3000 characters of REVIEW.md, head-truncated, so a principle moved below the repository detail
+is one a lens reviewer is asked to name without ever being shown it.
+
+**The Outside line.** The template ships three lens ids on it. Entries there take a subject OUT of the
+contract, which means a finding on that subject is never capped and keeps the severity its reviewer gave
+it -- Outside is the loud side, not a way to silence anything. Say that in one sentence if the user picked
+"set exclusions", then write what they name as one plain comma-separated line under the heading. Never
+bullet the entries: the parser reads every line under that heading as entries and does not strip a `- `
+prefix, so a bulleted entry matches nothing. An empty line is the widest coverage and the quietest gate,
+and `storybloq validate` warns about one.
+
+Same sanitization and preview rules as CLAUDE.md. Only write after explicit approval, and apply the same Read-back verification -- a REVIEW.md reported as created but never written is worse than none, because the warning that would have caught it stops firing.
+
 #### 1f. Post-Setup
 
 After creation completes:

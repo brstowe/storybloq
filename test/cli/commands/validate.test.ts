@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { handleValidate, handleValidateWithSourceRefs } from "../../../src/cli/commands/validate.js";
+import { loadArrangementsSafe } from "../../../src/core/arrangement-loader.js";
 
 type Json = Record<string, unknown>;
 
@@ -230,5 +231,235 @@ describe("handleValidate", () => {
       // A loader warning is advisory, not a validation failure.
       expect(result.exitCode).toBe(ExitCode.OK);
     });
+  });
+
+  describe("ISS-1117: arrangement_anchor_unresolvable diagnostic", () => {
+    const tempDirs: string[] = [];
+
+    afterEach(async () => {
+      await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+    });
+
+    async function tempRoot(): Promise<string> {
+      const root = await mkdtemp(join(tmpdir(), "validate-anchors-"));
+      tempDirs.push(root);
+      return root;
+    }
+
+    it("reports two arrangement_anchor_unresolvable findings for a two-party arrangement with non-uuid anchors, one per party", async () => {
+      const root = await tempRoot();
+      // writeArrangementFile's default parties (pen-session / worker-session) are
+      // exactly the shape ISS-1117's field report describes: they pass
+      // CLIENT_TASK_ID_PATTERN but are not client task ids.
+      await writeArrangementFile(root, "a-0123456789abcdef", {});
+      const ctx = makeCtx({ root, format: "json" });
+      const result = handleValidate(ctx);
+      const parsed = JSON.parse(result.output);
+      const anchorFindings = parsed.data.findings.filter(
+        (f: { code: string }) => f.code === "arrangement_anchor_unresolvable",
+      );
+      expect(anchorFindings).toHaveLength(2);
+      expect(anchorFindings).toContainEqual(
+        expect.objectContaining({ message: expect.stringContaining("pen") }),
+      );
+      expect(anchorFindings).toContainEqual(
+        expect.objectContaining({ message: expect.stringContaining("worker") }),
+      );
+      expect(result.exitCode).toBe(ExitCode.OK);
+    });
+
+    it("produces no arrangement_anchor_unresolvable finding when every anchor is uuid-shaped", async () => {
+      const root = await tempRoot();
+      await writeArrangementFile(root, "a-0123456789abcdef", {
+        parties: [
+          { role: "pen", client: "claude", identityAnchor: "b8df203d-d3f5-4520-8057-96babf59612c" },
+          { role: "worker", client: "codex", identityAnchor: "01a07f63-e16d-7783-9ee3-61d9aaaf941c" },
+        ],
+      });
+      // The fixture must actually have loaded (two distinct anchors avoid
+      // ArrangementSchema's duplicate-identity superRefine, which would
+      // otherwise make the "zero findings" assertions below pass vacuously
+      // because the arrangement was never loaded at all -- an empty scan
+      // also has zero loader warnings, so that check alone does not prove
+      // a successful load; assert the load directly (Codex code round 1).
+      const loaded = loadArrangementsSafe(root);
+      expect(loaded.warnings).toEqual([]);
+      expect(loaded.arrangements.map((a) => a.id)).toEqual(["a-0123456789abcdef"]);
+      const ctx = makeCtx({ root, format: "json" });
+      const result = handleValidate(ctx);
+      const parsed = JSON.parse(result.output);
+      expect(
+        parsed.data.findings.filter((f: { code: string }) => f.code === "arrangement_loader_warning"),
+      ).toEqual([]);
+      expect(
+        parsed.data.findings.filter((f: { code: string }) => f.code === "arrangement_anchor_unresolvable"),
+      ).toEqual([]);
+    });
+
+    it("exempts a closed arrangement from the warning even with non-uuid anchors", async () => {
+      const root = await tempRoot();
+      await writeArrangementFile(root, "a-0123456789abcdef", { lifecycle: "closed" });
+      // Assert the fixture actually loaded, not just that it produced no
+      // loader warning -- an empty scan also has zero loader warnings
+      // (Codex code round 1).
+      const loaded = loadArrangementsSafe(root);
+      expect(loaded.warnings).toEqual([]);
+      expect(loaded.arrangements.map((a) => a.id)).toEqual(["a-0123456789abcdef"]);
+      const ctx = makeCtx({ root, format: "json" });
+      const result = handleValidate(ctx);
+      const parsed = JSON.parse(result.output);
+      expect(
+        parsed.data.findings.filter((f: { code: string }) => f.code === "arrangement_loader_warning"),
+      ).toEqual([]);
+      expect(
+        parsed.data.findings.filter((f: { code: string }) => f.code === "arrangement_anchor_unresolvable"),
+      ).toEqual([]);
+    });
+  });
+});
+
+describe("T-494: the validate command supplies the citing-entity completeness half", () => {
+  const tmpDirs: string[] = [];
+  afterEach(async () => {
+    await Promise.all(tmpDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+  });
+
+  it("reports reachability UNKNOWN when the ticket/issue load dropped a corrupt entry", async () => {
+    const root = await mkdtemp(join(tmpdir(), "validate-reach-"));
+    tmpDirs.push(root);
+    await mkdir(join(root, ".story"), { recursive: true });
+    await writeRulingUnlocked(makeRuling({ id: "r-0000000000000001" }), root);
+
+    // The unit tests can only prove `validateRulings` HONOURS the flag. This
+    // one proves the command actually computes it from the load warnings: a
+    // hardcoded `true` at the call site would pass every unit test and still
+    // claim "no ticket or issue cites this" over a ledger that dropped one.
+    const ctx = makeCtx({
+      root,
+      state: makeState({ tickets: [makeTicket({ id: "T-1" })] }),
+      warnings: [{ file: ".story/tickets/T-9.json", message: "unparseable", type: "parse_error" }],
+    });
+    const result = handleValidate(ctx);
+
+    expect(result.output).toContain("ruling_reachability_unknown");
+    expect(result.output).not.toContain("unreachable_ruling");
+  });
+
+  it("computes reachability when the load reported no integrity warnings", async () => {
+    const root = await mkdtemp(join(tmpdir(), "validate-reach-ok-"));
+    tmpDirs.push(root);
+    await mkdir(join(root, ".story"), { recursive: true });
+    await writeRulingUnlocked(makeRuling({ id: "r-0000000000000001" }), root);
+
+    const ctx = makeCtx({
+      root,
+      state: makeState({ tickets: [makeTicket({ id: "T-1" })] }),
+      warnings: [{ file: ".story/tickets/T-9.json", message: "odd name", type: "naming_convention" }],
+    });
+    const result = handleValidate(ctx);
+
+    // A cosmetic warning drops no record, so it must not suppress the check.
+    expect(result.output).toContain("unreachable_ruling");
+    expect(result.output).not.toContain("ruling_reachability_unknown");
+  });
+
+  it("still computes reachability when the dropped entry was a NOTE, which cannot cite anything", async () => {
+    const root = await mkdtemp(join(tmpdir(), "validate-reach-note-"));
+    tmpDirs.push(root);
+    await mkdir(join(root, ".story"), { recursive: true });
+    await writeRulingUnlocked(makeRuling({ id: "r-0000000000000001" }), root);
+
+    // The question is "does any TICKET OR ISSUE cite this ruling", and nothing
+    // else has a citesRulings field. Treating every integrity warning as an
+    // incomplete citing-entity scan meant one corrupt note suppressed every
+    // reachability finding in the project and reported a scan that was, for
+    // this question, complete.
+    const ctx = makeCtx({
+      root,
+      state: makeState({ tickets: [makeTicket({ id: "T-1" })] }),
+      warnings: [{ file: ".story/notes/N-9.json", message: "unparseable", type: "parse_error" }],
+    });
+    const result = handleValidate(ctx);
+
+    expect(result.output).toContain("unreachable_ruling");
+    expect(result.output).not.toContain("ruling_reachability_unknown");
+  });
+
+  it("reports UNKNOWN for an ISSUE drop as well as a ticket drop", async () => {
+    const root = await mkdtemp(join(tmpdir(), "validate-reach-issue-"));
+    tmpDirs.push(root);
+    await mkdir(join(root, ".story"), { recursive: true });
+    await writeRulingUnlocked(makeRuling({ id: "r-0000000000000001" }), root);
+
+    // Both entity kinds can cite, so scoping the check to tickets alone would
+    // be the same bug in the other direction.
+    const ctx = makeCtx({
+      root,
+      state: makeState({ tickets: [makeTicket({ id: "T-1" })] }),
+      warnings: [{ file: ".story/issues/i-abc.json", message: "unparseable", type: "parse_error" }],
+    });
+    const result = handleValidate(ctx);
+
+    expect(result.output).toContain("ruling_reachability_unknown");
+    expect(result.output).not.toContain("unreachable_ruling");
+  });
+});
+
+describe("handleValidate: T-487 review contract", () => {
+  const roots: string[] = [];
+  afterEach(async () => {
+    for (const r of roots.splice(0)) await rm(r, { recursive: true, force: true });
+  });
+
+  async function projectRoot(files: Record<string, string> = {}): Promise<string> {
+    const root = await mkdtemp(join(tmpdir(), "t487-validate-"));
+    roots.push(root);
+    await mkdir(join(root, ".story"), { recursive: true });
+    for (const [rel, body] of Object.entries(files)) {
+      await writeFile(join(root, rel), body);
+    }
+    return root;
+  }
+
+  it("surfaces the absent-contract warning on a project with NO reviewBackends override", async () => {
+    // The recorded defect: the raw override array is absent here, so a gate
+    // keyed on it stays silent, while the effective list is the coding recipe's
+    // codex + agent and this project IS being reviewed.
+    const root = await projectRoot();
+    const out = handleValidate(makeCtx({ root }));
+    expect(out.output).toContain("REVIEW.md");
+    expect(out.output).toMatch(/setup/i);
+    // A warning, not an error: the severity ladder is still in force.
+    expect(out.exitCode).toBe(ExitCode.OK);
+  });
+
+  it("says nothing when no review backend is effective", async () => {
+    const root = await projectRoot();
+    const ctx = makeCtx({
+      root,
+      state: makeState({ config: { recipeOverrides: { reviewBackends: [] } } as never }),
+    });
+    expect(handleValidate(ctx).output).not.toContain("REVIEW.md");
+  });
+
+  it("reports an unrecognised blocking class as an ERROR that fails validation", async () => {
+    const root = await projectRoot({
+      "REVIEW.md": "# R\n\n## Security\ns\nBlocking: nit\n",
+    });
+    const out = handleValidate(makeCtx({ root }));
+    expect(out.output).toContain("nit");
+    expect(out.exitCode).toBe(ExitCode.VALIDATION_ERROR);
+  });
+
+  it("names a neverBlock entry that silences an implicit principle", async () => {
+    const root = await projectRoot({
+      "REVIEW.md": "# R\n\n## Security\ns\nBlocking: blocking\n\n## Outside this contract\nperformance\n",
+      ".story/config.json": JSON.stringify({
+        recipeOverrides: { blockingPolicy: { neverBlock: ["correctness"] } },
+      }),
+    });
+    const out = handleValidate(makeCtx({ root }));
+    expect(out.output).toContain("correctness");
+    expect(out.exitCode).toBe(ExitCode.OK);
   });
 });

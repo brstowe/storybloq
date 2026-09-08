@@ -10,7 +10,7 @@ import { assertBusEnabled, isBusEnabled } from "./config.js";
 import { canonicalHash, hashWithoutKey } from "./canonical.js";
 import { endpointAddressees, listEndpoints, withEndpointCaller } from "./endpoints.js";
 import { BusError } from "./errors.js";
-import { ensureDerivedThread, foldBusThread, verifiedSuccessorState, writeDerivedThread } from "./fold.js";
+import { classifyAutomaticParkTrigger, ensureDerivedThread, foldBusThread, verifiedSuccessorState, writeDerivedThread } from "./fold.js";
 import {
   BusReceiptSchema,
   readReceipt,
@@ -81,7 +81,9 @@ import {
   type BusSetupState,
   type BusSeverity,
   type BusStatePayload,
+  type BusWakePayload,
   type BusSummary,
+  type BusWakeSummary,
   type BusThreadKind,
   type BusThreadRecord,
   type FoldedBusThread,
@@ -107,6 +109,24 @@ const POINTER_FILENAME = /^(\d{12})-([0-9a-f-]{36})\.json$/;
 let afterMailboxLstatHook: ((dir: string) => Promise<void>) | null = null;
 let materializeFailureHook: (() => Promise<void>) | null = null;
 let countFailureHook: (() => Promise<void>) | null = null;
+// ISS-1153 test-only seams, both null in production.
+//
+// `pollObservedCallHook` fires at the observation appender's ENTRY. Two tests need
+// it and neither has another way in: proving the sweep's pre-filter did not open
+// the appender (asserting that nothing was written cannot tell a working
+// pre-filter from a missing one, because the appender's own canonical check
+// refuses the same input either way), and forcing a deterministic append failure
+// so containment can be tested without racing a real I/O fault.
+//
+// `pollObservedFoldHook` fires after each of that appender's in-lock folds, so the
+// repeated-fold cost is a MEASURED number in the test record rather than a claim
+// in a comment.
+let pollObservedCallHook: ((threadId: string, wakeIds: readonly string[]) => void | Promise<void>) | null = null;
+let pollObservedFoldHook: ((threadId: string) => void | Promise<void>) | null = null;
+// Fires after each successful fold in `pollBus`'s pointer walk, so a test can make a
+// wake entry land BETWEEN two folds of the same thread and prove the sweep uses the
+// later one. There is no other deterministic way to construct that interleaving.
+let pollPointerFoldHook: ((threadId: string) => void | Promise<void>) | null = null;
 const RECEIPT_FILENAME = /^([a-f0-9]{64})\.json$/;
 const ACTIONABLE_KINDS = new Set<BusMessageKind>(["issue_notice", "question", "reply", "patch_request"]);
 
@@ -242,6 +262,24 @@ function pointerMatchesCanonical(
     entry.payload.messageId === pointer.messageId && addressees.includes(entry.payload.to);
 }
 
+// ISS-1161: write-time-only. automatic:true requires a valid trigger, and a valid
+// trigger requires automatic:true. Deliberately NOT a BusStatePayloadSchema refinement
+// (unlike the existing droppedMessage-gated one just below) -- fold.ts reads existing
+// on-disk entries through that same schema, and legacy automatic parks can predate
+// this invariant entirely, so a schema-level change here would also apply retroactively
+// to every historical read. This check runs once, at construction, inside makeEntry.
+export function assertValidAutomaticParkTrigger(
+  payload: Pick<BusStatePayload, "automatic" | "trigger">,
+): void {
+  const validTrigger = payload.trigger === "hop_cap" || payload.trigger === "duplicate_fingerprint";
+  if (payload.automatic === true && !validTrigger) {
+    throw new BusError("invalid_input", "An automatic state entry requires a valid trigger (\"hop_cap\" or \"duplicate_fingerprint\")");
+  }
+  if (validTrigger && payload.automatic !== true) {
+    throw new BusError("invalid_input", "A trigger may only be set on an automatic entry (automatic: true)");
+  }
+}
+
 function makeEntry<T extends BusEntry["type"]>(input: {
   type: T;
   threadId: string;
@@ -249,6 +287,9 @@ function makeEntry<T extends BusEntry["type"]>(input: {
   prevHash: string;
   payload: Extract<BusEntry, { type: T }>["payload"];
 }): Extract<BusEntry, { type: T }> {
+  if (input.type === "state") {
+    assertValidAutomaticParkTrigger(input.payload as BusStatePayload);
+  }
   const unsigned = {
     schema: "storybloq-bus-entry/v2" as const,
     entryId: randomUUID(),
@@ -263,6 +304,16 @@ function makeEntry<T extends BusEntry["type"]>(input: {
   const signed = { ...unsigned, entryHash: hashWithoutKey(unsigned, "entryHash") };
   return BusEntrySchema.parse(signed) as Extract<BusEntry, { type: T }>;
 }
+
+// ISS-1161 test-only seam (see lock.ts/endpoints.ts/io.ts for the same convention).
+// Named __testingStore, not __testing: endpoints.ts's own __testing is ALSO
+// re-exported through bus/index.ts's `export *` barrel (lock.ts's and io.ts's are
+// not -- neither is re-exported there at all), so a second same-named `__testing`
+// export here is a genuine `export *` ambiguity TypeScript reports as a hard error
+// (TS2308) on the barrel itself, confirmed directly by running tsc.
+// makeEntry performs no disk I/O and needs no lock, so exposing it here carries none
+// of the risk a locked, disk-writing internal (e.g. appendStateEntry) would.
+export const __testingStore = { makeEntry };
 
 async function listThreadIds(paths: BusPaths): Promise<string[]> {
   let entries;
@@ -569,7 +620,7 @@ async function nextActionForPark(
   const entry = folded.entries.find((candidate) => candidate.entryHash === parkEntryHash);
   if (
     !entry || entry.type !== "state" || entry.payload.action !== "park" ||
-    entry.payload.automatic !== true || entry.payload.trigger !== "hop_cap" ||
+    entry.payload.automatic !== true || classifyAutomaticParkTrigger(entry.payload.trigger) !== "hop_cap" ||
     !entry.payload.droppedMessage ||
     folded.thread.kind !== "issue_notice" || !folded.thread.topicRef.issue
   ) {
@@ -817,9 +868,17 @@ async function createHopCapSuccessorThread(
     throw new BusError("corrupt", predecessor.finding ?? "Predecessor thread is quarantined");
   }
   const parkEntry = predecessor.entries.find((entry) => entry.entryHash === refusedEntryHash);
+  if (!parkEntry || parkEntry.type !== "state" || parkEntry.payload.action !== "park") {
+    throw new BusError("invalid_input", "refusedEntryHash does not name a hop-cap automatic park entry on the predecessor thread");
+  }
+  // ISS-1161: bind the classification to a local before checking it -- TypeScript
+  // cannot narrow `parkEntry.payload.trigger` itself through an opaque function call,
+  // but it DOES narrow this local from the throw guard just below, so the later
+  // `verifiedSuccessorState` call can pass a properly-narrowed "hop_cap" rather than
+  // the still-optional `parkEntry.payload.trigger`.
+  const classification = classifyAutomaticParkTrigger(parkEntry.payload.trigger);
   if (
-    !parkEntry || parkEntry.type !== "state" || parkEntry.payload.action !== "park" ||
-    parkEntry.payload.automatic !== true || parkEntry.payload.trigger !== "hop_cap" ||
+    parkEntry.payload.automatic !== true || classification !== "hop_cap" ||
     !parkEntry.payload.droppedMessage
   ) {
     throw new BusError("invalid_input", "refusedEntryHash does not name a hop-cap automatic park entry on the predecessor thread");
@@ -1099,7 +1158,7 @@ async function createHopCapSuccessorThread(
     // the marker below rather than resuming from its claimed successorThreadId;
     // see the ISS-1002 interim remedy comment on that branch for the corrected
     // model.
-    const verifiedState = await verifiedSuccessorState(paths, existing, refusedEntryHash, artifact, parkEntry.payload.trigger, predecessor);
+    const verifiedState = await verifiedSuccessorState(paths, existing, refusedEntryHash, artifact, classification, predecessor);
     if (verifiedState.status === "invalid") {
       throw new BusError("corrupt", `Redeliver marker ${refusedEntryHash} names a successor that fails its own verification`);
     }
@@ -1249,6 +1308,37 @@ async function createHopCapSuccessorThread(
   });
 }
 
+/**
+ * ISS-1116: is this thread parked by the automatic hop-cap park that produced its
+ * CURRENT state?
+ *
+ * "Some hop_cap park somewhere in the history" is the wrong question, and getting it
+ * wrong is not theoretical: `bus thread update` lets a thread be parked, reopened,
+ * and parked again, so a thread can carry a genuine automatic hop_cap park in its
+ * history while its current park is a human decision to stop the conversation.
+ * fold.ts assigns state as entries are walked and EVERY state entry sets it
+ * (park -> parked, resolve -> resolved, reopen -> open), so the transition that
+ * produced the current state is the LAST state entry in the valid prefix.
+ *
+ * The trigger test is positive equality rather than `!== "duplicate_fingerprint"`.
+ * That matters because BusStatePayloadSchema permits `automatic: true` with NO
+ * trigger at all (ISS-1161): a negative test would silently admit an entry with an
+ * undefined trigger, which is the exact fail-open resolveRefusals already had to
+ * close for itself. This predicate is correct with or without ISS-1161 landing.
+ *
+ * The `state !== "parked"` early return is redundant and kept only for legibility:
+ * the caller reaches this only when the state is not `resolved`, and an open thread's
+ * last state entry is always a reopen, which cannot satisfy `action === "park"`.
+ */
+function isAutomaticHopCapParked(folded: FoldedBusThread): boolean {
+  if (folded.state !== "parked") return false;
+  const last = [...folded.entries].reverse().find((entry) => entry.type === "state");
+  return last?.type === "state" &&
+    last.payload.action === "park" &&
+    last.payload.automatic === true &&
+    classifyAutomaticParkTrigger(last.payload.trigger) === "hop_cap";
+}
+
 async function createThread(
   paths: BusPaths,
   endpoint: BusEndpoint,
@@ -1293,8 +1383,27 @@ async function createThread(
     }
     if (input.predecessorThreadId) {
       const predecessor = await foldBusThread(paths.projectRoot, input.predecessorThreadId);
-      if (predecessor.integrity !== "verified" || predecessor.state !== "resolved") {
-        throw new BusError("conflict", "A predecessor thread must be integrity-verified and resolved");
+      // ISS-1116: a thread parked at the hop cap is a legitimate predecessor, not
+      // only a resolved one. Before this, a question or coordination thread that hit
+      // the cap had no continuation path at all: redelivery is issue_notice-only
+      // (createHopCapSuccessorThread's own guard) and this precondition refused a
+      // parked thread, so the conversation simply ended with no way to carry it on.
+      //
+      // What this grants is LINEAGE and nothing else. An ordinary successor carries
+      // no refusedEntryHash, no content match against the refused artifact, no
+      // redeliver marker (so no uniqueness -- several may exist), and no
+      // predecessorRelation, which is why it never reaches verifiedSuccessorState
+      // and never discharges the predecessor's refusal disposition. It grants no new
+      // authority either: the literal participantsInclude check below is unchanged,
+      // and either participant could already open an unrelated thread with the same
+      // content. duplicate_fingerprint parks stay refused because that trigger means
+      // the same actionable message was already sent, so a successor is not the remedy.
+      if (predecessor.integrity !== "verified" ||
+          (predecessor.state !== "resolved" && !isAutomaticHopCapParked(predecessor))) {
+        throw new BusError(
+          "conflict",
+          "A predecessor thread must be integrity-verified, and either resolved or parked at the hop cap",
+        );
       }
       if (!participantsInclude(predecessor.thread, endpoint.endpointId) ||
           !participantsInclude(predecessor.thread, toEndpointId)) {
@@ -1387,6 +1496,217 @@ async function appendStateEntry(
   const next = await foldBusThread(paths.projectRoot, folded.thread.threadId);
   await writeDerivedThread(paths.projectRoot, next).catch(() => undefined);
   return next;
+}
+
+/**
+ * T-489: append a wake entry.
+ *
+ * Acquires `thread-<id>.lock` and re-folds INSIDE it, exactly like every other
+ * appender. This is not ceremony. The two duet participants hold DIFFERENT
+ * endpoint locks, so an endpoint-locked wake append racing a peer's reply would
+ * compute the same `seq` and `prevHash`, publish a conflicting entry and
+ * QUARANTINE the thread, and catching the error afterwards cannot unpublish it.
+ *
+ * Called only AFTER the network attempt has finished. A wake involves socket I/O
+ * and must never hold a thread lock while it waits.
+ *
+ * Hop count is unaffected: fold.ts increments hopCount only for `message`
+ * entries, and a test pins that rather than assuming it.
+ */
+export async function appendWakeEntry(
+  root: string,
+  threadId: string,
+  payload: BusWakePayload,
+): Promise<void> {
+  const paths = await resolveBusPaths(root);
+  if (!ThreadIdSchema.safeParse(threadId).success) {
+    throw new BusError("invalid_input", "Invalid Bus thread id");
+  }
+  await withHardenedLock(join(paths.locks, `thread-${threadId}.lock`), async () => {
+    const folded = await foldBusThread(paths.projectRoot, threadId);
+    if (folded.integrity !== "verified") {
+      throw new BusError("corrupt", folded.finding ?? "Thread is quarantined");
+    }
+    const entry = makeEntry({
+      type: "wake",
+      threadId,
+      seq: folded.validThroughSeq + 1,
+      prevHash: folded.lastHash,
+      payload,
+    });
+    await durableCreate(
+      join(paths.threads, threadId, "entries", entryFilename(entry)),
+      serialize(entry),
+    );
+    const next = await foldBusThread(paths.projectRoot, threadId);
+    await writeDerivedThread(paths.projectRoot, next).catch(() => undefined);
+  });
+}
+
+/**
+ * ISS-1153: record that a poll passed a wake's cursor.
+ *
+ * WHAT AN ENTRY WRITTEN HERE CLAIMS, and nothing more: a poll by `endpointId`
+ * folded this thread, the thread carried a `requested` wake for that endpoint with
+ * wake-time cursor C, and the endpoint's polled mailbox cursor stood at or past C.
+ * It does NOT claim the wake caused the poll -- a peer polls because its owner
+ * typed "check the Bus" as readily as because a turn was started -- and its
+ * ABSENCE does not claim the mail went unread.
+ *
+ * WHAT IS VALIDATED HERE, AND WHAT IS TRUSTED. Validated: the request's IDENTITY (a
+ * `requested` entry with this `wakeId` exists on this thread, names the endpoint the
+ * caller claims to be, and has no observation yet) and the BOUNDARY comparison
+ * against `pollCursor`. Trusted: `pollCursor` itself. This function does not and
+ * cannot authenticate that an endpoint reached that position, so a caller passing an
+ * arbitrarily high integer clears the boundary check. That caller-side invariant is
+ * load-bearing rather than incidental: the only production caller is `pollBus`,
+ * which passes the cursor it has just persisted while holding that endpoint's lock.
+ * A new caller that cannot make the same guarantee has no business calling this.
+ *
+ * PER THREAD, not per wake: one lock and one deciding fold serve every wakeId on
+ * the thread. The cost is stated rather than bounded: each append re-folds, so K
+ * observations cost O(K x thread history) and the history is not bounded. K is the
+ * number of unobserved requests for one endpoint on one thread, which is 0 or 1 in
+ * ordinary operation. Re-folding is chosen over hand-chaining `seq`/`prevHash`
+ * because every appender in this file works that way and there is no batch-append
+ * primitive to reuse.
+ */
+export type PollObservedOutcome = "appended" | "duplicate" | "no-request" | "not-eligible";
+
+export async function appendPollObservedEntries(input: {
+  readonly root: string;
+  readonly threadId: string;
+  /** The POLLING endpoint. Matched against each canonical `requested` entry. */
+  readonly endpointId: string;
+  /** The cursor that endpoint had reached. Recorded on the entry. */
+  readonly pollCursor: number;
+  readonly wakeIds: readonly string[];
+}): Promise<ReadonlyMap<string, PollObservedOutcome>> {
+  const paths = await resolveBusPaths(input.root);
+  if (!ThreadIdSchema.safeParse(input.threadId).success) {
+    throw new BusError("invalid_input", "Invalid Bus thread id");
+  }
+  if (pollObservedCallHook) await pollObservedCallHook(input.threadId, input.wakeIds);
+  const results = new Map<string, PollObservedOutcome>();
+  if (input.wakeIds.length === 0) return results;
+  await withHardenedLock(join(paths.locks, `thread-${input.threadId}.lock`), async () => {
+    let folded = await foldBusThread(paths.projectRoot, input.threadId);
+    if (pollObservedFoldHook) await pollObservedFoldHook(input.threadId);
+    if (folded.integrity !== "verified") {
+      throw new BusError("corrupt", folded.finding ?? "Thread is quarantined");
+    }
+    for (const wakeId of input.wakeIds) {
+      // Re-read the wake entries from the CURRENT fold on every iteration: an
+      // append earlier in this loop is part of the state the next decision is made
+      // against, so a repeated wakeId sees its own observation and is refused.
+      const wakes = wakePayloadsOf(folded);
+      if (wakes.some((payload) => payload.action === "poll_observed" && payload.wakeId === wakeId)) {
+        results.set(wakeId, "duplicate");
+        continue;
+      }
+      const canonical = wakes.find(
+        (payload) => payload.action === "requested" && payload.wakeId === wakeId,
+      );
+      if (!canonical) {
+        // Includes the case where only a `failed` entry carries this id. A failed
+        // wake never started a turn, so no later poll is attributable to it.
+        results.set(wakeId, "no-request");
+        continue;
+      }
+      if (canonical.endpointId !== input.endpointId || canonical.batchCursor > input.pollCursor) {
+        results.set(wakeId, "not-eligible");
+        continue;
+      }
+      const entry = makeEntry({
+        type: "wake",
+        threadId: input.threadId,
+        seq: folded.validThroughSeq + 1,
+        prevHash: folded.lastHash,
+        payload: {
+          wakeId,
+          // Copied from the canonical entry, not from the caller: the record must
+          // say who the wake was FOR, which the canonical check has just proven
+          // equals the poller.
+          endpointId: canonical.endpointId,
+          attempt: canonical.attempt,
+          batchCursor: input.pollCursor,
+          action: "poll_observed",
+        },
+      });
+      await durableCreate(
+        join(paths.threads, input.threadId, "entries", entryFilename(entry)),
+        serialize(entry),
+      );
+      folded = await foldBusThread(paths.projectRoot, input.threadId);
+      if (pollObservedFoldHook) await pollObservedFoldHook(input.threadId);
+      results.set(wakeId, "appended");
+    }
+    await writeDerivedThread(paths.projectRoot, folded).catch(() => undefined);
+  });
+  return results;
+}
+
+/** Wake payloads of a fold, in chain order. */
+function wakePayloadsOf(folded: FoldedBusThread): BusWakePayload[] {
+  return folded.entries.flatMap((entry) => (entry.type === "wake" ? [entry.payload] : []));
+}
+
+/**
+ * ISS-1153: the sweep, run at the end of a poll from the folds the poll already did.
+ *
+ * CONTAINMENT IS PER THREAD, with an outer catch behind it. One catch around the
+ * whole sweep would let a single repeatedly-failing thread starve every healthy
+ * thread behind it on every poll. A failure becomes a finding on the poll result,
+ * never an error: the messages are already real, and the bookkeeping is idempotent
+ * so the next poll that folds the thread simply tries again.
+ */
+async function observeWakesForPoll(args: {
+  readonly root: string;
+  readonly endpointId: string;
+  readonly folds: ReadonlyMap<string, FoldedBusThread>;
+  readonly pollCursor: number;
+  readonly findings: string[];
+}): Promise<void> {
+  try {
+    for (const [threadId, folded] of args.folds) {
+      // A quarantined fold's entries are only valid through the break, so it is
+      // not a source of candidates. The appender refuses one anyway.
+      if (folded.integrity !== "verified") continue;
+      const wakes = wakePayloadsOf(folded);
+      const already = new Set(
+        wakes.filter((payload) => payload.action === "poll_observed").map((payload) => payload.wakeId),
+      );
+      const wakeIds = [...new Set(
+        wakes
+          .filter((payload) => payload.action === "requested"
+            && payload.endpointId === args.endpointId
+            && payload.batchCursor <= args.pollCursor
+            && !already.has(payload.wakeId))
+          .map((payload) => payload.wakeId),
+      )];
+      // The pre-filter is an OPTIMISATION, not the authority: it keeps an
+      // already-observed thread from reopening the appender on every later poll.
+      // The in-lock checks decide.
+      if (wakeIds.length === 0) continue;
+      try {
+        await appendPollObservedEntries({
+          root: args.root,
+          threadId,
+          endpointId: args.endpointId,
+          pollCursor: args.pollCursor,
+          wakeIds,
+        });
+      } catch (err) {
+        args.findings.push(
+          `${threadId}: wake observation not recorded (${err instanceof Error ? err.message : String(err)})`,
+        );
+      }
+    }
+  } catch (err) {
+    args.findings.push(
+      `wake observation sweep failed (${err instanceof Error ? err.message : String(err)})`,
+    );
+  }
 }
 
 async function replyToThread(
@@ -1967,9 +2287,13 @@ export async function redeliverBusMessage(root: string, input: BusRedeliverInput
     throw new BusError("corrupt", predecessor.finding ?? "Predecessor thread is quarantined");
   }
   const parkEntry = predecessor.entries.find((entry) => entry.entryHash === input.refusedEntryHash);
+  if (!parkEntry || parkEntry.type !== "state" || parkEntry.payload.action !== "park") {
+    throw new BusError("invalid_input", "refusedEntryHash does not name a hop-cap automatic park entry on the predecessor thread");
+  }
+  // ISS-1161: see the identical comment in createHopCapSuccessorThread.
+  const classification = classifyAutomaticParkTrigger(parkEntry.payload.trigger);
   if (
-    !parkEntry || parkEntry.type !== "state" || parkEntry.payload.action !== "park" ||
-    parkEntry.payload.automatic !== true || parkEntry.payload.trigger !== "hop_cap" ||
+    parkEntry.payload.automatic !== true || classification !== "hop_cap" ||
     !parkEntry.payload.droppedMessage
   ) {
     throw new BusError("invalid_input", "refusedEntryHash does not name a hop-cap automatic park entry on the predecessor thread");
@@ -2024,7 +2348,7 @@ export async function redeliverBusMessage(root: string, input: BusRedeliverInput
     }
     // The SAME verification resolveRefusals/createHopCapSuccessorThread use for
     // disposition, reused directly rather than re-derived.
-    const verifiedState = await verifiedSuccessorState(paths, marker, input.refusedEntryHash, artifact, parkEntry.payload.trigger, predecessor);
+    const verifiedState = await verifiedSuccessorState(paths, marker, input.refusedEntryHash, artifact, classification, predecessor);
     if (verifiedState.status === "invalid") {
       throw new BusError("corrupt", `Redeliver marker ${input.refusedEntryHash} names a successor that fails its own verification`);
     }
@@ -2637,6 +2961,14 @@ export async function pollBus(root: string, input: {
     const addressees = endpointAddressees(endpoint, allEndpoints).ids;
     const mailbox = await reconcileEndpointMailbox(paths, endpoint, allEndpoints);
     const messages: BusPollEnvelope[] = [];
+    // ISS-1153: every thread this poll actually folded, in walk order, deduplicated
+    // (a thread can own several pointers). This map is bounded by the POINTERS the
+    // loop walks, not by `limit`: the limit counts SURFACED messages, and a
+    // terminal pointer is folded, reclaimed and skipped without incrementing it.
+    const foldedThreads = new Map<string, FoldedBusThread>();
+    // `cursor` starts at the endpoint's polled high-water, not at zero, which is
+    // what makes the ISS-1153 observation condition CUMULATIVE: a poll that
+    // surfaces nothing new still carries the position the endpoint has reached.
     let cursor = endpoint.lastPolledMailboxSeq;
 
     for (const pointer of mailbox.pointers) {
@@ -2648,6 +2980,13 @@ export async function pollBus(root: string, input: {
         mailbox.findings.push(`${pointer.threadId}: ${err instanceof Error ? err.message : String(err)}`);
         continue;
       }
+      // The LATEST fold wins, not the first. `Map.set` on an existing key updates
+      // the value and keeps the insertion position, so walk order is unaffected.
+      // Keeping the first would discard a `requested` entry that landed between two
+      // of this poll's own folds of the same thread: the poll would have READ it and
+      // still ignored it, and an ack in the same poll can make that miss permanent.
+      foldedThreads.set(pointer.threadId, folded);
+      if (pollPointerFoldHook) await pollPointerFoldHook(pointer.threadId);
       const entry = folded.entries[pointer.entrySeq - 1];
       if (!entry || entry.type !== "message" || entry.entryHash !== pointer.entryHash ||
           entry.payload.messageId !== pointer.messageId || !addressees.includes(entry.payload.to)) {
@@ -2684,6 +3023,16 @@ export async function pollBus(root: string, input: {
         lastSeenAt: new Date().toISOString(),
       }));
     }
+    // ISS-1153. Runs AFTER the cursor persist and still inside the endpoint lock;
+    // the appender takes only a thread lock, and endpoint-then-thread is the order
+    // `withEndpointLock` already documents, so there is no inversion.
+    await observeWakesForPoll({
+      root: paths.projectRoot,
+      endpointId: endpoint.endpointId,
+      folds: foldedThreads,
+      pollCursor: cursor,
+      findings: mailbox.findings,
+    });
     return { endpointId: endpoint.endpointId, cursor, messages, findings: mailbox.findings };
   });
 }
@@ -2905,6 +3254,9 @@ function emptyBusSummary(setupState: BusSetupState = "not_initialized"): BusSumm
     quarantined: 0,
     hookDelivery: { claude: false, codex: false },
     deliveryCapabilities: { onStop: "none", onTool: "none" },
+    // Absent, not zero: a summary that could not read a runtime has not observed
+    // that no wake happened.
+    wake: { entries: null, lastOutcomes: null },
   };
 }
 
@@ -3490,6 +3842,66 @@ function deriveNextActions(setupState: BusSetupState, deliveryMode: BusDeliveryM
   return [];
 }
 
+/**
+ * ISS-1153: count the wake POPULATION off the thread entries.
+ *
+ * Returns null when no thread carries a wake entry at all, and the caller renders
+ * that as absent. Zeroes would say the wake tier ran and never succeeded; null says
+ * nothing was recorded, which is the true statement. Same reasoning for the ratio:
+ * `observedPerRequested` is null over an empty denominator, never 0.
+ */
+export function summarizeWakeEntries(
+  folds: readonly FoldedBusThread[],
+): BusWakeSummary["entries"] {
+  let requested = 0;
+  let pollObserved = 0;
+  const failures = new Map<string, number>();
+  let any = false;
+  for (const folded of folds) {
+    for (const entry of folded.entries) {
+      if (entry.type !== "wake") continue;
+      any = true;
+      if (entry.payload.action === "requested") requested += 1;
+      else if (entry.payload.action === "poll_observed") pollObserved += 1;
+      else {
+        const reason = entry.payload.reason ?? "unspecified";
+        failures.set(reason, (failures.get(reason) ?? 0) + 1);
+      }
+    }
+  }
+  if (!any) return null;
+  return {
+    requested,
+    pollObserved,
+    failed: [...failures.entries()]
+      .map(([reason, count]) => ({ reason, count }))
+      .sort((a, b) => (b.count - a.count) || a.reason.localeCompare(b.reason)),
+    observedPerRequested: requested === 0 ? null : pollObserved / requested,
+  };
+}
+
+/**
+ * ISS-1153: the OTHER sink, which is not a population.
+ *
+ * `lastWakeResult` is one overwritten value per endpoint, so this can only ever
+ * answer "how many endpoints ended their MOST RECENT wake this way". It is never a
+ * count of attempts, and the rendered line says so in words.
+ */
+export function summarizeWakeLastOutcomes(
+  endpoints: readonly BusEndpoint[],
+): BusWakeSummary["lastOutcomes"] {
+  const counts = new Map<string, number>();
+  for (const endpoint of endpoints) {
+    const result = endpoint.lastWakeResult;
+    if (!result) continue;
+    counts.set(result, (counts.get(result) ?? 0) + 1);
+  }
+  if (counts.size === 0) return null;
+  return [...counts.entries()]
+    .map(([result, count]) => ({ result, endpoints: count }))
+    .sort((a, b) => (b.endpoints - a.endpoints) || a.result.localeCompare(b.result));
+}
+
 async function summarizeFrom(
   paths: BusPaths,
   state: ProjectState,
@@ -3522,6 +3934,7 @@ async function summarizeFrom(
     client: endpoint.client,
     surface: endpoint.surface,
     state: endpoint.state,
+    wakePolicy: endpoint.wakePolicy,
   }));
   // A corrupt endpoint registry (a malformed record dropped from the parsed set)
   // makes readiness `invalid`, matching the v1 summary and the send path, which
@@ -3546,6 +3959,10 @@ async function summarizeFrom(
     quarantined: folds.filter((folded) => folded.integrity !== "verified").length,
     hookDelivery,
     deliveryCapabilities: deriveDeliveryCapabilities(active, hookDelivery),
+    wake: {
+      entries: summarizeWakeEntries(folds),
+      lastOutcomes: summarizeWakeLastOutcomes(active),
+    },
   };
 }
 
@@ -3821,4 +4238,15 @@ export const __storeTesting = {
   // ISS-872: force the post-mutation undelivered-count read to fail so tests can prove
   // setup still returns a resumable result (never throws) after joinEndpoint has mutated.
   setCountFailureHook: (fn: (() => Promise<void>) | null) => { countFailureHook = fn; },
+  // ISS-1153: see the seam declarations near the top of this file for why each of
+  // these is the only way its test can distinguish the behaviour it pins.
+  setPollObservedCallHook: (
+    fn: ((threadId: string, wakeIds: readonly string[]) => void | Promise<void>) | null,
+  ) => { pollObservedCallHook = fn; },
+  setPollObservedFoldHook: (
+    fn: ((threadId: string) => void | Promise<void>) | null,
+  ) => { pollObservedFoldHook = fn; },
+  setPollPointerFoldHook: (
+    fn: ((threadId: string) => void | Promise<void>) | null,
+  ) => { pollPointerFoldHook = fn; },
 };

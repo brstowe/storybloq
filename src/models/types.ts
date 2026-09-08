@@ -57,6 +57,35 @@ export const RULING_CANONICAL_ID_REGEX = new RegExp(`^r-${CROCKFORD_CLASS}{16}$`
  */
 export const CLIENT_TASK_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 
+/**
+ * ISS-1117: `CLIENT_TASK_ID_PATTERN` alone accepts a chosen session NAME
+ * (e.g. "claude-session-abc") just as readily as a real client task id, since
+ * both are ordinary identifier-shaped strings. This is the rejection message
+ * shown at both regex sites (`ArrangementPartySchema` and, via reuse rather
+ * than a duplicate, the MCP tool boundary), bounded to 190 characters so it
+ * survives `core/zod-issues.ts`'s 200-character per-field truncation cap on
+ * the CLI/model-handler path unmodified.
+ */
+export const IDENTITY_ANCHOR_FORMAT_MESSAGE =
+  'identityAnchor must be the client task id, never a display name or "name [ref]": ' +
+  "Claude uses CLAUDE_CODE_SESSION_ID, Codex uses CODEX_THREAD_ID " +
+  '(e.g. "b8df203d-d3f5-4520-8057-96babf59612c").';
+
+/**
+ * ISS-1117: a permissive "looks like a real task id, not a chosen name"
+ * check, used ONLY to decide whether to WARN (never to reject -- Codex
+ * thread ids and future clients are not required to be UUID-shaped, so
+ * `CLIENT_TASK_ID_PATTERN` itself must stay loose). Applied identically for
+ * both clients: the Codex thread ids observed in practice share this same
+ * general shape, just not necessarily RFC 4122 version/variant-conformant.
+ */
+const LOOKS_LIKE_A_TASK_ID =
+  /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+
+export function looksLikeClientTaskId(anchor: string): boolean {
+  return LOOKS_LIKE_A_TASK_ID.test(anchor);
+}
+
 // --- Ticket enums ---
 
 export const TICKET_STATUSES = ["open", "inprogress", "complete"] as const;

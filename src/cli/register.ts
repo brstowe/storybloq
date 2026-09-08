@@ -109,6 +109,7 @@ import {
   handleArrangementUpdate,
 } from "./commands/arrangement.js";
 import { ARRANGEMENT_LIFECYCLE, ARRANGEMENT_ROLES, type ArrangementParty } from "../models/arrangement.js";
+import { handleDuetCoordinate, parseDuetOperation } from "./commands/duet.js";
 import {
   handleRulingList,
   handleRulingGet,
@@ -176,6 +177,7 @@ export { registerBusCommand } from "./commands/bus.js";
 
 // New T-084 handler imports
 import { handleRecap } from "./commands/recap.js";
+import { handleReviewStats } from "./commands/review-stats.js";
 import { handleExport } from "./commands/export.js";
 import { handleSnapshot } from "./commands/snapshot.js";
 
@@ -2773,6 +2775,63 @@ export function registerRecapCommand(yargs: Argv): Argv {
 }
 
 // ---------------------------------------------------------------------------
+// review-stats
+// ---------------------------------------------------------------------------
+
+export function registerReviewStatsCommand(yargs: Argv): Argv {
+  return yargs.command(
+    "review-stats",
+    "Review efficiency metrics over review verdict artifacts",
+    (y) =>
+      addFormatOption(
+        y.option("fleet", {
+          type: "string",
+          describe:
+            "Scan every .story/ root under this directory. Root-level results are "
+            + "authoritative; the cross-root figure is a sum of root observations "
+            + "that may include duplicates, not unique fleet activity",
+        }).option("open-window", {
+          type: "boolean",
+          describe:
+            "T-495: open the review-contract measurement window. Records the current "
+            + "REVIEW.md hash as the week's baseline. Refuses if a window is already "
+            + "open; a window cannot be re-based once opened",
+        }).option("close-window", {
+          type: "boolean",
+          describe:
+            "T-495: close the measurement window, recording the three divergence "
+            + "observations. Refuses before seven days have elapsed, refuses to "
+            + "re-close, and refuses below the twenty-round population floor",
+        }).option("contract", {
+          type: "boolean",
+          describe:
+            "T-495: print the review-contract population and its verdict. The verdict "
+            + "is three threshold lines and is never an authorisation",
+        }),
+      ),
+    async (argv) => {
+      const format = parseOutputFormat(argv.format);
+      // `--open-window` WRITES, but it writes `.story/config.json` under the
+      // project lock taken inside `openContractWindow`, not through the ledger
+      // mutation path (config is not a ledger item and has no merge driver).
+      // The read path is still correct for reaching the handler; the lock and
+      // the atomic replace are where the safety lives.
+      await runReadCommand(format, (ctx) =>
+        handleReviewStats(
+          {
+            ...(argv.fleet === undefined ? {} : { fleet: String(argv.fleet) }),
+            ...(argv["open-window"] === true ? { openWindow: true } : {}),
+            ...(argv["close-window"] === true ? { closeWindow: true } : {}),
+            ...(argv.contract === true ? { contract: true } : {}),
+          },
+          ctx,
+        ),
+      );
+    },
+  );
+}
+
+// ---------------------------------------------------------------------------
 // export
 // ---------------------------------------------------------------------------
 
@@ -3236,6 +3295,30 @@ export function registerArrangementCommand(yargs: Argv): Argv {
     (y) =>
       y
         .command(
+          "coordinate <id>",
+          "Record a pen-owned duet coordination operation",
+          (y2) => addFormatOption(y2
+            .positional("id", { type: "string", demandOption: true })
+            .option("json", { type: "string", demandOption: true, describe: "Typed start/receipt/assign/update/recover operation including expectedSessionId and expectedRevision" })
+            .option("client-task-id", { type: "string", describe: "Explicit caller task identity" })),
+          async (argv) => {
+            const format = parseOutputFormat(argv.format);
+            try {
+              const input = parseDuetOperation(argv.id as string, argv.json as string, argv["client-task-id"] as string | undefined);
+              const root = (await import("../core/project-root-discovery.js")).discoverProjectRoot();
+              if (!root) throw new CliValidationError("not_found", "No .story/ project found.");
+              const result = await handleDuetCoordinate(input, format, root);
+              writeOutput(result.output);
+              process.exitCode = result.exitCode ?? ExitCode.OK;
+            } catch (error) {
+              const { ProjectLoaderError } = await import("../core/errors.js");
+              const code = error instanceof CliValidationError || error instanceof ProjectLoaderError ? error.code : "io_error";
+              writeOutput(formatError(code, error instanceof Error ? error.message : String(error), format));
+              process.exitCode = ExitCode.USER_ERROR;
+            }
+          },
+        )
+        .command(
           "list",
           "List arrangements",
           (y2) =>
@@ -3399,7 +3482,7 @@ export function registerArrangementCommand(yargs: Argv): Argv {
             }
           },
         )
-        .demandCommand(1, "Specify an arrangement subcommand: list, get, create, update")
+        .demandCommand(1, "Specify an arrangement subcommand: list, get, create, update, coordinate")
         .strict(),
     () => {},
   );
@@ -3464,7 +3547,15 @@ export function registerRulingCommand(yargs: Argv): Argv {
                   })
                   .option("date", { type: "string", demandOption: true, describe: "Ruling date (YYYY-MM-DD)" })
                   .option("client-task-id", { type: "string", describe: "Explicit caller identity, if not resolvable from the session" }),
-                { "scope-tag": { ...SPLIT_LIST, describe: "Scope tag (repeatable)" } },
+                {
+                  "scope-tag": { ...SPLIT_LIST, describe: "Scope tag (repeatable)" },
+                  cites: {
+                    ...SPLIT_LIST,
+                    describe:
+                      "Ticket or issue this ruling binds (repeatable). Adds the new ruling id to that item's citesRulings, " +
+                      "which is how the ruling reaches an agent working the item. Never replaces existing citations.",
+                  },
+                },
               ),
             ),
           async (argv) => {
@@ -3482,6 +3573,7 @@ export function registerRulingCommand(yargs: Argv): Argv {
                   attribution: argv.attribution as string,
                   date: argv.date as string,
                   scopeTags: (argv["scope-tag"] as string[] | undefined) ?? [],
+                  cites: argv.cites as string[] | undefined,
                   clientTaskId: argv["client-task-id"] as string | undefined,
                 },
                 format,
@@ -4606,46 +4698,45 @@ export function registerKnowledgeCommand(yargs: Argv): Argv {
           "Create a knowledge entry",
           (y2) =>
             addFormatOption(
-              y2
-                .option("title", {
-                  type: "string",
-                  demandOption: true,
-                  describe: "Knowledge title",
-                })
-                .option("content", {
-                  type: "string",
-                  describe: "Knowledge content (the actionable rule)",
-                })
-                .option("context", {
-                  type: "string",
-                  demandOption: true,
-                  describe: "What produced this knowledge",
-                })
-                .option("source", {
-                  type: "string",
-                  demandOption: true,
-                  choices: [...LESSON_SOURCES],
-                  describe: "Knowledge source",
-                })
-                .option("tags", {
-                  type: "array",
-                  describe: "Tags for the entry",
-                })
-                .option("supersedes", {
-                  type: "string",
-                  describe: "ID of entry this supersedes",
-                })
-                .option("stdin", {
-                  type: "boolean",
-                  describe: "Read content from stdin",
-                })
-                .conflicts("content", "stdin")
-                .check((argv) => {
-                  if (!argv.content && !argv.stdin) {
-                    throw new Error("Specify either --content or --stdin");
-                  }
-                  return true;
-                }),
+              arrayOptions(
+                y2
+                  .option("title", {
+                    type: "string",
+                    demandOption: true,
+                    describe: "Knowledge title",
+                  })
+                  .option("content", {
+                    type: "string",
+                    describe: "Knowledge content (the actionable rule)",
+                  })
+                  .option("context", {
+                    type: "string",
+                    demandOption: true,
+                    describe: "What produced this knowledge",
+                  })
+                  .option("source", {
+                    type: "string",
+                    demandOption: true,
+                    choices: [...LESSON_SOURCES],
+                    describe: "Knowledge source",
+                  })
+                  .option("supersedes", {
+                    type: "string",
+                    describe: "ID of entry this supersedes",
+                  })
+                  .option("stdin", {
+                    type: "boolean",
+                    describe: "Read content from stdin",
+                  })
+                  .conflicts("content", "stdin")
+                  .check((argv) => {
+                    if (!argv.content && !argv.stdin) {
+                      throw new Error("Specify either --content or --stdin");
+                    }
+                    return true;
+                  }),
+                { tags: { ...SPLIT_LIST, describe: "Tags for the entry" } },
+              ),
             ),
           async (argv) => {
             const format = parseOutputFormat(argv.format);
@@ -4673,34 +4764,39 @@ export function registerKnowledgeCommand(yargs: Argv): Argv {
           "Update a knowledge entry",
           (y2) =>
             addFormatOption(
-              y2
-                .positional("id", {
-                  type: "string",
-                  demandOption: true,
-                  describe: "Knowledge ID (e.g. K-001)",
-                })
-                .option("title", { type: "string", describe: "New title" })
-                .option("content", { type: "string", describe: "New content" })
-                .option("context", { type: "string", describe: "New context" })
-                .option("tags", {
-                  type: "array",
-                  describe: "New tags (replaces existing)",
-                })
-                .option("clear-tags", {
-                  type: "boolean",
-                  describe: "Clear all tags",
-                })
-                .option("status", {
-                  type: "string",
-                  choices: [...LESSON_STATUSES],
-                  describe: "New status",
-                })
-                .option("stdin", {
-                  type: "boolean",
-                  describe: "Read content from stdin",
-                })
-                .conflicts("content", "stdin")
-                .conflicts("tags", "clear-tags"),
+              arrayOptions(
+                y2
+                  .positional("id", {
+                    type: "string",
+                    demandOption: true,
+                    describe: "Knowledge ID (e.g. K-001)",
+                  })
+                  .option("title", { type: "string", describe: "New title" })
+                  .option("content", { type: "string", describe: "New content" })
+                  .option("context", { type: "string", describe: "New context" })
+                  .option("clear-tags", {
+                    type: "boolean",
+                    describe: "Clear all tags",
+                  })
+                  .option("status", {
+                    type: "string",
+                    choices: [...LESSON_STATUSES],
+                    describe: "New status",
+                  })
+                  .option("stdin", {
+                    type: "boolean",
+                    describe: "Read content from stdin",
+                  })
+                  .conflicts("content", "stdin")
+                  .conflicts("tags", "clear-tags"),
+                {
+                  tags: {
+                    ...SPLIT_LIST,
+                    describe: "New tags (replaces existing)",
+                    requireValue: "Use --clear-tags to clear tags.",
+                  },
+                },
+              ),
             ),
           async (argv) => {
             const format = parseOutputFormat(argv.format);

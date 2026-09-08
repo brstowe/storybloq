@@ -149,6 +149,38 @@ export const ConfigSchema = z
       protectedRef: z.string().min(1).refine((v) => !v.startsWith("-"), "Protected ref must not start with -").optional(),
       mergeDriverVersion: z.number().int().optional(),
     }).optional(),
+    // T-495: the review-contract measurement window, written once by
+    // `review-stats --open-window` and closed once by `--close-window`.
+    //
+    // DECLARED rather than left to `.passthrough()`. Passthrough would carry it
+    // today, but the guarantee this key needs is that a future tightening of
+    // the top-level object cannot silently drop it: a window that parses away
+    // is a window that does not exist, and the reader would then report
+    // UNDETERMINED for a week that really was measured.
+    //
+    // Deliberately at the TOP LEVEL and not under `recipeOverrides`, which is a
+    // plain z.object that strips what it does not declare. It is also not a
+    // recipe knob: it is a record of a measurement, not a setting.
+    contractMeasurement: z.object({
+      openedAt: z.string(),
+      closedAt: z.string().nullable(),
+      baselineHash: z.string(),
+      roots: z.array(z.string()),
+      // T-495 reader: what the three divergence checks saw at close. Written in
+      // the same atomic replace as `closedAt`, because a closed window without
+      // them cannot support the VOID decision and `readContractWindow` refuses
+      // that combination. Nullable per field: an observation that could not be
+      // made must not read as a clean one.
+      closeObservations: z.object({
+        reReadHash: z.string().nullable(),
+        // A COUNT, so a nonnegative integer. `-1` is not an unreadable
+        // observation, it is a number that answers the verdict's "above zero"
+        // question wrongly, and unreadable must be `null`.
+        commitsTouchingReview: z.number().int().nonnegative().nullable(),
+        reviewDirty: z.boolean().nullable(),
+        notes: z.array(z.string()),
+      }).nullable().optional(),
+    }).optional(),
   })
   .passthrough();
 

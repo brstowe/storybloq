@@ -19,6 +19,7 @@ import {
   type BusEndpoint,
 } from "../../src/bus/index.js";
 import * as fold from "../../src/bus/fold.js";
+import { assertValidAutomaticParkTrigger, __testingStore as storeTesting } from "../../src/bus/store.js";
 import * as io from "../../src/bus/io.js";
 import * as endpointsModule from "../../src/bus/endpoints.js";
 import { BusError } from "../../src/bus/errors.js";
@@ -6768,5 +6769,214 @@ describe("Storybloq Bus store", () => {
     });
     expect((await foldBusThread(value.root, successor.threadId)).thread.predecessorThreadId)
       .toBe(first.threadId);
+  });
+
+  // ISS-1161: automatic:true must tie to a present, valid trigger at write time;
+  // legacy/forged entries that predate or violate this must still fold, and must
+  // classify as "unknown" rather than being silently treated as hop_cap.
+
+  describe("ISS-1161: automatic park trigger invariant", () => {
+    function expectInvalidInput(fn: () => unknown): void {
+      // Codex code review round 1: assert the SPECIFIC BusError code, not just
+      // "some BusError" -- otherwise the guard could throw the wrong
+      // classification (e.g. "corrupt") and these tests would stay green.
+      let threw = false;
+      try {
+        fn();
+      } catch (err) {
+        threw = true;
+        expect(err).toBeInstanceOf(BusError);
+        expect((err as BusError).code).toBe("invalid_input");
+      }
+      expect(threw).toBe(true);
+    }
+
+    it("A1: assertValidAutomaticParkTrigger enforces automatic <-> valid trigger both ways", () => {
+      expectInvalidInput(() => assertValidAutomaticParkTrigger({ automatic: true, trigger: undefined }));
+      expect(() => assertValidAutomaticParkTrigger({ automatic: true, trigger: "hop_cap" })).not.toThrow();
+      expectInvalidInput(() => assertValidAutomaticParkTrigger({ automatic: undefined, trigger: "duplicate_fingerprint" }));
+      expectInvalidInput(() => assertValidAutomaticParkTrigger({ automatic: false, trigger: "hop_cap" }));
+      // The ordinary manual park/resolve/reopen shape: neither field set.
+      expect(() => assertValidAutomaticParkTrigger({ automatic: undefined, trigger: undefined })).not.toThrow();
+    });
+
+    it("A2: makeEntry itself invokes the guard (not just assertValidAutomaticParkTrigger in isolation)", async () => {
+      const value = await fixture();
+      const sent = await reviewSend(value);
+      const before = await foldBusThread(value.root, sent.threadId);
+      expectInvalidInput(() =>
+        storeTesting.makeEntry({
+          type: "state",
+          threadId: sent.threadId,
+          seq: before.validThroughSeq + 1,
+          prevHash: before.lastHash,
+          payload: { action: "park", byEndpoint: value.reviewer.endpointId, automatic: true },
+        })
+      );
+    });
+
+    it("B1: classifyAutomaticParkTrigger never normalizes absent or unrecognized to a specific cause", () => {
+      expect(fold.classifyAutomaticParkTrigger("hop_cap")).toBe("hop_cap");
+      expect(fold.classifyAutomaticParkTrigger("duplicate_fingerprint")).toBe("duplicate_fingerprint");
+      expect(fold.classifyAutomaticParkTrigger(undefined)).toBe("unknown");
+      expect(fold.classifyAutomaticParkTrigger("some_other_string")).toBe("unknown");
+    });
+
+    it("C1/C2: a legacy automatic park with no trigger and no droppedMessage still folds, classifying unknown; an ordinary legacy manual entry is unaffected", async () => {
+      const value = await fixture();
+      const sent = await reviewSend(value);
+      const before = await foldBusThread(value.root, sent.threadId);
+      const entriesDir = join(value.root, ".story", "bus", "threads", sent.threadId, "entries");
+
+      // Genuinely legacy shape: automatic:true, no trigger, no droppedMessage --
+      // written directly to disk, bypassing makeEntry's new guard entirely (as a
+      // real pre-ISS-1161 write would have), so the fold's READ-side tolerance is
+      // what this test actually exercises.
+      const unsigned = {
+        schema: "storybloq-bus-entry/v2" as const,
+        entryId: randomUUID(),
+        threadId: sent.threadId,
+        seq: before.validThroughSeq + 1,
+        type: "state" as const,
+        prevHash: before.lastHash,
+        payload: { action: "park" as const, byEndpoint: value.reviewer.endpointId, reason: "legacy", automatic: true },
+        createdAt: new Date().toISOString(),
+        entryHash: "0".repeat(64),
+      };
+      const legacyEntry = { ...unsigned, entryHash: hashWithoutKey(unsigned, "entryHash") };
+      const filename = `${String(legacyEntry.seq).padStart(6, "0")}-state-${legacyEntry.entryId}.json`;
+      await writeFile(join(entriesDir, filename), JSON.stringify(legacyEntry, null, 2) + "\n", "utf-8");
+
+      const folded = await foldBusThread(value.root, sent.threadId);
+      expect(folded.integrity).toBe("verified");
+      expect(folded.state).toBe("parked");
+      const last = folded.entries.at(-1);
+      expect(last?.type === "state" && fold.classifyAutomaticParkTrigger(last.payload.trigger)).toBe("unknown");
+
+      // C2: the ordinary legacy manual shape (neither automatic nor trigger present
+      // at all -- what updateBusThread has always produced) remains accepted,
+      // pinned directly rather than only implied by C1's one automatic-park shape.
+      expect(BusStatePayloadSchema.safeParse({ action: "resolve", byEndpoint: value.reviewer.endpointId }).success).toBe(true);
+    });
+
+    // D2-D4 use an UNRECOGNIZED (non-null, non-enum) trigger string, which
+    // BusStatePayloadSchema's `trigger: z.enum([...]).optional()` field can never
+    // parse from disk directly (a raw write of this shape, read back normally,
+    // quarantines the whole thread on the enum violation alone, before any of
+    // this item's own logic runs). Reaching a consumer's classification logic
+    // with this exact shape therefore requires bypassing schema validation for
+    // one read, exactly as the existing "never lets an absent or malformed park
+    // trigger normalize..." test above already does: spy on the single
+    // `readJsonNoFollow` call that reads the genuine park entry's file, and
+    // return an in-memory-only mutated copy (recomputed entryHash) instead.
+
+    async function forgeUnrecognizedTrigger(
+      value: BusFixture,
+      threadId: string,
+    ): Promise<{ mutatedEntryHash: string; spy: ReturnType<typeof vi.spyOn> }> {
+      const entriesDir = join(value.root, ".story", "bus", "threads", threadId, "entries");
+      const parkFilename = (await readdir(entriesDir)).sort().at(-1)!;
+      const parkPath = await realpath(join(entriesDir, parkFilename));
+      const rawParkEntry = JSON.parse(await readFile(parkPath, "utf-8"));
+      const mutatedEntry = structuredClone(rawParkEntry);
+      mutatedEntry.payload.trigger = "some_unrecognized_trigger";
+      mutatedEntry.entryHash = "0".repeat(64);
+      mutatedEntry.entryHash = hashWithoutKey(mutatedEntry, "entryHash");
+
+      const originalReadJsonNoFollow = io.readJsonNoFollow;
+      const spy = vi.spyOn(io, "readJsonNoFollow").mockImplementation(async (...callArgs: Parameters<typeof io.readJsonNoFollow>) => {
+        const [path] = callArgs;
+        if (path === parkPath) return mutatedEntry;
+        return originalReadJsonNoFollow(...callArgs);
+      });
+      return { mutatedEntryHash: mutatedEntry.entryHash, spy };
+    }
+
+    it("D2: nextActionForPark never treats an unrecognized trigger as hop_cap eligibility on replay", async () => {
+      const value = await fixture();
+      const issueId = await createIssue(value.root, "medium");
+      const { threadId } = await parkOverCap(value, issueId, "iss1161-d2");
+      const { mutatedEntryHash, spy } = await forgeUnrecognizedTrigger(value, threadId);
+
+      // The committed receipt binds to the park entry's hash (committedAutomaticPark
+      // rejects a receipt/entry mismatch as corrupt by design); since folding now
+      // returns the mutated entry (via the spy) for that file, the receipt must be
+      // updated in lockstep to keep pointing at the same logical entry.
+      const receiptKeyHash = idempotencyKeyHash(value.reviewer.endpointId, "iss1161-d2-over-cap");
+      const receiptPath = join(value.root, ".story", "bus", "idempotency", value.reviewer.endpointId, `${receiptKeyHash}.json`);
+      const rawReceipt = JSON.parse(await readFile(receiptPath, "utf-8"));
+      rawReceipt.stateEntryHash = mutatedEntryHash;
+      await writeFile(receiptPath, JSON.stringify(rawReceipt, null, 2) + "\n", "utf-8");
+
+      try {
+        const tamperedFold = await foldBusThread(value.root, threadId);
+        expect(tamperedFold.integrity).toBe("verified");
+
+        const replay = await sendBusMessage(value.root, {
+          endpointId: value.reviewer.endpointId,
+          clientTaskId: value.reviewerTaskId,
+          threadId,
+          toRole: "implementer",
+          messageKind: "reply",
+          severity: "medium",
+          body: "One more check needed before this can close.",
+          idempotencyKey: "iss1161-d2-over-cap",
+        });
+        expect(replay).toMatchObject({ parked: true, replayed: true, replaySource: "receipt" });
+        expect(replay.nextAction).toBeNull();
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it("D3: redeliverBusMessage's preflight never treats an unrecognized trigger as a hop-cap automatic park", async () => {
+      const value = await fixture();
+      const issueId = await createIssue(value.root, "medium");
+      const { threadId } = await parkOverCap(value, issueId, "iss1161-d3");
+      const { mutatedEntryHash, spy } = await forgeUnrecognizedTrigger(value, threadId);
+
+      try {
+        const tamperedFold = await foldBusThread(value.root, threadId);
+        expect(tamperedFold.integrity).toBe("verified");
+
+        await expect(redeliverBusMessage(value.root, {
+          endpointId: value.implementer.endpointId,
+          clientTaskId: value.implementerTaskId,
+          predecessorThreadId: threadId,
+          refusedEntryHash: mutatedEntryHash,
+        })).rejects.toMatchObject({ code: "invalid_input" });
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it("D4: createHopCapSuccessorThread's preflight never treats an unrecognized trigger as a hop-cap automatic park", async () => {
+      const value = await fixture();
+      const issueId = await createIssue(value.root, "medium");
+      const { threadId } = await parkOverCap(value, issueId, "iss1161-d4");
+      const { mutatedEntryHash, spy } = await forgeUnrecognizedTrigger(value, threadId);
+
+      try {
+        const tamperedFold = await foldBusThread(value.root, threadId);
+        expect(tamperedFold.integrity).toBe("verified");
+
+        await expect(sendBusMessage(value.root, {
+          endpointId: value.implementer.endpointId,
+          clientTaskId: value.implementerTaskId,
+          threadKind: "issue_notice",
+          predecessorThreadId: threadId,
+          predecessorRelation: "hop_cap_successor",
+          refusedEntryHash: mutatedEntryHash,
+          toRole: "reviewer",
+          messageKind: "issue_notice",
+          severity: "medium",
+          body: "Redelivering after hop cap.",
+          refs: { issue: issueId },
+          idempotencyKey: "iss1161-d4-redeliver",
+        })).rejects.toMatchObject({ code: "invalid_input" });
+      } finally {
+        spy.mockRestore();
+      }
+    });
   });
 });
