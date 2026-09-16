@@ -9,7 +9,7 @@
 import type { Argv } from "yargs";
 import type { CodexReviewKind } from "./commands/codex-review.js";
 import type { SetupClient } from "./commands/setup-skill.js";
-import { runReadCommand, runReadCommandWithRoot, runDeleteCommand, writeOutput } from "./run.js";
+import { runReadCommand, runReadCommandWithRoot, runDeleteCommand, writeOutput, applyHandlerWarnings } from "./run.js";
 import {
   addFormatOption,
   parseOutputFormat,
@@ -24,7 +24,7 @@ import {
   resolveCliNodeRoot,
   CliValidationError,
 } from "./helpers.js";
-import { arrayOptions, arrayPositional } from "./array-options.js";
+import { arrayOption, arrayOptions, arrayPositional } from "./array-options.js";
 
 // Shared comma/empty/trim/emptyAfterSplit combinations. See array-options.ts for
 // what each axis means and ISS-886 for why they are declared per registration.
@@ -62,6 +62,7 @@ import {
   handleHandoverLatest,
   handleHandoverGet,
   handleHandoverCreate,
+  handleHandoverTemplate,
 } from "./commands/handover.js";
 import { handleBlockerList, handleBlockerAdd, handleBlockerClear } from "./commands/blocker.js";
 import {
@@ -107,6 +108,8 @@ import {
   handleArrangementGet,
   handleArrangementCreate,
   handleArrangementUpdate,
+  handleArrangementCompact,
+  handleArrangementRotate,
 } from "./commands/arrangement.js";
 import { ARRANGEMENT_LIFECYCLE, ARRANGEMENT_ROLES, type ArrangementParty } from "../models/arrangement.js";
 import { handleDuetCoordinate, parseDuetOperation } from "./commands/duet.js";
@@ -208,7 +211,7 @@ function parseIssueSourceRefs(values: string[] | undefined): IssueSourceRefInput
 function addNodeOption<T>(y: Argv<T>): Argv<T & { node: string | undefined }> {
   return y.option("node", {
     type: "string",
-    describe: "Node name (orchestrator only). Operates on that node's .story/ instead of the orchestrator's.",
+    describe: 'Node name (orchestrator only). Operates on that node\'s .story/ instead of the orchestrator\'s. Pass "." for the orchestrator\'s own board.',
   }) as Argv<T & { node: string | undefined }>;
 }
 
@@ -234,11 +237,26 @@ export function registerStatusCommand(yargs: Argv): Argv {
   return yargs.command(
     "status",
     "Project summary",
-    (y) => addFormatOption(y).option("client-task-id", { type: "string", describe: "Explicit caller identity, if not resolvable from the session" }),
+    (y) =>
+      addFormatOption(y)
+        .option("client-task-id", { type: "string", describe: "Explicit caller identity, if not resolvable from the session" })
+        .option("compact", {
+          type: "boolean",
+          default: false,
+          describe: "T-320: reduced JSON payload (JSON only; ignores --format)",
+        }),
     async (argv) => {
-      const format = parseOutputFormat(argv.format);
+      const compact = argv.compact as boolean | undefined;
+      // T-320: compact is JSON regardless of --format, and that has to be
+      // decided HERE, before runReadCommand -- its usage-advisory/token-
+      // pressure pushes (emitCliBanner) append Markdown prose to stdout
+      // whenever they fire, which corrupts a compact body if format is
+      // still "md" at that point.
+      const format = compact ? "json" : parseOutputFormat(argv.format);
       const clientTaskId = argv["client-task-id"] as string | undefined;
-      await runReadCommand(format, (ctx) => handleStatus(ctx, clientTaskId));
+      // T-501: status is the /story priming call and the only CLI surface
+      // that shows (and consumes) the usage-cost advisory.
+      await runReadCommand(format, (ctx) => handleStatus(ctx, clientTaskId, { compact }), { usageAdvisory: true });
     },
   );
 }
@@ -721,17 +739,36 @@ export function registerHandoverCommand(yargs: Argv): Argv {
           "Content of most recent handover(s)",
           (y2) =>
             addFormatOption(
-              y2.option("count", {
-                type: "number",
-                default: 1,
-                describe: "Number of recent handovers to return (default: 1)",
-              }),
+              y2
+                .option("count", {
+                  type: "number",
+                  default: 1,
+                  describe: "Number of recent handovers to return (default: 1)",
+                })
+                .option("brief", {
+                  type: "boolean",
+                  describe:
+                    "T-320: structured record digest (continuation/blocked/owner-gated/carried plus trajectory) instead of full bodies",
+                })
+                .option("priming", {
+                  type: "boolean",
+                  describe:
+                    "T-320/T-497: full body at or under 12,000 bytes per handover, else the same structured digest as --brief",
+                }),
             ),
           async (argv) => {
             const format = parseOutputFormat(argv.format);
-            const count = Math.max(1, Math.floor(argv.count as number));
+            const brief = argv.brief as boolean | undefined;
+            const priming = argv.priming as boolean | undefined;
+            let count = Math.max(1, Math.floor(argv.count as number));
+            // T-320: capped at 10 ONLY for brief/priming, matching
+            // storybloq_handover_latest's existing MCP schema (z.number()
+            // .max(10)) -- the cross-handover budget's H=14,200 is only sized
+            // for a window this small. The plain default path (neither flag)
+            // is untouched: it never had a count cap and must stay that way.
+            if (brief || priming) count = Math.min(10, count);
             await runReadCommand(format, (ctx) =>
-              handleHandoverLatest(ctx, count),
+              handleHandoverLatest(ctx, count, { brief, priming }),
             );
           },
         )
@@ -841,7 +878,26 @@ export function registerHandoverCommand(yargs: Argv): Argv {
             }
           },
         )
-        .demandCommand(1, "Specify a handover subcommand: list, latest, get, create")
+        .command(
+          "template",
+          "Scaffold a new handover document (category headings, Carried forward, marker)",
+          (y2) =>
+            addFormatOption(
+              y2.option("override", {
+                type: "string",
+                describe:
+                  "Override line body: recommended=<id> worked=<id> because=<text>",
+              }),
+            ),
+          async (argv) => {
+            const format = parseOutputFormat(argv.format);
+            const override = argv.override as string | undefined;
+            await runReadCommand(format, (ctx) =>
+              handleHandoverTemplate(ctx, { override }),
+            );
+          },
+        )
+        .demandCommand(1, "Specify a handover subcommand: list, latest, get, create, template")
         .strict(),
     () => {},
   );
@@ -1373,7 +1429,7 @@ export function registerTicketCommand(yargs: Argv): Argv {
                 format,
                 eff.root,
               );
-              writeOutput(result.output);
+              writeOutput(applyHandlerWarnings(result.output, format, result.warnings ?? []));
               process.exitCode = result.exitCode ?? ExitCode.OK;
             } catch (err: unknown) {
               if (err instanceof CliValidationError) {
@@ -1527,7 +1583,7 @@ export function registerTicketCommand(yargs: Argv): Argv {
                 eff.root,
                 argv.force as boolean,
               );
-              writeOutput(result.output);
+              writeOutput(applyHandlerWarnings(result.output, format, result.warnings ?? []));
               process.exitCode = result.exitCode ?? ExitCode.OK;
             } catch (err: unknown) {
               if (err instanceof CliValidationError) {
@@ -2006,7 +2062,7 @@ export function registerIssueCommand(yargs: Argv): Argv {
                 format,
                 root,
               );
-              writeOutput(result.output);
+              writeOutput(applyHandlerWarnings(result.output, format, result.warnings ?? []));
               process.exitCode = result.exitCode ?? ExitCode.OK;
             } catch (err: unknown) {
               if (err instanceof CliValidationError) {
@@ -2143,7 +2199,7 @@ export function registerIssueCommand(yargs: Argv): Argv {
                 format,
                 root,
               );
-              writeOutput(result.output);
+              writeOutput(applyHandlerWarnings(result.output, format, result.warnings ?? []));
               process.exitCode = result.exitCode ?? ExitCode.OK;
             } catch (err: unknown) {
               if (err instanceof CliValidationError) {
@@ -2989,7 +3045,7 @@ export function registerNoteCommand(yargs: Argv): Argv {
                 format,
                 root,
               );
-              writeOutput(result.output);
+              writeOutput(applyHandlerWarnings(result.output, format, result.warnings ?? []));
               process.exitCode = result.exitCode ?? ExitCode.OK;
             } catch (err: unknown) {
               if (err instanceof CliValidationError) {
@@ -3087,7 +3143,7 @@ export function registerNoteCommand(yargs: Argv): Argv {
                 format,
                 root,
               );
-              writeOutput(result.output);
+              writeOutput(applyHandlerWarnings(result.output, format, result.warnings ?? []));
               process.exitCode = result.exitCode ?? ExitCode.OK;
             } catch (err: unknown) {
               if (err instanceof CliValidationError) {
@@ -3148,6 +3204,44 @@ export function registerNoteCommand(yargs: Argv): Argv {
 // ---------------------------------------------------------------------------
 // arrangement (T-473)
 // ---------------------------------------------------------------------------
+
+/**
+ * ISS-1191: the root discovery, format parsing and error classification the
+ * capacity-maintenance subcommands share with every other arrangement
+ * subcommand, factored out rather than pasted a third and fourth time.
+ */
+async function runArrangementMaintenance(
+  argv: { format?: string },
+  run: (format: ReturnType<typeof parseOutputFormat>, root: string) => Promise<{ output: string; exitCode?: number }>,
+): Promise<void> {
+  const format = parseOutputFormat(argv.format as string);
+  const root = (await import("../core/project-root-discovery.js")).discoverProjectRoot();
+  if (!root) {
+    writeOutput(formatError("not_found", "No .story/ project found.", format));
+    process.exitCode = ExitCode.USER_ERROR;
+    return;
+  }
+  try {
+    const result = await run(format, root);
+    writeOutput(result.output);
+    process.exitCode = result.exitCode ?? ExitCode.OK;
+  } catch (err: unknown) {
+    if (err instanceof CliValidationError) {
+      writeOutput(formatError(err.code, err.message, format));
+      process.exitCode = ExitCode.USER_ERROR;
+      return;
+    }
+    const { ProjectLoaderError } = await import("../core/errors.js");
+    if (err instanceof ProjectLoaderError) {
+      writeOutput(formatError(err.code, err.message, format));
+      process.exitCode = ExitCode.USER_ERROR;
+      return;
+    }
+    const message = err instanceof Error ? err.message : String(err);
+    writeOutput(formatError("io_error", message, format));
+    process.exitCode = ExitCode.USER_ERROR;
+  }
+}
 
 /**
  * ISS-1078 ([R1-FIX 8]): parses the `key=value,key=value,...` fields of one
@@ -3482,7 +3576,39 @@ export function registerArrangementCommand(yargs: Argv): Argv {
             }
           },
         )
-        .demandCommand(1, "Specify an arrangement subcommand: list, get, create, update, coordinate")
+        // ISS-1191: capacity maintenance. Both are CLI only and both are
+        // pen-authorized, exactly like `coordinate`.
+        .command(
+          "compact <id>",
+          "Compact an arrangement's coordination checkpoint (reduces resolved assignments)",
+          (y2) =>
+            addFormatOption(
+              y2
+                .positional("id", { type: "string", demandOption: true, describe: "Arrangement ID (e.g. a-[canonical])" })
+                .option("client-task-id", { type: "string", describe: "Caller's client task id; must match the arrangement's pen" }),
+            ),
+          async (argv) => {
+            await runArrangementMaintenance(argv, (format, root) =>
+              handleArrangementCompact(argv.id as string, { clientTaskId: argv.clientTaskId as string | undefined }, format, root),
+            );
+          },
+        )
+        .command(
+          "rotate <id>",
+          "Close an arrangement and carry its open work forward into a fresh successor",
+          (y2) =>
+            addFormatOption(
+              y2
+                .positional("id", { type: "string", demandOption: true, describe: "Arrangement ID (e.g. a-[canonical])" })
+                .option("client-task-id", { type: "string", describe: "Caller's client task id; must match the arrangement's pen" }),
+            ),
+          async (argv) => {
+            await runArrangementMaintenance(argv, (format, root) =>
+              handleArrangementRotate(argv.id as string, { clientTaskId: argv.clientTaskId as string | undefined }, format, root),
+            );
+          },
+        )
+        .demandCommand(1, "Specify an arrangement subcommand: list, get, create, update, compact, rotate, coordinate")
         .strict(),
     () => {},
   );
@@ -4063,12 +4189,16 @@ export function registerRecommendCommand(yargs: Argv): Argv {
         type: "number",
         default: 5,
         describe: "Number of recommendations (1-10)",
+      }).option("with-actionability", {
+        type: "boolean",
+        default: false,
+        describe: "Show actionability status/reason per row plus an Excluded section (ISS-1154)",
       }),
     async (argv) => {
       const format = parseOutputFormat(argv.format);
       const raw = Number(argv.count) || 5;
       const count = Math.max(1, Math.min(10, Math.floor(raw)));
-      await runReadCommand(format, (ctx) => handleRecommend(ctx, count));
+      await runReadCommand(format, (ctx) => handleRecommend(ctx, count, Boolean(argv["with-actionability"])));
     },
   );
 }
@@ -4205,10 +4335,27 @@ export function registerLessonCommand(yargs: Argv): Argv {
         .command(
           "digest",
           "Compiled ranked digest of active lessons",
-          (y2) => addFormatOption(y2),
+          (y2) =>
+            arrayOptions(
+              addFormatOption(y2).option("limit", {
+                type: "number",
+                describe: "Cap the digest to the top N lessons by reinforcement (T-320)",
+              }),
+              {
+                select: {
+                  ...SPLIT_LIST,
+                  describe: "Filter to lessons matching phase:<id>, component:<name>, or item:<id> selectors (T-320)",
+                },
+              },
+            ),
           async (argv) => {
             const format = parseOutputFormat(argv.format);
-            await runReadCommand(format, (ctx) => handleLessonDigest(ctx));
+            await runReadCommand(format, (ctx) =>
+              handleLessonDigest(ctx, {
+                limit: argv.limit as number | undefined,
+                select: argv.select as string[] | undefined,
+              }),
+            );
           },
         )
         .command(
@@ -4288,7 +4435,7 @@ export function registerLessonCommand(yargs: Argv): Argv {
                 format,
                 root,
               );
-              writeOutput(result.output);
+              writeOutput(applyHandlerWarnings(result.output, format, result.warnings ?? []));
               process.exitCode = result.exitCode ?? ExitCode.OK;
             } catch (err: unknown) {
               if (err instanceof CliValidationError) {
@@ -4389,7 +4536,7 @@ export function registerLessonCommand(yargs: Argv): Argv {
                 format,
                 root,
               );
-              writeOutput(result.output);
+              writeOutput(applyHandlerWarnings(result.output, format, result.warnings ?? []));
               process.exitCode = result.exitCode ?? ExitCode.OK;
             } catch (err: unknown) {
               if (err instanceof CliValidationError) {
@@ -5138,6 +5285,76 @@ export function registerNodeCommand(yargs: Argv): Argv {
 }
 
 // ---------------------------------------------------------------------------
+// health
+// ---------------------------------------------------------------------------
+
+/**
+ * T-502: `storybloq health`. Runs with OR WITHOUT a `.story/` project, so a
+ * missing root is not an error here the way it is for `selftest`: the
+ * no-project case is exactly when a newcomer most needs the answer.
+ *
+ * `projectDir` is `process.cwd()`, the invocation directory, because that is
+ * where Claude Code resolves project settings and `.mcp.json` from. The
+ * discovered ledger root supplies config only.
+ */
+export function registerHealthCommand(yargs: Argv): Argv {
+  return yargs.command(
+    "health",
+    "Check the tooling around this project: auto-compact window, CLI version, Codex review bridge, /story skill, cross-session messaging",
+    (y) =>
+      arrayOption(
+        addFormatOption(y).option("refresh", {
+          type: "boolean",
+          default: false,
+          describe: "Force the registry lookup even when the 24 hour cache is fresh",
+        }),
+        "only",
+        {
+          // Comma-split so `--only cli-version,codex-bridge` works the way a
+          // user expects; a bare `--only` is rejected, because omitting the
+          // flag is already the way to run everything and a bare flag that
+          // silently meant "all" would hide a typo'd value.
+          comma: "split",
+          emptyAfterSplit: "reject",
+          empty: "drop",
+          trim: "always",
+          requireValue: "Pass at least one check id, or omit --only to run them all.",
+          describe: "Run only these checks (usage-window, cli-version, codex-bridge, skill-version, cross-session-inbound, hook-duplicates)",
+        },
+      ),
+    async (argv) => {
+      const format = parseOutputFormat(argv.format);
+      const { HEALTH_CHECK_IDS } = await import("../core/health/types.js");
+      const requested: string[] = (Array.isArray(argv.only) ? (argv.only as unknown[]) : [])
+        .filter((v): v is string => typeof v === "string");
+      const unknown = requested.filter((id) => !(HEALTH_CHECK_IDS as readonly string[]).includes(id));
+      if (unknown.length > 0) {
+        writeOutput(
+          formatError(
+            "invalid_input",
+            `Unknown check id: ${unknown.join(", ")}. Valid ids: ${HEALTH_CHECK_IDS.join(", ")}.`,
+            format,
+          ),
+        );
+        process.exitCode = ExitCode.USER_ERROR;
+        return;
+      }
+      const projectDir = process.cwd();
+      const ledgerRoot = (await import("../core/project-root-discovery.js")).discoverProjectRoot() ?? null;
+      const { handleHealth } = await import("./commands/health.js");
+      const result = await handleHealth({ ledgerRoot, projectDir }, format, {
+        ...(requested.length > 0 ? { only: requested as never } : {}),
+        refresh: argv.refresh === true,
+      });
+      writeOutput(result.output);
+      // Deliberately always OK: a tooling report is information, not a gate,
+      // so scripts and hooks can call it without arming a failure.
+      process.exitCode = ExitCode.OK;
+    },
+  );
+}
+
+// ---------------------------------------------------------------------------
 // selftest
 // ---------------------------------------------------------------------------
 
@@ -5575,6 +5792,100 @@ export function registerSessionCommand(yargs: Argv): Argv {
           },
         )
         .command(
+          "intel",
+          "T-499: current context usage, expected auto-compact point and its provenance, session facts (works without .story/)",
+          (y2) =>
+            y2
+              .option("format", { type: "string", choices: ["md", "json"] as const, default: "md" as const, describe: "Output format" })
+              .option("session-id", { type: "string", describe: "Inspect another session read-only (never captures, persists or classifies)" })
+              .option("transcript", { type: "string", describe: "Explicit transcript path, read-only: must be ~/.claude/projects/<project>/<sessionId>.jsonl, a regular file, not a symlink; a refusal names the rule that failed" })
+              .option("caller-model", { type: "string", describe: "Cross-check against the transcript's last model; a mismatch is reported, never overridden" })
+              .option("full", { type: "boolean", default: false, describe: "Stream the whole transcript (64 MiB budget) for session-wide counts" })
+              .option("client-task-id", { type: "string", describe: "Explicit caller identity, if not resolvable from the session" }),
+          async (argv) => {
+            const { handleSessionIntel } = await import("./commands/session-intel.js");
+            try {
+              const result = handleSessionIntel({
+                format: argv.format as "json" | "md",
+                sessionId: argv["session-id"] as string | undefined,
+                transcript: argv.transcript as string | undefined,
+                callerModel: argv["caller-model"] as string | undefined,
+                full: argv.full === true,
+                clientTaskId: argv["client-task-id"] as string | undefined,
+              });
+              // Same project-free template as limit-status: every byte through writeOutput.
+              writeOutput(result.output);
+              if (result.errorCode) process.exitCode = 1;
+            } catch (err: unknown) {
+              const message = err instanceof Error ? err.message : String(err);
+              writeOutput(argv.format === "json" ? JSON.stringify({ ok: false, error: message }, null, 2) : message);
+              process.exitCode = 1;
+            }
+          },
+        )
+        .command(
+          "intel-start",
+          "T-499: capture the auto-compact setting for this process era (SessionStart hook: startup|resume|clear|compact)",
+          (y2) =>
+            y2.option("client", {
+              type: "string",
+              choices: ["claude", "codex"] as const,
+              default: "claude" as const,
+              describe: "AI client invoking the SessionStart hook",
+            }),
+          async (argv) => {
+            try {
+              const { readHookStdinContext } = await import("./commands/session-compact.js");
+              const { handleSessionIntelStart } = await import("./commands/session-intel.js");
+              const hookContext = await readHookStdinContext(process.stdin);
+              handleSessionIntelStart({
+                client: argv.client as "claude" | "codex",
+                source: hookContext.source,
+                sessionId: hookContext.sessionId,
+                cwd: hookContext.cwd,
+                transcriptPath: hookContext.transcriptPath,
+              });
+            } catch (err) {
+              // Hook contract: always exit 0, never block a session start.
+              process.stderr.write(
+                `[storybloq] intel-start failed: ${err instanceof Error ? err.message : String(err)}\n`,
+              );
+            }
+          },
+        )
+        .command(
+          "intel-prompt",
+          "T-499: synchronous context-pressure sample; emits additionalContext at imperative (UserPromptSubmit hook)",
+          (y2) =>
+            y2.option("client", {
+              type: "string",
+              choices: ["claude", "codex"] as const,
+              default: "claude" as const,
+              describe: "AI client invoking the UserPromptSubmit hook",
+            }),
+          async (argv) => {
+            try {
+              const { readHookStdinContext } = await import("./commands/session-compact.js");
+              const { handleSessionIntelPrompt } = await import("./commands/session-intel.js");
+              // The payload carries the whole prompt: a 1 MiB cap, and the
+              // prompt field itself is never read.
+              const hookContext = await readHookStdinContext(process.stdin, 200, { maxBytes: 1024 * 1024 });
+              const outcome = handleSessionIntelPrompt({
+                client: argv.client as "claude" | "codex",
+                sessionId: hookContext.sessionId,
+                cwd: hookContext.cwd,
+                transcriptPath: hookContext.transcriptPath,
+              });
+              if (outcome.output !== null) process.stdout.write(outcome.output + "\n");
+            } catch (err) {
+              // Hook contract: always exit 0, never block a prompt.
+              process.stderr.write(
+                `[storybloq] intel-prompt failed: ${err instanceof Error ? err.message : String(err)}\n`,
+              );
+            }
+          },
+        )
+        .command(
           "limit-stop",
           "Record a usage-limit stop for auto-resume (StopFailure hook)",
           (y2) => y2,
@@ -5967,8 +6278,126 @@ export function registerSessionCommand(yargs: Argv): Argv {
         )
         .demandCommand(
           1,
-          "Specify a session subcommand: compact-prepare, resume-prompt, limit-stop, clear-compact, stop, list, show, repair, delete, health, watch, milestone",
+          "Specify a session subcommand: compact-prepare, resume-prompt, intel, intel-start, intel-prompt, limit-stop, clear-compact, stop, list, show, repair, delete, health, watch, milestone",
         )
+        .strict(),
+    () => {},
+  );
+}
+
+// MARK: - Roster Command (T-507)
+
+/**
+ * `storybloq roster start|heartbeat|end|list`. The three writes are the Claude
+ * Code function-hooks path (a Mod would run them through
+ * `$.process.run` with `--stdin --format json`); they never load project
+ * state and always answer with one JSON envelope on stdout, `no_project`
+ * included. `list` is the human and MCP read, Bus merged, terminal seats
+ * hidden unless `--all`.
+ */
+export const ROSTER_BODY_MAX_BYTES = 4096;
+
+export function registerRosterCommand(yargs: Argv): Argv {
+  const write = (kind: "start" | "heartbeat" | "end", description: string) =>
+    (y: Argv) =>
+      y.command(
+        kind,
+        description,
+        (y2) => {
+          // Each operation exposes exactly the fields its strict body schema
+          // accepts (a flag the schema rejects would answer invalid_input).
+          let y3 = y2
+            .option("stdin", { type: "boolean", default: false, describe: `Read the JSON body from stdin (${ROSTER_BODY_MAX_BYTES} bytes max)` })
+            .option("client-task-id", { type: "string", describe: "Seat identity; default: CLAUDE_CODE_SESSION_ID or CODEX_THREAD_ID" })
+            .option("agent-id", { type: "string", describe: "Subagent id for a subagent seat" });
+          if (kind === "start") {
+            y3 = y3
+              .option("session-id", { type: "string", describe: "The client session id (default: the task id)" })
+              .option("description", { type: "string", describe: "A short label (200 bytes)" });
+          } else {
+            y3 = y3.option("generation", { type: "number", describe: "The generation from the start result" });
+          }
+          if (kind === "end") {
+            y3 = y3.option("state", { type: "string", choices: ["completed", "failed", "killed", "detached"] as const, describe: "The terminal state" });
+          }
+          return y3.option("format", { type: "string", choices: ["json"] as const, default: "json", describe: "JSON only" });
+        },
+        async (argv) => {
+          const { handleRosterWrite, parseRosterBody, identityFallbackFromEnvironment } = await import("./commands/roster.js");
+          const { ExitCode, errorEnvelope } = await import("../core/output-formatter.js");
+          const answer = (output: string, exitCode: number): void => {
+            process.stdout.write(output + "\n");
+            if (exitCode !== 0) process.exitCode = exitCode;
+          };
+          let body: Record<string, unknown> = {};
+          if (argv.stdin) {
+            // Bounded read: the body's fields are byte-capped, so the whole
+            // body is too; past the ceiling the read stops and the answer is
+            // invalid_input rather than an unbounded buffer.
+            const chunks: Buffer[] = [];
+            let total = 0;
+            for await (const chunk of process.stdin) {
+              const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+              total += buf.length;
+              if (total > ROSTER_BODY_MAX_BYTES) {
+                answer(JSON.stringify(errorEnvelope("invalid_input", `roster body exceeds ${ROSTER_BODY_MAX_BYTES} bytes`), null, 2), ExitCode.USER_ERROR);
+                return;
+              }
+              chunks.push(buf);
+            }
+            const parsed = parseRosterBody(Buffer.concat(chunks).toString("utf-8"));
+            if (!parsed.ok) {
+              answer(JSON.stringify(errorEnvelope("invalid_input", parsed.message), null, 2), ExitCode.USER_ERROR);
+              return;
+            }
+            body = parsed.body;
+          }
+          // Flags fill in what the body left out; the body wins.
+          const a = argv as Record<string, unknown>;
+          const flagged: Record<string, unknown> = {
+            ...(a["client-task-id"] !== undefined ? { clientTaskId: a["client-task-id"] } : {}),
+            ...(a["agent-id"] !== undefined ? { agentId: a["agent-id"] } : {}),
+            ...(a["session-id"] !== undefined ? { sessionId: a["session-id"] } : {}),
+            ...(a.description !== undefined ? { description: a.description } : {}),
+            ...(a.generation !== undefined ? { generation: a.generation } : {}),
+            ...(a.state !== undefined ? { state: a.state } : {}),
+          };
+          const { discoverProjectRoot } = await import("../core/project-root-discovery.js");
+          // `null` (no ledger above the cwd) is the only no_project answer. A
+          // throw is an unreadable .story/ and is said as io_error, so a caller
+          // never caches "no project here" over a permissions failure.
+          let root: string | null;
+          try {
+            root = discoverProjectRoot();
+          } catch (err) {
+            answer(JSON.stringify(errorEnvelope("io_error", err instanceof Error ? err.message : String(err)), null, 2), ExitCode.USER_ERROR);
+            return;
+          }
+          const result = handleRosterWrite(root, kind, { ...flagged, ...body }, identityFallbackFromEnvironment());
+          answer(result.output, result.exitCode);
+        },
+      );
+  return yargs.command(
+    "roster",
+    "Seat roster: who is working this ledger right now (T-507)",
+    (y) =>
+      write("start", "Start (or restart) a seat: a session or one of its subagents")(
+        write("heartbeat", "Refresh a running seat's lastSeenAt")(
+          write("end", "End a seat with a terminal state")(y),
+        ),
+      )
+        .command(
+          "list",
+          "List seats: running by default, every seat with --all",
+          (y2) =>
+            addFormatOption(y2).option("all", { type: "boolean", default: false, describe: "Include terminal seats (completed/failed/killed/detached)" }),
+          async (argv) => {
+            const format = parseOutputFormat(argv.format);
+            const { handleRosterList } = await import("./commands/roster.js");
+            await runReadCommand(format, (ctx) => handleRosterList(ctx, { all: argv.all as boolean }));
+          },
+        )
+        .demandCommand(1, "Specify a roster subcommand: start, heartbeat, end, list")
         .strict(),
     () => {},
   );

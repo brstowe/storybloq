@@ -3,13 +3,17 @@ import { lstatSync, mkdirSync, realpathSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 import { ArrangementSchema, type Arrangement } from "../models/arrangement.js";
 import { ArrangementIdSchema } from "../models/types.js";
-import { DuetOperationSchema, DuetStateSchema, type DuetOperation, type DuetState, type DuetAssignment } from "../models/duet.js";
+import { DuetOperationSchema, DuetStateSchema, assignmentIdOf, isCompactedAssignment, type DuetOperation, type DuetState, type DuetAssignment, type CheckpointAssignment } from "../models/duet.js";
+import { arrangementCapacity, checkpointMatches, compactCheckpoint, type ArrangementCapacity } from "./arrangement-compaction.js";
+import { CROSS_NODE_REF_CAPTURE_REGEX } from "../models/ticket.js";
+import { generateCanonicalId } from "./canonical-id.js";
+import { earmarkMatchesArrangement } from "./earmarks.js";
 import { ownerTaskForCurrentClient } from "../autonomous/client-profile.js";
 import { CliValidationError } from "../cli/helpers.js";
 import { loadArrangementsSafe, ARRANGEMENT_MAX_BYTES } from "./arrangement-loader.js";
 import { isArrangementConflicted } from "./arrangement-authority.js";
 import { readBoundedFile } from "./limit-config.js";
-import { withProjectLock, runTransactionUnlocked, serializeJSON } from "./project-loader.js";
+import { withProjectLock, runTransactionUnlocked, serializeJSON, prepareTicketWrite, prepareIssueWrite } from "./project-loader.js";
 
 export const DUET_STATE_MAX_BYTES = 2 * 1024 * 1024;
 const SILENCE_MS = 60 * 60 * 1000;
@@ -58,7 +62,7 @@ function loadRuntime(root: string, id: string): DuetState | null {
   const result = DuetStateSchema.safeParse(JSON.parse(raw));
   if (!result.success || result.data.arrangementId !== id) refuse("Duet recovery required: invalid runtime identity/schema");
   const state = result.data;
-  if (new Set(state.assignments.map(a => a.input.id)).size !== state.assignments.length) refuse("Duet recovery required: duplicate assignment ids");
+  if (new Set(state.assignments.map(assignmentIdOf)).size !== state.assignments.length) refuse("Duet recovery required: duplicate assignment ids");
   return state;
 }
 export interface DuetRoute {
@@ -67,23 +71,17 @@ export interface DuetRoute {
   reason?: string;
 }
 export interface DuetView { arrangement: Arrangement; state: DuetState | null; route: DuetRoute }
-function checkpointFor(state: DuetState) {
-  return {
-    revision: state.revision, sessionId: state.start.sessionId, pen: state.pen, worker: state.worker,
-    assignments: state.assignments.map(assignment => {
-      const { cursor: _cursor, ...rest } = assignment;
-      return { ...rest, events: assignment.events.filter(e => e.input.kind !== "cursor").map(event => {
-        const { cursor: _eventCursor, ...input } = event.input;
-        return { ...event, input };
-      }) };
-    }),
-  };
-}
+/**
+ * ISS-1191: the tracked projection is now `arrangement-compaction.ts`'s
+ * business, and consistency is decided by `checkpointMatches` -- the one
+ * place that verdict is computed, so the route status, `compact` and
+ * `rotate` can never disagree about whether a checkpoint is faithful.
+ */
 function routeFor(a: Arrangement, state: DuetState | null): DuetRoute {
   if (isArrangementConflicted(a)) return { status: "conflicted" };
   if (!a.currentCoordinationSessionId) return { status: "missing" };
   const pair = parties(a);
-  if (!state || state.start.sessionId !== a.currentCoordinationSessionId || !same(pair.pen, state.pen) || !same(pair.worker, state.worker) || !equal(a.coordinationCheckpoint, checkpointFor(state))) return { status: "recovery-required" };
+  if (!state || state.start.sessionId !== a.currentCoordinationSessionId || !same(pair.pen, state.pen) || !same(pair.worker, state.worker) || !checkpointMatches(a, state)) return { status: "recovery-required" };
   const receipt = [...(a.communicationReceipts ?? [])].reverse().find(r =>
     r.coordinationSessionId === a.currentCoordinationSessionId && r.nonce === state.nonce &&
     r.mode === state.start.mode && same(r.source, pair.worker) && same(r.destination, pair.pen) && same(r.recorder, pair.pen));
@@ -98,17 +96,37 @@ export function readDuetCoordination(root: string, arrangement: Arrangement): Du
     return { arrangement, state: null, route: { status: isArrangementConflicted(arrangement) ? "conflicted" : "recovery-required", reason: "Runtime cannot be verified; recover before dispatch" } };
   }
 }
-export function duetStatusDemandDue(assignment: DuetAssignment, now = Date.now()): boolean {
+/** Ids the tracked checkpoint records as compacted resolved history. */
+function archivedIds(arrangement: Arrangement): Set<string> {
+  return new Set((arrangement.coordinationCheckpoint?.compactedAssignments ?? []).map(entry => entry.id));
+}
+export function duetStatusDemandDue(assignment: CheckpointAssignment, now = Date.now()): boolean {
   if (assignment.status === "resolved") return false;
   const last = Date.parse(assignment.lastWorkerActivityAt);
   if (assignment.lastStatusDemandAt && Date.parse(assignment.lastStatusDemandAt) >= last) return false;
   return now - last >= SILENCE_MS;
 }
+/**
+ * ISS-1191: the exact bytes the refusal reports, so a pen who hits the wall
+ * is told what actually filled the file (the checkpoint's assignments,
+ * measured, not receipts assumed) and which command recovers the space.
+ */
+function capacityRefusal(arrangement: Arrangement, bytes: number): never {
+  const checkpoint = arrangement.coordinationCheckpoint;
+  const assignmentBytes = checkpoint === undefined ? 0 : Buffer.byteLength(serializeJSON(checkpoint.assignments));
+  return refuse(`Arrangement capacity reached (${bytes} of ${ARRANGEMENT_MAX_BYTES}; checkpoint assignments ${assignmentBytes}): run storybloq arrangement compact ${arrangement.id}, then rotate if still over`);
+}
+
 async function persist(root: string, arrangement: Arrangement, state: DuetState, recoveryBackup?: string) {
-  arrangement.coordinationCheckpoint = checkpointFor(state);
+  // Compaction is automatic on every coordination write, and the same
+  // `state.revision` the caller just bumped rides along with it, so a pen
+  // holding the pre-compaction revision gets the ordinary CAS refusal.
+  const projected = compactCheckpoint(arrangement, state);
+  if (!projected.ok) refuse(`Duet recovery required: ${projected.reason}`);
+  arrangement.coordinationCheckpoint = projected.checkpoint;
   const arrangementContent = serializeJSON(ArrangementSchema.parse(arrangement));
   const stateContent = serializeJSON(DuetStateSchema.parse(state));
-  if (Buffer.byteLength(arrangementContent) > ARRANGEMENT_MAX_BYTES) refuse("Arrangement receipt capacity reached; preserve this history and create a new arrangement");
+  if (Buffer.byteLength(arrangementContent) > ARRANGEMENT_MAX_BYTES) capacityRefusal(arrangement, Buffer.byteLength(arrangementContent));
   if (Buffer.byteLength(stateContent) > DUET_STATE_MAX_BYTES) refuse("Duet runtime capacity reached; preserve this history and create a new arrangement");
   const aPath = checkedPath(root, [".story", "arrangements", `${arrangement.id}.json`], true);
   const sPath = runtimePath(root, arrangement.id, true);
@@ -121,6 +139,200 @@ async function persist(root: string, arrangement: Arrangement, state: DuetState,
   ]);
 }
 
+/**
+ * ISS-1191 scope item 2, the explicit half: `storybloq arrangement compact`.
+ *
+ * Same authority as any other coordination write (only the pen records
+ * coordination state), and the same fail-closed posture as `recover` about
+ * a runtime it cannot vouch for. The runtime is classified into three
+ * cases, never two, because collapsing "unreadable" into "absent" would let
+ * this command overwrite the tracked checkpoint -- the ONLY surviving copy
+ * of that history -- from a file it never managed to read.
+ */
+export interface ArrangementCompactResult {
+  view: DuetView;
+  changed: boolean;
+  before: ArrangementCapacity;
+  after: ArrangementCapacity;
+}
+export async function compactArrangementCheckpoint(root: string, id: string, clientTaskId?: string): Promise<ArrangementCompactResult> {
+  ArrangementIdSchema.parse(id);
+  let output: ArrangementCompactResult | undefined;
+  await withProjectLock(root, { strict: true }, async () => {
+    const arrangement = loadArrangementsSafe(root).arrangements.find(a => a.id === id);
+    if (!arrangement) throw new CliValidationError("not_found", `Arrangement ${id} not found or unreadable`);
+    if (isArrangementConflicted(arrangement)) refuse(`Arrangement ${id} has unresolved merge conflicts; resolve them before compacting`);
+    const pair = parties(arrangement);
+    const actor = ownerTaskForCurrentClient(clientTaskId);
+    if (!actor || !same(actor, pair.pen)) refuse("Only the arrangement pen may compact coordination state");
+    const stored = arrangement.coordinationCheckpoint;
+    if (!stored) refuse(`Arrangement ${id} has no coordination checkpoint to compact`);
+    const before = arrangementCapacity(arrangement);
+    // Three cases, never two: `loadRuntime` returns null ONLY for a
+    // genuinely absent runtime, and anything unreadable (bad bytes, invalid
+    // JSON, wrong identity, oversized) refuses here rather than being
+    // treated as absent -- which would overwrite the tracked checkpoint,
+    // the only surviving copy of that history, from a file never read.
+    let state: DuetState | null;
+    try { state = loadRuntime(root, id); }
+    catch { refuse("Compaction requires a readable runtime; preserve and recover it before compacting"); }
+    const now = new Date().toISOString();
+
+    if (state) {
+      if (state.start.sessionId !== arrangement.currentCoordinationSessionId || !same(pair.pen, state.pen) || !same(pair.worker, state.worker) || !checkpointMatches(arrangement, state)) {
+        refuse("Readable runtime diverges from the checkpoint; preserve and reconcile both histories before compacting");
+      }
+      const trial = compactCheckpoint(arrangement, state);
+      if (!trial.ok) refuse(`Compaction refused: ${trial.reason}`);
+      if (equal(trial.checkpoint, stored)) {
+        output = { view: { arrangement, state, route: routeFor(arrangement, state) }, changed: false, before, after: before };
+        return;
+      }
+      // A changed recovery snapshot MUST change its CAS revision, and the
+      // runtime's revision moves with it in the same transaction: a pen
+      // holding the pre-compaction revision has to get the ordinary stale
+      // refusal, never a silently different checkpoint.
+      state.revision++;
+      arrangement.updatedAt = now;
+      await persist(root, arrangement, state);
+      output = { view: { arrangement, state, route: routeFor(arrangement, state) }, changed: true, before, after: arrangementCapacity(arrangement) };
+      return;
+    }
+
+    // Absent runtime: the checkpoint is the only history there is, so it is
+    // compacted in place and its own revision is bumped, which is what
+    // `recover`'s `expectedRevision` fence reads.
+    const asState: DuetState = {
+      schemaVersion: 1, arrangementId: id, revision: stored.revision,
+      start: { sessionId: stored.sessionId, previousSessionId: null, expectedRevision: stored.revision, mode: "native-return" },
+      nonce: randomUUID(), pen: stored.pen, worker: stored.worker, assignments: stored.assignments,
+    };
+    const trial = compactCheckpoint(arrangement, asState);
+    if (!trial.ok) refuse(`Compaction refused: ${trial.reason}`);
+    if (equal(trial.checkpoint, stored)) {
+      output = { view: { arrangement, state: null, route: routeFor(arrangement, null) }, changed: false, before, after: before };
+      return;
+    }
+    const bumped = compactCheckpoint(arrangement, { ...asState, revision: stored.revision + 1 });
+    if (!bumped.ok) refuse(`Compaction refused: ${bumped.reason}`);
+    arrangement.coordinationCheckpoint = bumped.checkpoint;
+    arrangement.updatedAt = now;
+    const content = serializeJSON(ArrangementSchema.parse(arrangement));
+    if (Buffer.byteLength(content) > ARRANGEMENT_MAX_BYTES) capacityRefusal(arrangement, Buffer.byteLength(content));
+    await runTransactionUnlocked(root, [
+      { op: "write", target: checkedPath(root, [".story", "arrangements", `${arrangement.id}.json`], true), content },
+    ]);
+    output = { view: { arrangement, state: null, route: routeFor(arrangement, null) }, changed: true, before, after: arrangementCapacity(arrangement) };
+  });
+  return output!;
+}
+
+/**
+ * ISS-1191 scope item 4: `storybloq arrangement rotate`.
+ *
+ * The escape hatch for an arrangement compaction can no longer shrink. The
+ * successor carries the OPEN work and the verified session forward; the
+ * predecessor keeps every byte of history and is closed pointing at its
+ * successor. Nothing is deleted and nothing runs in two places.
+ *
+ * Everything -- reads, authorization, retry detection, size validation and
+ * the commit -- happens under one strict project lock, and every file lands
+ * through one journaled transaction, so a concurrent coordination or
+ * earmark write can neither be lost nor half-applied.
+ */
+export interface ArrangementRotateResult {
+  predecessor: Arrangement;
+  successorId: string;
+  successor: Arrangement | null;
+  carriedAssignments: string[];
+  carriedEarmarks: string[];
+  alreadyRotated: boolean;
+}
+export async function rotateArrangement(root: string, id: string, clientTaskId?: string): Promise<ArrangementRotateResult> {
+  ArrangementIdSchema.parse(id);
+  let output: ArrangementRotateResult | undefined;
+  await withProjectLock(root, { strict: true }, async ({ state: projectState }) => {
+    const arrangement = loadArrangementsSafe(root).arrangements.find(a => a.id === id);
+    if (!arrangement) throw new CliValidationError("not_found", `Arrangement ${id} not found or unreadable`);
+    if (arrangement.continuedBy) {
+      // Idempotent retry: report the successor this arrangement already has
+      // rather than minting a second one.
+      output = { predecessor: arrangement, successorId: arrangement.continuedBy, successor: null, carriedAssignments: [], carriedEarmarks: [], alreadyRotated: true };
+      return;
+    }
+    if (isArrangementConflicted(arrangement)) refuse(`Arrangement ${id} has unresolved merge conflicts; resolve them before rotating`);
+    if (arrangement.lifecycle !== "active") refuse("Rotation requires an active arrangement");
+    const pair = parties(arrangement);
+    const actor = ownerTaskForCurrentClient(clientTaskId);
+    if (!actor || !same(actor, pair.pen)) refuse("Only the arrangement pen may rotate coordination state");
+    if (arrangement.bounds.some(ref => CROSS_NODE_REF_CAPTURE_REGEX.test(ref))) {
+      refuse(`Arrangement ${id} has node-qualified bounds; rotation cannot carry federated earmarks. Run storybloq arrangement compact ${id}, or close it and create a successor manually`);
+    }
+    let state: DuetState | null;
+    try { state = loadRuntime(root, id); }
+    catch { refuse("Rotation requires a readable runtime; preserve and recover it before rotating"); }
+    const route = routeFor(arrangement, state);
+    if (route.status !== "current" || !state) {
+      refuse(`Rotation requires a verified return route (route is ${route.status}); verify or recover the coordination session before rotating`);
+    }
+    const now = new Date().toISOString();
+    const successorId = generateCanonicalId("a");
+    const carried = state.assignments.filter(a => a.status !== "resolved");
+    const successorState: DuetState = { ...state, arrangementId: successorId, assignments: carried };
+    const { id: _oldId, coordinationCheckpoint: _oldCheckpoint, continuedBy: _oldContinuedBy, communicationReceipts: _oldReceipts, ...carriedFields } = arrangement;
+    const successorBase: Arrangement = {
+      ...carriedFields,
+      id: successorId,
+      lifecycle: "active",
+      createdDate: now.slice(0, 10),
+      updatedAt: now,
+      // Only the CURRENT session's receipts: they are what the successor's
+      // route verification reads, and older sessions' evidence stays with
+      // the history it belongs to.
+      communicationReceipts: (arrangement.communicationReceipts ?? []).filter(r => r.coordinationSessionId === state.start.sessionId),
+    };
+    const projected = compactCheckpoint(successorBase, successorState);
+    if (!projected.ok) refuse(`Rotation refused: ${projected.reason}`);
+    const successor = ArrangementSchema.parse({ ...successorBase, coordinationCheckpoint: projected.checkpoint });
+    const predecessor = ArrangementSchema.parse({ ...arrangement, lifecycle: "closed", continuedBy: successorId, updatedAt: now });
+
+    // Prevalidate every resulting file BEFORE anything is mutated: closing
+    // the predecessor grows it too (`continuedBy` plus the new lifecycle),
+    // and a rotation that cannot land must change nothing at all.
+    const successorContent = serializeJSON(successor);
+    const predecessorContent = serializeJSON(predecessor);
+    const successorStateContent = serializeJSON(DuetStateSchema.parse(successorState));
+    if (Buffer.byteLength(successorContent) > ARRANGEMENT_MAX_BYTES) capacityRefusal(successor, Buffer.byteLength(successorContent));
+    if (Buffer.byteLength(predecessorContent) > ARRANGEMENT_MAX_BYTES) capacityRefusal(predecessor, Buffer.byteLength(predecessorContent));
+    if (Buffer.byteLength(successorStateContent) > DUET_STATE_MAX_BYTES) refuse("Duet runtime capacity reached; preserve this history before rotating");
+
+    const itemWrites: Array<{ op: "write"; target: string; content: string }> = [];
+    const carriedEarmarks: string[] = [];
+    for (const ticket of projectState.tickets) {
+      if (!earmarkMatchesArrangement(ticket.earmark, id)) continue;
+      const { target, content } = await prepareTicketWrite({ ...ticket, earmark: { ...ticket.earmark!, arrangementId: successorId } }, root);
+      itemWrites.push({ op: "write", target, content });
+      carriedEarmarks.push(ticket.id);
+    }
+    for (const issue of projectState.issues) {
+      if (!earmarkMatchesArrangement(issue.earmark, id)) continue;
+      const { target, content } = await prepareIssueWrite({ ...issue, earmark: { ...issue.earmark!, arrangementId: successorId } }, root);
+      itemWrites.push({ op: "write", target, content });
+      carriedEarmarks.push(issue.id);
+    }
+
+    await runTransactionUnlocked(root, [
+      { op: "write", target: checkedPath(root, [".story", "duet-sessions", ".gitignore"], true), content: "*\n" },
+      { op: "write", target: checkedPath(root, [".story", "arrangements", `${successorId}.json`], true), content: successorContent },
+      { op: "write", target: runtimePath(root, successorId, true), content: successorStateContent },
+      ...itemWrites,
+      { op: "write", target: checkedPath(root, [".story", "arrangements", `${id}.json`], true), content: predecessorContent },
+    ]);
+    output = { predecessor, successorId, successor, carriedAssignments: carried.map(assignmentIdOf), carriedEarmarks, alreadyRotated: false };
+  });
+  return output!;
+}
+
 /** Operation identity and caller attribution are claims, never credentials. */
 export async function coordinateDuet(root: string, input: DuetOperation): Promise<DuetView> {
   const parsed = DuetOperationSchema.safeParse(input);
@@ -130,6 +342,10 @@ export async function coordinateDuet(root: string, input: DuetOperation): Promis
   await withProjectLock(root, { strict: true }, async () => {
     const arrangement = loadArrangementsSafe(root).arrangements.find(a => a.id === op.id);
     if (!arrangement) refuse("Arrangement missing or unreadable; cannot coordinate");
+    // ISS-1191: rotation is terminal for the arrangement it closed,
+    // regardless of lifecycle -- the successor holds this work now, and the
+    // same assignments must never be driven from two files.
+    if (arrangement.continuedBy) refuse(`Arrangement ${arrangement.id} was continued by ${arrangement.continuedBy}; coordinate against the successor`);
     if (arrangement.lifecycle !== "active" || isArrangementConflicted(arrangement)) refuse("Coordination requires an active, unconflicted arrangement");
     const pair = parties(arrangement);
     const actor = ownerTaskForCurrentClient(op.clientTaskId);
@@ -181,8 +397,14 @@ export async function coordinateDuet(root: string, input: DuetOperation): Promis
       if (Date.parse(receipt.observedAt) > Date.now() + 300_000) refuse("Receipt observation is in the future");
       arrangement.communicationReceipts = [...(arrangement.communicationReceipts ?? []), { ...receipt, coordinationSessionId: op.expectedSessionId, recorder: pair.pen }];
     } else if (op.action === "assign") {
-      const existing = state!.assignments.find(a => a.input.id === op.assignment.id);
+      // ISS-1191: identity spans the archive. After a `recover`, an
+      // archived assignment is gone from the runtime entirely, so without
+      // this check its id could be reused for NEW work while the archive
+      // still describes it as resolved history.
+      if (archivedIds(arrangement).has(op.assignment.id)) refuse(`Assignment ${op.assignment.id} belongs to compacted resolved history; dispatch under a new assignment id`);
+      const existing = state!.assignments.find(a => assignmentIdOf(a) === op.assignment.id);
       if (existing) {
+        if (isCompactedAssignment(existing)) refuse(`Assignment ${op.assignment.id} belongs to compacted resolved history; dispatch under a new assignment id`);
         if (!equal(existing.input, op.assignment)) refuse("Assignment id already has a different immutable scope");
         finish(); return;
       }
@@ -190,7 +412,10 @@ export async function coordinateDuet(root: string, input: DuetOperation): Promis
       if (routeFor(arrangement, state).status !== "current") refuse("Verify the return route before dispatch");
       state!.assignments.push({ input: op.assignment, dispatchSessionId: op.expectedSessionId, assignee: pair.worker, status: "assigned", createdAt: now, lastWorkerActivityAt: now, events: [] });
     } else {
-      const assignment = state!.assignments.find(a => a.input.id === op.assignmentId);
+      if (archivedIds(arrangement).has(op.assignmentId)) refuse(`Assignment ${op.assignmentId} belongs to compacted resolved history; resolved assignments cannot be reopened`);
+      const found = state!.assignments.find(a => assignmentIdOf(a) === op.assignmentId);
+      if (found && isCompactedAssignment(found)) refuse("Resolved assignments cannot be reopened");
+      const assignment: DuetAssignment | undefined = found as DuetAssignment | undefined;
       if (!assignment) refuse("Unknown assignment; recover its identity before updating");
       const event = op.event;
       const existing = assignment.events.find(e => e.input.id === event.id);

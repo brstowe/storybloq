@@ -1,0 +1,13 @@
+{
+  "id": "T-5001",
+  "title": "Integrate the Zephyr templating library for report generation",
+  "description": "Swap the hand-rolled report templates for the Zephyr templating library.",
+  "type": "chore",
+  "status": "open",
+  "phase": "reports",
+  "order": 10,
+  "createdDate": "2026-08-01",
+  "completedDate": null,
+  "blockedBy": [],
+  "parentTicket": null
+}

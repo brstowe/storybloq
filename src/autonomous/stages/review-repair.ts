@@ -54,6 +54,45 @@ export const EMPTY_CHANGE_REQUEST_INSTRUCTION =
  */
 export const REPAIR_ATTEMPT_CAP = 2;
 
+/**
+ * ISS-950: the coverage re-run, which is a repair of the same shape and for the
+ * same reason as the one above.
+ *
+ * A `revise` capped purely because a core lens did not cover its domain carries
+ * no findings either, so without its own trigger the guard above would claim it
+ * and send back an instruction demanding findings the reviewer has no reason to
+ * have. That is the exact pressure the field report recorded: the round asks for
+ * changes and names none, and the cheapest way out is for the lens to resubmit
+ * its skip as an `ok` with zero findings.
+ *
+ * Its own trigger, so the two bounds are separate. A coverage gap and an empty
+ * verdict are different failures and neither should spend the other's budget.
+ */
+export const COVERAGE_RERUN_TRIGGER = "coverage";
+
+/**
+ * The re-run instruction, naming exactly the lenses whose coverage capped the
+ * verdict.
+ *
+ * The last sentence is load-bearing for the same reason the empty-verdict one's
+ * is. An instruction that only said "clear the cap" would be satisfied by
+ * relabelling, which is the behaviour this whole item exists to stop rewarding.
+ */
+export function coverageRerunInstruction(lenses: readonly string[]): string {
+  const named = lenses.join(", ");
+  return (
+    `Coverage-only change request: no blocking or major findings were reported, and the verdict was ` +
+    `capped below approve solely because these core lens(es) did not cover their domain: ${named}. ` +
+    `There is nothing to implement, so this round does not go to the implementer. ` +
+    `Re-run exactly those lens(es) against the SAME diff and the same reviewId, then call ` +
+    `storybloq_review_lenses_synthesize with the full lens result set (echo the unchanged lenses) and ` +
+    `storybloq_review_lenses_judge, and report the new verdict with its capReasons. ` +
+    `If a lens genuinely has nothing in its domain it should say so in its own output and explain why; ` +
+    `do not relabel a skip as ok with zero findings to clear the cap, which is recorded as a relabel and ` +
+    `never counts as coverage.`
+  );
+}
+
 /** One recorded repair attempt. Mirrors the `reviewRepairAttempts` schema. */
 export interface ReviewRepairAttempt {
   readonly workItemId: string;

@@ -1,0 +1,33 @@
+{
+  "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
+  "name": "storybloq",
+  "displayName": "Storybloq",
+  "version": "1.15.0",
+  "description": "Project memory for Claude Code and Codex. Storybloq stores tickets, issues, handovers, and lessons in a .story/ folder inside your repo.",
+  "author": {
+    "name": "Amir Shayegh",
+    "url": "https://storybloq.com"
+  },
+  "homepage": "https://storybloq.com",
+  "repository": "https://github.com/Storybloq/storybloq",
+  "license": "PolyForm-Shield-1.0.0",
+  "keywords": [
+    "storybloq",
+    "claude-code",
+    "session-continuity",
+    "agentic-development"
+  ],
+  "skills": "./skills/",
+  "hooks": "./hooks/hooks.json",
+  "userConfig": {
+    "sidebar": {
+      "title": "Ledger dashboard",
+      "type": "boolean",
+      "default": true,
+      "description": "Draw the .story/ ledger in a pane beside the transcript. On by default; turn it off with /plugin configure storybloq. Projects with no .story/ directory show nothing either way (T-508, T-516)."
+    }
+  },
+  "metadata": {
+    "functionHooks": "Early-access Claude Code API (client 2.1.273, see hooks/client-api.ts). By owner decision the ledger dashboard ships on by default in 1.15 (T-516): storybloq setup writes env.CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 into ~/.claude/settings.json, which is what lets the client load this module at all, and the userConfig default above is what turns the Mod on inside it."
+  }
+}

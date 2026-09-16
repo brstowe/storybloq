@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+import type { FailUsageYargs, FailUsageOptionsSource } from "./fail-usage.js";
+
 export {};
 
 // --mcp flag: start MCP server instead of CLI.
@@ -34,10 +36,11 @@ async function emitUpdateBannerIfStale(version: string): Promise<void> {
 async function runCli(): Promise<void> {
   const { default: yargs } = await import("yargs");
   const { hideBin } = await import("yargs/helpers");
-  const { ExitCode, formatError } = await import("../core/output-formatter.js");
+  const { ExitCode, formatError, errorEnvelope } = await import("../core/output-formatter.js");
   const { writeOutput } = await import("./run.js");
   const { configureRawMode, checkRawMode, rawRejectionPending, RAW_REJECTION_EXIT } = await import("./raw-mode.js");
   const { takeArrayOptionError, resetArrayOptionError } = await import("./array-options.js");
+  const { buildUsageInfo, truncateHelpText, FAIL_USAGE_HELP_BYTE_BUDGET } = await import("./fail-usage.js");
   const {
     registerInitCommand,
     registerBusCommand,
@@ -65,6 +68,7 @@ async function runCli(): Promise<void> {
     registerDispatchCommand,
     registerReferenceCommand,
     registerSelftestCommand,
+    registerHealthCommand,
     registerCodexReviewCommand,
     registerSetupCommand,
     registerSetupSkillCommand,
@@ -74,6 +78,7 @@ async function runCli(): Promise<void> {
     registerLimitStatusCommand,
     registerConfigCommand,
     registerSessionCommand,
+    registerRosterCommand,
     registerRepairCommand,
     registerReconcileCommand,
     registerConflictsCommand,
@@ -129,7 +134,7 @@ async function runCli(): Promise<void> {
     .strict()
     .demandCommand(1, "Specify a command. Run with --help for available commands.")
     .help()
-    .fail((msg, err) => {
+    .fail((msg, err, y) => {
       // Array-option policies run in yargs coerce callbacks. yargs wraps whatever
       // they throw in its own YError, discarding the class and its code, so an
       // `err instanceof CliValidationError` test here would never match and the
@@ -143,7 +148,44 @@ async function runCli(): Promise<void> {
         throw new HandledError();
       }
       if (err) throw err;
-      writeOutput(formatError("invalid_input", msg ?? "Unknown error", errorFormat));
+
+      // ISS-1189: @types/yargs declares this third parameter as the full
+      // Argv<T>, but the object yargs actually hands .fail() at runtime is a
+      // restricted subset -- verified against the installed yargs@17 to have
+      // no getOptions() at all, and a .help() that returns a plain string
+      // synchronously despite being typed to return Argv<T>. FailUsageYargs
+      // is that verified runtime shape; the cast below is deliberate, not a
+      // type-safety hole this code introduces.
+      const failUsage = y as unknown as FailUsageYargs;
+      // ISS-1189 Codex round 1: parseEntries's "[required]" tag detection is
+      // read straight off .help()'s rendered text, so it inherits whatever
+      // yargs decided to render it in. Two real environment conditions were
+      // found to break that: (1) yargs auto-selects its locale from
+      // LC_ALL/LANG/LANGUAGE, so under e.g. LANG=fr_FR the tag renders as
+      // "[requis]", not "[required]"; (2) a narrow wrap width (auto-detected
+      // from a real terminal's COLUMNS, or an explicit .wrap() call) can
+      // split the tag itself across lines ("[required" / "]"). Both are
+      // fixed at the source -- forcing English + unbounded wrap on `cli`
+      // right before generating the help text used for BOTH parsing and the
+      // text-mode appendix -- rather than trying to make the parser
+      // tolerant of every locale's translated tag or every wrap width's
+      // split points. `--help` itself never reaches this branch (a separate
+      // parse that exits before .fail()), so this cannot change --help's own
+      // output; it only fixes the failure-usage appendix ISS-1189 adds.
+      cli.locale("en");
+      cli.wrap(null);
+      const helpText = failUsage.help();
+      // getOptions() is absent from @types/yargs entirely; cli (the outer,
+      // fully-registered instance by the time this callback runs) is where
+      // it is verified to reliably return choices, unlike y's demandedOptions.
+      const usage = buildUsageInfo(helpText, failUsage.getDescriptions(), cli as unknown as FailUsageOptionsSource);
+      if (errorFormat === "json") {
+        const envelope = errorEnvelope("invalid_input", msg ?? "Unknown error");
+        writeOutput(JSON.stringify({ ...envelope, error: { ...envelope.error, usage } }, null, 2));
+      } else {
+        const { text } = truncateHelpText(helpText, FAIL_USAGE_HELP_BYTE_BUDGET);
+        writeOutput([formatError("invalid_input", msg ?? "Unknown error", errorFormat), "", text].join("\n"));
+      }
       process.exitCode = ExitCode.USER_ERROR;
       throw new HandledError();
     })
@@ -204,6 +246,7 @@ async function runCli(): Promise<void> {
   cli = registerDispatchCommand(cli);
   cli = registerReferenceCommand(cli);
   cli = registerSelftestCommand(cli);
+  cli = registerHealthCommand(cli);
   cli = registerCodexReviewCommand(cli);
   cli = registerSetupCommand(cli);
   cli = registerSetupSkillCommand(cli);
@@ -214,6 +257,7 @@ async function runCli(): Promise<void> {
   cli = registerConfigCommand(cli);
   cli = registerNodeCommand(cli);
   cli = registerSessionCommand(cli);
+  cli = registerRosterCommand(cli);
   cli = registerFeedbackCommand(cli);
 
   function handleUnexpectedError(err: unknown): void {

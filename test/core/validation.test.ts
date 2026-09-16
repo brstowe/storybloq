@@ -367,6 +367,48 @@ describe("validateProject", () => {
   });
 });
 
+describe("ISS-1203: open issue with no phase, when the roadmap has phases", () => {
+  it("reports an info finding for an open issue with no phase", () => {
+    const state = makeState({
+      issues: [makeIssue({ id: "ISS-001", status: "open" })],
+      roadmap: makeRoadmap([makePhase({ id: "p1" })]),
+    });
+    const result = validateProject(state);
+    const finding = result.findings.find((f) => f.code === "issue_missing_phase");
+    expect(finding).toBeDefined();
+    expect(finding!.level).toBe("info");
+    expect(finding!.entity).toBe("ISS-001");
+    expect(result.valid).toBe(true); // info doesn't affect validity
+  });
+
+  it("does not flag an issue that already has a phase", () => {
+    const state = makeState({
+      issues: [makeIssue({ id: "ISS-001", status: "open", phase: "p1" })],
+      roadmap: makeRoadmap([makePhase({ id: "p1" })]),
+    });
+    const result = validateProject(state);
+    expect(result.findings.some((f) => f.code === "issue_missing_phase")).toBe(false);
+  });
+
+  it("does not flag a resolved issue with no phase", () => {
+    const state = makeState({
+      issues: [makeIssue({ id: "ISS-001", status: "resolved" })],
+      roadmap: makeRoadmap([makePhase({ id: "p1" })]),
+    });
+    const result = validateProject(state);
+    expect(result.findings.some((f) => f.code === "issue_missing_phase")).toBe(false);
+  });
+
+  it("does not flag a phase-less issue when the roadmap itself has no phases", () => {
+    const state = makeState({
+      issues: [makeIssue({ id: "ISS-001", status: "open" })],
+      roadmap: makeRoadmap([]),
+    });
+    const result = validateProject(state);
+    expect(result.findings.some((f) => f.code === "issue_missing_phase")).toBe(false);
+  });
+});
+
 describe("ISS-729: team-mode duplicate displayId detection", () => {
   const teamConfig = { ...minimalConfig, team: { enabled: true } } as Config;
 
@@ -605,5 +647,22 @@ describe("stale_earmark (T-475, AM-a/AM-b)", () => {
     const state = makeState({ tickets: [ticket], issues: [issue], roadmap: makeRoadmap([makePhase({ id: "p1" })]) });
     const result = validateProject(state, NOW);
     expect(result.findings.some((f) => f.code === "stale_earmark")).toBe(false);
+  });
+
+  it("T-498: fires handover_no_carried_forward only when the aux flag says so", () => {
+    const state = makeState({ tickets: [], roadmap: makeRoadmap([]) });
+
+    const fired = validateProject(state, NOW, { handoverNewestMarkedWithoutCarriedForward: true });
+    expect(fired.findings.some((f) => f.code === "handover_no_carried_forward")).toBe(true);
+    expect(fired.findings.find((f) => f.code === "handover_no_carried_forward")?.level).toBe("info");
+
+    const silentFalse = validateProject(state, NOW, { handoverNewestMarkedWithoutCarriedForward: false });
+    expect(silentFalse.findings.some((f) => f.code === "handover_no_carried_forward")).toBe(false);
+
+    const silentAbsent = validateProject(state, NOW, {});
+    expect(silentAbsent.findings.some((f) => f.code === "handover_no_carried_forward")).toBe(false);
+
+    const silentDefault = validateProject(state, NOW);
+    expect(silentDefault.findings.some((f) => f.code === "handover_no_carried_forward")).toBe(false);
   });
 });

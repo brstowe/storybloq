@@ -1,0 +1,13 @@
+{
+  "id": "ISS-2002",
+  "title": "Flag parser mishandles café, señor, and 🎉 in --page values",
+  "status": "open",
+  "severity": "medium",
+  "components": ["cli"],
+  "impact": "Reproducible with storybloq ticket list --page café; the parser should reject non-numeric input cleanly instead of throwing.",
+  "resolution": null,
+  "location": ["src/cli/args.ts:14"],
+  "discoveredDate": "2026-08-07",
+  "resolvedDate": null,
+  "relatedTickets": ["T-1003"]
+}

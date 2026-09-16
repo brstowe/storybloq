@@ -102,4 +102,34 @@ describe("codex-review helpers", () => {
 
     expect(finding.file).toBeUndefined();
   });
+
+  /**
+   * ISS-1202 (GitHub #36): recommendedNextState becomes required-plus-nullable
+   * in the schema, so a reviewer that has no redirect to recommend now emits
+   * an explicit `null` rather than omitting the key (omission is what strict
+   * mode forbids). The normalizer must treat that null the same as it always
+   * treated an absent key -- absent from the normalized Finding, not present
+   * with a null value -- or every non-redirecting native codex finding would
+   * carry a stray `recommendedNextState: null` from here on.
+   */
+  it("treats a null recommendedNextState the same as an absent one -- round-trips to an absent field", async () => {
+    const { normalizeFinding } = await import("../../../src/cli/commands/codex-review.js");
+    const finding = normalizeFinding(
+      { severity: "minor", category: "style", description: "Rename this", recommendedNextState: null },
+      0,
+    ) as Record<string, unknown>;
+
+    expect(finding.recommendedNextState).toBeUndefined();
+    expect("recommendedNextState" in finding).toBe(false);
+  });
+
+  it("still carries a real recommendedNextState through unchanged", async () => {
+    const { normalizeFinding } = await import("../../../src/cli/commands/codex-review.js");
+    const finding = normalizeFinding(
+      { severity: "minor", category: "style", description: "Rename this", recommendedNextState: "PLAN" },
+      0,
+    ) as Record<string, unknown>;
+
+    expect(finding.recommendedNextState).toBe("PLAN");
+  });
 });

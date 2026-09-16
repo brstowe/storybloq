@@ -82,12 +82,58 @@ describe("handleReconcile", () => {
     const result = await handleReconcile(root, { dryRun: false, ci: false, format: "md" });
 
     expect(result.exitCode).toBe(0);
+    // ISS-1190: reconcile found a real collision here (two tickets minted
+    // T-001 on divergent branches) -- the same one-line remedy the
+    // create-time warning and team doctor print must appear.
+    expect(result.output).toContain(
+      "Enable git-refs allocation: storybloq team init && storybloq team config set idAllocator git-refs",
+    );
     const loser = JSON.parse(readFileSync(join(tickets, "t-0000000000000002.json"), "utf-8"));
     const dependent = JSON.parse(readFileSync(join(tickets, "t-0000000000000003.json"), "utf-8"));
     expect(loser.displayId).toBe("T-003");
     expect(loser.previousDisplayIds).toEqual(["T-001"]);
     expect(dependent.blockedBy).toEqual(["T-001"]);
     expect(dependent.parentTicket).toBe("T-001");
+  });
+
+  it("includes the git-refs remedy in the json envelope's remedy field when a collision is found (ISS-1190)", async () => {
+    const root = createProject();
+    const tickets = join(root, ".story", "tickets");
+    writeJson(join(tickets, "t-0000000000000001.json"), {
+      id: "t-0000000000000001",
+      displayId: "T-001",
+      title: "Winner",
+      type: "task",
+      status: "open",
+      phase: "p1",
+      order: 10,
+      description: "",
+      createdDate: "2026-01-01",
+      completedDate: null,
+      blockedBy: [],
+      parentTicket: null,
+    });
+    writeJson(join(tickets, "t-0000000000000002.json"), {
+      id: "t-0000000000000002",
+      displayId: "T-001",
+      title: "Loser",
+      type: "task",
+      status: "open",
+      phase: "p1",
+      order: 20,
+      description: "",
+      createdDate: "2026-02-01",
+      completedDate: null,
+      blockedBy: [],
+      parentTicket: null,
+    });
+
+    const result = await handleReconcile(root, { dryRun: false, ci: false, format: "json" });
+    expect(result.exitCode).toBe(0);
+    const parsed = JSON.parse(result.output);
+    expect(parsed.data.remedy).toBe(
+      "Enable git-refs allocation: storybloq team init && storybloq team config set idAllocator git-refs",
+    );
   });
 
   it("rebalances ranks even when display IDs are clean", async () => {

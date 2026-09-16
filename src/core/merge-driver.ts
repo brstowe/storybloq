@@ -856,7 +856,7 @@ function mergeBlockerElement(
   return merged;
 }
 
-const CONFIG_DEEP_MERGE_KEYS = new Set(["features", "recipeOverrides", "team", "federation", "statusWriter"]);
+const CONFIG_DEEP_MERGE_KEYS = new Set(["features", "recipeOverrides", "team", "federation", "statusWriter", "sessionIntel", "healthCheck"]);
 const CONFIG_NODES_KEY = "nodes";
 
 export function mergeConfig(

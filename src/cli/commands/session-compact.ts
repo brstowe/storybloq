@@ -122,6 +122,19 @@ export async function handleSessionCompactPrepare(
   const clientTaskId = normalizeClientTaskId(options.clientTaskId)
     ?? normalizeClientTaskId(environmentTaskId);
 
+  // T-499: mark the compaction pending for session intel BEFORE anything
+  // that can stall. Reconciliation at the next entry point resolves it
+  // against the transcript's own boundary record. Claude only: Codex has no
+  // transcript to reconcile against.
+  if (client === "claude" && clientTaskId) {
+    try {
+      const { publishCompactPending } = await import("../../core/session-intel/capture.js");
+      publishCompactPending(root, clientTaskId, Date.now());
+    } catch {
+      // Best-effort; the boundary-driven path still catches the compaction.
+    }
+  }
+
   if (clientTaskId && options.transcriptPath) {
     try {
       await mintCompactionSuccession({
@@ -254,11 +267,21 @@ export interface SessionStartHookContext {
   readonly hookEventName?: string;
 }
 
+export const HOOK_STDIN_DEFAULT_MAX_BYTES = 65536;
+
 export async function readHookStdinContext(
   stream: NodeJS.ReadableStream & { isTTY?: boolean },
   timeoutMs = 200,
+  opts: {
+    /**
+     * T-499: a UserPromptSubmit payload carries the whole prompt, so that
+     * hook raises the cap to 1 MiB. The prompt field itself is never parsed.
+     */
+    readonly maxBytes?: number;
+  } = {},
 ): Promise<SessionStartHookContext> {
   if (stream.isTTY) return {};
+  const maxBytes = opts.maxBytes ?? HOOK_STDIN_DEFAULT_MAX_BYTES;
   const raw = await new Promise<string>((resolve) => {
     let data = "";
     let bytes = 0;
@@ -272,7 +295,7 @@ export async function readHookStdinContext(
     };
     const onData = (chunk: Buffer | string): void => {
       bytes += Buffer.byteLength(chunk);
-      if (bytes > 65536) {
+      if (bytes > maxBytes) {
         oversized = true;
         data = "";
         finish();

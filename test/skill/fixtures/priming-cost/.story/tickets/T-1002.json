@@ -1,0 +1,13 @@
+{
+  "id": "T-1002",
+  "title": "Document the export CLI flags",
+  "description": "Write the missing --phase/--all flag documentation for storybloq export.",
+  "type": "chore",
+  "status": "open",
+  "phase": "core",
+  "order": 20,
+  "createdDate": "2026-08-02",
+  "completedDate": null,
+  "blockedBy": [],
+  "parentTicket": null
+}

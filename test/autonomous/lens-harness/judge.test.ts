@@ -172,3 +172,107 @@ describe("handleJudge (deterministic three-value mapping)", () => {
     expect(() => handleJudge({ reviewVerdict: bad })).toThrow(/reviewVerdict/);
   });
 });
+
+/**
+ * ISS-950 acceptance 4: the judge separates the two reasons a verdict can sit
+ * below approve.
+ *
+ * A revise with zero blocking and zero major findings whose every cap reason
+ * names an uncovered core lens is a COVERAGE cap: nothing was found, a lens
+ * simply did not cover its domain. The remedy is that lens running again, not
+ * the implementer changing code. A revise carrying findings is a FINDINGS cap
+ * whatever its coverage looks like, and the two must never be conflated: one
+ * routes to a lens re-run, the other to IMPLEMENT.
+ */
+describe("handleJudge coverage-only cap (ISS-950)", () => {
+  const coverageEntry = (
+    lensId: string,
+    extra: Record<string, unknown> = {},
+  ) => ({ lensId, status: "skipped" as const, attempts: 1, contributedFindings: 0, ...extra });
+
+  it("M-CAP-CONFLATED: a findings-free revise capped by coverage is a coverage cap", () => {
+    const v = verdict({
+      verdict: "revise",
+      coverage: "partial",
+      lensCoverage: [
+        coverageEntry("security", { status: "ok" }),
+        coverageEntry("concurrency", { basis: "self-reported" }),
+      ],
+      capReasons: ["core lens 'concurrency' uncovered (skipped, self-reported)"],
+    });
+    const out = handleJudge({ reviewVerdict: v });
+    expect(out.verdict).toBe("revise");
+    expect(out.coverageOnlyCap).toBe(true);
+    expect(out.uncoveredCoreLenses).toEqual(["concurrency"]);
+    expect(out.capReasons).toEqual([
+      "core lens 'concurrency' uncovered (skipped, self-reported)",
+    ]);
+    expect(out.verdictReason).toContain("coverage");
+    expect(out.verdictReason).not.toContain("1 major");
+  });
+
+  it("M-CAP-CONFLATED: a revise carrying majors is a findings cap even with a coverage gap", () => {
+    const v = verdict({
+      verdict: "revise",
+      findings: [finding()],
+      coverage: "partial",
+      lensCoverage: [coverageEntry("concurrency", { basis: "self-reported" })],
+      capReasons: ["core lens 'concurrency' uncovered (skipped, self-reported)"],
+    });
+    const out = handleJudge({ reviewVerdict: v });
+    expect(out.verdict).toBe("revise");
+    expect(out.coverageOnlyCap).toBe(false);
+    // The lens is still named: a findings cap does not make the gap disappear.
+    expect(out.uncoveredCoreLenses).toEqual(["concurrency"]);
+  });
+
+  it("a relabelled core lens is a coverage cap and names the lens", () => {
+    const v = verdict({
+      verdict: "revise",
+      coverage: "partial",
+      lensCoverage: [
+        coverageEntry("concurrency", { status: "ok", relabeled: true }),
+      ],
+      capReasons: ["core lens 'concurrency' relabeled"],
+    });
+    const out = handleJudge({ reviewVerdict: v });
+    expect(out.coverageOnlyCap).toBe(true);
+    expect(out.uncoveredCoreLenses).toEqual(["concurrency"]);
+  });
+
+  it("a non-coverage cap reason disqualifies the coverage-only route", () => {
+    // `retry pending` and `review incomplete` also cap an approve, and neither
+    // is answered by re-running a named lens.
+    const v = verdict({
+      verdict: "revise",
+      coverage: "partial",
+      lensCoverage: [coverageEntry("concurrency", { basis: "self-reported" })],
+      capReasons: [
+        "core lens 'concurrency' uncovered (skipped, self-reported)",
+        "retry pending",
+      ],
+    });
+    const out = handleJudge({ reviewVerdict: v });
+    expect(out.coverageOnlyCap).toBe(false);
+  });
+
+  it("a reject is never a coverage cap", () => {
+    const v = verdict({
+      verdict: "reject",
+      findings: [finding({ severity: "blocking", category: "hardcoded-secrets" })],
+      coverage: "partial",
+      lensCoverage: [coverageEntry("concurrency", { basis: "self-reported" })],
+      capReasons: ["core lens 'concurrency' uncovered (skipped, self-reported)"],
+    });
+    const out = handleJudge({ reviewVerdict: v });
+    expect(out.verdict).toBe("reject");
+    expect(out.coverageOnlyCap).toBe(false);
+  });
+
+  it("an uncapped approve reports no cap at all", () => {
+    const out = handleJudge({ reviewVerdict: verdict({ capReasons: [] }) });
+    expect(out.coverageOnlyCap).toBe(false);
+    expect(out.capReasons).toEqual([]);
+    expect(out.uncoveredCoreLenses).toEqual([]);
+  });
+});

@@ -1201,3 +1201,34 @@ describe("sessionDiagnostics is only claimed when a scan supplied it (ISS-897)",
     expect(parsed.data.sessionDiagnostics[0]!.sourceDir).toBe(diagnostic.sourceDir);
   });
 });
+
+describe("handleStatus: compact mode (T-320 commit 3)", () => {
+  it("omitting opts stays byte-identical to today's default output", async () => {
+    const ctx = makeCtx({ format: "json" });
+    const bare = await handleStatus(ctx);
+    const withExplicitFalse = await handleStatus(ctx, undefined, { compact: false });
+    expect(bare.output).toBe(withExplicitFalse.output);
+  });
+
+  it("compact:true returns JSON even when ctx.format is md", async () => {
+    const ctx = makeCtx({ format: "md" });
+    const result = await handleStatus(ctx, undefined, { compact: true });
+    expect(() => JSON.parse(result.output)).not.toThrow();
+  });
+
+  it("compact:true drops archivedNotes/deprecatedLessons through the real handleStatus plumbing", async () => {
+    // Session/bus field reduction is asserted directly against formatStatus
+    // in output-formatter.test.ts, with injected fixtures; handleStatus
+    // builds those two populations itself (scanSessionSummaries, busSummary),
+    // so this test only needs to prove opts.compact reaches formatStatus at
+    // all -- the note/lesson counts are the simplest observable for that.
+    const state = makeState({
+      notes: [{ id: "N-1", title: "t", content: "c", tags: [], status: "archived", createdDate: "2026-01-01", updatedDate: "2026-01-01" } as never],
+    });
+    const ctx = makeCtx({ format: "json", state });
+    const result = await handleStatus(ctx, undefined, { compact: true });
+    const parsed = JSON.parse(result.output) as { data: Record<string, unknown> };
+    expect(parsed.data.archivedNotes).toBeUndefined();
+    expect(parsed.data.deprecatedLessons).toBeUndefined();
+  });
+});

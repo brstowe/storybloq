@@ -378,6 +378,72 @@ describe("handleTicketUpdate", () => {
     expect(result.output).toContain("Updated ticket T-001: Updated");
   });
 
+  it("strips a whole-input 4+ backtick render fence from description and warns (ISS-1192)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ticket-update-"));
+    tmpDirs.push(dir);
+    await setupProject(dir);
+    const inner = "line one\n```ts\ncode block\n```\nline three";
+    const rendered = `\`\`\`\`\n${inner}\n\`\`\`\``;
+    const result = await handleTicketUpdate("T-001", { description: rendered }, "json", dir);
+    const parsed = JSON.parse(result.output);
+    expect(parsed.data.description).toBe(inner);
+    expect(result.warnings).toEqual(["outer render fence removed; use --format json for round trips"]);
+
+    // A second round trip on the already-stripped description must not warn
+    // again or change anything (idempotent, no further growth).
+    const second = await handleTicketUpdate("T-001", { description: inner }, "json", dir);
+    const secondParsed = JSON.parse(second.output);
+    expect(secondParsed.data.description).toBe(inner);
+    expect(second.warnings).toBeUndefined();
+  });
+
+  it("leaves a 3-backtick whole-description fence untouched, with no warning", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ticket-update-"));
+    tmpDirs.push(dir);
+    await setupProject(dir);
+    const input = "```\nhello\n```";
+    const result = await handleTicketUpdate("T-001", { description: input }, "json", dir);
+    const parsed = JSON.parse(result.output);
+    expect(parsed.data.description).toBe(input);
+    expect(result.warnings).toBeUndefined();
+  });
+
+  it("[ISS-1192] MCP boundary: storybloq_ticket_update carries the render-fence warning in its envelope", async () => {
+    const { McpServer } = await import("@modelcontextprotocol/sdk/server/mcp.js");
+    const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
+    const { InMemoryTransport } = await import("@modelcontextprotocol/sdk/inMemory.js");
+    const { registerAllTools } = await import("../../../src/mcp/tools.js");
+
+    const dir = await mkdtemp(join(tmpdir(), "ticket-update-mcp-"));
+    tmpDirs.push(dir);
+    await setupProject(dir);
+
+    const server = new McpServer({ name: "test-server", version: "0.0.0" });
+    registerAllTools(server, dir);
+
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: "test-client", version: "0.0.0" });
+    await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
+
+    try {
+      const rendered = "````\nline one\n````";
+      const result = await client.callTool({
+        name: "storybloq_ticket_update",
+        arguments: { id: "T-001", description: rendered },
+      });
+      expect(result.isError).toBeFalsy();
+      const text = (result.content as Array<{ text: string }>)[0]!.text;
+      expect(text).toMatch(/^Warning: outer render fence removed; use --format json for round trips/);
+
+      const path = join(dir, ".story", "tickets", "T-001.json");
+      const updated = JSON.parse(await readFile(path, "utf-8"));
+      expect(updated.description).toBe("line one");
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
   it("status→complete sets completedDate", async () => {
     const dir = await mkdtemp(join(tmpdir(), "ticket-update-"));
     tmpDirs.push(dir);

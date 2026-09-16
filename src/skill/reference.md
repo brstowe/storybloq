@@ -4,724 +4,216 @@
 
 ### JSON output envelope
 
-Commands accepting `--format json` wrap their payload in a versioned envelope: `{"version": 1, "data": ...}` on success, `{"version": 1, "error": {"code": ..., "message": ...}}` on failure, plus a `warnings` array on partial loads (exit code 3). Pass `--raw` with `--format json` to emit the `data` payload verbatim: errors keep the envelope, partial-load warnings are dropped (the exit code still signals them), and commands whose JSON is not the standard envelope reject `--raw` naming their shape. A few commands predate the envelope and emit their own JSON instead: `gc`, `limit-status`, `conflicts list`, `conflicts show`, `resolve` and `team reserve` return an `{"ok", "data"}` object, and `team init` and `team setup` return a bare result object. `session list` and `session show` use a text/json axis with their own top-level shapes, and the `bus` subcommands speak the versioned Bus wire format. Every one of these names its own shape in its `--help` and does not accept `--raw` at all, so passing it is rejected during argument validation, before the command runs -- which matters because several of them mutate state.
-
-### init
-Initialize a new .story/ project
-
-```
-storybloq init [--name <name>] [--type <type>] [--language <lang>] [--force] [--format json|md]
-```
-
-### status
-Project summary: phase statuses, ticket/issue counts, blockers
-
-```
-storybloq status [--format json|md]
-```
-
-### ticket list
-List tickets with optional filters
-
-```
-storybloq ticket list [--status <s>] [--phase <p>] [--type <t>] [--format json|md]
-```
-
-### ticket get
-Get ticket details by ID
-
-```
-storybloq ticket get <id> [--format json|md]
-```
-
-### ticket next
-Suggest next ticket(s) to work on
-
-```
-storybloq ticket next [--count N] [--format json|md]
-```
-
-### ticket blocked
-List blocked tickets with their blocking dependencies
-
-```
-storybloq ticket blocked [--format json|md]
-```
-
-### ticket create
-Create a new ticket
-
-```
-storybloq ticket create --title <t> --type <type> [--phase <p>] [--description <d>] [--blocked-by <ids>] [--parent-ticket <id>] [--format json|md]
-```
-
-### ticket update
-Update a ticket
-
-```
-storybloq ticket update <id> [--status <s>] [--title <t>] [--type <type>] [--phase <p>] [--order <n>] [--description <d>] [--blocked-by <ids>] [--parent-ticket <id>] [--force] [--format json|md]
-```
-
-### ticket meta
-Get, set, or unset custom passthrough metadata on a ticket
-
-```
-storybloq ticket meta get|set|unset <id> [path] [value] [--format json|md]
-```
-
-### ticket delete
-Delete a ticket
-
-```
-storybloq ticket delete <id> [--force] [--format json|md]
-```
-
-### issue list
-List issues with optional filters
-
-```
-storybloq issue list [--status <s>] [--severity <sev>] [--component <c>] [--phase <p>] [--format json|md]
-```
-
-### issue get
-Get issue details by ID
-
-```
-storybloq issue get <id> [--format json|md]
-```
-
-### issue create
-Create a new issue
-
-```
-storybloq issue create --title <t> --severity <s> --impact <i> [--components <c>] [--related-tickets <ids>] [--location <locs>] [--source-ref <json>] [--dedupe-key <key>] [--created-by <reviewer>] [--phase <p>] [--format json|md]
-```
-
-### issue update
-Update an issue
-
-```
-storybloq issue update <id> [--status <s>] [--title <t>] [--severity <sev>] [--impact <i>] [--resolution <r>] [--components <c>] [--related-tickets <ids>] [--location <locs>] [--source-ref <json>] [--order <n>] [--phase <p>] [--format json|md]
-```
-
-### issue meta
-Get, set, or unset custom passthrough metadata on an issue
-
-```
-storybloq issue meta get|set|unset <id> [path] [value] [--format json|md]
-```
-
-### issue delete
-Delete an issue
-
-```
-storybloq issue delete <id> [--format json|md]
-```
-
-### phase list
-List all phases with derived status
-
-```
-storybloq phase list [--format json|md]
-```
-
-### phase current
-Show current (first non-complete) phase
-
-```
-storybloq phase current [--format json|md]
-```
-
-### phase tickets
-List tickets in a specific phase
-
-```
-storybloq phase tickets --phase <id> [--format json|md]
-```
-
-### phase create
-Create a new phase
-
-```
-storybloq phase create --id <id> --name <n> --label <l> --description <d> [--summary <s>] [--after <id>] [--at-start] [--format json|md]
-```
-
-### phase rename
-Rename/update phase metadata
-
-```
-storybloq phase rename <id> [--name <n>] [--label <l>] [--description <d>] [--summary <s>] [--format json|md]
-```
-
-### phase move
-Move a phase to a new position
-
-```
-storybloq phase move <id> [--after <id>] [--at-start] [--format json|md]
-```
-
-### phase delete
-Delete a phase
-
-```
-storybloq phase delete <id> [--reassign <phase-id>] [--format json|md]
-```
-
-### handover list
-List handover filenames (newest first)
-
-```
-storybloq handover list [--format json|md]
-```
-
-### handover latest
-Content of most recent handover
-
-```
-storybloq handover latest [--format json|md]
-```
-
-### handover get
-Content of a specific handover
-
-```
-storybloq handover get <filename> [--format json|md]
-```
-
-### handover create
-Create a new handover document
-
-```
-storybloq handover create [--content <md>] [--stdin] [--slug <slug>] [--format json|md]
-```
-
-### blocker list
-List all roadmap blockers
-
-```
-storybloq blocker list [--format json|md]
-```
-
-### blocker add
-Add a new blocker
-
-```
-storybloq blocker add --name <n> [--note <note>] [--format json|md]
-```
-
-### blocker clear
-Clear (resolve) a blocker
-
-```
-storybloq blocker clear --name <n> [--note <note>] [--format json|md]
-```
-
-### note list
-List notes with optional status/tag filters
-
-```
-storybloq note list [--status <s>] [--tag <t>] [--format json|md]
-```
-
-### note get
-Get a note by ID
-
-```
-storybloq note get <id> [--format json|md]
-```
-
-### note create
-Create a new note
-
-```
-storybloq note create --content <c> [--title <t>] [--tags <tags>] [--format json|md]
-```
-
-### note update
-Update a note
-
-```
-storybloq note update <id> [--content <c>] [--title <t>] [--tags <tags>] [--clear-tags] [--status <s>] [--format json|md]
-```
-
-### note delete
-Delete a note
-
-```
-storybloq note delete <id> [--format json|md]
-```
-
-### lesson list
-List lessons with optional status/tag/source filters
-
-```
-storybloq lesson list [--status <s>] [--tag <t>] [--source <src>] [--format json|md]
-```
-
-### lesson get
-Get a lesson by ID
-
-```
-storybloq lesson get <id> [--format json|md]
-```
-
-### lesson digest
-Ranked digest of active lessons for context loading
-
-```
-storybloq lesson digest [--format json|md]
-```
-
-### lesson create
-Create a new lesson
-
-```
-storybloq lesson create --title <t> --content <c> --context <ctx> --source <src> [--tags <tags>] [--supersedes <id>] [--format json|md]
-```
-
-### lesson update
-Update a lesson
-
-```
-storybloq lesson update <id> [--title <t>] [--content <c>] [--context <ctx>] [--tags <tags>] [--status <s>] [--supersedes <id>] [--format json|md]
-```
-
-### lesson reinforce
-Reinforce a lesson: increment count and update lastValidated
-
-```
-storybloq lesson reinforce <id> [--format json|md]
-```
-
-### lesson promote
-Promote a lesson into an attached storyknow knowledge pack (fork). The pack gains a K-entry (reinforcement count carried, origin stamped); the local lesson is superseded with a pointer.
-
-```
-storybloq lesson promote <id> --to <pack-name-or-path> [--force] [--format json|md]
-```
-
-### lesson delete
-Delete a lesson
-
-```
-storybloq lesson delete <id> [--hard] [--format json|md]
-```
-
-### knowledge (storyknow packs, fork)
-Manage shared K-NNN knowledge entries inside a knowledge pack (a project created with `storybloq init --type knowledge`). Consumer projects attach packs via the `knowledge: ["<name-or-path>"]` config key (bare names resolve under `$STORYKNOW_HOME`, default `~/dev/storyknow`); attached entries appear in `lesson digest` marked `[<pack>]`. `knowledge digest` is dual-mode: inside a pack it digests the pack's own entries; inside a consumer project it digests all attached knowledge.
-
-```
-storybloq knowledge list [--status <s>] [--tag <t>] [--source <src>] [--format json|md]
-storybloq knowledge get <id> [--format json|md]
-storybloq knowledge digest [--format json|md]
-storybloq knowledge create --title <t> --content <c> --context <ctx> --source <src> [--tags <tags>] [--supersedes <id>]
-storybloq knowledge update <id> [--title <t>] [--content <c>] [--context <ctx>] [--tags <tags>] [--status <s>]
-storybloq knowledge reinforce <id>
-storybloq knowledge delete <id>
-```
-
-### ruling list
-List owner-ruling attestation records
-
-```
-storybloq ruling list [--scope-tag <tag>] [--superseded] [--format json|md]
-```
-
-### ruling get
-Get a ruling by ID
-
-```
-storybloq ruling get <id> [--format json|md]
-```
-
-### ruling create
-Record a ruling verbatim and cite it from the tickets or issues it binds
-
-```
-storybloq ruling create --text <text> --attribution <source> --date <YYYY-MM-DD> [--scope-tag <tag>] [--cites <item>] [--format json|md]
-```
-
-### ruling supersede
-Supersede a ruling: link an existing one with --with, or record a new superseding ruling
-
-```
-storybloq ruling supersede <id> (--with <id> | --text <text> --attribution <source> --date <YYYY-MM-DD>) [--scope-tag <tag>] [--format json|md]
-```
-
-### validate
-Reference, schema, source-provenance, and loader-independent JSON checks
-
-```
-storybloq validate [--integrity-only] [--format json|md]
-```
-
-### snapshot
-Save current project state for session diffs
-
-```
-storybloq snapshot [--quiet] [--format json|md]
-```
-
-### recap
-Session diff: changes since last snapshot + suggested actions
-
-```
-storybloq recap [--format json|md]
-```
-
-### export
-Self-contained project document for sharing
-
-```
-storybloq export [--phase <id>] [--all] [--format json|md]
-```
-
-### recommend
-Context-aware work suggestions
-
-```
-storybloq recommend [--count N] [--format json|md]
-```
-
-### reference
-Print CLI command and MCP tool reference
-
-```
-storybloq reference [--format json|md]
-```
-
-### selftest
-Run integration smoke test: create/update/delete cycle across all entity types
-
-```
-storybloq selftest [--format json|md]
-```
-
-### codex-review
-Run native Codex plan or code review for an autonomous session
-
-```
-storybloq codex-review plan|code --session <id> --format guide-report
-```
-
-### limit-status
-Show pending usage-limit auto-resumes (global across projects); cancel or requeue records
-
-```
-storybloq limit-status [--cancel <key>] [--requeue <key>] [--recent] [--format json|md]
-```
-
-### setup
-Install Storybloq skill, MCP, and hooks for Claude, Codex, or both
-
-```
-storybloq setup [--client claude|codex|all] [--skip-hooks] [--skip-skill]
-```
-
-### setup-skill
-Compatibility alias for `storybloq setup --client claude`
-
-```
-storybloq setup-skill [--skip-hooks]
-```
-
-### reconcile
-Detect and fix duplicate displayIds across all entity types
-
-```
-storybloq reconcile [--dry-run] [--ci] [--rebalance-ranks] [--format json|md]
-```
-
-### conflicts list
-List all items with unresolved merge conflicts
-
-```
-storybloq conflicts list [--format json|md]
-```
-
-### conflicts show
-Show field-level conflict detail for an item
-
-```
-storybloq conflicts show <id> [--format json|md]
-```
-
-### resolve
-Resolve merge conflicts on a .story/ item
-
-```
-storybloq resolve <id> [--field <f>] [--use ours|theirs] [--value <json>] [--format json|md]
-```
-
-### merge-driver
-Git merge driver for .story/ JSON files (registered via team setup)
-
-```
-storybloq merge-driver <ancestor> <ours> <theirs> <pathname>
-```
-
-### team init
-Enable team mode on this project
-
-```
-storybloq team init [--claim-staleness-hours N] [--id-allocator local|git-refs] [--format json|md]
-```
-
-### team setup
-Install the git merge driver and .gitattributes for team mode
-
-```
-storybloq team setup [--format json|md]
-```
-
-### team doctor
-Run team health checks on the project
-
-```
-storybloq team doctor [--ci] [--format json|md]
-```
-
-### team reserve
-Reserve display IDs via remote git refs
-
-```
-storybloq team reserve <type> [--count N] [--format json|md]
-```
-
-### team config
-Show or set team configuration
-
-```
-storybloq team config get|set [key] [value] [--format json|md]
-```
-
-### gc
-Remove tombstoned files past retention period
-
-```
-storybloq gc [--apply] [--force] [--retention-days N] [--format json|md]
-```
-
-### repair
-Fix stale references in .story/ data
-
-```
-storybloq repair [--dry-run] [--canonicalize-refs]
-```
-
-### config
-Manage project configuration (recipe overrides)
-
-```
-storybloq config <subcommand> [--format json|md]
-```
-
-### migrate
-Migrate config schema to the latest version
-
-```
-storybloq migrate [--dry-run] [--format json|md]
-```
-
-### feedback
-Community feedback via GitHub Issues
-
-```
-storybloq feedback list|create|vote [args] [--format json|md]
-```
-
-### dispatch
-Dispatch work to Agent View background sessions
-
-```
-storybloq dispatch [ids..] [--format json|md]
-```
-
-### bus init
-Low-level initializer: enable the local Storybloq Bus v2 for this project (prefer `storybloq bus setup`). Initializes a fresh v2 runtime only; if a v1 runtime is present it refuses with `upgrade_required` and directs you to `storybloq bus setup`, which resolves this task's identity and runs the guided drain/upgrade.
-
-```
-storybloq bus init [--format json|md]
-```
-
-### bus setup
-Connect this task to the Storybloq Bus in one idempotent, resumable command. Initializes or upgrades the runtime, joins this task's endpoint, and (when hook delivery is enabled) enables this client's guarded on-boundary hooks. With one endpoint it ends with a handoff line inviting the other task to connect. --replace <endpoint-id> retires a proven-offline incumbent and takes its place, redelivering that endpoint's undelivered mail to this successor. --force-archive overrides unread noncritical v1 delivery only during a v1->v2 upgrade; it never bypasses ship-gate blockers (unacknowledged critical messages, parked unresolved critical threads, quarantined threads).
-
-```
-storybloq bus setup [--client claude|codex] [--task-id <id>] [--surface claude_cli|codex_cli|codex_desktop] [--delivery live|poll] [--replace <endpoint-id>] [--force-archive] [--format json|md]
-```
-
-### bus auto-attach
-Turn per-session Bus auto-attach on or off for this project (opt-in, default off). `on` runs the full `bus setup` bootstrap once (initializing the runtime, joining this task, and installing the global client hooks) and sets the opt-in flag; thereafter every new session auto-attaches at SessionStart with its on-boundary delivery tiers enabled, no command, and a session that finds a proven-dead peer reclaims its slot and inherits its undelivered mail. `off` clears the flag and leaves the runtime and existing endpoints in place.
-
-```
-storybloq bus auto-attach <on|off> [--client claude|codex] [--task-id <id>] [--surface claude_cli|codex_cli|codex_desktop] [--force-archive] [--format json|md]
-```
-
-### bus join
-Deprecated: roles are now per-message, so the legacy role argument is ignored. Use `storybloq bus setup`.
-
-```
-storybloq bus join [legacy-role] [--client claude|codex] [--task-id <id>] [--surface <surface>] [--replace <endpoint-id>] [--format json|md]
-```
-
-### bus leave
-Retire the Bus endpoint owned by this task
-
-```
-storybloq bus leave [--endpoint <id>] [--client claude|codex] [--task-id <id>] [--format json|md]
-```
-
-### bus endpoint retire
-Force-retire an endpoint with unknown liveness
-
-```
-storybloq bus endpoint retire <endpoint-id> --force --reason <text> [--format json|md]
-```
-
-### bus send
-Create a Bus thread or send a reply. Routing always targets the sole peer; `--to` is deprecated and ignored.
-
-```
-storybloq bus send --kind <kind> --body <text> --idempotency-key <key> [--to <role>] [--thread <id>] [--thread-kind <kind>] [--issue <id>] [--ticket <id>] [--commit <sha>] [--ci-run <id>] [--file <path>] [--format json|md]
-```
-
-### bus poll
-Poll unacknowledged messages for the task-bound endpoint. --limit bounds how many messages are returned (applies to the wait drain too). With --wait, block until a message arrives or --timeout elapses (v2 only), then exit: 0 = message delivered, 4 = timed out, 5 = another --wait already owns this endpoint.
-
-```
-storybloq bus poll [--endpoint <id>] [--client claude|codex] [--task-id <id>] [--limit N] [--wait] [--timeout <seconds>] [--format json|md]
-```
-
-### bus ack
-Record delivery disposition for one Bus message
-
-```
-storybloq bus ack <message-id> --disposition accepted|rejected|deferred [--reason <text>] [--format json|md]
-```
-
-### bus thread
-Show or update a participant Bus thread
-
-```
-storybloq bus thread show|update <thread-id> [options] [--format json|md]
-```
-
-### bus hooks
-Enable or disable guarded on-boundary Bus delivery for this project
-
-```
-storybloq bus hooks enable|disable [--client claude|codex|all] [--format json|md]
-```
-
-### bus status
-Show concise Bus runtime state
-
-```
-storybloq bus status [--format json|md]
-```
-
-### bus doctor
-Validate Bus storage, endpoint, and mailbox integrity
-
-```
-storybloq bus doctor [--format json|md]
-```
-
-### bus check
-Run the critical Bus release gate
-
-```
-storybloq bus check --ship [--format json|md]
-```
-
-### bus export
-Explicitly export one Bus transcript
-
-```
-storybloq bus export <thread-id> [--format json|md]
-```
-
-### node add
-Add a federation node to an orchestrator project
-
-```
-storybloq node add <name> --path <p> [--role <r>] [--kind <k>] [--format json|md]
-```
-
-### node update
-Update a federation node's metadata
-
-```
-storybloq node update <name> [--path <p>] [--role <r>] [--format json|md]
-```
-
-### node remove
-Remove a federation node from an orchestrator project
-
-```
-storybloq node remove <name> [--format json|md]
-```
+`--format json` normally returns `{"version":1,"data":...}` or `{"version":1,"error":{"code":...,"message":...}}`. Partial loads add `warnings` and exit 3. `--raw` emits only `data`, retaining error envelopes but dropping partial-load warnings; the exit code still signals them. Exceptions: `gc`, `limit-status`, `conflicts list`, `conflicts show`, `resolve`, and `team reserve` return `{"ok","data"}`; `team init` and `team setup` return bare objects; `session list/show` use their own text/json shapes; Bus commands use their versioned wire format. Those exceptions reject `--raw` during argument validation, before execution. Each command names its shape in `--help`. Use JSON to round-trip description/impact/content: markdown render fences grow when fed back through `update --stdin`; updates strip them and warn (ISS-1192).
+
+Run `storybloq <command>`. Positional arguments appear after the command; ? marks optional flags. Use `<command> --help` for value types and choices, or `storybloq reference --format json` for full usage strings.
+
+- **init** (--name?, --force?, --type?, --language?, --node?, --format?) - Initialize a new .story/ project
+- **status** (--format?, --client-task-id?, --compact?) - Project summary: phase statuses, ticket/issue counts, blockers. --compact (T-320): JSON only, ignores --format. Reduces the payload: drops archivedNotes, deprecatedLessons, and issueFlow.semantics; reduces each session record (activeSessions/resumableSessions/expiredLeaseSessions) to sessionId, sourceDir, state, mode, ownerTask, leaseState, leaseExpiresAt, compactPending, dropping ticketId/ticketTitle; reduces bus to enabled, daemonState, deliveryMode, pendingMessages, unacknowledgedCritical, nextActions, dropping participants, wake, hookDelivery, deliveryCapabilities, and every other bus field. limitStops, sessionDiagnostics, arrangements/arrangementWarnings, and every other top-level field are kept whole.
+- **ticket list** (--status?, --phase?, --type?, --format?, --node?) - List tickets with optional filters
+- **ticket get <id>** (--format?) - Get ticket details by ID
+- **ticket next** (--format?, --count?) - Suggest next ticket(s) to work on
+- **ticket blocked** (--format?) - List blocked tickets with their blocking dependencies
+- **ticket create** (--title, --type, --phase?, --description?, --stdin?, --parent-ticket?, --blocked-by?, --cites-ruling?, --format?, --node?) - Create a new ticket
+- **ticket update <id>** (--status?, --title?, --type?, --phase?, --order?, --description?, --stdin?, --parent-ticket?, --node?, --force?, --clear-cites-rulings?, --blocked-by?, --cross-node-blocked-by?, --cites-ruling?, --format?) - Update a ticket
+- **ticket meta <operation> <id> [path] [value]** (--format?) - Get, set, or unset custom passthrough metadata on a ticket
+- **ticket delete <id>** (--force?, --hard?, --format?) - Delete a ticket
+- **issue list** (--status?, --severity?, --component?, --phase?, --format?) - List issues with optional filters
+- **issue get <id>** (--format?) - Get issue details by ID
+- **issue create** (--title, --severity, --impact?, --stdin?, --phase?, --dedupe-key?, --created-by?, --components?, --related-tickets?, --location?, --source-ref?, --cites-ruling?, --format?) - Create a new issue
+- **issue update <id>** (--status?, --title?, --severity?, --impact?, --stdin?, --resolution?, --order?, --phase?, --clear-cites-rulings?, --components?, --related-tickets?, --location?, --source-ref?, --cites-ruling?, --format?) - Update an issue
+- **issue meta <operation> <id> [path] [value]** (--format?) - Get, set, or unset custom passthrough metadata on an issue
+- **issue delete <id>** (--hard?, --format?) - Delete an issue
+- **phase list** (--format?, --node?) - List all phases with derived status
+- **phase current** (--format?) - Show current (first non-complete) phase
+- **phase tickets** (--phase, --format?) - List tickets in a specific phase
+- **phase create** (--id, --name, --label, --description, --summary?, --after?, --at-start?, --node?, --format?) - Create a new phase
+- **phase rename <id>** (--name?, --label?, --description?, --summary?, --format?) - Rename/update phase metadata
+- **phase move <id>** (--after?, --at-start?, --format?) - Move a phase to a new position
+- **phase delete <id>** (--reassign?, --format?) - Delete a phase
+- **handover list** (--format?) - List handover filenames (newest first)
+- **handover latest** (--count?, --brief?, --priming?, --format?) - Content of most recent handover
+- **handover get <filename>** (--format?) - Content of a specific handover
+- **handover create** (--content?, --stdin?, --slug?, --format?) - Create a new handover document
+- **handover template** (--override?, --format?) - Scaffold a new handover document (category headings, Carried forward, marker)
+- **blocker list** (--format?) - List all roadmap blockers
+- **blocker add** (--name, --note?, --format?) - Add a new blocker
+- **blocker clear** (--name, --note?, --format?) - Clear (resolve) a blocker
+- **note list** (--status?, --tag?, --format?) - List notes with optional status/tag filters
+- **note get <id>** (--format?) - Get a note by ID
+- **note create** (--content?, --title?, --stdin?, --tags?, --format?) - Create a new note
+- **note update <id>** (--content?, --title?, --clear-tags?, --status?, --stdin?, --tags?, --format?) - Update a note
+- **note delete <id>** (--hard?, --format?) - Delete a note
+- **lesson list** (--status?, --tag?, --source?, --format?) - List lessons with optional status/tag/source filters
+- **lesson get <id>** (--format?) - Get a lesson by ID
+- **lesson digest** (--format?, --limit?, --select?) - Ranked digest of active lessons. --limit/--select (T-320): one-line-per-lesson form; --select is phase:<id>/component:<name>/item:<id>, falls back to --limit.
+- **lesson create** (--title, --content?, --context, --source, --supersedes?, --stdin?, --tags?, --format?) - Create a new lesson
+- **lesson update <id>** (--title?, --content?, --context?, --clear-tags?, --status?, --stdin?, --tags?, --format?) - Update a lesson
+- **lesson reinforce <id>** (--format?) - Reinforce a lesson: increment count and update lastValidated
+- **lesson delete <id>** (--hard?, --format?) - Delete a lesson
+- **ruling list** (--scope-tag?, --superseded?, --format?) - List owner-ruling attestation records
+- **ruling get <id>** (--format?) - Get a ruling by ID
+- **ruling create** (--text, --attribution, --date, --client-task-id?, --scope-tag?, --cites?, --format?) - Record a ruling verbatim and cite it from the tickets or issues it binds
+- **ruling supersede <id>** (--with?, --text?, --attribution?, --date?, --client-task-id?, --scope-tag?, --format?) - Supersede a ruling: link an existing one with --with, or record a new superseding ruling
+- **arrangement compact <id>** (--client-task-id?, --format?) - Compact a duet arrangement's coordination checkpoint: resolved assignments keep their last event, overflow moves to an archive list. Pen only
+- **arrangement rotate <id>** (--client-task-id?, --format?) - Close a duet arrangement at capacity and carry its open assignments, verified session and earmarks into a fresh successor. Pen only
+- **validate** (--integrity-only?, --format?) - Reference, schema, source-provenance, and loader-independent JSON checks
+- **snapshot** (--quiet?, --format?) - Save current project state for session diffs
+- **recap** (--format?) - Session diff: changes since last snapshot + suggested actions
+- **export** (--phase?, --all?, --format?) - Self-contained project document for sharing
+- **recommend** (--format?, --count?, --with-actionability?) - Context-aware work suggestions
+- **reference** (--format?) - Print CLI command and MCP tool reference
+- **selftest** (--format?) - Run integration smoke test: create/update/delete cycle across all entity types
+- **health** (--only?, --refresh?, --format?) - Check the tooling around this project: auto-compact window, CLI version, Codex review bridge (launched and answered, not just registered), /story skill, cross-session messaging, duplicate hook rows. --format json is the shared {version, data} envelope with the result under data; --raw unwraps it
+- **codex-review <kind>** (--session, --format?) - Run native Codex plan or code review for an autonomous session
+- **limit-status** (--cancel?, --requeue?, --recent?, --format?) - Show pending usage-limit auto-resumes (global across projects); cancel or requeue records
+- **session intel-start** (--client?) - Capture the auto-compact setting for the current process era (SessionStart hook)
+- **session intel-prompt** (--client?) - Sample context pressure and emit additionalContext at imperative pressure (UserPromptSubmit hook)
+- **session intel** (--session-id?, --transcript?, --caller-model?, --full?, --client-task-id?, --format?) - Context usage, expected auto-compaction point with provenance, pressure state (ok/advisory/imperative/compact-needed), session facts. Works without .story/. --transcript must be ~/.claude/projects/<project>/<sessionId>.jsonl (a regular file, not a symlink); a refusal names the rule that failed
+- **setup** (--client?, --skip-hooks?, --skip-skill?) - Install Storybloq skill, MCP, and hooks for Claude, Codex, or both
+- **setup-skill** (--skip-hooks?) - Compatibility alias for `storybloq setup --client claude`
+- **reconcile** (--dry-run?, --ci?, --rebalance-ranks?, --format?) - Detect and fix duplicate displayIds across all entity types
+- **conflicts list** (--format?) - List all items with unresolved merge conflicts
+- **conflicts show <id>** (--format?) - Show field-level conflict detail for an item
+- **resolve <id>** (--field?, --use?, --value?, --format?) - Resolve merge conflicts on a .story/ item
+- **merge-driver <ancestor> <ours> <theirs> <pathname>** - Git merge driver for .story/ JSON files (registered via team setup)
+- **team init** (--claim-staleness-hours?, --id-allocator?, --format?) - Enable team mode on this project
+- **team setup** (--format?) - Install the git merge driver and .gitattributes for team mode
+- **team doctor** (--ci?, --format?) - Run team health checks on the project
+- **team reserve <type>** (--count?, --format?) - Reserve display IDs via remote git refs
+- **gc** (--apply?, --force?, --retention-days?, --format?) - Remove tombstoned files past retention period
+- **repair** (--dry-run?, --canonicalize-refs?) - Fix stale references in .story/ data
+- **migrate** (--dry-run?, --format?) - Migrate config schema to the latest version
+- **dispatch [ids..]** (--format?, --recommend?, --all?, --count?, --yes?, --dry-run?) - Dispatch work to Agent View background sessions
+- **bus init** (--format?) - Low-level initializer: enable the local Storybloq Bus v2 for this project (prefer `storybloq bus setup`). Initializes a fresh v2 runtime only; if a v1 runtime is present it refuses with `upgrade_required` and directs you to `storybloq bus setup`, which resolves this task's identity and runs the guided drain/upgrade.
+- **bus setup** (--client?, --task-id?, --surface?, --delivery?, --wake?, --session-name?, --transport-address?, --replace?, --force-archive?, --format?) - Connect this task to the Storybloq Bus in one idempotent, resumable command. Initializes or upgrades the runtime, joins this task's endpoint, and (when hook delivery is enabled) enables this client's guarded on-boundary hooks. With one endpoint it ends with a handoff line inviting the other task to connect. --replace <endpoint-id> retires a proven-offline incumbent and takes its place, redelivering that endpoint's undelivered mail to this successor. --force-archive overrides unread noncritical v1 delivery only during a v1->v2 upgrade; it never bypasses ship-gate blockers (unacknowledged critical messages, parked unresolved critical threads, quarantined threads).
+- **bus auto-attach <state>** (--client?, --task-id?, --surface?, --force-archive?, --format?) - Turn per-session Bus auto-attach on or off for this project (opt-in, default off). `on` runs the full `bus setup` bootstrap once (initializing the runtime, joining this task, and installing the global client hooks) and sets the opt-in flag; thereafter every new session auto-attaches at SessionStart with its on-boundary delivery tiers enabled, no command, and a session that finds a proven-dead peer reclaims its slot and inherits its undelivered mail. `off` clears the flag and leaves the runtime and existing endpoints in place.
+- **bus join [legacy-role]** (--client?, --task-id?, --surface?, --replace?, --format?) - Deprecated: roles are now per-message, so the legacy role argument is ignored. Use `storybloq bus setup`.
+- **bus leave** (--endpoint?, --client?, --task-id?, --format?) - Retire the Bus endpoint owned by this task
+- **bus endpoint retire <endpoint-id>** (--force, --reason, --format?) - Force-retire an endpoint with unknown liveness
+- **bus send** (--endpoint?, --client?, --task-id?, --thread?, --thread-kind?, --predecessor-thread?, --to?, --kind, --severity?, --body, --idempotency-key, --in-reply-to?, --issue?, --ticket?, --commit?, --ci-run?, --file?, --format?) - Create a Bus thread or send a reply. Routing always targets the sole peer; `--to` is deprecated and ignored.
+- **bus poll** (--endpoint?, --client?, --task-id?, --limit?, --wait?, --timeout?, --format?) - Poll unacknowledged messages for the task-bound endpoint. --limit bounds how many messages are returned (applies to the wait drain too). With --wait, block until a message arrives or --timeout elapses (v2 only), then exit: 0 = message delivered, 4 = timed out, 5 = another --wait already owns this endpoint.
+- **bus ack <message-id>** (--endpoint?, --client?, --task-id?, --disposition, --reason?, --format?) - Record delivery disposition for one Bus message
+- **bus status** (--format?) - Show concise Bus runtime state
+- **bus doctor** (--format?) - Validate Bus storage, endpoint, and mailbox integrity
+- **bus check** (--ship, --format?) - Run the critical Bus release gate
+- **bus export <thread-id>** (--format?) - Explicitly export one Bus transcript
+- **node add <name>** (--path, --stack?, --role?, --kind?, --summary?, --depends-on?, --link?, --format?) - Add a federation node to an orchestrator project
+- **node update <name>** (--path?, --stack?, --role?, --kind?, --summary?, --clear-depends-on?, --clear-links?, --depends-on?, --link?, --format?) - Update a federation node's metadata
+- **node remove <name>** (--force?, --prune?, --format?) - Remove a federation node from an orchestrator project
+- **arrangement coordinate <id>** (--json, --client-task-id?, --format?) - Record a pen-owned duet coordination operation
+- **arrangement list** (--lifecycle?, --format?) - List arrangements
+- **arrangement get <id>** (--format?) - Get an arrangement
+- **arrangement create** (--unreachability-irreversible, --unreachability-reversible?, --bounds?, --party?, --format?) - Create a new arrangement
+- **arrangement update <id>** (--lifecycle?, --format?) - Update an arrangement
+- **bus endpoint list** (--format?) - List endpoints with their wake configuration and last wake outcome
+- **bus hooks enable** (--client?, --format?) - Opt this project into guarded SessionStart and Stop delivery
+- **bus hooks disable** (--client?, --format?) - Disable guarded Bus hook delivery for this project
+- **bus redeliver** (--endpoint?, --client?, --task-id?, --predecessor-thread, --refused-entry-hash, --format?) - Redeliver a hop-cap-parked, never-dropped Bus message onto a fresh successor thread
+- **bus thread show <thread-id>** (--endpoint?, --client?, --task-id?, --format?) - Show an integrity-verified participant thread
+- **bus thread update <thread-id>** (--endpoint?, --client?, --task-id?, --action, --reason?, --resolution?, --commit?, --ci-run?, --format?) - Park, resolve, or reopen a participant thread
+- **config set-overrides** (--json?, --clear?, --deep?, --format?) - Set or clear recipe overrides in config.json
+- **config set-federation** (--allow-node-writes?, --format?) - Set federation settings (orchestrator only)
+- **earmark get <ref>** (--format?, --node?) - Get the earmark on a ticket or issue
+- **earmark reserve <ref>** (--role, --arrangement?, --format?, --node?) - Reserve a ticket or issue for a role, pending pickup
+- **earmark assign <ref>** (--to, --role, --arrangement?, --format?, --node?) - Assign a ticket or issue's earmark directly to a live session (direct placement, or an explicit reserved -> assigned conversion)
+- **earmark release <ref>** (--arrangement?, --format?, --node?) - Release (clear) a ticket or issue's earmark
+- **feedback list** (--category?, --format?) - List community feedback
+- **feedback create** (--title, --category?, --body?) - Create new feedback (opens browser)
+- **feedback vote <number>** - Vote on feedback (opens browser)
+- **gate-ack list** (--arrangement?, --ticket?, --format?) - List gate-acks
+- **gate-ack get <id>** (--format?) - Get a gate-ack
+- **gate-ack create** (--arrangement, --gate, --ticket, --plan-file?, --from-staged?, --codex-session-id?, --verdict?, --rounds?, --deltas?, --format?) - Create a gate-ack
+- **gate-ack contest <id>** (--reason, --format?) - Mark a gate-ack contested (record + surfaced flag only)
+- **landings** (--since?, --limit?, --format?) - Commits that touched tickets/issues, with review coverage (CLI-only; no MCP tool)
+- **node list** (--format?) - List configured nodes
+- **review-stats** (--fleet?, --open-window?, --close-window?, --contract?, --format?) - Review efficiency metrics over review verdict artifacts
+- **session compact-prepare** (--client?) - Prepare session for compaction (PreCompact hook)
+- **session resume-prompt** (--codex-hook-json?) - Output resume instruction after compaction (SessionStart hook)
+- **session limit-stop** - Record a usage-limit stop for auto-resume (StopFailure hook)
+- **session clear-compact [sessionId]** (--force?) - Clear stale compact marker (admin)
+- **session stop [sessionId]** - Stop an active session (admin)
+- **session list** (--status?, --format?) - List sessions on disk (admin)
+- **session show <sessionId>** (--format?, --events?) - Show details of a session (admin)
+- **session repair [sessionId]** (--dry-run?, --all?, --yes?) - Supersede orphaned sessions (admin)
+- **session delete <sessionId>** (--yes?) - Delete a session directory (admin, destructive)
+- **session health [sessionId]** - Derive and display session health state
+- **session watch [sessionId]** (--events?, --quiet?) - Stream session health state changes
+- **session milestone <kind>** (--gate-name?, --note?, --client-task-id?, --format?) - Report a self-described work milestone for presence display (duet/arrangement sessions)
+- **roster start** (--stdin?, --client-task-id?, --agent-id?, --session-id?, --description?, --format?) - Start (or restart) a seat on the roster: a session or one of its subagents. JSON envelope; no_project outside a ledger
+- **roster heartbeat** (--stdin?, --client-task-id?, --agent-id?, --generation, --format?) - Refresh a running seat's lastSeenAt; --generation from the start result is required
+- **roster end** (--stdin?, --client-task-id?, --agent-id?, --generation, --state, --format?) - End a seat with a terminal state (completed/failed/killed/detached); --generation required
+- **roster list** (--all?, --format?) - List seats (Bus endpoints merged): running by default, every seat including terminal ones with --all
+- **team config show** (--format?) - Show current team configuration
+- **team config set <key> <value>** (--format?) - Set a team configuration value
+- **ticket move <id>** (--after?, --before?, --format?) - Move a ticket relative to another (fractional rank)
+- **ticket unclaim <id>** (--format?) - Remove claim from a ticket
+- **ticket start <id>** (--force?, --format?) - Claim a ticket and set status to inprogress
 
 ## MCP Tools
 
-The base tools below are registered in full mode (inside a .story/ project). The five storybloq_bus_* tools are always registered in full mode; when the Bus is disabled or uninitialized they return setup guidance pointing at `storybloq bus setup`, with no MCP restart required.
+The base tools below are registered in full mode (inside a .story/ project). The storybloq_bus_* tools are always registered in full mode; when the Bus is disabled or uninitialized they return setup guidance pointing at `storybloq bus setup`, with no MCP restart required.
 
-- **storybloq_status** (format?, clientTaskId?) - Project summary: phase statuses, ticket/issue counts, blockers. Markdown is the default; JSON includes full active/resumable session ownership and lease metadata. clientTaskId (T-477) also enriches this session's own arrangementPresence/ownerIdentity onto its presence record as a side effect; omit to inherit the environment identity, same as storybloq_session_guard.
+Arguments marked ? are optional in the registered schema; handlers may require combinations depending on the action. Use the client’s tool schema for types and constraints.
+
+- **storybloq_status** (format?, clientTaskId?, compact?) - Project summary; markdown default, JSON includes session ownership/leases. clientTaskId enriches this session's arrangementPresence/ownerIdentity; omit to inherit environment identity. compact always returns reduced JSON: see CLI status for retained/dropped fields.
+- **storybloq_roster_get** (format?, all?) - Seat roster: live sessions and subagents (Bus endpoints merged) with live/stale/terminal counts; terminal seats hidden unless all. Read-only; writes are CLI-only.
 - **storybloq_phase_list** - All phases with derived status
 - **storybloq_phase_current** - First non-complete phase
-- **storybloq_phase_tickets** (phaseId) - Leaf tickets for a specific phase
-- **storybloq_ticket_list** (status?, phase?, type?) - List leaf tickets with optional filters
-- **storybloq_ticket_get** (id) - Get a ticket by ID
+- **storybloq_phase_tickets** (phaseId, node?) - Leaf tickets for a specific phase
+- **storybloq_ticket_list** (status?, phase?, type?, node?) - List leaf tickets with optional filters
+- **storybloq_ticket_get** (id, format?, withActionability?, node?) - Get a ticket by ID
 - **storybloq_ticket_meta_get** (id, path?) - Get custom passthrough metadata from a ticket
-- **storybloq_ticket_next** (count?) - Highest-priority unblocked ticket(s)
-- **storybloq_ticket_blocked** - All blocked tickets with dependencies
-- **storybloq_issue_list** (status?, severity?, component?, phase?) - List issues with optional filters
-- **storybloq_issue_get** (id) - Get an issue by ID
+- **storybloq_ticket_next** (count?, node?) - Highest-priority unblocked ticket(s)
+- **storybloq_ticket_blocked** (node?) - All blocked tickets with dependencies
+- **storybloq_issue_list** (status?, severity?, component?, phase?, node?) - List issues with optional filters
+- **storybloq_issue_get** (id, format?, withActionability?, node?) - Get an issue by ID
 - **storybloq_issue_meta_get** (id, path?) - Get custom passthrough metadata from an issue
 - **storybloq_handover_list** - List handover filenames (newest first)
-- **storybloq_handover_latest** - Content of most recent handover
-- **storybloq_handover_get** (filename) - Content of a specific handover
+- **storybloq_handover_latest** (count?, brief?, priming?, format?) - Content of most recent handover
+- **storybloq_handover_get** (filename, format?) - Content of a specific handover
 - **storybloq_handover_create** (content, slug?) - Create a handover from markdown content
 - **storybloq_blocker_list** - All roadmap blockers with status
 - **storybloq_validate** (format?, integrityOnly?) - Reference, schema, source-provenance, and loader-independent JSON checks
 - **storybloq_recap** - Session diff: changes since last snapshot
-- **storybloq_recommend** (count?) - Context-aware ranked work suggestions
+- **storybloq_recommend** (count?, node?) - Context-aware ranked work suggestions
 - **storybloq_snapshot** - Save current project state snapshot
 - **storybloq_export** (phase?, all?) - Self-contained project document
 - **storybloq_note_list** (status?, tag?) - List notes
 - **storybloq_note_get** (id) - Get note by ID
 - **storybloq_note_create** (content, title?, tags?) - Create note
 - **storybloq_note_update** (id, content?, title?, tags?, status?) - Update note
-- **storybloq_ticket_create** (title, type, phase?, description?, blockedBy?, parentTicket?) - Create ticket
-- **storybloq_ticket_update** (id, status?, title?, type?, order?, description?, phase?, parentTicket?, blockedBy?, force?) - Update ticket
-- **storybloq_ticket_meta_set** (id, path, value) - Set custom passthrough metadata on a ticket
+- **storybloq_ticket_create** (title, type, phase?, description?, blockedBy?, parentTicket?, citesRuling?, node?) - Create ticket
+- **storybloq_ticket_update** (id, status?, title?, type?, order?, description?, phase?, parentTicket?, blockedBy?, crossNodeBlockedBy?, force?, citesRuling?, clearCitesRulings?, node?) - Update ticket
+- **storybloq_ticket_meta_set** (id, path, value?) - Set custom passthrough metadata on a ticket
 - **storybloq_ticket_meta_unset** (id, path) - Unset custom passthrough metadata from a ticket
-- **storybloq_issue_create** (title, severity, impact, components?, relatedTickets?, location?, sourceRefs?, dedupeKey?, createdBy?, phase?) - Create issue with optional durable review provenance and retry deduplication
-- **storybloq_issue_update** (id, status?, title?, severity?, impact?, resolution?, components?, relatedTickets?, location?, sourceRefs?, order?, phase?) - Update issue
-- **storybloq_issue_meta_set** (id, path, value) - Set custom passthrough metadata on an issue
+- **storybloq_issue_create** (title, severity, impact, components?, relatedTickets?, location?, sourceRefs?, dedupeKey?, createdBy?, phase?, citesRuling?, node?) - Create issue with optional durable review provenance and retry deduplication
+- **storybloq_issue_update** (id, status?, title?, severity?, impact?, resolution?, components?, relatedTickets?, location?, sourceRefs?, order?, phase?, citesRuling?, clearCitesRulings?, node?) - Update issue
+- **storybloq_issue_meta_set** (id, path, value?) - Set custom passthrough metadata on an issue
 - **storybloq_issue_meta_unset** (id, path) - Unset custom passthrough metadata from an issue
 - **storybloq_phase_create** (id, name, label, description, summary?, after?, atStart?) - Create phase in roadmap
 - **storybloq_lesson_list** (status?, tag?, source?) - List lessons
 - **storybloq_lesson_get** (id) - Get lesson by ID
-- **storybloq_lesson_digest** - Ranked digest of active lessons for context loading
+- **storybloq_lesson_digest** (limit?, select?) - Ranked digest of active lessons. limit/select (T-320); see CLI lesson digest.
 - **storybloq_lesson_create** (title, content, context, source, tags?, supersedes?) - Create lesson
-- **storybloq_lesson_update** (id, title?, content?, context?, tags?, status?, supersedes?) - Update lesson
+- **storybloq_lesson_update** (id, title?, content?, context?, tags?, status?) - Update lesson
 - **storybloq_lesson_reinforce** (id) - Reinforce lesson: increment count and update lastValidated
 - **storybloq_ruling_list** (scopeTag?, superseded?) - List rulings, optionally filtered by scope tag or superseded state
 - **storybloq_ruling_get** (id) - Get a ruling by ID
-- **storybloq_ruling_create** (text, attribution, date, scopeTags?, cites?) - Record a ruling verbatim; cites adds its id to each named ticket or issue in the same transaction
-- **storybloq_ruling_supersede** (id, with?, text?, attribution?, date?, scopeTags?) - Supersede a ruling: link an existing one with `with`, or record a new superseding ruling
+- **storybloq_ruling_create** (text, attribution, date, scopeTags?, cites?, clientTaskId?) - Record a ruling verbatim; cites adds its id to each named ticket or issue in the same transaction
+- **storybloq_ruling_supersede** (id, with?, text?, attribution?, date?, scopeTags?, clientTaskId?) - Supersede a ruling: link an existing one with `with`, or record a new superseding ruling
 - **storybloq_selftest** - Integration smoke test: create/update/delete cycle
+- **storybloq_health** (format?, only?, refresh?) - Tooling check: auto-compact window, CLI version, Codex review bridge (launched and answered, not just registered), /story skill, cross-session message delivery. Works without .story/, read-only
 - **storybloq_review_lenses_prepare** (stage, diff, changedFiles, ticketDescription?, reviewRound?, priorDeferrals?, sessionId?, target?) - Prepare multi-lens review on @storybloq/lenses: activation, secrets gate, context packaging, cited-ruling delivery, complete lens prompts
 - **storybloq_review_lenses_synthesize** (stage?, lensResults, activeLenses, skippedLenses, reviewRound?, reviewId?, diff?, changedFiles?, sessionId?, citedRulingsUndelivered?) - Run the @storybloq/lenses merger pipeline programmatically over raw lens outputs; returns the ReviewVerdict envelope (no merger agent). Echo prepare's citedRulingsUndelivered here; without a sessionId it is the only route a delivery hold has
-- **storybloq_review_lenses_judge** (reviewVerdict, convergenceHistory?) - Deterministic three-value verdict mapping over the synthesize ReviewVerdict plus convergence history (no judge agent)
-- **storybloq_autonomous_guide** (sessionId?, action, mode?, ticketId?, clientTaskId?, takeover?, reviewEffort?) - Autonomous session orchestrator -- call at every decision point to drive PICK_TICKET through COMPLETE
+- **storybloq_review_lenses_judge** (reviewVerdict?, convergenceHistory?) - Deterministic three-value verdict mapping over the synthesize ReviewVerdict plus convergence history (no judge agent). Returns capReasons, coverageOnlyCap and uncoveredCoreLenses; report capReasons with the round or a coverage cap is routed like a findings cap
+- **storybloq_autonomous_guide** (sessionId, action, clientTaskId?, takeover?, ownerGoneCandidateTakeover?, ownerGoneCandidateCancel?, mode?, reviewEffort?, ticketId?, targetWork?, report?) - Autonomous session orchestrator -- call at every decision point to drive PICK_TICKET through COMPLETE
 - **storybloq_session_guard** (clientTaskId?) - Session ownership verdict: is anything running, and may I write? Reads only .story/sessions/, no ledger load. Also registered in degraded mode
-- **storybloq_session_milestone** (kind, gateName?, note?, clientTaskId?) - Report a self-described work milestone (implementing/gate-hold/blocked-external/reviewing) onto this session's own presence record, for duet/arrangement visibility. Self-reported, never a computed verdict. gateName is required when kind is gate-hold. On lock contention or write failure, returns an explicit machine-readable retryable error rather than a false success.
+- **storybloq_session_milestone** (kind, gateName?, note?, clientTaskId?) - Self-reported implementing/gate-hold/blocked-external/reviewing milestone on this session's presence, never a computed verdict. gate-hold requires gateName. Lock contention or write failure returns a retryable error.
 - **storybloq_session_report** (sessionId) - Structured analysis of an autonomous session (works even if project state is corrupted)
-- **storybloq_register_subprocess** (pid, cmd, category?, sessionId?) - Register a running subprocess so monitors can tell slow builds from hung agents
-- **storybloq_unregister_subprocess** (pid, sessionId?) - Unregister a subprocess after it completes (idempotent)
+- **storybloq_session_intel** (format?, sessionId?, transcript?, callerModel?, full?, clientTaskId?) - Context usage, expected auto-compaction point with provenance, pressure state (ok/advisory/imperative/compact-needed) and session facts. Works without .story/; sessionId or transcript inspects another session read-only. Also registered in degraded mode
+- **storybloq_register_subprocess** (pid, cmd, category, sessionId) - Register a running subprocess so monitors can tell slow builds from hung agents
+- **storybloq_unregister_subprocess** (pid, sessionId) - Unregister a subprocess after it completes (idempotent)
 - **storybloq_bus_send** (endpointId, clientTaskId, threadId?, threadKind?, predecessorThreadId?, toRole?, messageKind, severity, body, refs?, inReplyTo?, idempotencyKey) - Send a task-bound advisory peer message; routes to the sole peer (toRole is deprecated, optional, and ignored)
 - **storybloq_bus_redeliver** (endpointId, clientTaskId, predecessorThreadId, refusedEntryHash) - Redeliver a hop-cap-parked, never-dropped message onto a fresh successor thread; content is always the resolved refused artifact, never caller-supplied
 - **storybloq_bus_poll** (endpointId, clientTaskId, limit?) - Poll a task-bound endpoint mailbox with peer-authority envelopes
@@ -729,47 +221,56 @@ The base tools below are registered in full mode (inside a .story/ project). The
 - **storybloq_bus_thread_get** (endpointId, clientTaskId, threadId) - Read a participant thread's verified prefix and folded state
 - **storybloq_bus_thread_update** (endpointId, clientTaskId, threadId, action, reason?, resolution?, evidence?) - Park, resolve, or evidence-reopen a participant thread
 - **storybloq_node_list** - List configured federation nodes in an orchestrator project
-- **storybloq_node_init** (node, type?, language?) - Initialize .story/ in a federation child node from the orchestrator
-- **storybloq_node_add** (name, path, role?, kind?) - Add a federation node to an orchestrator project's config
-- **storybloq_node_update** (name, path?, role?) - Update a federation node's metadata (shallow-merge)
+- **storybloq_node_init** (node, type?, language?, force?) - Initialize .story/ in a federation child node from the orchestrator
+- **storybloq_node_add** (name, path, stack?, role?, kind?, summary?, dependsOn?, links?) - Add a federation node to an orchestrator project's config
+- **storybloq_node_update** (name, path?, stack?, role?, kind?, summary?, dependsOn?, clearDependsOn?, links?, clearLinks?) - Update a federation node's metadata (shallow-merge)
+- **storybloq_arrangement_coordinate** (operation) - Record pen-observed duet coordination state; requires the current session and revision. Receipts are attributed evidence, not authentication.
+- **storybloq_arrangement_get** (id, format?) - Get a duet/wave arrangement by ID
+- **storybloq_arrangement_create** (bounds, parties, onIrreversibleWork, onReversibleWork?) - Create a duet/wave charter. identityAnchor must match a client task id (CLAUDE_CODE_SESSION_ID/CODEX_THREAD_ID), never a display name; it is not authentication.
+- **storybloq_arrangement_update** (id, lifecycle) - Update an arrangement's lifecycle (active/suspended/closed)
+- **storybloq_gate_ack_get** (id) - Get a duet-mode gate-ack record by ID
+- **storybloq_gate_ack_create** (arrangement, gate, ticket, planFile?, fromStaged?, codexSessionId?, verdict?, rounds?, deltas?) - Pin acceptance of a declared plan-ack or pre-commit-ack gate. Exactly one of planFile/fromStaged is required; ackRole derives from the arrangement gate.
+- **storybloq_gate_ack_contest** (id, reason) - Record a contested acknowledgment and its reason; does not reopen the workflow.
+- **storybloq_earmark_get** (ref, node?) - Get the pick-exclusion earmark (if any) on a ticket or issue
+- **storybloq_earmark_reserve** (ref, role, arrangement?, clientTaskId?, node?) - Reserve an item for a duet role pending pickup. Conflicts with another earmark; arrangement is required only if several active arrangements cover the item.
+- **storybloq_earmark_assign** (ref, to, role, arrangement?, clientTaskId?, node?) - Place or convert an earmark to a live session matching the arrangement role. Reserved-to-assigned conversion requires the reserver or the arrangement pen.
+- **storybloq_earmark_release** (ref, arrangement?, clientTaskId?, node?) - Release an earmark as its reserver or the pen of its authorizing arrangement; no-op when absent.
 
 ### MCP Tools (degraded mode)
 
 With no .story/ project on the path, the MCP server starts degraded and registers only:
 
-- **storybloq_session_guard** -- the ownership verdict, available here because the no-project case is exactly where the skill runs its Step 0.5 guard first (T-446)
-- **storybloq_init** -- bootstrap a .story/ project, then dynamically register the full tool set
-- **storybloq_status** -- returns setup guidance instead of a project summary
+- **storybloq_session_guard** (clientTaskId?) -- the ownership verdict, available here because the no-project case is exactly where the skill runs its Step 0.5 guard first (T-446)
+- **storybloq_session_intel** (format?, sessionId?, transcript?, callerModel?, full?, clientTaskId?) -- context usage and session facts without a project
+- **storybloq_health** (format?, only?, refresh?) -- read-only tooling checks without a project
+- **storybloq_init** (name, type?, language?) -- bootstrap a .story/ project, then dynamically register the full tool set
+- **storybloq_status** (format?) -- returns setup guidance instead of a project summary
 
 Destructive, admin, and git-integration workflows (delete, reconcile, conflicts, resolve, merge-driver, team, gc, repair, config, feedback) are CLI-only in both modes; see the CLI Commands section above.
 
 ## Review verdict artifacts
 
-Every review round writes a JSON artifact to `.story/sessions/<sessionId>/telemetry/reviews/`. The filename is `<target>-<stage>-r<round>.json`, and `-g<generation>` is appended once a round belongs to a generation above the first. The generation is a SUFFIX so the `*-code-r*.json` glob external readers already use keeps matching; it is also carried in the payload, so no reader has to parse a filename to know it.
-
-A generation opens whenever the round numbering restarts -- a plan redirect out of code review, or a plan-review reject. Before generations existed, the restarted rounds reproduced existing filenames and were silently dropped; artifacts under one target can therefore still be a mixture of two generations that predate this field.
+Review JSON lives in `.story/sessions/<sessionId>/telemetry/reviews/<target>-<stage>-r<round>.json`. Generations above the first append `-g<generation>` before `.json`, preserving the `*-code-r*.json` glob. Generation also appears in the payload. Redirects and plan-review rejects restart round numbering; old artifacts may mix pre-generation rounds whose colliding files were silently dropped.
 
 ### Joining a round to what produced it
 
-`backendRunId` carries the backend's own run id and `backendRunIdKind` says what that id is the id OF, which is what decides how precisely a round can be joined:
+`backendRunIdKind` defines the scope of `backendRunId`; derive join quality from the ids rather than storing a potentially contradictory summary:
 
-| `backendRunIdKind` | scope of the run id | join is `exact` when |
+| Kind | Scope | Exact join requires |
 |---|---|---|
-| `codex-session` | a thread spanning many turns | `backendTurnId` is also present |
-| `agent-dispatch` | one dispatch, already a single turn | always -- the dispatch id is turn-precise |
-| `lens-review` | one review invocation | always -- the review id is the invocation |
+| `codex-session` | Thread spanning turns | `backendTurnId` too |
+| `agent-dispatch` | One dispatch/turn | Run id alone |
+| `lens-review` | One review invocation | Run id alone |
 
-A `backendTurnId` without its parent `backendRunId` joins nothing and reads as `none`, and so does a record carrying neither. ABSENCE IS NEVER READ AS `exact`. Join quality is deliberately not a stored field: it is derived from these ids on every read, because a stored copy can contradict the ids it summarizes.
+A turn id without its parent run id joins nothing (`none`), as does a record with neither. Absence is never `exact`. `reviewAttemptId` identifies a round across state, artifact, and event sinks; deduplicate best-effort events by it. `itemAttemptId` identifies one work-item attempt across its rounds.
 
-`reviewAttemptId` identifies one round across all three of its sinks (the state record, this artifact, and the events log); `itemAttemptId` identifies one attempt at one work item across every round of it. Events are best-effort and may duplicate after a crash, so deduplicate by `reviewAttemptId`.
-
-`generation` has TWO readings and `itemAttemptId` is what tells them apart. Where `itemAttemptId` is present, the generation is attempt-scoped lineage: it advances when a redirect restarts the round numbering, so rounds of one attempt at different generations are different rounds and counting distinct generations counts replans. Where `itemAttemptId` is ABSENT, the round had no work item, there is no lineage for the number to describe, and the generation is only a filename discriminator. Rounds with no work item all share the `unknown` filename stem, so two unrelated sequences can meet at one path and one of them is advanced to avoid overwriting the other. Do not count generations as attempts on records that carry no `itemAttemptId`.
+With `itemAttemptId`, `generation` tracks replans within that attempt: redirects advance it when numbering restarts. Without `itemAttemptId`, there was no work item; generation only prevents filename collisions among unrelated `unknown` targets. Never count those generations as attempts or replans.
 
 ### Reading absent values
 
-Every field in this spine is optional, and an absent one means the value was not recorded -- never that it was measured and came back empty. Absence does NOT date a record: a round written today omits `backendRunId` and `backendTurnId` when the backend supplied none, and omits `workItemId` and `itemAttemptId` when the round had no work item at all, so an absent field is not evidence that the record predates the field. Three cases are worth naming because they are easy to misread. An absent `normalizerVersion` means the severities may not be normalized at all, so a `blocking` severity is possible. An absent `artifactStatus` means the artifact's existence is UNKNOWN; it never means the artifact is missing, and it never means one exists. And `reviewerIdentity.evidence` distinguishes what was OBSERVED to run from what was merely CONFIGURED to run -- a pin recorded as `configured` is evidence of intent and never of execution, which is why `unknown`/`none` is a valid and preferred record rather than a guessed model name.
+Fields are optional. Missing means unrecorded, not measured-empty or old: current records can omit backend ids when none were supplied, or work/item ids when no item existed. Missing `normalizerVersion` permits unnormalized severities such as `blocking`; missing `artifactStatus` means existence is unknown. `reviewerIdentity.evidence` distinguishes observed execution from configuration: `configured` proves intent only; prefer `unknown`/`none` to a guessed model.
 
-`payloadConsistent` records whether a verdict agreed with the findings it carried. Reading its rate needs care: change-requesting verdicts with zero findings are now repaired before they become rounds, so they are counted in `reviewRepairAttempts` instead. Those are two separate populations and must never be summed.
+`payloadConsistent` compares a verdict with its findings. Change-requesting verdicts with zero findings are repaired before becoming rounds and counted in `reviewRepairAttempts`; these populations must never be summed.
 
 ## /story design
 
@@ -787,25 +288,13 @@ Creates issues automatically when storybloq MCP tools or CLI are available. Chec
 
 ## /story orchestrate
 
-Drive a multi-repo federation (or a large single-repo backlog) as an orchestrator: durable state in storybloq, implementation in background agents a tier below the session model when the client offers one, adversarial review gates on the session model.
+Drive a federation or large backlog with a durable ledger, lower-tier implementation agents where available, and independent review gates. Read `orchestrator-mode.md` for enrichment, sizing, the six-stage pipeline, workflow scripts, and rules.
 
-```
-/story orchestrate               # guard checks, explicit opt-in, then the wave loop
-```
-
-Requires explicit opt-in via AskUserQuestion before any agents are dispatched, and refuses to start while any federation node has an active autonomous session (one pen per repo; the per-node check reads each node's `.story/sessions/` directly because orchestrator status does not scan node repos). The full procedure -- enrichment template, sizing convention, 6-stage pipeline, workflow-script skeleton, critical rules -- is in `orchestrator-mode.md`. Needs a client with background dynamic workflows or subagents; Claude can also use the Agent View-backed `storybloq dispatch` path. Codex users can orchestrate when exact callable subagent tools are present; product-managed Codex dispatch remains unshipped.
-
-`/story` surfaces this option proactively at context load when the client is capable and the actionable backlog is orchestrate-sized, so you do not have to know the command exists; it stays a recommendation, and selecting it still routes through the explicit opt-in.
+`/story orchestrate` requires explicit opt-in via AskUserQuestion before dispatch and refuses to start while any federation node has an active autonomous session. The one-pen-per-repo check reads each node's `.story/sessions/` directly; orchestrator status does not scan node repos. Requires callable background workflows or subagents. Claude also supports Agent View-backed `storybloq dispatch`; product-managed Codex dispatch remains unshipped. `/story` may recommend orchestration for a capable client and substantial actionable backlog; selection still requires opt-in.
 
 ## /story triage
 
-Read-only triage of the open issue backlog: verifies each finding against the pinned current HEAD (reusing the same source-reference provenance checks as `storybloq validate`), flags already-fixed and duplicate issues, groups issues that share one verified root cause, and produces a prioritized recommendations report.
-
-```
-/story triage                    # triage all open issues, report only
-```
-
-Mutates no issue and no ticket: classifications and recommendations are report vocabulary, and closing or filing stays with the maintainer. The only optional write is saving the finished report as a handover (snapshot first), offered once and performed only on explicit confirmation. The full procedure -- integrity branching, alias correlation, evidence bars, report format -- is in `triage-mode.md`.
+`/story triage` reads the open issue backlog against pinned HEAD, validates source provenance, identifies fixed/duplicate findings and shared root causes, and reports priorities. It changes no issue or ticket. Saving the report as a handover is offered once and requires explicit confirmation, with a snapshot first. Read `triage-mode.md` for integrity checks, alias correlation, evidence requirements, and the report format.
 
 ## /story bus
 
@@ -834,13 +323,13 @@ Coordinate an owner-paired manager and worker with a proved return route and dur
 2. `storybloq handover create --content <md>` -- write session handover
 
 ### Project Setup
-1. `npm install -g @storybloq/storybloq` - install CLI
+1. `npm install -g @storybloq/storybloq@latest` - install CLI
 2. `storybloq setup --client all` - install Storybloq skill, MCP, and hooks for Claude Code and Codex
 3. `storybloq init --name my-project` - initialize .story/ in your project
 
 ## Troubleshooting
 
 - **MCP not connected:** Run `storybloq setup --client all`
-- **CLI not found:** Run `npm install -g @storybloq/storybloq`
+- **CLI not found:** Run `npm install -g @storybloq/storybloq@latest`
 - **Stale data:** Run `storybloq validate` to check integrity
 - **Storybloq skill not available:** Run `storybloq setup --client all` to install the skill

@@ -138,6 +138,33 @@ describe("resolveNodeRoot", () => {
       expect(result.errorCode).toBe("node_unresolvable");
     }
   });
+
+  describe('ORCHESTRATOR_NODE_SENTINEL ("." -- ISS-1181)', () => {
+    it('resolves "." to the pinned root, without needing it present in config.nodes', async () => {
+      const orchDir = await createOrchestratorProject({ nodes: {} });
+      const result = resolveNodeRoot(orchDir, ".");
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.root).toBe(orchDir);
+      }
+    });
+
+    it('still refuses "." with not_orchestrator on a plain project -- the config.type check is preserved', async () => {
+      const dir = await mkdtemp(join(tmpdir(), "fed-non-orch-dot-"));
+      tmpDirs.push(dir);
+      const storyDir = join(dir, ".story");
+      await mkdir(storyDir, { recursive: true });
+      await writeFile(join(storyDir, "config.json"), JSON.stringify({
+        version: 2, project: "regular", type: "npm", language: "typescript",
+        features: { tickets: true, issues: true, handovers: true, roadmap: true, reviews: true },
+      }));
+      const result = resolveNodeRoot(dir, ".");
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.errorCode).toBe("not_orchestrator");
+      }
+    });
+  });
 });
 
 describe("checkNodeWritePermission", () => {

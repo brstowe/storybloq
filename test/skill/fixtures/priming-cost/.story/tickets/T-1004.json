@@ -1,0 +1,13 @@
+{
+  "id": "T-1004",
+  "title": "Refactor the snapshot pruning logic",
+  "description": "pruneSnapshots walks the directory twice; collapse to one pass.",
+  "type": "task",
+  "status": "open",
+  "phase": "polish",
+  "order": 20,
+  "createdDate": "2026-08-04",
+  "completedDate": null,
+  "blockedBy": [],
+  "parentTicket": null
+}

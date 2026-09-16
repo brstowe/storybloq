@@ -236,7 +236,7 @@ describe("setup-skill", () => {
     // the default response is Markdown and step 1b reads array fields. Asserted
     // against the Step 2 slice, since the string appears elsewhere in the file.
     expect(step2, "Step 2 requests Markdown, from which no fingerprint can be built").toMatch(
-      /call `storybloq_status` with `\{ "format": "json" \}`/,
+      /call `storybloq_status` with `\{ "format": "json", "compact": true \}`/,
     );
     expect(step2).toMatch(/JSON is required, not a preference/i);
     expect(step2).toMatch(/Retain this exact payload/i);
@@ -270,9 +270,12 @@ describe("setup-skill", () => {
     );
 
     // And the re-trigger rule must carry the same contract, not the superseded
-    // set-comparison-and-restart wording.
-    const guardSection = content.slice(content.indexOf("## Step 0.5"), content.indexOf("## How to Handle Arguments"));
-    const retrigger = guardSection.slice(guardSection.indexOf("Re-trigger rule for the Step 2 reconciliation"));
+    // set-comparison-and-restart wording. T-496 relocated the full guard body
+    // (byte-for-byte) to session-guard.md; SKILL.md's stub carries only a
+    // one-line pointer to it, so this detail is asserted against the moved
+    // text, not against SKILL.md itself.
+    const guardBody = await readFile(join(PROJECT_ROOT, "src", "skill", "session-guard.md"), "utf-8");
+    const retrigger = guardBody.slice(guardBody.indexOf("Re-trigger rule for the Step 2 reconciliation"));
     const bounded = retrigger.slice(0, retrigger.indexOf("Re-trigger rule for start"));
     expect(bounded).toMatch(/classification FINGERPRINT/i);
     expect(bounded).toMatch(/status payload ALREADY HELD/i);
@@ -288,23 +291,29 @@ describe("setup-skill", () => {
 
     // And the rescan has to be authorized, or Step 2 prescribes a call the
     // whitelist forbids -- the same prescribed-and-forbidden shape as ISS-900.
-    const guard = content.slice(content.indexOf("## Step 0.5"), content.indexOf("## How to Handle Arguments"));
-    expect(guard, "the second guard call is prescribed but not authorized").toMatch(
+    expect(guardBody, "the second guard call is prescribed but not authorized").toMatch(
       /Re-trigger rule for the Step 2 reconciliation/i,
     );
-    expect(guard).toMatch(/ownership counts as unresolved again/i);
-    expect(guard).toMatch(/the only rescan authorized here/i);
+    expect(guardBody).toMatch(/ownership counts as unresolved again/i);
+    expect(guardBody).toMatch(/the only rescan authorized here/i);
   });
 
   it("SKILL.md defines task-aware continuation and foreign-task relay", async () => {
     const content = await readFile(join(PROJECT_ROOT, "src", "skill", "SKILL.md"), "utf-8");
-    expect(content).toContain('`storybloq_status` with `{ "format": "json" }`');
+    expect(content).toContain('`storybloq_status` with `{ "format": "json", "compact": true }`');
 
     // T-446: SKILL.md now calls `storybloq_session_guard` and acts on the
     // verdict instead of walking a prose matrix. Every action in the union must
     // still be handled, or a verdict the tool can return has no instruction
     // attached to it.
     expect(content).toContain("storybloq_session_guard");
+
+    // T-496 relocated the full guard body (byte-for-byte) to session-guard.md;
+    // SKILL.md's stub carries only the ordinary path plus one-line pointers
+    // for the exceptional verdicts. Every assertion below that needs the full
+    // guard detail (the prelude, the whitelist, and every verdict's own
+    // bullet) reads the moved text, not SKILL.md itself.
+    const guardBody = await readFile(join(PROJECT_ROOT, "src", "skill", "session-guard.md"), "utf-8");
 
     /**
      * The tool-absent branch requires that a TARGETED discovery call for the
@@ -313,7 +322,7 @@ describe("setup-skill", () => {
      * it nor discover it, so mode A is unreachable and every invocation stops
      * before argument routing.
      */
-    const prelude = content.slice(content.indexOf("**Guard prelude"), content.indexOf("**Whitelist semantics"));
+    const prelude = guardBody.slice(guardBody.indexOf("**Guard prelude"), guardBody.indexOf("**Whitelist semantics"));
     expect(prelude.length, "could not locate the guard prelude").toBeGreaterThan(200);
     expect(prelude).toMatch(/query: "storybloq_session_guard"/);
     // Both required tools, not just the guard: deleting the status lookup would
@@ -324,14 +333,14 @@ describe("setup-skill", () => {
     // Bounded to each action's OWN bullet in the "Act on `overallAction`" list.
     // A whole-file substring search passes as long as the word appears anywhere,
     // so it cannot see an action whose instruction drifted or went missing.
-    const sectionStart = content.indexOf("2. Act on `overallAction`");
-    const sectionEnd = content.indexOf("**If `storybloq_session_guard` is confirmed absent**");
+    const sectionStart = guardBody.indexOf("2. Act on `overallAction`");
+    const sectionEnd = guardBody.indexOf("**If `storybloq_session_guard` is confirmed absent**");
     // Both markers asserted before slicing: a missing marker silently yields an
     // empty or whole-file slice, and every bullet assertion below would then be
     // testing something other than the section it names.
-    expect(sectionStart, "no `Act on overallAction` heading in SKILL.md").toBeGreaterThan(-1);
+    expect(sectionStart, "no `Act on overallAction` heading in session-guard.md").toBeGreaterThan(-1);
     expect(sectionEnd, "no tool-absent marker to bound the section").toBeGreaterThan(sectionStart);
-    const actOn = content.slice(sectionStart, sectionEnd);
+    const actOn = guardBody.slice(sectionStart, sectionEnd);
 
     const bulletFor = (action: string): string => {
       const start = actOn.indexOf(`**\`${action}\`**`);
@@ -511,7 +520,7 @@ describe("setup-skill", () => {
      * two conditions, or widening it to arbitrary reads would otherwise leave
      * these tests green while the fallback contract became unreachable or unsafe.
      */
-    const whitelist = content.slice(content.indexOf("**Whitelist semantics"), content.indexOf("1. Call `storybloq_session_guard`"));
+    const whitelist = guardBody.slice(guardBody.indexOf("**Whitelist semantics"), guardBody.indexOf("1. Call `storybloq_session_guard`"));
     expect(whitelist.length, "could not locate the whitelist paragraph").toBeGreaterThan(200);
     expect(whitelist).toMatch(/One READ of the installed `session-guard-fallback\.md`/);
     expect(whitelist, "the exception must name BOTH cases that need it").toMatch(/`overallAction: null`/);
@@ -554,7 +563,7 @@ describe("setup-skill", () => {
     // Only the OUTCOME is historical. Calling the new direct-to-CLI route "the
     // route this skill has always taken" misstates the executable contract and
     // contradicts ISS-900, which records why the old route dead-ends.
-    const guardText = content.slice(content.indexOf("## Step 0.5"), content.indexOf("## How to Handle Arguments"));
+    const guardText = guardBody;
     expect(guardText, "the failure branch does not distinguish outcome from route").toMatch(
       /preserves the fail-open OUTCOME[\s\S]{0,160}different ROUTE/i,
     );
@@ -580,15 +589,17 @@ describe("setup-skill", () => {
     expect(fallback).toContain("Same owner, COMPACT");
     expect(fallback).toContain("Different live owner");
 
-    expect(content).toContain("codex_app__send_message_to_thread");
-    expect(content).toContain("the user's exact message");
-    expect(content).toContain("Sent to T-020's running task.");
-    expect(content).toContain("manual-switch instruction");
-    expect(content).not.toContain("take over (only safe if the owning instance is gone)");
+    // Codex owner-response relay (item 3): full detail moved to
+    // session-guard.md; SKILL.md's stub carries only a one-line pointer to it.
+    expect(guardBody).toContain("codex_app__send_message_to_thread");
+    expect(guardBody).toContain("the user's exact message");
+    expect(guardBody).toContain("Sent to T-020's running task.");
+    expect(guardBody).toContain("manual-switch instruction");
+    expect(guardBody).not.toContain("take over (only safe if the owning instance is gone)");
   });
 
-  it("SKILL.md documents the bounded code-review landing policy", async () => {
-    const content = await readFile(join(PROJECT_ROOT, "src", "skill", "SKILL.md"), "utf-8");
+  it("settings.md documents the bounded code-review landing policy (T-460 Leg C step 1)", async () => {
+    const content = await readFile(join(PROJECT_ROOT, "src", "skill", "settings.md"), "utf-8");
     const autonomous = await readFile(join(PROJECT_ROOT, "src", "skill", "autonomous-mode.md"), "utf-8");
     expect(content).toContain('"maxReviewRounds": "number (default: 12');
     expect(autonomous).toContain("Code-review landing cap");
@@ -660,17 +671,34 @@ describe("setup-skill", () => {
     }
   });
 
-  it("no orphaned .md files in src/skill/ (every file is SKILL.md or referenced from it)", async () => {
+  it("no orphaned .md files in src/skill/ (every file is reachable, transitively, from SKILL.md)", async () => {
+    // T-496 introduced a two-hop reference: SKILL.md's Step 0.5 stub points
+    // at session-guard.md, and session-guard.md (the verbatim original guard
+    // body) is what names session-guard-fallback.md onward for modes A/B.
+    // Direct containment in SKILL.md alone no longer proves reachability, so
+    // this walks the reference graph instead of checking one hop.
     const { readdirSync } = await import("node:fs");
     const skillDir = join(PROJECT_ROOT, "src", "skill");
     const allFiles = readdirSync(skillDir).filter(f => f.endsWith(".md"));
-    const content = await readFile(join(skillDir, "SKILL.md"), "utf-8");
+
+    const reachable = new Set<string>(["SKILL.md"]);
+    const queue = ["SKILL.md"];
+    while (queue.length > 0) {
+      const current = queue.shift()!;
+      const content = await readFile(join(skillDir, current), "utf-8");
+      for (const file of allFiles) {
+        if (!reachable.has(file) && content.includes(file)) {
+          reachable.add(file);
+          queue.push(file);
+        }
+      }
+    }
 
     for (const file of allFiles) {
       if (file === "SKILL.md") continue;
       expect(
-        content.includes(file),
-        `"${file}" exists in src/skill/ but is not referenced from SKILL.md`,
+        reachable.has(file),
+        `"${file}" exists in src/skill/ but is not reachable, even transitively, from SKILL.md`,
       ).toBe(true);
     }
   });
@@ -942,20 +970,77 @@ describe("setup-skill", () => {
   // Settings command
   // -------------------------------------------------------------------------
 
-  it("SKILL.md has /story settings command in argument handler", async () => {
+  it("SKILL.md has /story settings command in argument handler, pointing at settings.md", async () => {
     const content = await readFile(join(PROJECT_ROOT, "src", "skill", "SKILL.md"), "utf-8");
     expect(content).toContain("/story settings");
     expect(content).toContain("## Settings");
+    expect(content).toContain("settings.md");
   });
 
-  it("SKILL.md has config schema reference (no source code digging needed)", async () => {
-    const content = await readFile(join(PROJECT_ROOT, "src", "skill", "SKILL.md"), "utf-8");
+  it("settings.md has the config schema reference (no source code digging needed) (T-460 Leg C step 1)", async () => {
+    const content = await readFile(join(PROJECT_ROOT, "src", "skill", "settings.md"), "utf-8");
     expect(content).toContain("### Config Schema Reference");
     expect(content).toContain("WRITE_TESTS");
     expect(content).toContain("VERIFY");
     expect(content).toContain("maxTicketsPerSession");
     expect(content).toContain("reviewBackends");
     expect(content).toContain("Do NOT search source code");
+  });
+
+  it("only the /story settings route in How to Handle Arguments names settings.md (T-460 Leg C step 1)", async () => {
+    const content = await readFile(join(PROJECT_ROOT, "src", "skill", "SKILL.md"), "utf-8");
+    const start = content.indexOf("## How to Handle Arguments");
+    const end = content.indexOf("\n## ", start + 1);
+    expect(start).toBeGreaterThan(-1);
+    const section = end === -1 ? content.slice(start) : content.slice(start, end);
+    const routeLines = section.split("\n").filter((l) => l.trim().startsWith("- `/story"));
+    expect(routeLines.length).toBeGreaterThan(1);
+    const settingsRouteLines = routeLines.filter((l) => l.includes("settings.md"));
+    expect(settingsRouteLines).toHaveLength(1);
+    expect(settingsRouteLines[0]).toContain("/story settings");
+  });
+
+  it("settings.md's body still contains every pre-split line, in order and unreworded (T-460 Leg C step 1)", () => {
+    // Proves the T-460 Leg C step 1 relocation moved the Settings section
+    // verbatim -- zero rewording -- the same preservation-proof pattern T-496
+    // used for session-guard.md. The fixture is the exact pre-split body
+    // (current-main SKILL.md lines 424-631, before this ticket's edit); only
+    // the new heading + one-line intro precede it in settings.md.
+    //
+    // The split point is derived from the EXACT expected header text, not
+    // from settings.length - fixture.length: deriving it from the fixture's
+    // own length turns this into a suffix check that an empty fixture (or
+    // arbitrary content inserted between the intro and the body, absorbed
+    // into a now-larger "header") would pass vacuously. Asserting the fixture
+    // is non-empty and the header is an EXACT prefix match closes both gaps.
+    const settings = readFileSync(join(PROJECT_ROOT, "src", "skill", "settings.md"));
+    const fixture = readFileSync(
+      join(PROJECT_ROOT, "test", "core", "fixtures", "t460-settings-section-presplit.txt"),
+    );
+    expect(fixture.length, "fixture must not be empty").toBeGreaterThan(0);
+    const expectedHeader =
+      "# Settings (/story settings)\n\n" +
+      "Full `/story settings` flow: read `.story/config.json`, present current settings, walk the user through changes via `AskUserQuestion`, apply via `storybloq config set-overrides`, and the complete config schema reference. Loaded on demand from SKILL.md; not part of every `/story` session.\n\n";
+    const headerBytes = Buffer.byteLength(expectedHeader, "utf-8");
+    expect(settings.subarray(0, headerBytes).toString("utf-8")).toBe(expectedHeader);
+    const body = settings.subarray(headerBytes);
+    // T-501: settings.md is a living document again (it now documents
+    // `autoCompactWindow`), so a byte-for-byte equality with the frozen
+    // pre-split fixture would forbid every later addition rather than prove
+    // anything about the relocation. What the relocation proof is actually
+    // about survives as stated: every pre-split line is still present, in the
+    // same order, with its bytes unchanged -- so nothing was reworded,
+    // reordered or dropped, and a later ticket may only ADD.
+    const bodyLines = body.toString("utf-8").split("\n");
+    const fixtureLines = fixture.toString("utf-8").split("\n");
+    let cursor = 0;
+    const missing: string[] = [];
+    for (const line of fixtureLines) {
+      const at = bodyLines.indexOf(line, cursor);
+      if (at === -1) missing.push(line);
+      else cursor = at + 1;
+    }
+    expect(missing, "pre-split lines missing or reworded in settings.md").toEqual([]);
   });
 
   // -------------------------------------------------------------------------
@@ -1066,6 +1151,47 @@ describe("setup-skill", () => {
     // the allow-list it would simply not be installed, and the setup flow would
     // report a missing file instead of writing a review contract.
     expect(tsContent).toContain('"review-contract-template.md"');
+    // T-496 (ISS-1144 guard pattern): session-guard.md is the on-demand
+    // reference the Step 0.5 stub points to. Left out of the allow-list it
+    // would simply not be installed, and every exceptional-verdict pointer
+    // in the stub would dangle.
+    expect(tsContent).toContain('"session-guard.md"');
+  });
+
+  it("every real supportFiles entry has a Support Files inventory line in SKILL.md (ISS-1186)", async () => {
+    // Directional counterpart to the "no orphaned .md files" reachability
+    // scan: that test asserts inventoried/referenced-implies-reachable; this
+    // one asserts the reverse, installed-implies-inventoried. A file can drift
+    // out of sync in either direction independently, so both tests are needed.
+    const tsContent = await readFile(
+      join(PROJECT_ROOT, "src", "cli", "commands", "setup-skill.ts"),
+      "utf-8",
+    );
+    const match = tsContent.match(/const supportFiles = \[([^\]]*)\];/);
+    expect(match, "supportFiles array not found in setup-skill.ts").not.toBeNull();
+    const supportFiles = match![1]
+      .split(",")
+      .map((entry) => entry.trim().replace(/^"|"$/g, ""))
+      .filter(Boolean);
+    expect(supportFiles.length).toBeGreaterThan(1);
+
+    const skillContent = await readFile(join(PROJECT_ROOT, "src", "skill", "SKILL.md"), "utf-8");
+    // Scoped to the Support Files section itself, not the whole file -- a
+    // bold-backticked filename mentioned anywhere else (a body reference, a
+    // code sample) must not satisfy this. Support Files is currently the
+    // last level-two section, but the slice still bounds itself to the next
+    // "## " heading (or EOF) rather than assuming that.
+    const sectionStart = skillContent.indexOf("## Support Files");
+    expect(sectionStart, "no Support Files section found in SKILL.md").toBeGreaterThan(-1);
+    const nextHeadingIdx = skillContent.indexOf("\n## ", sectionStart + 1);
+    const inventorySection =
+      nextHeadingIdx === -1 ? skillContent.slice(sectionStart) : skillContent.slice(sectionStart, nextHeadingIdx);
+    for (const file of supportFiles) {
+      expect(
+        inventorySection.includes(`**\`${file}\`**`),
+        `"${file}" is installed by setup-skill.ts's supportFiles array but has no Support Files inventory line in SKILL.md`,
+      ).toBe(true);
+    }
   });
 
   it("setup-skill.ts handles subdirectory skills with copyDirRecursive", async () => {
@@ -1662,6 +1788,24 @@ describe("migrateLegacyHookVariants", () => {
     );
     expect(count).toBe(1);
     expect(await remainingCommands("PreCompact")).toEqual([]);
+  });
+
+  it("ISS-1226: a group emptied by the migration disappears instead of surviving as an empty shell", async () => {
+    await writeFile(settingsPath, JSON.stringify({
+      hooks: {
+        SessionStart: [
+          { matcher: "startup|resume|clear|compact", hooks: [{ type: "command", command: "/new/v22/bin/storybloq session resume-prompt" }] },
+          { matcher: "resume", hooks: [{ type: "command", command: "/Users/o/.npm/_npx/573f/node_modules/.bin/storybloq session resume-prompt" }] },
+          { matcher: "", hooks: [] },
+        ],
+      },
+    }, null, 2), "utf-8");
+    const { migrateLegacyHookVariants } = await import("../../../src/cli/commands/setup-skill.js");
+    const count = await migrateLegacyHookVariants("SessionStart", "session resume-prompt", "/new/v22/bin/storybloq session resume-prompt", settingsPath);
+    expect(count).toBe(1);
+    const settings = JSON.parse(await readFile(settingsPath, "utf-8")) as { hooks: { SessionStart: Array<{ matcher: string; hooks: unknown[] }> } };
+    // The emptied "resume" group is gone; a group that was already empty before the migration is not this function's to touch.
+    expect(settings.hooks.SessionStart.map((g) => [g.matcher, g.hooks.length])).toEqual([["startup|resume|clear|compact", 1], ["", 0]]);
   });
 
   it("removes stale absolute path that no longer matches", async () => {
@@ -2410,12 +2554,13 @@ describe("T-414: orchestrate discoverability", () => {
     const content = await readFile(join(PROJECT_ROOT, "src", "skill", "SKILL.md"), "utf-8");
     // storybloq_recommend loaded with count: 10.
     expect(content).toContain("count: 10");
-    // issue rows are verified actionable via storybloq_issue_get.
-    expect(content).toContain("storybloq_issue_get");
+    // recommend() already partitions actionability server-side (ISS-1154
+    // Commit B); Gate B counts recommendations rows directly, no per-row get.
+    expect(content).toContain("already partitioned to actionable candidates");
     // kind "action" rows are excluded.
     expect(content).toContain("never count a row whose `kind` is `\"action\"`");
-    // status verification.
-    expect(content).toContain("open` or `inprogress");
+    // unreadableHandoverCount disclosure.
+    expect(content).toContain("unreadableHandoverCount");
   });
 
   it("SKILL.md Gate A uses an exact-name allowlist that fails closed", async () => {
@@ -2584,5 +2729,157 @@ describe("--skip-skill (ISS-834)", () => {
       threw = true;
     }
     expect(threw).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// T-516: the function-hooks env switch in settings.json
+//
+// Claude Code loads a plugin's hooks modules only when
+// CLAUDE_CODE_ENABLE_FUNCTION_HOOKS is set in the process environment (or the
+// rollout flag is on), and the settings `env` field reaches that environment.
+// The installer writes the switch so the ledger dashboard appears after a
+// plain `storybloq setup --client all`, with one rule that outranks the
+// ruling: a value already in the file was chosen by the user, so it is never
+// overwritten, not even "0" or "".
+// ---------------------------------------------------------------------------
+
+describe("enableFunctionHooksEnv / removeFunctionHooksEnv (T-516)", () => {
+  let tempDir: string;
+  let settingsPath: string;
+
+  beforeEach(async () => {
+    tempDir = join(tmpdir(), `storybloq-fnhooks-env-${randomUUID()}`);
+    await mkdir(tempDir, { recursive: true });
+    settingsPath = join(tempDir, "settings.json");
+  });
+
+  afterEach(async () => {
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  const KEY = "CLAUDE_CODE_ENABLE_FUNCTION_HOOKS";
+
+  async function api() {
+    const mod = await import("../../../src/cli/commands/setup-skill.js");
+    return {
+      enable: (path?: string) => mod.enableFunctionHooksEnv(path ?? settingsPath),
+      remove: (path?: string) => mod.removeFunctionHooksEnv(path ?? settingsPath),
+    };
+  }
+
+  async function env(): Promise<Record<string, unknown>> {
+    const settings = JSON.parse(await readFile(settingsPath, "utf-8")) as { env?: Record<string, unknown> };
+    return settings.env ?? {};
+  }
+
+  it("creates settings.json with the env block when the file is absent", async () => {
+    const { enable } = await api();
+    expect(await enable()).toBe("set");
+    expect(await env()).toEqual({ [KEY]: "1" });
+  });
+
+  it("adds the env block to an existing settings.json without disturbing the rest", async () => {
+    await writeFile(settingsPath, JSON.stringify({ hooks: { PreCompact: [] }, model: "opus" }, null, 2) + "\n", "utf-8");
+    const { enable } = await api();
+    expect(await enable()).toBe("set");
+    const settings = JSON.parse(await readFile(settingsPath, "utf-8")) as Record<string, unknown>;
+    expect((settings.env as Record<string, unknown>)[KEY]).toBe("1");
+    expect(settings.model).toBe("opus");
+    expect(settings.hooks).toEqual({ PreCompact: [] });
+  });
+
+  it("sets the key inside an env block that already holds other keys", async () => {
+    await writeFile(settingsPath, JSON.stringify({ env: { FOO: "bar" } }, null, 2) + "\n", "utf-8");
+    const { enable } = await api();
+    expect(await enable()).toBe("set");
+    expect(await env()).toEqual({ FOO: "bar", [KEY]: "1" });
+  });
+
+  it("leaves an explicit \"0\" alone and rewrites nothing (m1)", async () => {
+    // Deliberately unusual formatting: any rewrite at all reformats it, so
+    // byte equality is the assertion, not just the value.
+    const original = `{\n    "env": {\n        "${KEY}": "0"\n    }\n}\n`;
+    await writeFile(settingsPath, original, "utf-8");
+    const { enable } = await api();
+    expect(await enable()).toBe("exists");
+    expect(await readFile(settingsPath, "utf-8")).toBe(original);
+  });
+
+  it("leaves an explicit empty string alone", async () => {
+    const original = `{\n    "env": {\n        "${KEY}": ""\n    }\n}\n`;
+    await writeFile(settingsPath, original, "utf-8");
+    const { enable } = await api();
+    expect(await enable()).toBe("exists");
+    expect(await readFile(settingsPath, "utf-8")).toBe(original);
+  });
+
+  it("leaves an existing \"1\" untouched and rewrites nothing", async () => {
+    const original = `{\n    "env": {\n        "${KEY}": "1"\n    }\n}\n`;
+    await writeFile(settingsPath, original, "utf-8");
+    const { enable } = await api();
+    expect(await enable()).toBe("exists");
+    expect(await readFile(settingsPath, "utf-8")).toBe(original);
+  });
+
+  it("is idempotent on rerun: the second call writes nothing", async () => {
+    const { enable } = await api();
+    expect(await enable()).toBe("set");
+    const afterFirst = await readFile(settingsPath, "utf-8");
+    expect(await enable()).toBe("exists");
+    expect(await readFile(settingsPath, "utf-8")).toBe(afterFirst);
+  });
+
+  it("skips a settings.json that is not a JSON object, leaving it byte-identical", async () => {
+    const original = "[1, 2, 3]\n";
+    await writeFile(settingsPath, original, "utf-8");
+    const { enable } = await api();
+    expect(await enable()).toBe("skipped");
+    expect(await readFile(settingsPath, "utf-8")).toBe(original);
+  });
+
+  it("skips a settings.json whose env field is not an object", async () => {
+    const original = `{ "env": "nope" }\n`;
+    await writeFile(settingsPath, original, "utf-8");
+    const { enable } = await api();
+    expect(await enable()).toBe("skipped");
+    expect(await readFile(settingsPath, "utf-8")).toBe(original);
+  });
+
+  it("removal deletes the key when its value is exactly \"1\" and keeps everything else", async () => {
+    await writeFile(settingsPath, JSON.stringify({ model: "opus", env: { FOO: "bar", [KEY]: "1" } }, null, 2) + "\n", "utf-8");
+    const { remove } = await api();
+    expect(await remove()).toBe("removed");
+    expect(await env()).toEqual({ FOO: "bar" });
+    const settings = JSON.parse(await readFile(settingsPath, "utf-8")) as Record<string, unknown>;
+    expect(settings.model).toBe("opus");
+  });
+
+  it("skips malformed JSON in both directions, leaving the file byte-identical", async () => {
+    const original = "{ invalid }\n";
+    await writeFile(settingsPath, original, "utf-8");
+    const { enable, remove } = await api();
+    expect(await enable()).toBe("skipped");
+    expect(await readFile(settingsPath, "utf-8")).toBe(original);
+    expect(await remove()).toBe("skipped");
+    expect(await readFile(settingsPath, "utf-8")).toBe(original);
+  });
+
+  it("removal leaves a value the user chose, including \"0\"", async () => {
+    const original = `{\n    "env": {\n        "${KEY}": "0"\n    }\n}\n`;
+    await writeFile(settingsPath, original, "utf-8");
+    const { remove } = await api();
+    expect(await remove()).toBe("not_found");
+    expect(await readFile(settingsPath, "utf-8")).toBe(original);
+  });
+
+  it("removal reports not_found when the key or the file is absent", async () => {
+    const { remove } = await api();
+    expect(await remove()).toBe("not_found");
+    expect(existsSync(settingsPath)).toBe(false);
+
+    await writeFile(settingsPath, JSON.stringify({ env: { FOO: "bar" } }, null, 2) + "\n", "utf-8");
+    expect(await remove()).toBe("not_found");
+    expect(await env()).toEqual({ FOO: "bar" });
   });
 });

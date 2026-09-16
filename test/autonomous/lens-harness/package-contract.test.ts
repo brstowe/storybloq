@@ -21,6 +21,10 @@ import {
   PreambleConfigSchema,
   DEFAULT_ALWAYS_BLOCK,
   COVERED_STATUSES,
+  changeFileUnion,
+  coreLensApplicability,
+  diffTouchedPaths,
+  isCoveredEntry,
 } from "@storybloq/lenses";
 
 describe("@storybloq/lenses stable library surface (ISS-823)", () => {
@@ -174,5 +178,174 @@ describe("@storybloq/lenses stable library surface (ISS-823)", () => {
       }).success,
     ).toBe(false);
     expect(MergerConfigSchema.parse(undefined).confidenceFloor).toBe(0.6);
+  });
+});
+
+/**
+ * ISS-950: the 0.6.0 coverage surface the harness half is built on.
+ *
+ * Pinned here rather than inside the harness tests because these are the
+ * package's promises, not the harness's: the signatures, the basis vocabulary,
+ * the single coverage predicate, and the `capReasons` default. A 0.5.x package
+ * fails every assertion in this block at the import, which is exactly the
+ * coordinated-release fence the CHANGELOG describes.
+ */
+describe("@storybloq/lenses 0.6.0 coverage surface (ISS-950)", () => {
+  const DOCS_DIFF = [
+    "diff --git a/docs/guide.md b/docs/guide.md",
+    "--- a/docs/guide.md",
+    "+++ b/docs/guide.md",
+    "@@ -1,2 +1,3 @@",
+    " intro",
+    "+a new sentence",
+    " outro",
+    "",
+  ].join("\n");
+
+  const CODE_DIFF = [
+    "diff --git a/src/pool.ts b/src/pool.ts",
+    "--- a/src/pool.ts",
+    "+++ b/src/pool.ts",
+    "@@ -1,2 +1,3 @@",
+    " export const pool = 1;",
+    "+export const extra = 2;",
+    " export default pool;",
+    "",
+  ].join("\n");
+
+  it("coreLensApplicability takes (lensId, changedFiles, diff) and rules a docs-only change not applicable", () => {
+    expect(typeof coreLensApplicability).toBe("function");
+    for (const core of ["security", "error-handling", "clean-code", "concurrency"]) {
+      expect(coreLensApplicability(core, ["docs/guide.md"], DOCS_DIFF)).toBe("not-applicable");
+    }
+  });
+
+  it("coreLensApplicability rules a code change applicable, and an empty union applicable", () => {
+    expect(coreLensApplicability("error-handling", ["src/pool.ts"], CODE_DIFF)).toBe("applicable");
+    // Nothing there proves the lens had no surface, so the uncertain case is
+    // applicable. A PLAN_REVIEW with no diff lands here.
+    expect(coreLensApplicability("error-handling", [], "")).toBe("applicable");
+  });
+
+  it("the declared file list is a claim: the diff-touched union overrides it", () => {
+    // The caller declares docs only while the diff deletes a source file. The
+    // union is what the check ranges over, so no core lens is excused.
+    const deletion = [
+      "diff --git a/src/auth.ts b/src/auth.ts",
+      "deleted file mode 100644",
+      "--- a/src/auth.ts",
+      "+++ /dev/null",
+      "@@ -1,2 +0,0 @@",
+      "-export const token = process.env.TOKEN;",
+      "-export default token;",
+      "",
+    ].join("\n");
+    const union = changeFileUnion(["docs/guide.md"], deletion);
+    expect(union).toContain("src/auth.ts");
+    expect(coreLensApplicability("security", ["docs/guide.md"], deletion)).toBe("applicable");
+  });
+
+  it("changeFileUnion and diffTouchedPaths take the raw diff string", () => {
+    expect(diffTouchedPaths(CODE_DIFF)).toEqual(["src/pool.ts"]);
+    expect(changeFileUnion([], CODE_DIFF)).toEqual(["src/pool.ts"]);
+    expect(changeFileUnion(["docs/guide.md"], "").sort()).toEqual(["docs/guide.md"]);
+  });
+
+  it("isCoveredEntry is the single coverage rule: only a not-applicable skip is covered", () => {
+    const base = { lensId: "concurrency", attempts: 1, contributedFindings: 0 } as const;
+    expect(isCoveredEntry({ ...base, status: "ok" })).toBe(true);
+    expect(isCoveredEntry({ ...base, status: "cached" })).toBe(true);
+    expect(isCoveredEntry({ ...base, status: "skipped", basis: "not-applicable" })).toBe(true);
+    expect(isCoveredEntry({ ...base, status: "skipped", basis: "self-reported" })).toBe(false);
+    expect(isCoveredEntry({ ...base, status: "error", basis: "no-submission" })).toBe(false);
+    // A relabel is never coverage, whatever the status says.
+    expect(
+      isCoveredEntry({ ...base, status: "ok", relabeled: true }),
+    ).toBe(false);
+  });
+
+  it("ReviewVerdict carries capReasons, defaulted to empty", () => {
+    const verdict = runMergerPipeline({
+      stage: "CODE_REVIEW",
+      perLens: [
+        { lensId: "security", output: { status: "ok", findings: [], error: null, notes: null } },
+      ],
+      reviewComplete: true,
+    });
+    expect(verdict.capReasons).toEqual([]);
+  });
+
+  it("a self-reported core skip caps the verdict and names itself in capReasons", () => {
+    const coverage = (
+      lensId: string,
+      extra: Record<string, unknown>,
+    ) => ({ lensId, attempts: 1, contributedFindings: 0, ...extra });
+    const verdict = runMergerPipeline({
+      stage: "CODE_REVIEW",
+      perLens: [
+        { lensId: "security", output: { status: "ok", findings: [], error: null, notes: null } },
+      ],
+      lensCoverage: [
+        coverage("security", { status: "ok" }),
+        coverage("error-handling", { status: "ok" }),
+        coverage("clean-code", { status: "ok" }),
+        coverage("concurrency", { status: "skipped", basis: "self-reported" }),
+      ] as never,
+      reviewComplete: true,
+    });
+    expect(verdict.verdict).toBe("revise");
+    expect(verdict.capReasons).toEqual([
+      "core lens 'concurrency' uncovered (skipped, self-reported)",
+    ]);
+  });
+
+  it("a not-applicable core skip does not cap, but only when anchoring lets the server confirm it", () => {
+    const coverage = (
+      lensId: string,
+      extra: Record<string, unknown>,
+    ) => ({ lensId, attempts: 1, contributedFindings: 0, ...extra });
+    const lensCoverage = [
+      coverage("security", { status: "skipped", basis: "not-applicable" }),
+      coverage("error-handling", { status: "skipped", basis: "not-applicable" }),
+      coverage("clean-code", { status: "skipped", basis: "not-applicable" }),
+      coverage("concurrency", { status: "skipped", basis: "not-applicable" }),
+    ] as never;
+    const perLens = [
+      { lensId: "security" as const, output: { status: "skipped" as const, findings: [], error: null, notes: null } },
+    ];
+
+    // TRUSTED DOWNWARD ONLY. With no anchoring the server has no diff to check
+    // the claim against, so a supplied `not-applicable` is DEMOTED to
+    // `self-reported` and still caps. This is the contract the harness has to
+    // satisfy: a basis it computes itself does not survive on its own word.
+    const unconfirmed = runMergerPipeline({
+      stage: "CODE_REVIEW",
+      perLens,
+      lensCoverage,
+      reviewComplete: true,
+    });
+    expect(unconfirmed.verdict).toBe("revise");
+    expect(unconfirmed.capReasons).toEqual([
+      "core lens 'security' uncovered (skipped, self-reported)",
+      "core lens 'error-handling' uncovered (skipped, self-reported)",
+      "core lens 'clean-code' uncovered (skipped, self-reported)",
+      "core lens 'concurrency' uncovered (skipped, self-reported)",
+    ]);
+
+    // With the artifact the lenses actually saw, the server confirms it.
+    const confirmed = runMergerPipeline({
+      stage: "CODE_REVIEW",
+      perLens,
+      lensCoverage,
+      reviewComplete: true,
+      anchoring: {
+        stage: "CODE_REVIEW",
+        artifact: DOCS_DIFF,
+        changedFiles: ["docs/guide.md"],
+      },
+    });
+    expect(confirmed.verdict).toBe("approve");
+    expect(confirmed.capReasons).toEqual([]);
+    expect(confirmed.coverage).toBe("full");
   });
 });

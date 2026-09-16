@@ -81,6 +81,83 @@ export const StatusWriterConfigSchema = z.object({
 
 export type StatusWriterConfig = z.infer<typeof StatusWriterConfigSchema>;
 
+/**
+ * T-499: session intel (token pressure, compaction forecast). Numbers with
+ * bounds and never enums, for the reviewEffort reason: this schema is parsed,
+ * not safe-parsed, and a typo must cost the project today's intel rather
+ * than every command. Cross-field rules (imperative above advisory, floor at
+ * or below cap) are NOT expressed here because a violated pair must fall back
+ * per pair, not throw; `core/session-intel/config.ts` applies them and reports
+ * the fallback. Passthrough so future additive keys never brick older readers.
+ */
+export const SessionIntelConfigSchema = z.object({
+  enabled: z.boolean().optional(),                                   // default true
+  advisoryPct: z.number().min(0.5).max(0.95).optional(),             // default 0.70
+  imperativePct: z.number().min(0.6).max(0.99).optional(),           // default 0.85; must exceed advisoryPct
+  ceilingFraction: z.number().min(0.8).max(1).optional(),            // default 0.925 (measured, T-499)
+  boundarySampleCount: z.number().int().min(1).max(50).optional(),   // default 20; also per-session ledger retention
+  jumpAllowanceFloorTokens: z.number().int().min(0).max(10_000_000).optional(), // default 25000
+  jumpAllowanceCapTokens: z.number().int().min(0).max(10_000_000).optional(),   // default 150000; must be >= floor
+  maxSampleAgeMs: z.number().int().min(0).max(600_000).optional(),   // default 30000
+  compactPendingTtlMs: z.number().int().min(10_000).max(3_600_000).optional(), // default 300000
+  stepPct: z.number().min(0.01).max(0.5).optional(),                 // default 0.05
+  // ISS-1197: the three handover re-arm gates. Suppression holds while ANY
+  // of them is closed, so a handover is not demanded again on the next prompt.
+  handoverRearmStepCapTokens: z.number().int().min(1_000).max(1_000_000).optional(), // default 25000
+  handoverRearmIntervalMs: z.number().int().min(0).max(3_600_000).optional(),        // default 600000
+  handoverRearmPrompts: z.number().int().min(0).max(50).optional(),                  // default 3
+  // ISS-1197 commit 2: the compact-needed line. Must exceed imperativePct;
+  // that pair rule lives in the reader, not here, like the other two.
+  compactNeededPct: z.number().min(0.85).max(1).optional(),                          // default 0.95
+  // T-501: 0 disables the usage-cost advisory; any other value is a
+  // threshold compared as written. The union mirrors the hot-path reader's
+  // `allowZero` rule exactly (the agreement test pins both ends).
+  recommendedWindowMax: z.union([z.literal(0), z.number().int().min(100_000).max(1_000_000)]).optional(), // default 450000
+  banner: z.boolean().optional(),                                    // default true
+  promptHook: z.boolean().optional(),                                // default true
+  guideDirective: z.boolean().optional(),                            // default true
+}).passthrough();
+
+export type SessionIntelConfigInput = z.infer<typeof SessionIntelConfigSchema>;
+
+/**
+ * T-502: `storybloq health`'s per-project switches. Booleans only, all
+ * optional, all defaulting to true, `.passthrough()` so a future sixth check
+ * added to a newer CLI's config never bricks an older reader (the
+ * statusWriter/sessionIntel precedent).
+ *
+ * No toggle is declared as a boolean, so a bad VALUE can never reject the
+ * config. This matters because `ConfigSchema` is PARSED, not safe-parsed, by
+ * the project loader: a rejection here would turn `"cliVersion": "false"` into
+ * a failure of every ordinary command, when the honest cost of that typo is
+ * one health check running by default. Same division of labour as
+ * `SessionIntelConfigSchema` and its hot-path reader: the schema is
+ * permissive and the reader applies the per-value fallback.
+ */
+/**
+ * Declared as `unknown`, not `boolean`, on purpose. The toggles must fall back
+ * per key instead of rejecting, and the two Zod ways of saying that are both
+ * worse here: `.catch()` makes a schema's input and output types diverge,
+ * which breaks `ConfigSchema`'s use as a `ZodType<Out, Def, Out>` in
+ * project-loader, and a plain `z.boolean()` would throw. The meaning of each
+ * value lives in `core/health/config.ts`'s resolver, which is the single
+ * place that turns anything-but-false into the documented default.
+ */
+const healthToggle = () => z.unknown().optional();
+
+export const HealthCheckConfigSchema = z.object({
+  enabled: healthToggle(),               // boolean, default true
+  checks: z.object({
+    usageWindow: healthToggle(),         // boolean, default true
+    cliVersion: healthToggle(),          // boolean, default true
+    codexBridge: healthToggle(),         // boolean, default true
+    skillVersion: healthToggle(),        // boolean, default true
+    crossSessionInbound: healthToggle(), // boolean, default true
+  }).passthrough().optional(),
+}).passthrough();
+
+export type HealthCheckConfigInput = z.infer<typeof HealthCheckConfigSchema>;
+
 export const ConfigSchema = z
   .object({
     version: z.number().int().min(1),
@@ -92,6 +169,8 @@ export const ConfigSchema = z
     bus: BusConfigSchema.optional(),
     limitResume: LimitResumeConfigSchema,
     statusWriter: StatusWriterConfigSchema.optional(),
+    sessionIntel: SessionIntelConfigSchema.optional(),
+    healthCheck: HealthCheckConfigSchema.optional(),
     recipe: z.string().optional(),  // default "coding" applied in guide.ts handleStart
     // ISS-730: opt-in continuous cross-reference integrity check. When true,
     // loadProject runs a full validateProject pass and surfaces ERROR-level

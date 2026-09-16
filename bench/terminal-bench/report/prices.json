@@ -1,0 +1,73 @@
+{
+  "_comment": "Prices in USD per million tokens. Keys are exact model ids as they appear in transcripts (message.model in Claude Code session files; turn_context.model in Codex rollouts). Each entry carries the URL and the date the values were copied. A model absent here, or a dimension absent from an entry, makes the row's cost unknown; the report never substitutes zero. Anthropic dimensions: input, cache_read, cache_write_5m, cache_write_1h, output. OpenAI dimensions: input, cached_input, output (reasoning tokens are billed as output).",
+  "date": "2026-09-09",
+  "models": {
+    "claude-sonnet-5": {
+      "input": 2.0,
+      "cache_read": 0.2,
+      "cache_write_5m": 2.5,
+      "cache_write_1h": 4.0,
+      "output": 10.0,
+      "source": "https://platform.claude.com/docs/en/about-claude/pricing (copied 2026-09-09; cache read = 0.1x input except Fable 5.1 at 0.025x; 5m write 1.25x, 1h write 2x)"
+    },
+    "claude-haiku-4-5-20251001": {
+      "input": 1.0,
+      "cache_read": 0.1,
+      "cache_write_5m": 1.25,
+      "cache_write_1h": 2.0,
+      "output": 5.0,
+      "source": "https://platform.claude.com/docs/en/about-claude/pricing (copied 2026-09-09; cache read = 0.1x input except Fable 5.1 at 0.025x; 5m write 1.25x, 1h write 2x)"
+    },
+    "claude-opus-5": {
+      "input": 5.0,
+      "cache_read": 0.5,
+      "cache_write_5m": 6.25,
+      "cache_write_1h": 10.0,
+      "output": 25.0,
+      "source": "https://platform.claude.com/docs/en/about-claude/pricing (copied 2026-09-09; cache read = 0.1x input except Fable 5.1 at 0.025x; 5m write 1.25x, 1h write 2x)"
+    },
+    "claude-opus-4-8": {
+      "input": 5.0,
+      "cache_read": 0.5,
+      "cache_write_5m": 6.25,
+      "cache_write_1h": 10.0,
+      "output": 25.0,
+      "source": "https://platform.claude.com/docs/en/about-claude/pricing (copied 2026-09-09; cache read = 0.1x input except Fable 5.1 at 0.025x; 5m write 1.25x, 1h write 2x)"
+    },
+    "claude-fable-5-1": {
+      "input": 10.0,
+      "cache_read": 0.25,
+      "cache_write_5m": 12.5,
+      "cache_write_1h": 20.0,
+      "output": 50.0,
+      "source": "https://platform.claude.com/docs/en/about-claude/pricing (copied 2026-09-09; cache read = 0.1x input except Fable 5.1 at 0.025x; 5m write 1.25x, 1h write 2x)"
+    },
+    "claude-fable-5": {
+      "input": 10.0,
+      "cache_read": 1.0,
+      "cache_write_5m": 12.5,
+      "cache_write_1h": 20.0,
+      "output": 50.0,
+      "source": "https://platform.claude.com/docs/en/about-claude/pricing (copied 2026-09-09; cache read = 0.1x input except Fable 5.1 at 0.025x; 5m write 1.25x, 1h write 2x)"
+    },
+    "gpt-6-astra": {
+      "input": 10.0,
+      "cached_input": 1.0,
+      "output": 50.0,
+      "source": "https://developers.openai.com/api/docs/pricing (Standard tier, copied 2026-09-09)"
+    },
+    "gpt-5.6-sol": {
+      "input": 4.0,
+      "cached_input": 0.4,
+      "output": 20.0,
+      "source": "https://developers.openai.com/api/docs/pricing (Standard tier, copied 2026-09-09)",
+      "note": "promotional pricing, valid at least through 2026-11-21 per the page"
+    },
+    "gpt-5.6-terra": {
+      "input": 2.0,
+      "cached_input": 0.2,
+      "output": 12.0,
+      "source": "https://developers.openai.com/api/docs/pricing (Standard tier, copied 2026-09-09)"
+    }
+  }
+}

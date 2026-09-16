@@ -24,6 +24,11 @@ import { makeState } from "../core/test-factories.js";
 const pkgRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const fallbackPath = join(pkgRoot, "src", "skill", "session-guard-fallback.md");
 const skillPath = join(pkgRoot, "src", "skill", "SKILL.md");
+// T-496: the full Step 0.5 guard body (byte-for-byte, unchanged) now lives in
+// this sibling file. SKILL.md's stub carries only the ordinary path plus
+// one-line pointers for exceptional verdicts, so any assertion that needs the
+// full detail reads this file, not SKILL.md.
+const sessionGuardPath = join(pkgRoot, "src", "skill", "session-guard.md");
 const generatorPath = join(pkgRoot, "scripts", "gen-guard-matrix.ts");
 const fixturePath = join(pkgRoot, "test", "fixtures", "session-guard-matrix.json");
 
@@ -39,6 +44,10 @@ const fixture = JSON.parse(readFileSync(fixturePath, "utf-8")) as {
 
 function fallback(): string {
   return readFileSync(fallbackPath, "utf-8");
+}
+
+function guardBody(): string {
+  return readFileSync(sessionGuardPath, "utf-8");
 }
 
 /**
@@ -1370,10 +1379,13 @@ describe("SKILL.md keeps the matrix out and points at the fallback", () => {
   });
 
   it("references session-guard-fallback.md for both entry modes", () => {
-    const skill = readFileSync(skillPath, "utf-8");
-    expect(skill).toContain("session-guard-fallback.md");
+    const guard = guardBody();
+    expect(guard).toContain("session-guard-fallback.md");
     // Mode A: the tool is confirmed absent. Mode B: overallAction is null.
-    expect(skill).toMatch(/overallAction[^\n]*null/);
+    expect(guard).toMatch(/overallAction[^\n]*null/);
+    // And SKILL.md's stub reaches this file, so the reference is not orphaned.
+    const skill = readFileSync(skillPath, "utf-8");
+    expect(skill).toContain("session-guard.md");
   });
 
   /**
@@ -1442,7 +1454,7 @@ describe("SKILL.md keeps the matrix out and points at the fallback", () => {
   });
 
   it("states the rendering rule for the raw fields it tells the agent to report", () => {
-    const skill = readFileSync(skillPath, "utf-8");
+    const skill = guardBody();
     // The RULE's own paragraph, not the whole of Step 0.5. Searching the wider
     // slice let a field name satisfy the coverage assertions from an
     // operational procedure further down, so the rule could lose a field and
@@ -1522,7 +1534,7 @@ describe("SKILL.md keeps the matrix out and points at the fallback", () => {
     // bug in this test's first form: it holds three remedies, so one could lose
     // `no NUL` while another kept it and the assertion still passed -- the
     // copy-level drift the test exists to catch, invisible to the test.
-    const skill = readFileSync(skillPath, "utf-8");
+    const skill = guardBody();
     const fixtureText = readFileSync(fixturePath, "utf-8");
     const parsed = JSON.parse(fixtureText) as {
       collisionRule: { remedy: string };
@@ -1583,8 +1595,8 @@ describe("SKILL.md keeps the matrix out and points at the fallback", () => {
   });
 
   it("adds storybloq_session_guard to the Step 0.5 whitelist", () => {
-    const skill = readFileSync(skillPath, "utf-8");
-    const whitelist = skill.slice(skill.indexOf("Whitelist semantics"), skill.indexOf("## How to Handle Arguments"));
+    const skill = guardBody();
+    const whitelist = skill.slice(skill.indexOf("Whitelist semantics"), skill.indexOf("1. Call `storybloq_session_guard`"));
     expect(whitelist).toContain("storybloq_session_guard");
   });
 
@@ -1603,7 +1615,27 @@ describe("SKILL.md keeps the matrix out and points at the fallback", () => {
    */
   it("routes a discovered-but-failing guard to the Step 0 fallback, in every place it says so", () => {
     const skill = readFileSync(skillPath, "utf-8");
-    const step05 = skill.slice(skill.indexOf("## Step 0.5"), skill.indexOf("## How to Handle Arguments"));
+    const step05 = guardBody();
+
+    // T-496: session-guard.md's own execution-failure prose (asserted below,
+    // unchanged) only covers mode A's storybloq_status call. The PRIMARY
+    // storybloq_session_guard call in the stub's own step 1 needs its own
+    // route -- and the stub's whitelist has to authorize reading
+    // session-guard.md itself, since every exceptional verdict routes there
+    // while ownership is still unresolved and the whitelist otherwise forbids
+    // any other read. Both are asserted against the actual stub, not the
+    // relocated reference text, since that is where the gap would appear.
+    const stub = skill.slice(skill.indexOf("## Step 0.5"), skill.indexOf("## How to Handle Arguments"));
+    // Markdown line-wraps a sentence across lines with mid-sentence indentation,
+    // so the two phrase anchors below are matched against whitespace-collapsed
+    // text, not the raw wrapped stub.
+    const stubFlat = stub.replace(/\s+/g, " ");
+    expect(stubFlat, "the stub whitelist does not authorize reading session-guard.md").toMatch(
+      /session-guard\.md`[^.]*when a numbered item below directs you to it/i,
+    );
+    expect(stubFlat, "the stub has no route for its own storybloq_session_guard call failing to execute").toMatch(
+      /the call itself fails to execute[\s\S]{0,200}execution-failure rule\*\* in Step 0/i,
+    );
 
     // Absent and failed must stay distinguishable, with their own routes.
     expect(step05).toMatch(/confirmed absent[\s\S]{0,600}mode A/i);
@@ -1720,7 +1752,7 @@ describe("SKILL.md keeps the matrix out and points at the fallback", () => {
    * behavior this ticket reverted, arriving by a different door.
    */
   it("authorizes the Step 0 fallback it routes to, scoped to that branch alone", () => {
-    const skill = readFileSync(skillPath, "utf-8");
+    const skill = guardBody();
     const whitelist = skill.slice(skill.indexOf("Whitelist semantics"), skill.indexOf("\n1. Call `storybloq_session_guard`"));
     expect(whitelist.length, "could not slice the whitelist paragraph").toBeGreaterThan(200);
 
@@ -2490,7 +2522,9 @@ describe("aged-anomaly: one example, checked against all five surfaces (ISS-945)
   });
 
   it("4. SKILL.md's doctrine prose describes aged-anomaly as admitting no record, not as a reported session", () => {
-    const text = readFileSync(skillPath, "utf-8");
+    // T-496: this doctrine prose lives in session-guard.md now (the moved,
+    // unchanged guard body), not in SKILL.md's stub.
+    const text = guardBody();
     expect(text).toContain("aged-anomaly");
     expect(text).toContain("admits no record");
     expect(text).toContain("session-delete");
@@ -2501,7 +2535,7 @@ describe("aged-anomaly: one example, checked against all five surfaces (ISS-945)
     // document, and the negative assertion below would then pass vacuously if
     // this exact sentence were ever removed or reworded.
     const agedIndex = text.indexOf("A fifth, `aged-anomaly`");
-    expect(agedIndex, "anchor sentence not found in SKILL.md").toBeGreaterThanOrEqual(0);
+    expect(agedIndex, "anchor sentence not found in session-guard.md").toBeGreaterThanOrEqual(0);
     const agedSentence = text.slice(agedIndex);
     expect(agedSentence.slice(0, 900)).not.toMatch(/observed a session|reports a session/i);
 

@@ -504,6 +504,21 @@ const MATRIX: Coverage[] = [
     },
   },
   {
+    key: "lesson digest --select",
+    check: (dir) => {
+      expect(run(dir, "lesson", "create", "--title", "Matches", "--content", "c",
+        "--context", "x", "--source", "manual", "--tags", "cli-status").code).toBe(0);
+      expect(run(dir, "lesson", "create", "--title", "Excluded", "--content", "c",
+        "--context", "x", "--source", "manual", "--tags", "other").code).toBe(0);
+      const res = run(dir, "lesson", "digest", "--select", "component:cli-status", "--format", "json");
+      expect(res.code, res.out).toBe(0);
+      const parsed = JSON.parse(res.out) as { data: { digest: string } };
+      expect(parsed.data.digest).toContain("Matches");
+      expect(parsed.data.digest).not.toContain("Excluded");
+      expectRejected(run(dir, "lesson", "digest", "--select", "bogus:x", "--format", "json"));
+    },
+  },
+  {
     key: "lesson update --tags",
     check: (dir) => {
       expect(run(dir, "lesson", "create", "--title", "t", "--content", "c",
@@ -769,6 +784,22 @@ const MATRIX: Coverage[] = [
       expect(res.code, res.out).toBe(0);
       const superseding = readEntities(dir, "rulings").find((r) => r.id !== oldId)!;
       expect(superseding.scopeTags).toEqual(["gamma", "delta"]);
+    },
+  },
+  {
+    // T-502: `health --only` is a read-only selector, so unlike every row
+    // above there is no stored field to inspect. What it proves instead is
+    // the array behaviour itself: the comma expression selects exactly those
+    // two checks in the fixed order, and a bare flag is rejected rather than
+    // silently meaning "all", which would hide a typo'd value.
+    key: "health --only",
+    check: (dir) => {
+      const res = run(dir, "health", "--only", "cli-version,cross-session-inbound", "--format", "json");
+      expect(res.code, res.out).toBe(0);
+      // ISS-1223: health json is the shared {version, data} envelope.
+      const ids = (JSON.parse(res.out) as { data: { checks: Array<{ id: string }> } }).data.checks.map((c) => c.id);
+      expect(ids).toEqual(["cli-version", "cross-session-inbound"]);
+      expectRejected(run(dir, "health", "--only", "--format", "json"));
     },
   },
 ];

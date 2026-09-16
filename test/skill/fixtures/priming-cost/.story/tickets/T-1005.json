@@ -1,0 +1,13 @@
+{
+  "id": "T-1005",
+  "title": "Migrate config schema to v3",
+  "description": "Depends on the v3 schema design landing first.",
+  "type": "task",
+  "status": "open",
+  "phase": "core",
+  "order": 30,
+  "createdDate": "2026-08-05",
+  "completedDate": null,
+  "blockedBy": ["T-1006"],
+  "parentTicket": null
+}

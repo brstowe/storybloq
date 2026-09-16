@@ -13,6 +13,14 @@ export type NodeResolutionResult =
   | { ok: true; root: string }
   | { ok: false; error: string; errorCode: string };
 
+/**
+ * ISS-1181: the reserved `node` value denoting the orchestrator's own board.
+ * Cannot collide with a real node name -- `NODE_NAME_REGEX` requires a
+ * leading lowercase letter, so no existing or future config can define a
+ * node named ".", and no migration is needed.
+ */
+export const ORCHESTRATOR_NODE_SENTINEL = ".";
+
 export function readOrchestratorConfig(pinnedRoot: string): Record<string, unknown> | null {
   try {
     return JSON.parse(readFileSync(join(pinnedRoot, ".story", "config.json"), "utf-8")) as Record<string, unknown>;
@@ -39,6 +47,10 @@ export function resolveNodeRoot(
       error: "Node parameter is only supported on orchestrator projects.",
       errorCode: "not_orchestrator",
     };
+  }
+
+  if (nodeName === ORCHESTRATOR_NODE_SENTINEL) {
+    return { ok: true, root: pinnedRoot };
   }
 
   const rawNodes = config.nodes;

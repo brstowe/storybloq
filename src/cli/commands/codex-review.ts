@@ -26,18 +26,18 @@ export interface CodexFinding {
   readonly file?: string | null;
   readonly line?: number | null;
   readonly suggestion?: string | null;
-  readonly recommendedNextState?: "PLAN" | "IMPLEMENT";
+  readonly recommendedNextState?: "PLAN" | "IMPLEMENT" | null;
   /**
    * T-487: the principle of the project's review contract this finding
    * violates, lowercase. ABSENT is the only way to say "names no principle" --
    * a consumer reads a missing key as the empty string, so a blank would be
    * indistinguishable from absence at the seam that decides capping.
    */
-  readonly principle?: string;
-  readonly origin?: string;
-  readonly originClass?: string;
-  readonly sinceRound?: number;
-  readonly dispositionReason?: string;
+  readonly principle?: string | null;
+  readonly origin?: string | null;
+  readonly originClass?: string | null;
+  readonly sinceRound?: number | null;
+  readonly dispositionReason?: string | null;
 }
 
 interface CodexReviewOutput {
@@ -68,7 +68,28 @@ function reviewSchema(verdicts: readonly string[]): object {
         items: {
           type: "object",
           additionalProperties: false,
-          required: ["severity", "category", "description", "file", "line", "suggestion"],
+          // ISS-1202 (GitHub #36): OpenAI structured outputs in strict mode
+          // (what `codex exec --output-schema` uses) require every key in
+          // `properties` to also appear here -- an optional key expressed by
+          // omission, as recommendedNextState/principle/origin/originClass/
+          // sinceRound/dispositionReason all were, makes the WHOLE schema
+          // invalid and Codex returns a 400 before producing any review at
+          // all. "Optional" for those six is expressed the same way file/
+          // line/suggestion already worked: required, with a nullable anyOf.
+          required: [
+            "severity",
+            "category",
+            "description",
+            "file",
+            "line",
+            "suggestion",
+            "recommendedNextState",
+            "principle",
+            "origin",
+            "originClass",
+            "sinceRound",
+            "dispositionReason",
+          ],
           properties: {
             severity: { type: "string", enum: ["critical", "major", "minor", "suggestion", "nitpick"] },
             category: { type: "string" },
@@ -76,7 +97,9 @@ function reviewSchema(verdicts: readonly string[]): object {
             file: { anyOf: [{ type: "string" }, { type: "null" }] },
             line: { anyOf: [{ type: "integer", minimum: 1 }, { type: "null" }] },
             suggestion: { anyOf: [{ type: "string" }, { type: "null" }] },
-            recommendedNextState: { type: "string", enum: ["PLAN", "IMPLEMENT"] },
+            recommendedNextState: {
+              anyOf: [{ type: "string", enum: ["PLAN", "IMPLEMENT"] }, { type: "null" }],
+            },
             // T-487: this object is `additionalProperties: false`, so without
             // this key a reviewer that follows the prompt has its answer
             // DROPPED BY THE SCHEMA and the contract measures zero while every
@@ -86,25 +109,31 @@ function reviewSchema(verdicts: readonly string[]): object {
             // nothing else. It still accepts "  ": rejecting whitespace here
             // would fail the reviewer's whole output, and the normalizer is
             // the layer that can safely discard instead.
-            principle: { type: "string", minLength: 1 },
+            principle: { anyOf: [{ type: "string", minLength: 1 }, { type: "null" }] },
             // ISS-1115: provenance. This object is `additionalProperties:
             // false`, so without these four keys a native reviewer CANNOT EMIT
             // a provenance field even when the prompt asks for one, and the
             // laundering guard downstream would be protecting a field that
-            // never arrives. Optional, so an older reviewer that omits them
-            // still validates.
+            // never arrives. Strict-mode output MUST include these keys,
+            // using null when there is nothing to report -- an omitted key
+            // fails schema validation outright, the schema does not fill one
+            // in. normalizeFinding also accepts an omitted key (from an older,
+            // non-strict-mode caller) and treats it the same as an explicit
+            // null: both become absent on the normalized Finding.
             //
             // `disposition` is deliberately NOT here. A reviewer REPORTS
             // findings; dispositioning them is a later decision by someone
             // else, and inviting a reviewer to mark its own finding
             // `addressed` would hand it the laundering route directly.
-            origin: { type: "string", enum: ["introduced", "pre-existing"] },
+            origin: { anyOf: [{ type: "string", enum: ["introduced", "pre-existing"] }, { type: "null" }] },
             originClass: {
-              type: "string",
-              enum: ["new", "reintroduced", "unchanged", "introduced-by-fix"],
+              anyOf: [
+                { type: "string", enum: ["new", "reintroduced", "unchanged", "introduced-by-fix"] },
+                { type: "null" },
+              ],
             },
-            sinceRound: { type: "integer", minimum: 1 },
-            dispositionReason: { type: "string" },
+            sinceRound: { anyOf: [{ type: "integer", minimum: 1 }, { type: "null" }] },
+            dispositionReason: { anyOf: [{ type: "string" }, { type: "null" }] },
           },
         },
       },
@@ -338,7 +367,13 @@ export function normalizeFinding(finding: CodexFinding, index: number): Finding 
     // Still defaulted, and still the reviewer's finding is `open` until someone
     // dispositions it. The schema does not let a reviewer set this.
     disposition: "open",
-    recommendedNextState: finding.recommendedNextState,
+    // ISS-1202: recommendedNextState is required-plus-nullable in the schema
+    // now, so a reviewer with no redirect to recommend emits an explicit
+    // `null` rather than omitting the key. Null must normalize the same as
+    // an always-absent key did -- absent here, not a stored `null`.
+    ...(finding.recommendedNextState === undefined || finding.recommendedNextState === null
+      ? {}
+      : { recommendedNextState: finding.recommendedNextState }),
     // ISS-1115: provenance SURVIVES normalization. This function used to build
     // a fresh object and drop everything it did not name, so even a reviewer
     // that reported `originClass: "reintroduced"` had it discarded here, one
@@ -356,10 +391,17 @@ export function normalizeFinding(finding: CodexFinding, index: number): Finding 
     ...(normalizePrinciple(finding.principle) === undefined
       ? {}
       : { principle: normalizePrinciple(finding.principle)! }),
-    ...(finding.origin === undefined ? {} : { origin: finding.origin }),
-    ...(finding.originClass === undefined ? {} : { originClass: finding.originClass }),
-    ...(finding.sinceRound === undefined ? {} : { sinceRound: finding.sinceRound }),
-    ...(finding.dispositionReason === undefined
+    // ISS-1202: these four are also required-plus-nullable now (same strict-
+    // mode requirement), so `null` reaches here where only `undefined` did
+    // before. Both mean absent.
+    ...(finding.origin === undefined || finding.origin === null ? {} : { origin: finding.origin }),
+    ...(finding.originClass === undefined || finding.originClass === null
+      ? {}
+      : { originClass: finding.originClass }),
+    ...(finding.sinceRound === undefined || finding.sinceRound === null
+      ? {}
+      : { sinceRound: finding.sinceRound }),
+    ...(finding.dispositionReason === undefined || finding.dispositionReason === null
       ? {}
       : { dispositionReason: finding.dispositionReason }),
   };

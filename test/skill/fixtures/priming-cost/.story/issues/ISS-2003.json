@@ -1,0 +1,14 @@
+{
+  "id": "ISS-2003",
+  "title": "Snapshot pruning may keep stale entries under clock skew",
+  "status": "open",
+  "severity": "low",
+  "components": ["core"],
+  "impact": "OWNER-GATED: pending a decision on the retention policy before any fix lands; do not treat as actionable yet.",
+  "resolution": null,
+  "location": ["src/core/snapshot.ts:108"],
+  "discoveredDate": "2026-08-08",
+  "resolvedDate": null,
+  "relatedTickets": ["T-1004"],
+  "disposition": "owner_gated"
+}

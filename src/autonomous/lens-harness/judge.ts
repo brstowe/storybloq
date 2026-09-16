@@ -27,6 +27,7 @@ import {
   type ReviewVerdict,
   type Tension,
 } from "@storybloq/lenses";
+import { analyzeCapReasons } from "./cap-reasons.js";
 
 export interface ConvergenceHistoryEntry {
   readonly round: number;
@@ -62,6 +63,26 @@ export interface JudgeOutput {
   readonly findings: readonly MergedFinding[];
   readonly tensions: readonly Tension[];
   readonly lensCoverage: readonly LensCoverageEntry[];
+  /** ISS-950: every cap the pipeline fired, verbatim. */
+  readonly capReasons: readonly string[];
+  /**
+   * ISS-950 acceptance 4: this verdict sits below approve SOLELY because a core
+   * lens did not cover its domain.
+   *
+   * The distinction is the routing decision. A coverage cap is answered by the
+   * named lens running again; a findings cap is answered by changing the code.
+   * Sending a coverage cap to the implementer is what the field report recorded
+   * as training a relabel: the round asks for changes, names none, and the
+   * cheapest exit is for the lens to resubmit its skip as an `ok`.
+   *
+   * Requires all three: a `revise` (a reject is a blocking finding, never a
+   * cap), zero blocking and zero major findings, and every cap reason naming a
+   * core lens. `retry pending` and `review incomplete` disqualify it, because
+   * neither is answered by re-running a named lens.
+   */
+  readonly coverageOnlyCap: boolean;
+  /** Core lenses named by a coverage cap, whether or not the cap was the only one. */
+  readonly uncoveredCoreLenses: readonly string[];
 }
 
 /**
@@ -98,6 +119,16 @@ export function handleJudge(input: JudgeInput): JudgeOutput {
   const v: ReviewVerdict = parsed.data;
 
   const coverageGap = v.coverage !== "full";
+  const caps = analyzeCapReasons(v.capReasons);
+  // A cap only ever converts an approve to a revise (the pipeline's own rule),
+  // so a findings-free revise whose every reason names a core lens is a cap and
+  // nothing else. The findings test is on the COUNTS rather than on
+  // `findings.length`, because a minor or suggestion never capped anything.
+  const coverageOnlyCap =
+    v.verdict === "revise" &&
+    v.blocking === 0 &&
+    v.major === 0 &&
+    caps.allCoverage;
   let verdict: JudgeOutput["verdict"];
   let recommendFixRound: boolean;
   let verdictReason: string;
@@ -111,8 +142,17 @@ export function handleJudge(input: JudgeInput): JudgeOutput {
   } else if (v.verdict === "revise") {
     verdict = "revise";
     recommendFixRound = false;
-    const capNote = coverageGap ? ", coverage partial" : "";
-    verdictReason = `revise: ${v.major} major finding(s)${capNote}`;
+    if (coverageOnlyCap) {
+      // Says what it is, because this reason is read by a human deciding
+      // whether a round was worth its cost. "0 major finding(s), coverage
+      // partial" is true and tells them nothing.
+      verdictReason =
+        `revise: coverage cap only (${caps.uncoveredCoreLenses.join(", ")}); ` +
+        "no blocking or major findings, so the remedy is re-running the named lens(es)";
+    } else {
+      const capNote = coverageGap ? ", coverage partial" : "";
+      verdictReason = `revise: ${v.major} major finding(s)${capNote}`;
+    }
   } else {
     verdict = "approve";
     const majorsGap = v.major > 0 && !converged(input.convergenceHistory, v.major);
@@ -143,5 +183,8 @@ export function handleJudge(input: JudgeInput): JudgeOutput {
     findings: v.findings,
     tensions: v.tensions,
     lensCoverage: v.lensCoverage,
+    capReasons: v.capReasons,
+    coverageOnlyCap,
+    uncoveredCoreLenses: caps.uncoveredCoreLenses,
   };
 }

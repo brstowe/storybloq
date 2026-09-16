@@ -127,6 +127,7 @@ describe("preCommandHousekeeping end-to-end", () => {
       const settings = JSON.parse(await readFile(settingsPath, "utf-8")) as { hooks?: Record<string, unknown> };
       expect(settings.hooks?.StopFailure).toBeUndefined();
       expect(settings.hooks?.SessionStart).toBeUndefined();
+      expect((settings.hooks as Record<string, unknown> | undefined)?.UserPromptSubmit).toBeUndefined();
     } finally {
       if (savedDisable === undefined) delete process.env.STORYBLOQ_DISABLE_WAKER_SPAWN;
       else process.env.STORYBLOQ_DISABLE_WAKER_SPAWN = savedDisable;
@@ -150,6 +151,11 @@ describe("preCommandHousekeeping end-to-end", () => {
       ]);
       const resume = (settings.hooks?.SessionStart ?? []).find((g) => g.matcher === "resume");
       expect(resume?.hooks).toEqual([{ type: "command", command: `${binPath} session resume-prompt` }]);
+      // T-499: both session-intel hooks arrive through the same housekeeping pass.
+      const intelStart = (settings.hooks?.SessionStart ?? []).find((g) => g.matcher === "startup|resume|clear|compact");
+      expect(intelStart?.hooks).toEqual([{ type: "command", command: `${binPath} session intel-start`, timeout: 5 }]);
+      const prompt = (settings.hooks as { UserPromptSubmit?: Array<{ matcher: string; hooks: unknown[] }> } | undefined)?.UserPromptSubmit;
+      expect(prompt).toEqual([{ matcher: "", hooks: [{ type: "command", command: `${binPath} session intel-prompt`, timeout: 10 }] }]);
     } finally {
       if (savedDisable === undefined) delete process.env.STORYBLOQ_DISABLE_WAKER_SPAWN;
       else process.env.STORYBLOQ_DISABLE_WAKER_SPAWN = savedDisable;
@@ -185,6 +191,14 @@ describe("shouldSkipHousekeeping (ISS-777)", () => {
   it("skips session resume-prompt (SessionStart hook)", async () => {
     const { shouldSkipHousekeeping } = await import("../../src/cli/housekeeping.js");
     expect(shouldSkipHousekeeping(["session", "resume-prompt"])).toBe(true);
+  });
+
+  it("skips session intel-start and intel-prompt (T-499 SessionStart and UserPromptSubmit hooks)", async () => {
+    const { shouldSkipHousekeeping } = await import("../../src/cli/housekeeping.js");
+    expect(shouldSkipHousekeeping(["session", "intel-start"])).toBe(true);
+    expect(shouldSkipHousekeeping(["session", "intel-prompt"])).toBe(true);
+    // The query surface is interactive and keeps housekeeping.
+    expect(shouldSkipHousekeeping(["session", "intel"])).toBe(false);
   });
 
   it("does NOT skip interactive session subcommands", async () => {

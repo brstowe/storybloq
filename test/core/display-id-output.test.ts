@@ -59,6 +59,9 @@ describe("display ID output in aggregate formatters", () => {
           { id: "t-abcdef1234567890", kind: "ticket", title: "Team ticket", category: "open_ticket", reason: "Ready", score: 100, displayId: "T-042" },
         ],
         totalCandidates: 1,
+        excludedCount: 0,
+        excluded: [],
+        unreadableHandoverCount: 0,
       };
       const md = formatRecommendations(result, state, "md");
       expect(md).toContain("T-042");

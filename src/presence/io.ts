@@ -148,10 +148,24 @@ export function directoryIdentity(path: string): DirIdentity | null {
  * an existing symlink at any level and would silently write through it.
  */
 export function ensurePresenceDir(root: string): string | null {
+  return ensureTelemetrySubdir(root, "presence");
+}
+
+/** Subdirectory names this writer will create under `.story/telemetry/`. */
+const TELEMETRY_SUBDIR_NAME = /^[a-z][a-z0-9-]{0,31}$/;
+
+/**
+ * T-499: the same validated directory chain for any `.story/telemetry/<name>`
+ * (presence records, session-intel eras, pending files). Same posture as the
+ * presence directory: non-recursive mkdir per level, identity-checked, never
+ * through a symlink. Null for a name outside the portable shape above.
+ */
+export function ensureTelemetrySubdir(root: string, name: string): string | null {
+  if (!TELEMETRY_SUBDIR_NAME.test(name)) return null;
   const levels = [
     join(root, ".story"),
     join(root, ".story", "telemetry"),
-    join(root, ".story", "telemetry", "presence"),
+    join(root, ".story", "telemetry", name),
   ];
   for (const dir of levels) {
     if (directoryIdentity(dir) === null) {
@@ -163,6 +177,26 @@ export function ensurePresenceDir(root: string): string | null {
       }
       if (directoryIdentity(dir) === null) return null;
     }
+  }
+  return levels[2]!;
+}
+
+/**
+ * T-499: `.story/telemetry/<name>` without creating anything, validated at
+ * EVERY level (`.story`, `telemetry`, `<name>`) as a real, non-symlink
+ * directory. Checking only the leaf would let a symlinked `.story` or
+ * `telemetry` redirect reads, updates and sweep deletions outside the
+ * project. Null when any level is missing or not a real directory.
+ */
+export function telemetrySubdirIfPresent(root: string, name: string): string | null {
+  if (!TELEMETRY_SUBDIR_NAME.test(name)) return null;
+  const levels = [
+    join(root, ".story"),
+    join(root, ".story", "telemetry"),
+    join(root, ".story", "telemetry", name),
+  ];
+  for (const dir of levels) {
+    if (directoryIdentity(dir) === null) return null;
   }
   return levels[2]!;
 }

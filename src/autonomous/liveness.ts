@@ -2672,17 +2672,49 @@ export function readOwnerLiveness(
   }
 }
 
+/**
+ * The bundle paths a running server can have been launched from, in
+ * preference order. Shared so the stat-only probe below and the hashing one
+ * cannot drift onto different files.
+ */
+function binaryCandidatePaths(): string[] {
+  const thisFile = fileURLToPath(import.meta.url);
+  const parentDir = dirname(dirname(thisFile));
+  return [
+    join(parentDir, "mcp.js"),
+    join(parentDir, "dist", "mcp.js"),
+  ];
+}
+
+/**
+ * ISS-1214: the stat-only half of the fingerprint question. Every MCP write
+ * tool now asks whether the server is stale, and hashing the bundle on each
+ * one is wasted work; this identifies the target cheaply so the caller can
+ * memoize the hash against it. Null when no candidate can be stat-ed, which
+ * is the same "cannot establish" answer `computeBinaryFingerprint` gives.
+ */
+export function statBinaryTarget(): { path: string; mtimeMs: number; size: number } | null {
+  try {
+    for (const p of binaryCandidatePaths()) {
+      try {
+        const stat = fs.statSync(p);
+        return { path: p, mtimeMs: stat.mtimeMs, size: stat.size };
+      } catch {
+        continue;
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 export function computeBinaryFingerprint(): {
   mtime: string;
   sha256: string;
 } | null {
   try {
-    const thisFile = fileURLToPath(import.meta.url);
-    const parentDir = dirname(dirname(thisFile));
-    const candidates = [
-      join(parentDir, "mcp.js"),
-      join(parentDir, "dist", "mcp.js"),
-    ];
+    const candidates = binaryCandidatePaths();
     for (const p of candidates) {
       try {
         const stat = fs.statSync(p);

@@ -4,13 +4,17 @@ import { join } from "node:path";
 import { recommend, type RecommendOptions } from "../../core/recommend.js";
 import { formatRecommendations } from "../../core/output-formatter.js";
 import { loadFederationState } from "../../federation/recommend-loader.js";
-import { readFederationCache } from "../../federation/cache.js";
+import { loadClassificationContext } from "../../core/classification-context.js";
 import type { CommandContext, CommandResult } from "../types.js";
 
-export async function handleRecommend(ctx: CommandContext, count: number): Promise<CommandResult> {
+export async function handleRecommend(
+  ctx: CommandContext,
+  count: number,
+  withActionability = false,
+): Promise<CommandResult> {
   const baseOptions = buildRecommendOptions(ctx);
   const fedState = await loadFederationState(ctx.root, ctx.state.config);
-  const cache = readFederationCache(join(ctx.root, ".story"));
+  const classification = loadClassificationContext(ctx.root, ctx.handoversDir);
 
   let currentUser: string | undefined;
   try {
@@ -20,25 +24,18 @@ export async function handleRecommend(ctx: CommandContext, count: number): Promi
 
   const options: RecommendOptions = {
     ...baseOptions,
+    recentHandovers: classification.recentHandovers,
+    unreadableHandoverCount: classification.unreadableHandoverCount,
     ...(fedState ? { federationState: fedState } : {}),
-    ...(cache?.crossNodeRefStatuses ? { crossNodeRefStatuses: cache.crossNodeRefStatuses } : {}),
+    ...(classification.crossNodeRefStatuses ? { crossNodeRefStatuses: classification.crossNodeRefStatuses } : {}),
     ...(currentUser ? { currentUser } : {}),
   };
   const result = recommend(ctx.state, count, options);
-  return { output: formatRecommendations(result, ctx.state, ctx.format) };
+  return { output: formatRecommendations(result, ctx.state, ctx.format, withActionability) };
 }
 
 function buildRecommendOptions(ctx: CommandContext): RecommendOptions {
-  const opts: { latestHandoverContent?: string; previousOpenIssueCount?: number } = {};
-
-  // ISS-018: Load latest handover content
-  try {
-    const files = readdirSync(ctx.handoversDir).filter((f) => f.endsWith(".md")).sort();
-    if (files.length > 0) {
-      const handoverResult = tryReadFile(join(ctx.handoversDir, files[files.length - 1]));
-      if (handoverResult.ok) opts.latestHandoverContent = handoverResult.content;
-    }
-  } catch { /* no handovers */ }
+  const opts: { previousOpenIssueCount?: number } = {};
 
   // ISS-019: Load previous open issue count from latest snapshot
   try {

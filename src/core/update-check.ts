@@ -26,9 +26,11 @@
  * - Semver compare is done via a minimal inline comparator (no new deps).
  */
 
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
+import { writeFileSync, mkdirSync, renameSync, unlinkSync, openSync, closeSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { readBoundedFile } from "./limit-config.js";
 
 const NPM_REGISTRY_URL = "https://registry.npmjs.org/@storybloq/storybloq/latest";
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
@@ -65,11 +67,21 @@ function isCacheFresh(cache: UpdateCache): boolean {
  * Read + shape-validate the cache file. Does NOT apply the freshness window,
  * so callers that need to distinguish "stale" from "absent" can.
  */
+/**
+ * T-502: bounded. This file sits in a user-writable directory and is read on
+ * the CLI startup path, in `storybloq_status`, and now synchronously inside
+ * `storybloq health` before its fetch timer is even armed. An unbounded
+ * `readFileSync` there would hang forever on a FIFO planted at the cache's
+ * name and would happily load an oversized replacement into memory. The cap
+ * is far above anything this two-field document can legitimately be.
+ */
+const CACHE_MAX_BYTES = 65_536;
+
 function readCacheRaw(): UpdateCache | null {
   try {
-    const p = cachePath();
-    if (!existsSync(p)) return null;
-    const data = JSON.parse(readFileSync(p, "utf-8")) as UpdateCache;
+    const body = readBoundedFile(cachePath(), CACHE_MAX_BYTES);
+    if (body === null) return null;
+    const data = JSON.parse(body) as UpdateCache;
     if (typeof data.latestVersion !== "string" || typeof data.fetchedAt !== "number") {
       return null;
     }
@@ -85,14 +97,50 @@ function readCache(): UpdateCache | null {
   return isCacheFresh(data) ? data : null;
 }
 
+/**
+ * T-502: write-then-rename, the limit-ledger pattern.
+ *
+ * Two reasons, both about not making things worse than they were. A truncating
+ * `writeFileSync` that fails partway (disk full, interrupted) destroys a
+ * previously valid cache and leaves a corrupt one behind. And it FOLLOWS a
+ * symlink at the cache path, which would let a cache write land on some other
+ * file entirely -- unacceptable for a command whose only permitted write this
+ * is. `renameSync` replaces the path itself, symlink included, atomically.
+ */
 function writeCache(latestVersion: string): void {
+  const p = cachePath();
+  // The temp path is only ever unlinked once the EXCLUSIVE open has
+  // succeeded. Cleaning up on an EEXIST would delete a file this invocation
+  // never created, which is another writer's in-flight temp.
+  let owned: { path: string; fd: number } | null = null;
   try {
-    const p = cachePath();
     mkdirSync(join(homedir(), ".claude", "storybloq"), { recursive: true });
     const data: UpdateCache = { latestVersion, fetchedAt: Date.now() };
-    writeFileSync(p, JSON.stringify(data, null, 2), "utf-8");
+    const tmp = `${p}.tmp.${process.pid}.${Date.now()}.${randomBytes(2).toString("hex")}`;
+    const fd = openSync(tmp, "wx", 0o600);
+    owned = { path: tmp, fd };
+    writeFileSync(fd, JSON.stringify(data, null, 2), "utf-8");
+    closeSync(fd);
+    owned = { path: tmp, fd: -1 };
+    renameSync(tmp, p);
+    owned = null;
   } catch {
-    // Cache write is best-effort.
+    // Cache write is best-effort: the prior contents survive untouched.
+  } finally {
+    if (owned !== null) {
+      if (owned.fd >= 0) {
+        try {
+          closeSync(owned.fd);
+        } catch {
+          // ignore
+        }
+      }
+      try {
+        unlinkSync(owned.path);
+      } catch {
+        // ignore
+      }
+    }
   }
 }
 
@@ -109,18 +157,29 @@ function shouldSuppressUpdateFetch(env: Record<string, string | undefined> = pro
   return false;
 }
 
-async function fetchLatestFromNpm(): Promise<string | null> {
+/**
+ * T-502: the abort timer stays ARMED through `res.json()` and is cleared in
+ * `finally`. Before this, the timer was cleared as soon as the response
+ * HEADERS arrived, so a registry (or a captive portal) that answered with
+ * headers and then stalled the body left the await hanging with no cap at
+ * all -- on the health check's synchronous path that is the difference
+ * between a 2 second skip and a wedged command. The timeout is a parameter
+ * because the health check budgets it from the remaining run budget; the
+ * background caller keeps the original constant.
+ */
+async function fetchLatestFromNpm(timeoutMs: number = FETCH_TIMEOUT_MS): Promise<string | null> {
   if (shouldSuppressUpdateFetch()) return null;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
     const res = await fetch(NPM_REGISTRY_URL, { signal: controller.signal });
-    clearTimeout(timeout);
     if (!res.ok) return null;
     const body = (await res.json()) as { version?: unknown };
     return typeof body.version === "string" ? body.version : null;
   } catch {
     return null;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -203,9 +262,54 @@ export function refreshUpdateCacheInBackground(): void {
   if (shouldSuppressUpdateFetch()) return;
   const cached = readCacheRaw();
   if (cached && isCacheFresh(cached)) return;
-  void fetchLatestFromNpm().then((v) => {
+  void fetchLatestFromNpm(FETCH_TIMEOUT_MS).then((v) => {
     if (v) writeCache(v);
   });
+}
+
+/**
+ * T-502: the AWAITED refresh the `cli-version` health check needs.
+ *
+ * One cache, one TTL, one contract: this is the same
+ * `~/.claude/storybloq/update-check.json` the startup banner and
+ * `storybloq_status` already share, so a health run costs at most the one
+ * registry request per day that the CLI already permits itself.
+ *
+ * Returns the cached answer when it is fresh and `force` is false; otherwise
+ * fetches under `timeoutMs` and writes. A failed fetch returns null and
+ * leaves the cache file byte-identical, so the caller reports "offline"
+ * rather than a stale claim. A corrupt cache counts as absent and is
+ * rewritten on the next success.
+ *
+ * `currentVersion` is needed to shape the `UpdateInfo` verdict; it is not
+ * stored, and a dev or non-release version is refused outright because the
+ * comparison would be meaningless.
+ */
+export async function refreshUpdateCache(opts: {
+  currentVersion: string;
+  force?: boolean;
+  timeoutMs?: number;
+}): Promise<UpdateInfo | null> {
+  const { currentVersion } = opts;
+  if (!currentVersion || currentVersion === "0.0.0-dev") return null;
+  const timeoutMs = opts.timeoutMs ?? FETCH_TIMEOUT_MS;
+  if (timeoutMs <= 0) return null;
+  const cached = readCacheRaw();
+  if (!opts.force && cached && isCacheFresh(cached)) {
+    return {
+      currentVersion,
+      latestVersion: cached.latestVersion,
+      updateAvailable: compareVersions(currentVersion, cached.latestVersion) < 0,
+    };
+  }
+  const latestVersion = await fetchLatestFromNpm(timeoutMs);
+  if (!latestVersion) return null;
+  writeCache(latestVersion);
+  return {
+    currentVersion,
+    latestVersion,
+    updateAvailable: compareVersions(currentVersion, latestVersion) < 0,
+  };
 }
 
 /**

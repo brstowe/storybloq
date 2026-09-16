@@ -21,8 +21,11 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { compareVersionStrings } from "./team-capabilities.js";
+import { readBoundedFile } from "./limit-config.js";
 
-const MARKER_FILE = ".storybloq-version";
+/** T-502: exported so the health check's default adapter reads the same file name. */
+export const SKILL_MARKER_FILE = ".storybloq-version";
+const MARKER_FILE = SKILL_MARKER_FILE;
 
 export type SkillInstallTarget = "claude" | "codex" | "codexCompat";
 
@@ -74,12 +77,23 @@ function markerPath(target: SkillInstallTarget = "claude"): string {
   return join(skillDir(target), MARKER_FILE);
 }
 
-/** Read the CLI version that last wrote the skill dir. null if missing. */
+/**
+ * Read the CLI version that last wrote the skill dir. null if missing.
+ *
+ * T-502: bounded (`readBoundedFile`), so the shared path cannot hang on a
+ * FIFO left at the marker's name or slurp an oversized replacement. The
+ * marker is a single version string; the 64 KiB cap is orders of magnitude
+ * above anything legitimate.
+ */
+export const SKILL_MARKER_MAX_BYTES = 65_536;
+
 export function readSkillMarker(target: SkillInstallTarget = "claude"): string | null {
   try {
     const p = markerPath(target);
     if (!existsSync(p)) return null;
-    const text = readFileSync(p, "utf-8").trim();
+    const body = readBoundedFile(p, SKILL_MARKER_MAX_BYTES);
+    if (body === null) return null;
+    const text = body.trim();
     return text.length > 0 ? text : null;
   } catch {
     return null;
@@ -182,6 +196,75 @@ async function refreshCodexConfigIfPresent(): Promise<void> {
  * a UX degradation, not a blocker. The user's original command still
  * runs.
  */
+/**
+ * T-507 pen hold 1, second half: the Mods copy follows the binary even when
+ * the storybloq version has not changed (an nvm switch at the same version
+ * leaves the marker current and the stale branch above never runs). Where a
+ * copy is installed, the path it records is compared with a fresh
+ * resolution on every invocation the marker check runs; the copy is
+ * rewritten once when they differ and left alone when they match. A copy
+ * from before the sidecar existed is rewritten once to gain it. Best-effort,
+ * logged, never blocking.
+ */
+/**
+ * ISS-1233: the settings switch follows the Mods copy.
+ *
+ * An upgrade that is only `npm install -g @storybloq/storybloq@latest` never
+ * reaches `storybloq setup`, so this refresh is all an existing install gets,
+ * and a Mods copy the client is not allowed to load draws nothing. Same rule
+ * as the installer's: a value already in the file is the user's and is never
+ * rewritten, so a dashboard someone turned off stays off across every
+ * upgrade. Best-effort and quiet unless it actually wrote.
+ *
+ * Imported dynamically like every other reach into `setup-skill` from here,
+ * which is also what keeps the two modules' mutual references out of the
+ * static graph.
+ */
+async function ensureFunctionHooksSwitch(): Promise<void> {
+  try {
+    const { enableFunctionHooksEnv, FUNCTION_HOOKS_ENV_KEY } = await import("../cli/commands/setup-skill.js");
+    if ((await enableFunctionHooksEnv()) !== "set") return;
+    process.stderr.write(
+      `storybloq: set env.${FUNCTION_HOOKS_ENV_KEY}=1 in ${join(homedir(), ".claude", "settings.json")} (draws the ledger dashboard)\n`,
+    );
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    process.stderr.write(`storybloq: could not set the function-hooks switch (non-fatal): ${msg}\n`);
+  }
+}
+
+async function refreshModsIfBinMoved(): Promise<void> {
+  try {
+    const { installMods, modsInstalled, readModsBin, MODS_DISPLAY_PATH } = await import("./mods-install.js");
+    if (!modsInstalled()) return;
+    const { resolveStorybloqBin } = await import("../cli/commands/setup-skill.js");
+    const bin = resolveStorybloqBin();
+    const recorded = readModsBin();
+    if (recorded !== undefined && recorded === bin) return;
+    // Same shape as the version-advance branch: the copy is on disk either
+    // way, so the switch is not conditional on this re-copy succeeding.
+    try {
+      await installMods({ bin });
+      process.stderr.write(
+        `storybloq: the storybloq binary moved; refreshed Mods at ${MODS_DISPLAY_PATH} (storybloq at ${bin ?? "the bare name, not found on PATH"})\n`,
+      );
+    } catch (copyErr: unknown) {
+      const copyMsg = copyErr instanceof Error ? copyErr.message : String(copyErr);
+      process.stderr.write(
+        `storybloq: Mods refresh failed (non-fatal): ${copyMsg}\n` +
+        `  Run 'storybloq setup --client claude' manually to retry.\n`,
+      );
+    }
+    await ensureFunctionHooksSwitch();
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    process.stderr.write(
+      `storybloq: Mods refresh failed (non-fatal): ${msg}\n` +
+      `  Run 'storybloq setup --client claude' manually to retry.\n`,
+    );
+  }
+}
+
 export async function autoRefreshSkillIfStale(
   runningVersion: string,
   opts: { reconcileLimitHooks?: boolean } = {},
@@ -191,7 +274,10 @@ export async function autoRefreshSkillIfStale(
   // explicitly opted out of.
   const reconcileLimitHooks = opts.reconcileLimitHooks !== false;
   const staleTargets = skillTargets().filter((target) => isSkillStale(runningVersion, target.id));
-  if (staleTargets.length === 0) return false;
+  if (staleTargets.length === 0) {
+    await refreshModsIfBinMoved();
+    return false;
+  }
 
   try {
     const { copyDirRecursive, resolveSkillSourceDir, resolveStorybloqBin } =
@@ -256,6 +342,44 @@ export async function autoRefreshSkillIfStale(
     // nothing to re-register against, and any failure logs but does
     // not block the refresh.
     const bin = refreshedClaude ? resolveStorybloqBin() : null;
+
+    // T-507 commit D: the Mods copy follows the CLI. Re-resolving the global
+    // binary here is what moves the generated hooks/install.ts when the
+    // binary moves (an nvm switch). Only where a copy is installed: the
+    // refresh is not a setup. Best-effort, logged, never blocking.
+    if (refreshedClaude) {
+      try {
+        const { installMods, modsInstalled, MODS_DISPLAY_PATH } = await import("./mods-install.js");
+        if (modsInstalled()) {
+          // ISS-1233: the switch follows the copy EXISTING, not this refresh
+          // succeeding, so its own try. A copy already on disk is loadable
+          // whether or not today's re-copy worked, and a transient failure
+          // here (a held lock, a full disk) must not be what leaves someone's
+          // dashboard dark for good: the next invocation would find the
+          // marker current and never come back through this branch.
+          try {
+            await installMods({ bin });
+            process.stderr.write(
+              `storybloq: refreshed Mods at ${MODS_DISPLAY_PATH} (storybloq at ${bin ?? "the bare name, not found on PATH"})\n`,
+            );
+          } catch (copyErr: unknown) {
+            const copyMsg = copyErr instanceof Error ? copyErr.message : String(copyErr);
+            process.stderr.write(
+              `storybloq: Mods refresh failed (non-fatal): ${copyMsg}\n` +
+              `  Run 'storybloq setup --client claude' manually to retry.\n`,
+            );
+          }
+          await ensureFunctionHooksSwitch();
+        }
+      } catch (modsErr: unknown) {
+        const modsMsg = modsErr instanceof Error ? modsErr.message : String(modsErr);
+        process.stderr.write(
+          `storybloq: Mods refresh failed (non-fatal): ${modsMsg}\n` +
+          `  Run 'storybloq setup --client claude' manually to retry.\n`,
+        );
+      }
+    }
+
     if (bin !== null) {
       try {
         const { countLegacyHooks, sweepLegacyHooks } = await import("./hook-migration.js");
@@ -307,8 +431,27 @@ export async function autoRefreshSkillIfStale(
           );
         }
       }
+      // T-499: same shape for the session-intel hooks (un-gated, kill-switch
+      // aware, honors --skip-hooks through the same flag).
+      if (reconcileLimitHooks) {
+        try {
+          const { ensureSessionIntelHooksRegistered } = await import("../cli/commands/setup-skill.js");
+          const intelHooks = await ensureSessionIntelHooksRegistered(undefined, bin);
+          if (intelHooks.action === "installed") {
+            process.stderr.write("storybloq: registered session-intel hooks on version advance\n");
+          } else if (intelHooks.action === "removed") {
+            process.stderr.write("storybloq: removed session-intel hooks (disabled globally)\n");
+          }
+        } catch (intelErr: unknown) {
+          const intelMsg = intelErr instanceof Error ? intelErr.message : String(intelErr);
+          process.stderr.write(
+            `storybloq: session-intel hook reconcile failed (non-fatal): ${intelMsg}\n`,
+          );
+        }
+      }
     }
 
+    await refreshModsIfBinMoved();
     return true;
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);

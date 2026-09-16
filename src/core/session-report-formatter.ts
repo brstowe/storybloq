@@ -356,6 +356,8 @@ function buildReviewSection(state: FullSessionState): string {
     reviewerIdentity?: { model?: unknown; evidence?: unknown } | null;
     backendRunId?: unknown; backendRunIdKind?: unknown; backendTurnId?: unknown;
     generation?: unknown; artifactStatus?: unknown;
+    // ISS-950: absent means no claim was made, never "no caps fired".
+    capReasons?: readonly unknown[];
   }): string => {
     const unresolved = r.unresolvedCriticalCount === undefined ? "" : `, ${r.unresolvedCriticalCount} unresolved critical`;
     // T-461: only levels OTHER than standard are named. Standard is what every
@@ -366,7 +368,15 @@ function buildReviewSection(state: FullSessionState): string {
     const effort = isReviewEffort(r.effort) && r.effort !== "standard" ? ` @ ${r.effort}` : "";
     const head = `  - Round ${safe(r.round)}: ${safe(r.verdict)} (${r.findingCount} findings, ${r.criticalCount} critical${unresolved}, ${r.majorCount} major) -- ${safe(r.reviewer)}${effort}`;
     const spine = provenanceLine(r);
-    return spine === null ? head : `${head}\n${spine}`;
+    // ISS-950: the caps that fired. A `revise` with zero findings is otherwise
+    // unreadable -- a reader cannot tell a round that found nothing and was
+    // capped by an uncovered lens from one whose reviewer returned an empty
+    // change request, and those two are different failures with different
+    // remedies. Printed only when the round actually carried the field.
+    const caps = Array.isArray(r.capReasons) && r.capReasons.length > 0
+      ? `    caps: ${r.capReasons.map((c) => safe(c)).join("; ")}`
+      : null;
+    return [head, spine, caps].filter((l) => l !== null).join("\n");
   };
 
   if (plan.length > 0) {

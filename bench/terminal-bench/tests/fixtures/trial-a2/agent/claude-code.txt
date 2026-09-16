@@ -1,0 +1,2 @@
+{"type":"system","subtype":"init"}
+{"type":"result","total_cost_usd":0.0123,"num_turns":3}

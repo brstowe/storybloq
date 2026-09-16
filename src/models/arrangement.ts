@@ -125,6 +125,11 @@ export const ArrangementSchema = z
     currentCoordinationSessionId: CoordinationSessionIdSchema.optional(),
     communicationReceipts: z.array(CommunicationReceiptSchema).optional(),
     coordinationCheckpoint: DuetCheckpointSchema.optional(),
+    // ISS-1191: set by `storybloq arrangement rotate` on the arrangement it
+    // closes, naming the successor that carried its open work forward. It is
+    // terminal: a continued arrangement refuses coordination and refuses any
+    // lifecycle change, so the same work can never run in two places.
+    continuedBy: ArrangementIdSchema.optional(),
     treeProtocol: z
       .object({
         pathScopes: z.array(z.string()).optional(),
@@ -162,6 +167,13 @@ export const ArrangementSchema = z
         code: z.ZodIssueCode.custom,
         message: "An arrangement must have exactly one pen and one worker party",
         path: ["parties"],
+      });
+    }
+    if (val.continuedBy !== undefined && val.continuedBy === val.id) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "continuedBy cannot name the arrangement itself",
+        path: ["continuedBy"],
       });
     }
     const seen = new Set<string>();

@@ -47,6 +47,15 @@ export interface ReviewVerdictArtifact {
   // T-461: the effort level this round ran at. Additive and optional, so a
   // pre-dial artifact still parses and still hashes identically.
   readonly effort?: string;
+  /**
+   * ISS-950: the caps the lens pipeline fired on this round, verbatim.
+   *
+   * Written only when the report supplied them, so an artifact from a backend
+   * that produces no caps hashes exactly as it did before this field existed.
+   * A reader can tell a round capped by coverage from one capped by findings,
+   * which the verdict alone cannot say.
+   */
+  readonly capReasons?: readonly string[];
 
   /**
    * ISS-1115 3.3b: why this round was not required to carry provenance labels.
@@ -248,6 +257,12 @@ const ARTIFACT_HASH_DECISIONS = {
   // Identity, for the same reason the exemption is: it changes how the round's
   // findings should be read, so a copy that lost it is not the same artifact.
   provenanceUnresolved: "included",
+  // ISS-950. INCLUDED for the same reason those two are: the caps that fired
+  // are WHAT THE ROUND WAS, not how it was produced. A revise capped only by
+  // an uncovered core lens is a different round from one capped by findings,
+  // and a copy that lost the distinction is not the same artifact. Absent on
+  // every artifact written before this field, so no existing hash moves.
+  capReasons: "included",
   reviewAttemptId: "excluded",
   itemAttemptId: "excluded",
   backendRunId: "excluded",

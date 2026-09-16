@@ -288,7 +288,11 @@ describe("checkLocalIdAllocator (ISS-734)", () => {
     expect(finding).toBeDefined();
     expect(finding!.severity).toBe("info");
     expect(finding!.message).toContain("reconcile");
-    expect(finding!.message).toContain("git-refs");
+    // ISS-1190: the exact same one-line remedy the create-time warning and
+    // reconcile's collision output print.
+    expect(finding!.message).toContain(
+      "storybloq team init && storybloq team config set idAllocator git-refs",
+    );
     // Nothing is broken: info must not affect error/warning counts.
     expect(result.errorCount).toBe(0);
     expect(result.warningCount).toBe(0);

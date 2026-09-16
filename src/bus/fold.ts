@@ -492,6 +492,10 @@ export async function foldBusThread(
   let hopCount = 0;
   let lastHash = thread.threadHash;
   let finding: string | undefined;
+  // ISS-1162: lazily populated at most once per fold, only on a manual park's
+  // literal-participant miss. A thread whose parks are all literal (or has
+  // none) never touches this, hence never reads the endpoints directory.
+  let endpointsMemo: Awaited<ReturnType<typeof listEndpoints>> | undefined;
 
   if (threadHash(thread) !== thread.threadHash) {
     finding = "thread.json hash mismatch";
@@ -555,6 +559,40 @@ export async function foldBusThread(
         if (state !== "open" || !transition.reason) {
           finding = `${filename}: invalid park transition`;
           break;
+        }
+        // ISS-1162: byEndpoint is schema-checked only as a UUID, never against
+        // this thread's own participants -- a hash-consistent park entry could
+        // otherwise name an invented actor. Literal participation covers both
+        // automatic and manual parks and is checked first (no directory I/O).
+        // An AUTOMATIC park has no succession fallback: sendBusMessage always
+        // writes one from a caller that already passed the literal-only
+        // readThreadParticipants check, so a non-literal byEndpoint there is
+        // always forged. A MANUAL park's caller is authorized via ISS-872
+        // succession by updateBusThread (store.ts), which can legitimately
+        // record a successor's own id -- so a literal miss falls back to a
+        // lazy, per-fold-memoized succession check via the same
+        // endpointAddressees helper verifiedSuccessorState already uses for
+        // this identical "author-side participant via succession" problem.
+        if (!participantsInclude(thread.participants, transition.byEndpoint)) {
+          if (transition.automatic === true) {
+            finding = `${filename}: park byEndpoint is not a participant`;
+            break;
+          }
+          if (!endpointsMemo) {
+            endpointsMemo = await listEndpoints(paths.projectRoot);
+          }
+          const author = endpointsMemo.endpoints.find((candidate) => candidate.endpointId === transition.byEndpoint);
+          const addressees = author ? endpointAddressees(author, endpointsMemo.endpoints) : undefined;
+          if (
+            endpointsMemo.findings.length > 0 ||
+            !author ||
+            !addressees ||
+            addressees.corrupt ||
+            !(addressees.ids.includes(thread.participants[0]) || addressees.ids.includes(thread.participants[1]))
+          ) {
+            finding = `${filename}: park byEndpoint is not a participant`;
+            break;
+          }
         }
         state = "parked";
         // ISS-953 fix step 16: mirror the message-entry branch above for a dropped

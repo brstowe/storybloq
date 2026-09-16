@@ -1,0 +1,13 @@
+{
+  "id": "ISS-2001",
+  "title": "Retry queue drops the final byte of a chunked payload",
+  "status": "open",
+  "severity": "high",
+  "components": ["ingest"],
+  "impact": "Confirmed to drop the tail byte of a chunked payload under concurrent retries; actionable now.",
+  "resolution": null,
+  "location": ["src/ingest/queue.ts:88"],
+  "discoveredDate": "2026-08-06",
+  "resolvedDate": null,
+  "relatedTickets": ["T-1001"]
+}

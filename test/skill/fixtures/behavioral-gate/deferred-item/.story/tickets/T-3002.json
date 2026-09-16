@@ -1,0 +1,13 @@
+{
+  "id": "T-3002",
+  "title": "Add the CSV export quick action",
+  "description": "storybloq export has no one-shot CSV mode; add a --csv flag that skips the JSON envelope.",
+  "type": "chore",
+  "status": "open",
+  "phase": "core",
+  "order": 20,
+  "createdDate": "2026-08-01",
+  "completedDate": null,
+  "blockedBy": [],
+  "parentTicket": null
+}

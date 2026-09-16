@@ -10,6 +10,7 @@ import { REVIEW_VERDICTS, REVIEW_VERDICTS_PROSE } from "../session-types.js";
 import { normalizeRiskLevel, requiredRounds, nextReviewer } from "../review-depth.js";
 import { effectiveReviewEffort, effortDisclosureLine, effortMinRounds } from "../review-effort.js";
 import { codeReviewLandingFloor, dialCodeReviewMaxRounds } from "../session-diagnostics.js";
+import { analyzeCapReasons } from "../lens-harness/cap-reasons.js";
 import { clearCache } from "../lens-harness/cache.js";
 import { accumulateVerificationCounters } from "../lens-harness/verification-log.js";
 import {
@@ -53,8 +54,10 @@ import {
 } from "./codex-native.js";
 import { decideCeiling, outstandingCeilingFindings, codeReviewHardCeiling } from "./code-review-ceiling.js";
 import {
+  COVERAGE_RERUN_TRIGGER,
   EMPTY_CHANGE_REQUEST_INSTRUCTION,
   REPAIR_ATTEMPT_CAP,
+  coverageRerunInstruction,
   isEmptyChangeRequest,
   pendingRoundOrdinal,
   countRepairAttempts,
@@ -303,8 +306,8 @@ export class CodeReviewStage implements WorkflowStage {
           `2. Call \`storybloq_review_lenses_prepare\` with the diff, changedFiles, stage: CODE_REVIEW, ticketDescription, reviewRound: ${roundNum}, and sessionId: "${ctx.state.sessionId}"`,
           "3. Spawn all lens subagents in parallel, dispatching each returned prompt as-is (it already embeds the diff; do not append the diff again). Each lens returns a single JSON object ({status, findings, error, notes}). If a prompt comes back empty (promptTruncated), reduce the diff and re-run that lens rather than dispatching a blank prompt. For cached entries, do not spawn an agent; echo cachedFindings back in step 4 with cached: true.",
           `4. Call \`storybloq_review_lenses_synthesize\` with lensResults: [{lens, output}] (output = each lens's raw JSON), plus activeLenses and skippedLenses from prepare, the diff and changedFiles from step 1, the same reviewRound: ${roundNum}, the reviewId returned by prepare, and the sessionId "${ctx.state.sessionId}". It runs the merger pipeline programmatically (anchoring, dedup, blocking policy, coverage caps) and returns the reviewVerdict envelope plus filedIssues for pre-existing findings.`,
-          "5. Call `storybloq_review_lenses_judge` with the reviewVerdict from step 4 (plus convergenceHistory on round 2+). It returns the final deterministic verdict: approve, revise, or reject, with recommendFixRound.",
-          "6. Report the judge's verdict and the verdict findings, including the reviewId from prepare. Map finding severity \"blocking\" to \"critical\" when reporting.",
+          "5. Call `storybloq_review_lenses_judge` with the reviewVerdict from step 4 (plus convergenceHistory on round 2+). It returns the final deterministic verdict: approve, revise, or reject, with recommendFixRound, plus capReasons and coverageOnlyCap.",
+          "6. Report the judge's verdict and the verdict findings, including the reviewId from prepare and capReasons verbatim. Map finding severity \"blocking\" to \"critical\" when reporting. capReasons is what separates a coverage cap from a findings cap: without it a revise capped only by an uncovered core lens is routed to IMPLEMENT with nothing to implement.",
         ].join("\n"),
         reminders: [
           diffReminder,
@@ -678,6 +681,70 @@ export class CodeReviewStage implements WorkflowStage {
       return { action: "retry", instruction: "Contradictory review payload: verdict is 'approve' but findings recommend replanning. Re-run the review or correct the verdict." };
     }
 
+    // ── ISS-950: the coverage-only change request ──────────────────────────
+    //
+    // A `revise` the lens pipeline produced SOLELY because a core lens did not
+    // cover its domain. Nothing was found; a lens simply did not look. The
+    // remedy is that lens running again, and sending it to the implementer
+    // instead is what the second field report recorded as training a relabel:
+    // the round demands changes and names none, so the cheapest exit is for the
+    // lens to resubmit its skip as an `ok` with zero findings.
+    //
+    // PLACED BEFORE the ISS-1114 empty change-request guard, and the order is
+    // the whole mechanism. These payloads carry zero findings by construction,
+    // so the generic guard would claim every one of them and answer a coverage
+    // gap with an instruction demanding findings.
+    //
+    // It reads `report.capReasons` and never the verdict alone, because a
+    // coverage cap and a findings cap are the same word on the wire. A backend
+    // that supplies none falls through unchanged, which is every non-lens
+    // backend and every pre-0.6.0 lens round.
+    const caps = analyzeCapReasons(report.capReasons ?? []);
+    const coverageOnlyRevise =
+      isEmptyChangeRequest(verdict, findings)
+      && caps.allCoverage
+      && caps.selfReportedSkips.length > 0
+      && !planRedirect;
+    // Same no-work-item exemption the guard below takes, for the same reason:
+    // an attempt record keyed on `undefined` would either fail schema
+    // validation or collide across items.
+    if (coverageOnlyRevise && repairItem) {
+      const coverageRepairKey = {
+        workItemId: repairItem.id,
+        kind: repairItem.kind,
+        stage: "code" as const,
+        round: repairKeyRound,
+        trigger: COVERAGE_RERUN_TRIGGER,
+      };
+      const spent = countRepairAttempts(ctx.state.reviewRepairAttempts, coverageRepairKey);
+      // BOUNDED, and the fall-through is deliberate rather than a park. Past the
+      // bound the payload is handled by whatever would have handled it before
+      // this guard existed, which for a findings-free revise is the ISS-1114
+      // repair and its own park. A second unbounded retry path is precisely the
+      // shape ISS-950 is about.
+      if (spent < REPAIR_ATTEMPT_CAP) {
+        // PERSIST FIRST, THEN RETRY -- see the empty-verdict guard below for why
+        // `writeState` and not `updateDraft`.
+        ctx.writeState({
+          reviewRepairAttempts: [
+            ...(ctx.state.reviewRepairAttempts ?? []),
+            buildRepairAttempt({
+              key: coverageRepairKey,
+              existing: ctx.state.reviewRepairAttempts,
+              verdict,
+              reviewer: reviewerBackend,
+              reviewStartedAt: ctx.state.currentReviewStartedAt,
+              nowMs: Date.now(),
+            }),
+          ],
+        } as Partial<FullSessionState>);
+        return {
+          action: "retry",
+          instruction: coverageRerunInstruction(caps.uncoveredCoreLenses),
+        };
+      }
+    }
+
     // ISS-1114: the MIRROR of the guard above. `approve` with blocking findings
     // has been caught since ISS-035; a change-request with NO findings was not,
     // and it is the more expensive half. It reaches the ladder below as an
@@ -924,6 +991,9 @@ export class CodeReviewStage implements WorkflowStage {
       ...(lensReviewId ? { reviewId: lensReviewId } : {}),
       ...(reviewerPath ? { reviewerPath } : {}),
       effort: roundEffort,
+      // ISS-950: written only when the reporter supplied caps, so an artifact
+      // from a backend that produces none hashes exactly as it did before.
+      ...(report.capReasons ? { capReasons: [...report.capReasons] } : {}),
       // ISS-1115 3.3b: an exempt round SAYS it was exempt. Absent on every
       // round that was actually required to label.
       //
@@ -971,6 +1041,9 @@ export class CodeReviewStage implements WorkflowStage {
       suggestionCount,
       codexSessionId: report.reviewerSessionId,
       effort: roundEffort,
+      // ISS-950: the record and the artifact must AGREE, so the same absent-or-
+      // present rule applies to both.
+      ...(report.capReasons ? { capReasons: [...report.capReasons] } : {}),
       timestamp: new Date().toISOString(),
       ...identityFields(identity),
       artifactStatus: artifactResult.artifactStatus,

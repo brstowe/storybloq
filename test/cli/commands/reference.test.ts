@@ -37,6 +37,7 @@ describe("reference command", () => {
     expect(names).toContain("export");
     expect(names).toContain("reference");
     expect(names).toContain("setup-skill");
+    expect(names).toContain("health");
     // Ticket subcommands
     expect(names).toContain("ticket list");
     expect(names).toContain("ticket get");
@@ -75,6 +76,7 @@ describe("reference command", () => {
   it("MCP_TOOLS registry covers all expected tools", () => {
     const names = MCP_TOOLS.map((t) => t.name);
     expect(names).toContain("storybloq_status");
+    expect(names).toContain("storybloq_health");
     expect(names).toContain("storybloq_phase_list");
     expect(names).toContain("storybloq_phase_current");
     expect(names).toContain("storybloq_phase_tickets");

@@ -1,0 +1,13 @@
+{
+  "id": "T-3001",
+  "title": "Refactor the ingest batching window",
+  "description": "The ingest worker batches on a fixed 500ms window; make it adaptive to queue depth.",
+  "type": "task",
+  "status": "inprogress",
+  "phase": "core",
+  "order": 10,
+  "createdDate": "2026-08-01",
+  "completedDate": null,
+  "blockedBy": [],
+  "parentTicket": null
+}

@@ -88,13 +88,45 @@ const MAX_TAIL_BYTES = 512 * 1024;
  * before any read. Short reads are looped and only actually-read bytes are
  * decoded (zero-filled residue would corrupt the final JSONL record).
  */
-export function readFileTailLines(filePath: string, tailLines = DEFAULT_TAIL_LINES): string[] {
+export interface OpenTranscript {
+  readonly fd: number;
+  readonly size: number;
+  /** `<dev>:<ino>` -- the file's incarnation identity (T-499 observation). */
+  readonly incarnation: string;
+}
+
+/**
+ * The open prelude every transcript reader shares (T-424 tail reads, T-499
+ * session-intel scans): O_RDONLY|O_NOFOLLOW|O_NONBLOCK, then fstat must say
+ * regular file. Null for anything else (FIFO, device, directory, symlink at
+ * the final component, absent, unreadable) with nothing left open. The
+ * CALLER owns the returned fd and must close it in a `finally`.
+ */
+export function openTranscriptReadOnly(filePath: string): OpenTranscript | null {
   let fd: number | null = null;
   try {
     fd = openSync(filePath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
     const st = fstatSync(fd);
-    if (!st.isFile()) return [];
-    const size = st.size;
+    if (!st.isFile()) {
+      closeSync(fd);
+      return null;
+    }
+    return { fd, size: st.size, incarnation: `${st.dev}:${st.ino}` };
+  } catch {
+    if (fd !== null) {
+      try { closeSync(fd); } catch { /* already closed */ }
+    }
+    return null;
+  }
+}
+
+export function readFileTailLines(filePath: string, tailLines = DEFAULT_TAIL_LINES): string[] {
+  let fd: number | null = null;
+  try {
+    const opened = openTranscriptReadOnly(filePath);
+    if (opened === null) return [];
+    fd = opened.fd;
+    const size = opened.size;
     const readBytes = Math.min(size, MAX_TAIL_BYTES);
     if (readBytes <= 0) return [];
     const buf = Buffer.alloc(readBytes);
@@ -128,7 +160,7 @@ export interface TranscriptIdentityFilter {
   cwd?: string | null;
 }
 
-function identityMatches(
+export function identityMatches(
   entrySessionId: string | null,
   entryCwd: string | null,
   filter: TranscriptIdentityFilter | undefined,

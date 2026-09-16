@@ -20,6 +20,11 @@ import {
 import { reviewBackendsForClient } from "../../autonomous/stages/codex-native.js";
 import { ExitCode, formatValidation } from "../../core/output-formatter.js";
 import type { CommandContext, CommandResult } from "../types.js";
+import { HANDOVER_TEMPLATE_MARKER, hasCarriedForwardHeading } from "../../core/handover-template.js";
+import { isFilenameAdmitted } from "../../core/handover-brief.js";
+import { verifyContainment } from "../../core/readdir-safe.js";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 
 /** The coding recipe's default. Named here so the fallback is not a literal. */
 const DEFAULT_REVIEW_BACKENDS: readonly string[] = ["codex", "agent"];
@@ -120,6 +125,38 @@ function reviewContractFindings(ctx: CommandContext): ValidationFinding[] {
   }));
 }
 
+/**
+ * T-498: the one file read `handover_no_carried_forward` needs. Reads only
+ * the NEWEST handover (index 0 of `ctx.state.handoverFilenames`) -- absent,
+ * unadmitted, escaping the handovers directory, unreadable, or lacking the
+ * marker, this returns false and the check never fires, matching
+ * `validateProject`'s "no marker, no claim" contract.
+ *
+ * Pen byte-review finding (Commit 1): the original version read the file
+ * with no admission or containment check at all, unlike every other
+ * handover read path. `validateWithRulings`/`handleValidate` stay
+ * synchronous (many existing callers and tests depend on that), so this
+ * cannot call the async `parseHandoverFilename` used elsewhere -- it uses
+ * `verifyContainment` instead, the same sync, already-established
+ * realpath-based containment check `readdir-safe.ts` provides, which
+ * refuses a name whose resolved target escapes `handoversDir` (a symlink
+ * pointing outside it included).
+ */
+function handoverCarriedForwardAux(ctx: CommandContext): boolean {
+  const newest = ctx.state.handoverFilenames[0];
+  if (!newest) return false;
+  if (!isFilenameAdmitted(newest)) return false;
+  if (verifyContainment(ctx.handoversDir, newest) !== null) return false;
+  let content: string;
+  try {
+    content = readFileSync(join(ctx.handoversDir, newest), "utf-8");
+  } catch {
+    return false;
+  }
+  if (!content.includes(HANDOVER_TEMPLATE_MARKER)) return false;
+  return !hasCarriedForwardHeading(content);
+}
+
 function validateWithRulings(ctx: CommandContext): ValidationResult {
   const { rulings, warnings, unavailableIds, scanCompleteness, hasUnrecoverableEntries } = loadRulingsSafe(ctx.root);
   // T-494: the SECOND half of the reachability condition. `loadProjectUnlocked`
@@ -158,6 +195,7 @@ function validateWithRulings(ctx: CommandContext): ValidationResult {
     rulingScanCompleteness: scanCompleteness,
     rulingHasUnrecoverableEntries: hasUnrecoverableEntries,
     citingEntityLoadComplete,
+    handoverNewestMarkedWithoutCarriedForward: handoverCarriedForwardAux(ctx),
   });
   const merged = mergeValidation(baseResult, ctx.warnings);
   // loadRulingsSafe's own per-file warnings (unreadable/invalid JSON/schema

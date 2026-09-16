@@ -1,0 +1,208 @@
+**Step 1: Read and display current config.** Read `.story/config.json` directly. Show a clean table:
+
+```
+## Current Settings
+
+| Setting | Value |
+|---------|-------|
+| Max tickets per session | 5 |
+| Review backends | codex, agent |
+| Code review round cap | 12 (minimum still follows ticket risk) |
+| Handover interval | every 3 tickets |
+| Compact threshold | high (default) |
+| TDD (WRITE_TESTS) | enabled |
+| Run tests (TEST) | enabled, command: npm test |
+| Smoke test (VERIFY) | disabled |
+| Build validation (BUILD) | disabled |
+```
+
+**Step 2: Ask what to change.** Use `AskUserQuestion`:
+- question: "What would you like to change?"
+- header: "Settings"
+- options:
+  - "Quality pipeline" -- TDD, tests, endpoint checks, build validation
+  - "Session limits" -- tickets per session, context compaction
+  - "Review backends" -- which reviewers to use
+  - "Handover frequency" -- how often to write session handovers
+
+**Step 3: Focused follow-up for each category:**
+
+**Quality pipeline:**
+```
+AskUserQuestion: "Quality pipeline settings"
+header: "Quality"
+options:
+- "Full pipeline" -- TDD + tests + endpoint checks + build
+- "Tests only" -- run tests after building
+- "Minimal" -- no automated checks
+- "Custom" -- pick individual stages
+```
+
+If "Custom", show each stage as a separate AskUserQuestion.
+
+**Session limits:**
+```
+AskUserQuestion: "Max tickets per autonomous session?"
+header: "Limit"
+options: "3 (conservative)", "5 (default)", "10 (aggressive)", "Unlimited"
+```
+
+**Review backends:**
+```
+AskUserQuestion: "Which reviewers for code and plan review?"
+header: "Review"
+options:
+- "Codex + Claude agent (Recommended)" -- alternate between both
+- "Codex only" -- OpenAI Codex reviews
+- "Claude agent only" -- independent Claude agent reviews
+- "None" -- skip automated review
+```
+
+Note: this sets the top-level `reviewBackends`. If the config has per-stage overrides in `stages.PLAN_REVIEW.backends` or `stages.CODE_REVIEW.backends`, those take precedence. `stages.CODE_REVIEW.maxReviewRounds` defaults to 12 and is clamped upward to the ticket-risk minimum; `0` explicitly disables the cap. When displaying settings, show both per-stage backends and this cap when present.
+
+**Handover frequency:**
+```
+AskUserQuestion: "Write a handover after every N tickets?"
+header: "Handover"
+options: "Every ticket", "Every 3 tickets (default)", "Every 5 tickets", "Manual only"
+```
+
+**Step 4: Apply changes.** Run via Bash:
+```
+storybloq config set-overrides --json '<constructed JSON>'
+```
+
+**IMPORTANT:** The `--json` argument takes only the `recipeOverrides` object, NOT the full config. Top-level fields (version, project, type, language) are NOT settable via this command.
+```
+# Correct:
+storybloq config set-overrides --json '{"maxTicketsPerSession": 10}'
+
+# Correct (stages):
+storybloq config set-overrides --json '{"stages": {"VERIFY": {"enabled": true}}}'
+
+# WRONG -- do not include top-level fields:
+storybloq config set-overrides --json '{"version": 2, "project": "foo"}'
+```
+
+Show a confirmation of what changed, then ask if the user wants to change anything else or is done. If done, return to normal session.
+
+### Config Schema Reference
+
+Do NOT search source code for this. The full config.json schema is shown below. Only the `recipeOverrides` section is settable via `config set-overrides`.
+
+```json
+{
+  "version": 2,
+  "schemaVersion": 1,
+  "project": "string",
+  "type": "string (npm, cargo, pip, orchestrator, etc.)",
+  "language": "string",
+  "features": {
+    "tickets": true, "issues": true, "handovers": true,
+    "roadmap": true, "reviews": true
+  },
+  "recipe": "string (default: coding)",
+  "statusWriter": {
+    "stopHook": "boolean (default true). false stops the turn-end Stop hook from doing ANY status work (no session scan, no payload build, no gitignore heal, no write) for projects whose test harness fails on writes during a run. Autonomous sessions still refresh status on their own MCP transitions."
+  },
+  "sessionIntel": {
+    "enabled": "boolean (default true). false disables sampling, banners, the prompt-hook line, the guide directive and the status projection for this project; `session intel` still answers read-only",
+    "advisoryPct": "number 0.5-0.95 (default 0.70) of the expected auto-compact ceiling",
+    "imperativePct": "number 0.6-0.99 (default 0.85), must exceed advisoryPct; applied after the jump allowance",
+    "ceilingFraction": "number 0.8-1.0 (default 0.925; measured fire point over autoCompactWindow)",
+    "boundarySampleCount": "integer 1-50 (default 20) recent auto-compaction boundaries used for the measured ceiling",
+    "jumpAllowanceFloorTokens": "integer (default 25000) <= jumpAllowanceCapTokens (default 150000); bounds the p90 per-turn growth reserved before imperative",
+    "maxSampleAgeMs": "integer 0-600000 (default 30000); an older stored sample is refreshed by one bound tail read before a banner",
+    "compactPendingTtlMs": "integer 10000-3600000 (default 300000); a PreCompact event with no boundary seen within this window is treated as an assumed compaction",
+    "stepPct": "number 0.01-0.5 (default 0.05); context growth after a handover that re-arms imperative",
+    "banner": "boolean (default true) MCP/CLI response banner",
+    "promptHook": "boolean (default true) UserPromptSubmit additionalContext at imperative",
+    "guideDirective": "boolean (default true) autonomous guide directive at imperative"
+  },
+  "recipeOverrides": {
+    "maxTicketsPerSession": "number (0 = unlimited, default: 0)",
+    "compactThreshold": "string (medium/high/critical; selects pressure limits and rotation trigger; default: high)",
+    "reviewBackends": ["codex", "agent"],
+    "handoverInterval": "number (default: 3)",
+    "reviewEffort": "off | light | standard | thorough | size-mapped (default: size-mapped; one dial for how hard review works; standard is today's behavior exactly; see Review effort below)",
+    "stages": {
+      "WRITE_TESTS": {
+        "enabled": "boolean",
+        "command": "string (test command)",
+        "onExhaustion": "plan | advance (default: plan)"
+      },
+      "TEST": {
+        "enabled": "boolean",
+        "command": "string (default: npm test)"
+      },
+      "VERIFY": {
+        "enabled": "boolean",
+        "startCommand": "string (e.g., npm run dev)",
+        "readinessUrl": "string (e.g., http://localhost:3000)",
+        "endpoints": ["GET /api/health", "POST /api/users"]
+      },
+      "BUILD": {
+        "enabled": "boolean",
+        "command": "string (default: npm run build)"
+      },
+      "PLAN_REVIEW": {
+        "backends": ["codex", "agent"],
+        "confidenceFloor": "number 0-1 (default: 0.6; minimum lens confidence for a finding to count)"
+      },
+      "CODE_REVIEW": {
+        "backends": ["codex", "agent"],
+        "maxReviewRounds": "number (default: 12; 0 disables; otherwise effective cap is max(value, required risk rounds); setting it explicitly beats reviewEffort)",
+        "confidenceFloor": "number 0-1 (default: 0.6; minimum lens confidence for a finding to count)"
+      },
+      "LESSON_CAPTURE": { "enabled": "boolean" },
+      "ISSUE_SWEEP": { "enabled": "boolean" }
+    },
+    "lensConfig": {
+      "lenses": "\"auto\" | string[] (default: \"auto\"; restricts activation to the named lenses. A set that matches no active lens is treated as a mistake and ignored, so a typo cannot turn lens review off)",
+      "maxLenses": "number (1-8, default: uncapped; keeps the first N activated lenses. Out-of-range values are ignored)"
+    },
+    "blockingPolicy": {
+      "neverBlock": "string[] (lens names that never produce blocking findings, default: [])",
+      "alwaysBlock": "string[] (categories that always block, default: [injection, auth-bypass, hardcoded-secrets])",
+      "planReviewBlockingLenses": "string[] (default: [security, error-handling])"
+    },
+    "requireSecretsGate": "boolean (default: false, require detect-secrets for lens reviews)",
+    "requireAccessibility": "boolean (default: false, make accessibility findings blocking)"
+  },
+  "nodes": {
+    "<name (lowercase, alphanumeric, hyphens, underscores)>": {
+      "path": "string (required, existing directory -- absolute or ~/relative)",
+      "stack": "string (optional, max 40 chars, e.g. npm, swift-spm)",
+      "role": "string (optional, max 120 chars, human-readable purpose)",
+      "summary": "string (optional, max 200 chars, status snapshot)",
+      "health": "green | yellow | red | grey (default: grey)",
+      "dependsOn": "string[] (node names, build-order deps, validated for cycles)",
+      "kind": "string (optional, max 32 chars, e.g. library, service, app)",
+      "links": [{"to": "node-name", "via": "string (optional, max 60 chars, integration description)"}]
+    }
+  },
+  "federation": {
+    "allowNodeWrites": "boolean (default: false, permits orchestrator MCP tools to write to node .story/ dirs)"
+  }
+}
+```
+
+### Review effort
+
+`reviewEffort` is one dial for how hard review works. `standard` is today's
+behavior exactly, so a project that never sets it does not move. `size-mapped`
+(the default) derives it per item: risk `high` -> `thorough`, `chore` at risk
+`low` -> `light`, else `standard`; issues map severity `low`/`medium` ->
+`light`, else `standard`.
+
+Precedence, highest first: an explicit `stages.*` knob, then ticket/issue
+`reviewEffort` metadata, then the start call's `reviewEffort`, then this
+project default, then size mapping. **The dial never overrides an explicit
+`stages.*` knob**, never adds a backend you did not configure, and fails
+closed to `standard` on an unrecognized value, so a typo cannot buy less
+review than you have today. Every level is disclosed on the review
+instruction, in a `review_effort_resolved` event, on the round record, and in
+`storybloq session-report`.
+
+Full level table, the `off` semantics, and the `light` landing rule are in
+`autonomous-mode.md`.

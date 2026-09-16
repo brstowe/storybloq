@@ -12,11 +12,16 @@
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { readFile, writeFile, mkdir, rm, chmod } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
-import { shouldRefresh } from "../../src/core/skill-version-marker.js";
+import { fileURLToPath } from "node:url";
+import { shouldRefresh, readSkillMarker, SKILL_MARKER_FILE, SKILL_MARKER_MAX_BYTES } from "../../src/core/skill-version-marker.js";
+import { probeRead } from "./health/subprocess-probe.js";
+
+const MARKER_MODULE = fileURLToPath(new URL("../../src/core/skill-version-marker.ts", import.meta.url));
 
 // ISS-1091 (R4/round-3): the auto-refresh path (isSkillStale) must never
 // downgrade. shouldRefresh is the pure decision function, final round-3
@@ -226,8 +231,13 @@ describe("autoRefreshSkillIfStale with legacy hook sweep", () => {
     expect(settings.hooks?.StopFailure).toEqual([
       { matcher: "rate_limit", hooks: [{ type: "command", command: `${binPath} session limit-stop` }] },
     ]);
+    // T-499: the session-intel hooks reconcile the same un-gated way.
     expect(settings.hooks?.SessionStart).toEqual([
       { matcher: "resume", hooks: [{ type: "command", command: `${binPath} session resume-prompt` }] },
+      { matcher: "startup|resume|clear|compact", hooks: [{ type: "command", command: `${binPath} session intel-start`, timeout: 5 }] },
+    ]);
+    expect(settings.hooks?.UserPromptSubmit).toEqual([
+      { matcher: "", hooks: [{ type: "command", command: `${binPath} session intel-prompt`, timeout: 10 }] },
     ]);
   });
 
@@ -241,7 +251,7 @@ describe("autoRefreshSkillIfStale with legacy hook sweep", () => {
 
     const globalDir = join(tempDir, "storybloq-global");
     await mkdir(globalDir, { recursive: true });
-    await writeFile(join(globalDir, "config.json"), JSON.stringify({ limitResume: { enabled: false } }), "utf-8");
+    await writeFile(join(globalDir, "config.json"), JSON.stringify({ limitResume: { enabled: false }, sessionIntel: { enabled: false } }), "utf-8");
     const savedGlobal = process.env.STORYBLOQ_GLOBAL_DIR;
     process.env.STORYBLOQ_GLOBAL_DIR = globalDir;
     try {
@@ -524,6 +534,8 @@ describe("autoRefreshSkillIfStale with legacy hook sweep", () => {
     expect(settings.hooks.Stop).toBeUndefined();
     expect(settings.hooks.SessionStart).toEqual([
       { matcher: "resume", hooks: [{ type: "command", command: `${binPath} session resume-prompt` }] },
+      // T-499: the intel-start group is installed the same un-gated way.
+      { matcher: "startup|resume|clear|compact", hooks: [{ type: "command", command: `${binPath} session intel-start`, timeout: 5 }] },
     ]);
     expect(settings.hooks.StopFailure).toEqual([
       { matcher: "rate_limit", hooks: [{ type: "command", command: `${binPath} session limit-stop` }] },
@@ -634,5 +646,175 @@ describe("autoRefreshSkillIfStale with legacy hook sweep", () => {
     // Must not throw.
     const refreshed = await autoRefreshSkillIfStale("1.1.6");
     expect(refreshed).toBe(true);
+  });
+});
+
+// T-502: the marker read is bounded, so the shared self-heal path cannot hang
+// on a FIFO planted at the marker's name or slurp an oversized replacement.
+describe("readSkillMarker is bounded (T-502)", () => {
+  it("exposes a cap and a stable file name", () => {
+    expect(SKILL_MARKER_MAX_BYTES).toBe(65_536);
+    expect(SKILL_MARKER_FILE).toBe(".storybloq-version");
+  });
+
+  // In a CHILD under a SIGKILL deadline: a blocking-read regression would
+  // freeze the worker's event loop, so a Vitest timeout could never fire and
+  // the suite would hang instead of failing.
+  it("returns null for a FIFO at the marker path instead of blocking", { timeout: 40_000 }, () => {
+    const home = mkdtempSync(join(tmpdir(), "storybloq-marker-fifo-"));
+    try {
+      const dir = join(home, ".claude", "skills", "story");
+      mkdirSync(dir, { recursive: true });
+      const marker = join(dir, SKILL_MARKER_FILE);
+      if (spawnSync("mkfifo", [marker], { stdio: "ignore" }).status !== 0) return;
+      const probe = probeRead({
+        moduleFile: MARKER_MODULE,
+        exportName: "readSkillMarker",
+        path: "claude",
+        timeoutMs: 20_000,
+        env: { HOME: home },
+      });
+      expect(probe.timedOut).toBe(false);
+      expect(probe.status).toBe(0);
+      expect(probe.value).toBeNull();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("returns null for a marker over the cap", () => {
+    const home = mkdtempSync(join(tmpdir(), "storybloq-marker-big-"));
+    const originalHome = process.env.HOME;
+    process.env.HOME = home;
+    try {
+      const dir = join(home, ".claude", "skills", "story");
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, SKILL_MARKER_FILE), "1".repeat(SKILL_MARKER_MAX_BYTES + 1));
+      expect(readSkillMarker("claude")).toBeNull();
+    } finally {
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ISS-1233 (first half): the function-hooks switch follows the Mods refresh
+//
+// An upgrade that only runs `npm install -g` never reaches `storybloq setup`,
+// so the version-marker refresh is the whole of what an existing install gets.
+// It already re-copies the Mods; a copy the client is not allowed to load is
+// inert, so the refresh writes the same settings switch the installer does,
+// under the same rule: a value already in the file is never overwritten.
+// ---------------------------------------------------------------------------
+
+describe("the Mods refresh writes the function-hooks switch (ISS-1233)", () => {
+  let tempDir: string;
+  let originalHome: string | undefined;
+  let originalPath: string | undefined;
+  let originalCodexHome: string | undefined;
+  let settingsPath: string;
+  /** What the refresh said, so a failing assertion names the reason. */
+  let err: string[];
+  let stderrSpy: { mockRestore: () => void } | undefined;
+
+  beforeEach(async () => {
+    tempDir = join(tmpdir(), `storybloq-marker-fnhooks-${randomUUID()}`);
+    await mkdir(tempDir, { recursive: true });
+    originalHome = process.env.HOME;
+    originalPath = process.env.PATH;
+    originalCodexHome = process.env.CODEX_HOME;
+    process.env.HOME = tempDir;
+    // Pin CODEX_HOME inside the fixture too: a developer or CI shell with it
+    // set would let this refresh reach state outside the fixture, and the
+    // Codex targets must be judged against this HOME like the Claude one.
+    process.env.CODEX_HOME = join(tempDir, ".codex");
+    // No storybloq on PATH: the hook registrars have no binary to register
+    // and write nothing, which is what lets the "leave it alone" case below
+    // assert byte identity on the whole file.
+    const emptyBin = join(tempDir, "empty-bin");
+    await mkdir(emptyBin, { recursive: true });
+    process.env.PATH = emptyBin;
+
+    // A stale skill dir, so the refresh runs at all.
+    const skillDir = join(tempDir, ".claude", "skills", "story");
+    await mkdir(skillDir, { recursive: true });
+    await writeFile(join(skillDir, "SKILL.md"), "# stub\n", "utf-8");
+    await writeFile(join(skillDir, ".storybloq-version"), "1.1.0\n", "utf-8");
+    // A Mods copy, so `modsInstalled()` is true and the refresh has one to
+    // refresh. The refresh replaces this stub with the real copy.
+    const modsHooks = join(tempDir, ".claude", "skills", "storybloq", "hooks");
+    await mkdir(modsHooks, { recursive: true });
+    await writeFile(join(modsHooks, "mod.ts"), "// stub\n", "utf-8");
+    settingsPath = join(tempDir, ".claude", "settings.json");
+
+    err = [];
+    const { vi } = await import("vitest");
+    stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(((chunk: unknown) => {
+      err.push(String(chunk));
+      return true;
+    }) as never);
+  });
+
+  afterEach(async () => {
+    stderrSpy?.mockRestore();
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
+    if (originalPath === undefined) delete process.env.PATH;
+    else process.env.PATH = originalPath;
+    if (originalCodexHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = originalCodexHome;
+    await rm(tempDir, { recursive: true, force: true });
+    const { vi } = await import("vitest");
+    vi.resetModules();
+    vi.doUnmock("../../src/core/mods-install.js");
+  });
+
+  /** The written value, or null, with the refresh's own log in the message. */
+  async function writtenSwitch(): Promise<unknown> {
+    if (!existsSync(settingsPath)) return null;
+    const settings = JSON.parse(await readFile(settingsPath, "utf-8")) as { env?: Record<string, unknown> };
+    return settings.env?.CLAUDE_CODE_ENABLE_FUNCTION_HOOKS ?? null;
+  }
+
+  it("writes env.CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 when settings.json has no such key", async () => {
+    const { autoRefreshSkillIfStale } = await import("../../src/core/skill-version-marker.js");
+    expect(await autoRefreshSkillIfStale("1.1.6")).toBe(true);
+
+    // The refresh's own stderr rides along in the message: a failure here
+    // then names its reason instead of being a bare missing file.
+    expect(await writtenSwitch(), err.join("")).toBe("1");
+  });
+
+  it("writes the switch even when the Mods re-copy itself fails", async () => {
+    // The copy on disk is loadable whether or not today's re-copy worked, and
+    // a transient failure must not be what leaves the dashboard dark: the
+    // next invocation finds the marker current and never returns here.
+    // M-SWITCH-BEHIND-COPY puts the switch back inside the copy's try.
+    const { vi } = await import("vitest");
+    vi.resetModules();
+    vi.doMock("../../src/core/mods-install.js", async (importOriginal) => {
+      const actual = await importOriginal<typeof import("../../src/core/mods-install.js")>();
+      return { ...actual, installMods: async () => { throw new Error("disk full (simulated)"); } };
+    });
+
+    const { autoRefreshSkillIfStale } = await import("../../src/core/skill-version-marker.js");
+    expect(await autoRefreshSkillIfStale("1.1.6")).toBe(true);
+
+    expect(err.join("")).toContain("Mods refresh failed (non-fatal): disk full (simulated)");
+    expect(await writtenSwitch(), err.join("")).toBe("1");
+  });
+
+  it("leaves an explicit \"0\" alone, rewriting nothing", async () => {
+    // Unusual formatting on purpose: any rewrite reformats it, so this is a
+    // byte comparison and not a value comparison.
+    const original = `{\n    "env": {\n        "CLAUDE_CODE_ENABLE_FUNCTION_HOOKS": "0"\n    }\n}\n`;
+    await writeFile(settingsPath, original, "utf-8");
+
+    const { autoRefreshSkillIfStale } = await import("../../src/core/skill-version-marker.js");
+    expect(await autoRefreshSkillIfStale("1.1.6")).toBe(true);
+
+    expect(await readFile(settingsPath, "utf-8"), err.join("")).toBe(original);
   });
 });

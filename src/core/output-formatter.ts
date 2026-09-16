@@ -1,6 +1,9 @@
 import { computeIssueFlow, formatIssueFlow, ISSUE_FLOW_SEMANTICS } from "./issue-flow.js";
-import type { DuetRoute, DuetView } from "./duet-coordination.js";
+import type { ArrangementCompactResult, ArrangementRotateResult, DuetRoute, DuetView } from "./duet-coordination.js";
+import { arrangementCapacity, type ArrangementCapacity } from "./arrangement-compaction.js";
+import { assignmentIdOf, isCompactedAssignment } from "../models/duet.js";
 import { displayIdOf } from "./resolver.js";
+import { ENABLE_GIT_REFS_REMEDY } from "./branch-allocation-warning.js";
 import type { OutputFormat, ErrorCode } from "../models/types.js";
 import type { FederationState, FederationNodeEntry } from "../federation/state.js";
 import type { Config } from "../models/config.js";
@@ -15,9 +18,13 @@ import type { ValidationResult, ValidationFinding, ValidationLevel } from "./val
 import type { LedgerIntegrityResult } from "./ledger-integrity.js";
 import type { NextTicketOutcome, NextTicketsOutcome } from "./queries.js";
 import type { RecommendResult } from "./recommend.js";
+import { isHandoverWindowIncomplete } from "./recommend.js";
+import type { HandoverBriefResult, HandoverBriefEntry } from "./handover-brief.js";
+import type { SectionRecord, TrajectoryEntry } from "./markdown-sections.js";
 import type { ReconcileResult } from "./reconcile.js";
 import type { DoctorResult } from "./team-doctor.js";
 import type { ActiveSessionSummary, SessionScanDiagnostic } from "./session-scan.js";
+import type { StatusRoster } from "./roster-view.js";
 import type { Arrangement, ArrangementLifecycle, ArrangementRole } from "../models/arrangement.js";
 import type { GateAck } from "../models/gate-ack.js";
 import type { LandingsResult } from "./landings.js";
@@ -304,6 +311,28 @@ export function fencedBlock(content: string, lang?: string): string {
   }
   const fence = "`".repeat(maxTicks + 1);
   return `${fence}${lang ?? ""}\n${content}\n${fence}`;
+}
+
+/**
+ * ISS-1192: inverts `fencedBlock`. When the ENTIRE input, after trimming only
+ * outer whitespace, is one fenced block whose opening and closing fences are
+ * equal runs of 4+ backticks with no info string, returns the inner text
+ * (byte-identical to what was fenced). Otherwise returns the input unchanged.
+ *
+ * Never strips a 3-backtick fence (that is ordinary user content -- 3 is
+ * `fencedBlock`'s own minimum for content with no backticks at all, so a
+ * lower threshold here would eat legitimate user-authored fences). Never
+ * strips when the fence does not span the whole input, or when it carries an
+ * info string. The closing fence is matched only at the true end of input --
+ * greedy backtracking naturally finds the LAST `\n<fence>` in the string, so
+ * a same-length backtick run inside the content is never mistaken for the
+ * close.
+ */
+export function stripRenderFence(input: string): { text: string; stripped: boolean } {
+  const trimmed = input.trim();
+  const match = /^(`{4,})\n([\s\S]*)\n\1$/.exec(trimmed);
+  if (!match) return { text: input, stripped: false };
+  return { text: match[2] as string, stripped: true };
 }
 
 /**
@@ -692,6 +721,122 @@ function issueLine(state: ProjectState): string {
   return flow === null ? `Issues: ${state.activeIssueCount} open` : formatIssueFlow(flow);
 }
 
+/**
+ * T-320 commit 3: the eight session fields Step 2's reconciliation reads
+ * (SKILL.md 1b's fingerprint plus `mode`/`leaseExpiresAt`). Drops
+ * `ticketId`/`ticketTitle`, which reconciliation never reads. Exported so the
+ * acceptance test (`scripts/priming-cost.ts`'s `reconcileFingerprints`, the
+ * harness's own transcription of that reconciliation logic) can run against
+ * this SAME reduction rather than a second, test-local one.
+ */
+export function reduceSessionForCompact(s: ActiveSessionSummary): Pick<ActiveSessionSummary, "sessionId" | "sourceDir" | "state" | "mode" | "ownerTask" | "leaseState" | "leaseExpiresAt" | "compactPending"> {
+  return {
+    sessionId: s.sessionId,
+    sourceDir: s.sourceDir,
+    state: s.state,
+    mode: s.mode,
+    ownerTask: s.ownerTask,
+    leaseState: s.leaseState,
+    leaseExpiresAt: s.leaseExpiresAt,
+    compactPending: s.compactPending,
+  };
+}
+
+/**
+ * T-320 commit 3: reduces `bus` to the six fields the ticket's amendment
+ * names, dropping `participants`, `wake`, `hookDelivery`, and
+ * `deliveryCapabilities` (named explicitly) plus `initialized`, `setupState`,
+ * `endpoints`, `openThreads`, `parkedThreads`, `undeliverable`, and
+ * `quarantined` (also outside the kept list). The error variant (bus runtime
+ * unreachable) carries none of those fields to begin with, so it passes
+ * through unchanged.
+ */
+function reduceBusForCompact(bus: BusStatusInput): unknown {
+  if (!bus) return bus;
+  if ("error" in bus) return bus;
+  return {
+    enabled: bus.enabled,
+    daemonState: bus.daemonState,
+    deliveryMode: bus.deliveryMode,
+    pendingMessages: bus.pendingMessages,
+    unacknowledgedCritical: bus.unacknowledgedCritical,
+    nextActions: bus.nextActions,
+  };
+}
+
+/**
+ * T-320 commit 3: the compact JSON payload. Only the single-project status
+ * shape is defined by the ticket (no federated/compact combination is
+ * specified), so `compact` has no effect on `formatFederatedStatus`. JSON
+ * only, by the ticket's own text -- callers reach this branch regardless of
+ * the `format` argument, since no Markdown compact rendering exists to keep
+ * byte-compatible.
+ *
+ * T-508: exported so the ledger sidebar Mod's projection can be checked
+ * against it rather than forked. A hooks module cannot import this file (the
+ * client admits only relative imports inside the plugin's own folder, and
+ * this module's graph reaches `node:` code), so the sidebar carries its own
+ * pure projection and one vitest asserts the two agree on a fixture `.story/`.
+ * That test is what "do not fork the projection" means here; this export
+ * exists to give it the other side of the equality.
+ */
+export function buildCompactStatusData(
+  state: ProjectState,
+  activeSessions: readonly ActiveSessionSummary[],
+  resumableSessions: readonly ActiveSessionSummary[],
+  bus: BusStatusInput,
+  limitStops: readonly LimitStopSummary[],
+  sessionDiagnostics: readonly SessionScanDiagnostic[] | undefined,
+  expiredLeaseSessions: readonly ActiveSessionSummary[],
+  arrangements: StatusArrangements,
+) {
+  const phases = phasesWithStatus(state);
+  return {
+    project: state.config.project,
+    totalTickets: state.leafTicketCount,
+    completeTickets: state.completeLeafTicketCount,
+    openTickets: state.leafTicketCount - state.completeLeafTicketCount,
+    blockedTickets: state.blockedCount,
+    openIssues: state.activeIssueCount,
+    // No `semantics` here (unlike full status): the compact schema explicitly
+    // omits `issueFlow.semantics`.
+    issueFlow: statusIssueFlow(state),
+    activeNotes: state.activeNoteCount,
+    activeLessons: state.activeLessonCount,
+    handovers: state.handoverFilenames.length,
+    isEmptyScaffold: state.isEmptyScaffold,
+    phases: phases.map((p) => ({
+      id: p.phase.id,
+      name: p.phase.name,
+      status: p.status,
+      leafCount: p.leafCount,
+    })),
+    activeSessions: activeSessions.map(reduceSessionForCompact),
+    resumableSessions: resumableSessions.map(reduceSessionForCompact),
+    expiredLeaseSessions: expiredLeaseSessions.map(reduceSessionForCompact),
+    ...(sessionDiagnostics ? { sessionDiagnostics } : {}),
+    ...(bus ? { bus: reduceBusForCompact(bus) } : {}),
+    // Kept whole -- the ticket's amendment: the original text calling for a
+    // reduced `limitStops` was a slip.
+    limitStops,
+    arrangements: arrangements.items,
+    arrangementWarnings: arrangements.warnings,
+  };
+}
+
+/** T-507: one line, live and stale only; terminal seats are hidden from status (they stay in `roster list --all`). */
+function rosterStatusLines(roster: StatusRoster | undefined): string[] {
+  if (!roster) return [];
+  // An unreadable roster is not an empty one, and a cut scan is not the
+  // population: the line says so instead of presenting the counts as whole.
+  if (roster.diagnostics.some((d) => d.startsWith("roster unreadable"))) {
+    return ["Seats: unknown (roster unreadable; see roster list)"];
+  }
+  const partial = roster.scanTruncated || roster.resultTruncated || roster.busScanTruncated || roster.diagnostics.length > 0;
+  const qualifier = partial ? " (partial; see roster list)" : "";
+  return [`Seats: ${roster.live} live, ${roster.stale} stale${qualifier}`];
+}
+
 export function formatStatus(
   state: ProjectState,
   format: OutputFormat,
@@ -713,7 +858,35 @@ export function formatStatus(
   // doing so would change this command's exit classification for a merely
   // degraded, non-blocking arrangement read.
   arrangements: StatusArrangements = { items: [], warnings: [] },
+  // T-320 commit 3, same APPENDED-LAST discipline. JSON only: when true, this
+  // returns the compact payload regardless of `format`, since the ticket
+  // defines no Markdown compact rendering. Omitting it (or passing `false`)
+  // leaves every prior positional caller byte-identical.
+  compact: boolean = false,
+  // T-507, same APPENDED-LAST discipline. The seat roster (running seats plus
+  // counts), non-compact JSON and one Markdown line only: the compact payload
+  // is T-320's pinned schema and does not gain a key. Omitted means unknown,
+  // not empty, so a bare formatter call carries no `roster` key at all.
+  roster?: StatusRoster,
 ): string {
+  if (compact) {
+    return JSON.stringify(
+      successEnvelope(
+        buildCompactStatusData(
+          state,
+          activeSessions,
+          resumableSessions,
+          bus,
+          limitStops,
+          sessionDiagnostics,
+          expiredLeaseSessions,
+          arrangements,
+        ),
+      ),
+      null,
+      2,
+    );
+  }
   const phases = phasesWithStatus(state);
   const data = {
     project: state.config.project,
@@ -782,6 +955,9 @@ export function formatStatus(
     // command's exit code reads from.
     arrangements: arrangements.items,
     arrangementWarnings: arrangements.warnings,
+    // T-507: present only when the caller read the roster (handleStatus
+    // always does); an absent key means "not read", never "no seats".
+    ...(roster ? { roster } : {}),
   };
 
   if (format === "json") {
@@ -796,6 +972,7 @@ export function formatStatus(
     `Notes: ${state.activeNoteCount} active, ${state.archivedNoteCount} archived`,
     `Lessons: ${state.activeLessonCount} active, ${state.deprecatedLessonCount} deprecated`,
     `Handovers: ${state.handoverFilenames.length}`,
+    ...rosterStatusLines(roster),
     ...busStatusLines(bus),
     "",
     ...formatConfigHints(state),
@@ -893,6 +1070,8 @@ export function formatFederatedStatus(
   expiredLeaseSessions: readonly ActiveSessionSummary[] = [],
   // T-473: appended last, matching `formatStatus`'s placement, same reasons.
   arrangements: StatusArrangements = { items: [], warnings: [] },
+  // T-507: appended last, matching `formatStatus`'s placement, same reasons.
+  roster?: StatusRoster,
 ): string {
   // NO ISSUE-FLOW LINE HERE, deliberately, and this comment is the plan's
   // "or an explicit comment saying why not".
@@ -956,6 +1135,9 @@ export function formatFederatedStatus(
     // command's exit code reads from.
     arrangements: arrangements.items,
     arrangementWarnings: arrangements.warnings,
+    // T-507: present only when the caller read the roster (handleStatus
+    // always does); an absent key means "not read", never "no seats".
+    ...(roster ? { roster } : {}),
   };
 
   if (format === "json") {
@@ -967,6 +1149,7 @@ export function formatFederatedStatus(
     "",
     `Federation: ${fedState.nodeCount} nodes (${fedState.reachableCount} reachable${fedState.unreachableCount > 0 ? `, ${fedState.unreachableCount} unreachable` : ""})`,
     `Tickets: ${fedState.totalCompleteTickets}/${fedState.totalTickets} across all nodes | Issues: ${fedState.totalOpenIssues} open`,
+    ...rosterStatusLines(roster),
     ...busStatusLines(bus),
     "",
   ];
@@ -1113,9 +1296,15 @@ export function formatTicket(
   state: ProjectState,
   format: OutputFormat,
   citedRulings: readonly CitationResolution[] = [],
+  /** ISS-1154 2h: `{ actionability, unreadableHandoverCount }` when `withActionability` was requested. JSON-only. */
+  extraJsonFields?: Record<string, unknown>,
 ): string {
   if (format === "json") {
-    return JSON.stringify(successEnvelope({ ...ticket, citedRulings: citedRulingsForJson(citedRulings) }), null, 2);
+    return JSON.stringify(
+      successEnvelope({ ...ticket, citedRulings: citedRulingsForJson(citedRulings), ...extraJsonFields }),
+      null,
+      2,
+    );
   }
 
   const blocked = state.isBlocked(ticket) ? " [BLOCKED]" : "";
@@ -1314,9 +1503,15 @@ export function formatIssue(
   format: OutputFormat,
   state?: ProjectState,
   citedRulings: readonly CitationResolution[] = [],
+  /** ISS-1154 2h: `{ actionability, unreadableHandoverCount }` when `withActionability` was requested. JSON-only. */
+  extraJsonFields?: Record<string, unknown>,
 ): string {
   if (format === "json") {
-    return JSON.stringify(successEnvelope({ ...issue, citedRulings: citedRulingsForJson(citedRulings) }), null, 2);
+    return JSON.stringify(
+      successEnvelope({ ...issue, citedRulings: citedRulingsForJson(citedRulings), ...extraJsonFields }),
+      null,
+      2,
+    );
   }
 
   const lines: string[] = [
@@ -1652,13 +1847,17 @@ export function formatArrangement(
   citedRulings: readonly CitationResolution[] = [],
   coordination?: DuetView,
 ): string {
+  // ISS-1191: capacity is reported on every read, so a pen sees the wall
+  // approaching instead of discovering it as a refused write.
+  const capacity = arrangementCapacity(arrangement);
   if (format === "json") {
-    return JSON.stringify(successEnvelope({ ...arrangement, citedRulings: citedRulingsForJson(citedRulings), ...(coordination && { state: coordination.state, route: coordination.route }) }), null, 2);
+    return JSON.stringify(successEnvelope({ ...arrangement, capacity, citedRulings: citedRulingsForJson(citedRulings), ...(coordination && { state: coordination.state, route: coordination.route }) }), null, 2);
   }
   const parties = arrangement.parties.map((p) => `${p.role} (${p.client})`).join(", ");
   const lines: string[] = [
     `# Arrangement ${escapeMarkdownInline(arrangement.id)} [${arrangement.lifecycle}]`,
     "",
+    `Capacity: ${capacity.bytes} of ${capacity.max} bytes (${capacity.pct}%); checkpoint ${capacity.checkpointBytes}`,
     `Bounds: ${escapeMarkdownInline(arrangement.bounds.join(", "))}`,
     `Parties: ${escapeMarkdownInline(parties)}`,
     `Unreachability (irreversible): ${arrangement.unreachability.onIrreversibleWork}`,
@@ -1674,7 +1873,10 @@ function duetCoordinationLines(view: DuetView): string[] {
   if (view.state) {
     lines.push(`Coordination session: ${safe(view.state.start.sessionId)}; revision: ${view.state.revision}`, `Handshake nonce: ${safe(view.state.nonce)}`);
     for (const assignment of view.state.assignments.slice(0, 20)) {
-      lines.push(`- ${safe(assignment.input.id)}: ${safe(assignment.status)}; ${safe(assignment.input.scope.slice(0, 240))}`);
+      // ISS-1191: a compacted assignment kept its identity and status, not
+      // its scope text -- say so rather than printing an empty scope.
+      const detail = isCompactedAssignment(assignment) ? "compacted resolved history" : safe(assignment.input.scope.slice(0, 240));
+      lines.push(`- ${safe(assignmentIdOf(assignment))}: ${safe(assignment.status)}; ${detail}`);
     }
     if (view.state.assignments.length > 20) lines.push(`(${view.state.assignments.length - 20} more assignments)`);
     lines.push("Full runtime, events, obligations and cursors: arrangement get with format json. Route readiness does not grant write authority.");
@@ -1684,6 +1886,46 @@ function duetCoordinationLines(view: DuetView): string[] {
 
 export function formatDuetCoordination(view: DuetView, format: OutputFormat): string {
   return format === "json" ? JSON.stringify(successEnvelope(view), null, 2) : formatArrangement(view.arrangement, format, [], view);
+}
+
+/** ISS-1191: what `storybloq arrangement compact` reports. */
+export function formatArrangementCompactResult(result: ArrangementCompactResult, format: OutputFormat): string {
+  const { view, changed, before, after } = result;
+  if (format === "json") {
+    return JSON.stringify(successEnvelope({ id: view.arrangement.id, changed, before, after, route: view.route }), null, 2);
+  }
+  if (!changed) {
+    return `Arrangement ${escapeMarkdownInline(view.arrangement.id)} is already compact: ${before.bytes} of ${before.max} bytes (${before.pct}%).`;
+  }
+  return [
+    `Compacted arrangement ${escapeMarkdownInline(view.arrangement.id)}.`,
+    `Before: ${before.bytes} bytes (${before.pct}%), checkpoint ${before.checkpointBytes}`,
+    `After: ${after.bytes} bytes (${after.pct}%), checkpoint ${after.checkpointBytes}`,
+    `Communication: ${escapeMarkdownInline(sanitizeDisplayText(view.route.status))}`,
+  ].join("\n");
+}
+
+/** ISS-1191: what `storybloq arrangement rotate` reports. */
+export function formatArrangementRotateResult(result: ArrangementRotateResult, format: OutputFormat): string {
+  if (format === "json") {
+    return JSON.stringify(successEnvelope({
+      id: result.predecessor.id,
+      successor: result.successorId,
+      alreadyRotated: result.alreadyRotated,
+      carriedAssignments: result.carriedAssignments,
+      carriedEarmarks: result.carriedEarmarks,
+    }), null, 2);
+  }
+  const successor = escapeMarkdownInline(result.successorId);
+  if (result.alreadyRotated) {
+    return `Arrangement ${escapeMarkdownInline(result.predecessor.id)} was already rotated; its successor is ${successor}.`;
+  }
+  return [
+    `Rotated ${escapeMarkdownInline(result.predecessor.id)} into ${successor}.`,
+    `Carried assignments: ${result.carriedAssignments.length === 0 ? "none" : escapeMarkdownInline(result.carriedAssignments.join(", "))}`,
+    `Carried earmarks: ${result.carriedEarmarks.length === 0 ? "none" : escapeMarkdownInline(result.carriedEarmarks.join(", "))}`,
+    `History stays in the closed arrangement; coordinate against ${successor} from now on.`,
+  ].join("\n");
 }
 
 export function formatArrangementList(
@@ -1950,12 +2192,31 @@ function formatEarmarkLine(earmark: Earmark): string {
   );
 }
 
-export function formatEarmarkGetResult(ref: string, earmark: Earmark | null, format: OutputFormat): string {
+/**
+ * ISS-1191: the earmark's authorizing arrangement carries a hard 64 KiB
+ * cap, so its capacity is reported here too -- the pen reads this surface
+ * far more often than `arrangement get`. `capacity` is null (with a reason)
+ * whenever the arrangement cannot be resolved in the root being read, which
+ * is the normal case for a federated node read: never a fabricated number.
+ */
+export function formatEarmarkGetResult(
+  ref: string,
+  earmark: Earmark | null,
+  format: OutputFormat,
+  capacity?: { capacity: ArrangementCapacity | null; reason?: string },
+): string {
   if (format === "json") {
-    return JSON.stringify(successEnvelope({ ref, earmark }), null, 2);
+    return JSON.stringify(successEnvelope({ ref, earmark, ...(capacity && { capacity: capacity.capacity, ...(capacity.reason !== undefined && { capacityReason: capacity.reason }) }) }), null, 2);
   }
   if (!earmark) return `${escapeMarkdownInline(sanitizeDisplayText(ref))} has no earmark.`;
-  return `Earmark on ${escapeMarkdownInline(sanitizeDisplayText(ref))}: ${formatEarmarkLine(earmark)}`;
+  const lines = [`Earmark on ${escapeMarkdownInline(sanitizeDisplayText(ref))}: ${formatEarmarkLine(earmark)}`];
+  if (capacity?.capacity) {
+    const c = capacity.capacity;
+    lines.push(`Arrangement capacity: ${c.bytes} of ${c.max} bytes (${c.pct}%); checkpoint ${c.checkpointBytes}`);
+  } else if (capacity?.reason) {
+    lines.push(`Arrangement capacity: unavailable (${escapeMarkdownInline(sanitizeDisplayText(capacity.reason))})`);
+  }
+  return lines.join("\n");
 }
 
 export function formatEarmarkActionResult(
@@ -2135,14 +2396,196 @@ export function formatHandoverContent(
   return content;
 }
 
-export function formatHandoverCreateResult(
-  filename: string,
+export function formatHandoverTemplate(content: string, format: OutputFormat): string {
+  if (format === "json") {
+    return JSON.stringify(successEnvelope({ content }), null, 2);
+  }
+  return content;
+}
+
+function formatRecordLine(record: SectionRecord): string {
+  const idPart = record.id ? `**${record.id}**` : `*(${record.kind})*`;
+  const rationalePart = record.rationale === "unknown" ? "" : ` -- ${record.rationale}`;
+  return `- ${idPart} ${record.label}${rationalePart}`;
+}
+
+function formatHandoverBriefEntryMd(entry: HandoverBriefEntry): string {
+  const lines: string[] = [`## ${entry.filename}`];
+  if (entry.form === "raw") {
+    lines.push("", entry.body);
+    return lines.join("\n");
+  }
+  if (entry.form === "index-only") {
+    lines.push(
+      "",
+      `(${entry.index.omittedCount} item(s) omitted; ids: ${entry.index.ids.join(", ") || "none"})`,
+    );
+    return lines.join("\n");
+  }
+  if (entry.records.length === 0) {
+    lines.push("", "(no continuation, blocked, owner-gated, or carried items)");
+  }
+  for (const record of entry.records) {
+    lines.push(formatRecordLine(record));
+  }
+  if (entry.index) {
+    lines.push(
+      `(${entry.index.omittedCount} more omitted; ids: ${entry.index.ids.join(", ") || "none"})`,
+    );
+  }
+  return lines.join("\n");
+}
+
+function formatTrajectoryMd(trajectory: readonly TrajectoryEntry[]): string {
+  if (trajectory.length === 0) return "";
+  const lines = ["## Trajectory"];
+  for (const entry of trajectory) {
+    // ISS-1219: occurrenceCount counts only continuation/blocked/owner-gated/
+    // carried mentions while latest takes any mention, so a shipped-only id
+    // has count 0 beside a named latest. Say that plainly instead of the
+    // single-sentence form, which read as a contradiction.
+    if (entry.occurrenceCount === 0) {
+      lines.push(`- ${entry.id}: no open mention; last named as ${entry.latestDisposition} in ${entry.latest}`);
+      continue;
+    }
+    lines.push(
+      `- ${entry.id}: seen in ${entry.occurrenceCount} handover(s), latest ${entry.latest} (${entry.latestDisposition})`,
+    );
+  }
+  return lines.join("\n");
+}
+
+/**
+ * T-320 commit 2: renders `handover_latest`'s brief/priming result. JSON
+ * mode is the exact `{handovers, trajectory, skippedHandovers,
+ * missingHandovers}` shape from `buildHandoverBrief`, wrapped in the
+ * standard success envelope. MD mode groups each handover's records under
+ * its filename, falling back to the raw body for an entry priming kept
+ * unstructured, and appends a trajectory section when non-empty.
+ */
+export function formatHandoverBrief(
+  result: HandoverBriefResult,
   format: OutputFormat,
 ): string {
   if (format === "json") {
-    return JSON.stringify(successEnvelope({ filename }), null, 2);
+    return JSON.stringify(successEnvelope(result), null, 2);
   }
-  return `Created handover: ${filename}`;
+  const sections = result.handovers.map(formatHandoverBriefEntryMd);
+  const trajectorySection = formatTrajectoryMd(result.trajectory);
+  if (trajectorySection) sections.push(trajectorySection);
+  if (result.skippedHandovers > 0) {
+    sections.push(`(${result.skippedHandovers} handover(s) skipped: filename too long)`);
+  }
+  if (result.missingHandovers > 0) {
+    sections.push(`(${result.missingHandovers} handover(s) skipped: no longer on disk)`);
+  }
+  return sections.join("\n\n");
+}
+
+/** T-499: the continuation line after a handover that was stamped on the caller's presence record. */
+export const HANDOVER_STAMPED_CONTINUE_LINE =
+  "Handover recorded against your current compaction boundary: context pressure is held at advisory. Keep working in this same turn; do not stop, defer the next step, or ask the user whether to continue.";
+
+/**
+ * ISS-1197 commit 2: the same stamp, at compact-needed. The line above is a
+ * false claim here -- the stamp lands, but nothing is suppressed past the
+ * compact line, and it would print directly under a COMPACT-NEEDED banner
+ * telling the caller the opposite.
+ */
+export const HANDOVER_STAMPED_COMPACT_NEEDED_LINE =
+  "Handover recorded, but context is past the compact line, so this does not lower the pressure. Auto-compaction will follow and is expected: keep working through it, and write no further handovers.";
+
+/**
+ * ISS-1214: the one action a reader can take when the stamp failed because
+ * the process that tried to write it cannot bind the caller at all -- the
+ * stale-server shape from the field report, where the MCP server predates the
+ * on-disk build and the prompt hook (which runs the new binary) disagrees
+ * with it about the era.
+ */
+export const HANDOVER_STAMP_RESTART_HINT =
+  "Restart the client: an MCP server older than the on-disk build cannot bind the caller, so the stamp has nowhere to land.";
+
+/**
+ * The same situation without the cause. A binding failure has many possible
+ * causes and a stale server is only one of them, so the hint above is printed
+ * ONLY where staleness was positively established; everywhere else the reader
+ * gets what is known plus a remedy that costs nothing if the guess is wrong.
+ */
+export const HANDOVER_STAMP_UNBOUND_LINE =
+  "The caller could not be bound to a live presence record; if this repeats, restart the client.";
+
+/**
+ * ISS-1214: why an attempted stamp did not land. `reason` is display text;
+ * `kind` is what may be concluded from it, decided by the stamp path that
+ * knows -- this formatter never re-derives cause from message text.
+ */
+export interface HandoverStampFailure {
+  readonly reason: string;
+  readonly kind: "binding" | "outcome" | "refused" | "error";
+}
+
+/**
+ * ISS-1214: the line a reply carries when a stamp was attempted and did not
+ * land. Before this, `handover_create` returned exactly "Created handover:
+ * <file>" on every failure path, so an agent read the reply as success while
+ * `handoverWrittenAt` stayed null and the prompt hook re-fired the imperative
+ * with no visible cause.
+ *
+ * `serverStale` must come from a POSITIVE staleness check (the caller's own
+ * `describeBinaryStaleness`), never from the shape of the reason: the hint is
+ * a causal claim, and a false one sends a reader to restart a client that was
+ * never the problem.
+ */
+export function formatHandoverStampFailure(failure: HandoverStampFailure, serverStale = false): string {
+  const base = `Handover stamp did not land (${failure.reason}): context pressure is not held; the next imperative is expected.`;
+  // Only a binding failure is about the caller's link to a record at all; an
+  // outcome, a refusal and a thrown error each have their own causes, and a
+  // restart addresses none of them.
+  if (failure.kind !== "binding") return base;
+  return `${base} ${serverStale ? HANDOVER_STAMP_RESTART_HINT : HANDOVER_STAMP_UNBOUND_LINE}`;
+}
+
+/**
+ * ISS-1185: `stampedRoot`/`mcpRoot` report the actually-stamped root only
+ * when it diverges from the MCP server's own root (the common single-root
+ * case stays exactly as before, no added noise).
+ */
+export function formatHandoverCreateResult(
+  filename: string,
+  format: OutputFormat,
+  stamped = false,
+  stampedRoot: string | null = null,
+  mcpRoot: string | null = null,
+  /** ISS-1197 commit 2: the stamp landed, but on a compact-needed sample. */
+  compactNeeded = false,
+  /**
+   * ISS-1214: why an attempted stamp did not land. Null when it landed, when
+   * none was attempted, and when the skip was a precondition this surface
+   * cannot act on (session intel off, a non-Claude client on the CLI).
+   */
+  stampFailure: HandoverStampFailure | null = null,
+  /**
+   * ISS-1214: whether the running server was POSITIVELY established as older
+   * than the on-disk build. Only the MCP surface can answer this; a caller
+   * that cannot must leave it false rather than infer it.
+   */
+  serverStale = false,
+): string {
+  const diverged = stamped && stampedRoot !== null && mcpRoot !== null && stampedRoot !== mcpRoot;
+  const failure = stamped ? null : stampFailure;
+  if (format === "json") {
+    const data: Record<string, unknown> = stamped ? { filename, tokenPressureStamped: true } : { filename };
+    if (diverged) data.tokenPressureStampedRoot = stampedRoot;
+    if (failure !== null) data.tokenPressureStampReason = failure.reason;
+    return JSON.stringify(successEnvelope(data), null, 2);
+  }
+  if (!stamped) {
+    const base = `Created handover: ${filename}`;
+    return failure === null ? base : `${base}\n\n${formatHandoverStampFailure(failure, serverStale)}`;
+  }
+  const note = diverged ? ` (stamped under a different root: ${stampedRoot})` : "";
+  const line = compactNeeded ? HANDOVER_STAMPED_COMPACT_NEEDED_LINE : HANDOVER_STAMPED_CONTINUE_LINE;
+  return `Created handover: ${filename}\n\n${line}${note}`;
 }
 
 // --- Snapshot / Recap / Export ---
@@ -2333,8 +2776,22 @@ export function formatRecap(
   }
 
   if (actions.highSeverityIssues.length > 0) {
-    for (const i of actions.highSeverityIssues) {
+    // T-320 commit 4: show at most the first five (already sorted
+    // critical-before-high, then discoveredDate, then displayId by
+    // buildRecap); report anything past that as a per-severity overflow line
+    // rather than silently dropping it.
+    const shown = actions.highSeverityIssues.slice(0, 5);
+    for (const i of shown) {
       lines.push(`- **${i.severity} issue:** ${displayIdOf(i)} -- ${escapeMarkdownInline(i.title)}`);
+    }
+    const omitted = actions.highSeverityIssues.slice(5);
+    if (omitted.length > 0) {
+      const criticalOmitted = omitted.filter((i) => i.severity === "critical").length;
+      const highOmitted = omitted.filter((i) => i.severity === "high").length;
+      const parts: string[] = [];
+      if (criticalOmitted > 0) parts.push(`${criticalOmitted} critical`);
+      if (highOmitted > 0) parts.push(`${highOmitted} high`);
+      lines.push(`- *(${omitted.length} more issue${omitted.length === 1 ? "" : "s"} omitted: ${parts.join(", ")})*`);
     }
   }
 
@@ -2731,25 +3188,26 @@ export function formatReference(
   lines.push("");
   lines.push("## CLI Commands");
   lines.push("");
-  // ISS-910: the JSON envelope is part of every command's contract; document
-  // it once at the top of the command reference rather than per command.
   lines.push("### JSON output envelope");
   lines.push("");
-  lines.push('Commands accepting `--format json` wrap their payload in a versioned envelope: `{"version": 1, "data": ...}` on success, `{"version": 1, "error": {"code": ..., "message": ...}}` on failure, plus a `warnings` array on partial loads (exit code 3). Pass `--raw` with `--format json` to emit the `data` payload verbatim: errors keep the envelope, partial-load warnings are dropped (the exit code still signals them), and commands whose JSON is not the standard envelope reject `--raw` naming their shape. A few commands predate the envelope and emit their own JSON instead: `gc`, `limit-status`, `conflicts list`, `conflicts show`, `resolve` and `team reserve` return an `{"ok", "data"}` object, and `team init` and `team setup` return a bare result object. `session list` and `session show` use a text/json axis with their own top-level shapes, and the `bus` subcommands speak the versioned Bus wire format. Every one of these names its own shape in its `--help` and does not accept `--raw` at all, so passing it is rejected during argument validation, before the command runs -- which matters because several of them mutate state.');
+  lines.push('`--format json` normally returns `{"version":1,"data":...}` or `{"version":1,"error":{"code":...,"message":...}}`. Partial loads add `warnings` and exit 3. `--raw` emits only `data`, retaining error envelopes but dropping partial-load warnings; the exit code still signals them. Exceptions: `gc`, `limit-status`, `conflicts list`, `conflicts show`, `resolve`, and `team reserve` return `{"ok","data"}`; `team init` and `team setup` return bare objects; `session list/show` use their own text/json shapes; Bus commands use their versioned wire format. Those exceptions reject `--raw` during argument validation, before execution. Each command names its shape in `--help`. Use JSON to round-trip description/impact/content: markdown render fences grow when fed back through `update --stdin`; updates strip them and warn (ISS-1192).');
+  lines.push("");
+  lines.push("Run `storybloq <command>`. Positional arguments appear after the command; ? marks optional flags. Use `<command> --help` for value types and choices, or `storybloq reference --format json` for full usage strings.");
   lines.push("");
   for (const cmd of commands) {
-    lines.push(`### ${cmd.name}`);
-    lines.push(cmd.description);
-    lines.push("");
-    lines.push("```");
-    lines.push(cmd.usage);
-    lines.push("```");
-    lines.push("");
+    const suffix = cmd.usage.slice(`storybloq ${cmd.name}`.length);
+    const positionals = suffix.split(/\s+\[?--/)[0]!.trim();
+    const flags = (cmd.flags ?? []).map(flag => flag + (cmd.usage.includes(`[${flag}`) ? "?" : ""));
+    const argumentsList = flags.length ? ` (${flags.join(", ")})` : "";
+    lines.push(`- **${cmd.name}${positionals ? ` ${positionals}` : ""}**${argumentsList} - ${cmd.description}`);
   }
+  lines.push("");
 
   lines.push("## MCP Tools");
   lines.push("");
-  lines.push("The base tools below are registered in full mode (inside a .story/ project). The five storybloq_bus_* tools are always registered in full mode; when the Bus is disabled or uninitialized they return setup guidance pointing at `storybloq bus setup`, with no MCP restart required.");
+  lines.push("The base tools below are registered in full mode (inside a .story/ project). The storybloq_bus_* tools are always registered in full mode; when the Bus is disabled or uninitialized they return setup guidance pointing at `storybloq bus setup`, with no MCP restart required.");
+  lines.push("");
+  lines.push("Arguments marked ? are optional in the registered schema; handlers may require combinations depending on the action. Use the client’s tool schema for types and constraints.");
   lines.push("");
   for (const tool of mcpTools) {
     const params = tool.params?.length ? ` (${tool.params.join(", ")})` : "";
@@ -2761,41 +3219,38 @@ export function formatReference(
   lines.push("");
   lines.push("With no .story/ project on the path, the MCP server starts degraded and registers only:");
   lines.push("");
-  lines.push("- **storybloq_session_guard** -- the ownership verdict, available here because the no-project case is exactly where the skill runs its Step 0.5 guard first (T-446)");
-  lines.push("- **storybloq_init** -- bootstrap a .story/ project, then dynamically register the full tool set");
-  lines.push("- **storybloq_status** -- returns setup guidance instead of a project summary");
+  lines.push("- **storybloq_session_guard** (clientTaskId?) -- the ownership verdict, available here because the no-project case is exactly where the skill runs its Step 0.5 guard first (T-446)");
+  lines.push("- **storybloq_session_intel** (format?, sessionId?, transcript?, callerModel?, full?, clientTaskId?) -- context usage and session facts without a project");
+  lines.push("- **storybloq_health** (format?, only?, refresh?) -- read-only tooling checks without a project");
+  lines.push("- **storybloq_init** (name, type?, language?) -- bootstrap a .story/ project, then dynamically register the full tool set");
+  lines.push("- **storybloq_status** (format?) -- returns setup guidance instead of a project summary");
   lines.push("");
   lines.push("Destructive, admin, and git-integration workflows (delete, reconcile, conflicts, resolve, merge-driver, team, gc, repair, config, feedback) are CLI-only in both modes; see the CLI Commands section above.");
 
   lines.push("");
   lines.push("## Review verdict artifacts");
   lines.push("");
-  lines.push("Every review round writes a JSON artifact to `.story/sessions/<sessionId>/telemetry/reviews/`. The filename is `<target>-<stage>-r<round>.json`, and `-g<generation>` is appended once a round belongs to a generation above the first. The generation is a SUFFIX so the `*-code-r*.json` glob external readers already use keeps matching; it is also carried in the payload, so no reader has to parse a filename to know it.");
-  lines.push("");
-  lines.push("A generation opens whenever the round numbering restarts -- a plan redirect out of code review, or a plan-review reject. Before generations existed, the restarted rounds reproduced existing filenames and were silently dropped; artifacts under one target can therefore still be a mixture of two generations that predate this field.");
+  lines.push("Review JSON lives in `.story/sessions/<sessionId>/telemetry/reviews/<target>-<stage>-r<round>.json`. Generations above the first append `-g<generation>` before `.json`, preserving the `*-code-r*.json` glob. Generation also appears in the payload. Redirects and plan-review rejects restart round numbering; old artifacts may mix pre-generation rounds whose colliding files were silently dropped.");
   lines.push("");
   lines.push("### Joining a round to what produced it");
   lines.push("");
-  lines.push("`backendRunId` carries the backend's own run id and `backendRunIdKind` says what that id is the id OF, which is what decides how precisely a round can be joined:");
+  lines.push("`backendRunIdKind` defines the scope of `backendRunId`; derive join quality from the ids rather than storing a potentially contradictory summary:");
   lines.push("");
-  lines.push("| `backendRunIdKind` | scope of the run id | join is `exact` when |");
+  lines.push("| Kind | Scope | Exact join requires |");
   lines.push("|---|---|---|");
-  lines.push("| `codex-session` | a thread spanning many turns | `backendTurnId` is also present |");
-  lines.push("| `agent-dispatch` | one dispatch, already a single turn | always -- the dispatch id is turn-precise |");
-  lines.push("| `lens-review` | one review invocation | always -- the review id is the invocation |");
+  lines.push("| `codex-session` | Thread spanning turns | `backendTurnId` too |");
+  lines.push("| `agent-dispatch` | One dispatch/turn | Run id alone |");
+  lines.push("| `lens-review` | One review invocation | Run id alone |");
   lines.push("");
-  lines.push("A `backendTurnId` without its parent `backendRunId` joins nothing and reads as `none`, and so does a record carrying neither. ABSENCE IS NEVER READ AS `exact`. Join quality is deliberately not a stored field: it is derived from these ids on every read, because a stored copy can contradict the ids it summarizes.");
+  lines.push("A turn id without its parent run id joins nothing (`none`), as does a record with neither. Absence is never `exact`. `reviewAttemptId` identifies a round across state, artifact, and event sinks; deduplicate best-effort events by it. `itemAttemptId` identifies one work-item attempt across its rounds.");
   lines.push("");
-  lines.push("`reviewAttemptId` identifies one round across all three of its sinks (the state record, this artifact, and the events log); `itemAttemptId` identifies one attempt at one work item across every round of it. Events are best-effort and may duplicate after a crash, so deduplicate by `reviewAttemptId`.");
-  lines.push("");
-  lines.push("`generation` has TWO readings and `itemAttemptId` is what tells them apart. Where `itemAttemptId` is present, the generation is attempt-scoped lineage: it advances when a redirect restarts the round numbering, so rounds of one attempt at different generations are different rounds and counting distinct generations counts replans. Where `itemAttemptId` is ABSENT, the round had no work item, there is no lineage for the number to describe, and the generation is only a filename discriminator. Rounds with no work item all share the `unknown` filename stem, so two unrelated sequences can meet at one path and one of them is advanced to avoid overwriting the other. Do not count generations as attempts on records that carry no `itemAttemptId`.");
+  lines.push("With `itemAttemptId`, `generation` tracks replans within that attempt: redirects advance it when numbering restarts. Without `itemAttemptId`, there was no work item; generation only prevents filename collisions among unrelated `unknown` targets. Never count those generations as attempts or replans.");
   lines.push("");
   lines.push("### Reading absent values");
   lines.push("");
-  lines.push("Every field in this spine is optional, and an absent one means the value was not recorded -- never that it was measured and came back empty. Absence does NOT date a record: a round written today omits `backendRunId` and `backendTurnId` when the backend supplied none, and omits `workItemId` and `itemAttemptId` when the round had no work item at all, so an absent field is not evidence that the record predates the field. Three cases are worth naming because they are easy to misread. An absent `normalizerVersion` means the severities may not be normalized at all, so a `blocking` severity is possible. An absent `artifactStatus` means the artifact's existence is UNKNOWN; it never means the artifact is missing, and it never means one exists. And `reviewerIdentity.evidence` distinguishes what was OBSERVED to run from what was merely CONFIGURED to run -- a pin recorded as `configured` is evidence of intent and never of execution, which is why `unknown`/`none` is a valid and preferred record rather than a guessed model name.");
+  lines.push("Fields are optional. Missing means unrecorded, not measured-empty or old: current records can omit backend ids when none were supplied, or work/item ids when no item existed. Missing `normalizerVersion` permits unnormalized severities such as `blocking`; missing `artifactStatus` means existence is unknown. `reviewerIdentity.evidence` distinguishes observed execution from configuration: `configured` proves intent only; prefer `unknown`/`none` to a guessed model.");
   lines.push("");
-  lines.push("`payloadConsistent` records whether a verdict agreed with the findings it carried. Reading its rate needs care: change-requesting verdicts with zero findings are now repaired before they become rounds, so they are counted in `reviewRepairAttempts` instead. Those are two separate populations and must never be summed.");
-
+  lines.push("`payloadConsistent` compares a verdict with its findings. Change-requesting verdicts with zero findings are repaired before becoming rounds and counted in `reviewRepairAttempts`; these populations must never be summed.");
   lines.push("");
   lines.push("## /story design");
   lines.push("");
@@ -2813,25 +3268,13 @@ export function formatReference(
   lines.push("");
   lines.push("## /story orchestrate");
   lines.push("");
-  lines.push("Drive a multi-repo federation (or a large single-repo backlog) as an orchestrator: durable state in storybloq, implementation in background agents a tier below the session model when the client offers one, adversarial review gates on the session model.");
+  lines.push("Drive a federation or large backlog with a durable ledger, lower-tier implementation agents where available, and independent review gates. Read `orchestrator-mode.md` for enrichment, sizing, the six-stage pipeline, workflow scripts, and rules.");
   lines.push("");
-  lines.push("```");
-  lines.push("/story orchestrate               # guard checks, explicit opt-in, then the wave loop");
-  lines.push("```");
-  lines.push("");
-  lines.push("Requires explicit opt-in via AskUserQuestion before any agents are dispatched, and refuses to start while any federation node has an active autonomous session (one pen per repo; the per-node check reads each node's `.story/sessions/` directly because orchestrator status does not scan node repos). The full procedure -- enrichment template, sizing convention, 6-stage pipeline, workflow-script skeleton, critical rules -- is in `orchestrator-mode.md`. Needs a client with background dynamic workflows or subagents; Claude can also use the Agent View-backed `storybloq dispatch` path. Codex users can orchestrate when exact callable subagent tools are present; product-managed Codex dispatch remains unshipped.");
-  lines.push("");
-  lines.push("`/story` surfaces this option proactively at context load when the client is capable and the actionable backlog is orchestrate-sized, so you do not have to know the command exists; it stays a recommendation, and selecting it still routes through the explicit opt-in.");
+  lines.push("`/story orchestrate` requires explicit opt-in via AskUserQuestion before dispatch and refuses to start while any federation node has an active autonomous session. The one-pen-per-repo check reads each node's `.story/sessions/` directly; orchestrator status does not scan node repos. Requires callable background workflows or subagents. Claude also supports Agent View-backed `storybloq dispatch`; product-managed Codex dispatch remains unshipped. `/story` may recommend orchestration for a capable client and substantial actionable backlog; selection still requires opt-in.");
   lines.push("");
   lines.push("## /story triage");
   lines.push("");
-  lines.push("Read-only triage of the open issue backlog: verifies each finding against the pinned current HEAD (reusing the same source-reference provenance checks as `storybloq validate`), flags already-fixed and duplicate issues, groups issues that share one verified root cause, and produces a prioritized recommendations report.");
-  lines.push("");
-  lines.push("```");
-  lines.push("/story triage                    # triage all open issues, report only");
-  lines.push("```");
-  lines.push("");
-  lines.push("Mutates no issue and no ticket: classifications and recommendations are report vocabulary, and closing or filing stays with the maintainer. The only optional write is saving the finished report as a handover (snapshot first), offered once and performed only on explicit confirmation. The full procedure -- integrity branching, alias correlation, evidence bars, report format -- is in `triage-mode.md`.");
+  lines.push("`/story triage` reads the open issue backlog against pinned HEAD, validates source provenance, identifies fixed/duplicate findings and shared root causes, and reports priorities. It changes no issue or ticket. Saving the report as a handover is offered once and requires explicit confirmation, with a snapshot first. Read `triage-mode.md` for integrity checks, alias correlation, evidence requirements, and the report format.");
   lines.push("");
   lines.push("## /story bus");
   lines.push("");
@@ -2860,30 +3303,43 @@ export function formatReference(
   lines.push("2. `storybloq handover create --content <md>` -- write session handover");
   lines.push("");
   lines.push("### Project Setup");
-  lines.push("1. `npm install -g @storybloq/storybloq` - install CLI");
+  lines.push("1. `npm install -g @storybloq/storybloq@latest` - install CLI");
   lines.push("2. `storybloq setup --client all` - install Storybloq skill, MCP, and hooks for Claude Code and Codex");
   lines.push("3. `storybloq init --name my-project` - initialize .story/ in your project");
   lines.push("");
   lines.push("## Troubleshooting");
   lines.push("");
   lines.push("- **MCP not connected:** Run `storybloq setup --client all`");
-  lines.push("- **CLI not found:** Run `npm install -g @storybloq/storybloq`");
+  lines.push("- **CLI not found:** Run `npm install -g @storybloq/storybloq@latest`");
   lines.push("- **Stale data:** Run `storybloq validate` to check integrity");
   lines.push("- **Storybloq skill not available:** Run `storybloq setup --client all` to install the skill");
 
   return lines.join("\n");
 }
 
+/**
+ * ISS-1154: without `withActionability`, markdown output is byte-identical
+ * to before this ticket -- the flag opt-in gates every new rendering
+ * addition (actionability suffixes, the Excluded section, the
+ * window-incomplete warning). MCP's JSON envelope carries the new fields
+ * unconditionally regardless of this flag (2f) -- this gate is CLI-only.
+ */
 export function formatRecommendations(
   result: RecommendResult,
   state: ProjectState,
   format: OutputFormat,
+  withActionability = false,
 ): string {
   if (format === "json") {
     return JSON.stringify(successEnvelope({ ...result, isEmptyScaffold: state.isEmptyScaffold }), null, 2);
   }
 
-  if (result.recommendations.length === 0) {
+  const windowIncomplete = isHandoverWindowIncomplete(result.unreadableHandoverCount);
+  const hasNothingToShow = withActionability
+    ? result.recommendations.length === 0 && result.excludedCount === 0 && !windowIncomplete
+    : result.recommendations.length === 0;
+
+  if (hasNothingToShow) {
     if (state.isEmptyScaffold) {
       return "No recommendations yet -- this project needs tickets and phases. Run the /story setup flow to get started.";
     }
@@ -2895,10 +3351,23 @@ export function formatRecommendations(
 
   const lines: string[] = ["# Recommendations", ""];
 
+  if (withActionability && windowIncomplete) {
+    lines.push(
+      result.unreadableHandoverCount === null
+        ? "_Warning: handover history could not be listed -- results may be incomplete._"
+        : `_Warning: ${result.unreadableHandoverCount} handover file(s) could not be read -- results may be incomplete._`,
+    );
+    lines.push("");
+  }
+
   for (let i = 0; i < result.recommendations.length; i++) {
     const rec = result.recommendations[i]!;
+    const suffix =
+      withActionability && rec.actionability
+        ? ` (${rec.actionability.status} -- ${escapeMarkdownInline(rec.actionability.reason)})`
+        : "";
     lines.push(
-      `${i + 1}. **${escapeMarkdownInline(displayIdOf(rec))}** (${rec.kind}) -- ${escapeMarkdownInline(rec.title)}`,
+      `${i + 1}. **${escapeMarkdownInline(displayIdOf(rec))}** (${rec.kind}) -- ${escapeMarkdownInline(rec.title)}${suffix}`,
     );
     lines.push(`   _${escapeMarkdownInline(rec.reason)}_`);
     lines.push("");
@@ -2910,6 +3379,22 @@ export function formatRecommendations(
     );
   }
 
+  if (withActionability && result.excludedCount > 0) {
+    lines.push("");
+    const shown = result.excluded.length;
+    lines.push(
+      shown === result.excludedCount
+        ? `## Excluded (${result.excludedCount})`
+        : `## Excluded (${result.excludedCount} total, showing ${shown})`,
+    );
+    lines.push("");
+    for (const entry of result.excluded) {
+      lines.push(
+        `- ${escapeMarkdownInline(displayIdOf(entry))}: ${escapeMarkdownInline(entry.title)} (${entry.actionability.status} -- ${escapeMarkdownInline(entry.actionability.reason)})`,
+      );
+    }
+  }
+
   return lines.join("\n");
 }
 
@@ -2918,7 +3403,9 @@ export function formatReconcileResult(
   format: OutputFormat,
 ): string {
   if (format === "json") {
-    return JSON.stringify(result.ok ? successEnvelope(result.plan) : { ok: false, errors: result.errors }, null, 2);
+    if (!result.ok) return JSON.stringify({ ok: false, errors: result.errors }, null, 2);
+    const remedy = result.plan.renames.length > 0 ? ENABLE_GIT_REFS_REMEDY : undefined;
+    return JSON.stringify(successEnvelope({ ...result.plan, ...(remedy && { remedy }) }), null, 2);
   }
   if (!result.ok) {
     const lines = ["# Reconcile Failed", ""];
@@ -2943,6 +3430,9 @@ export function formatReconcileResult(
       lines.push(`- ${escapeMarkdownInline(w.message)}`);
     }
   }
+  // ISS-1190: the same one-line remedy the create-time warning and team
+  // doctor print, whenever this collision-finding run actually found one.
+  lines.push("", `${escapeMarkdownInline(ENABLE_GIT_REFS_REMEDY)}`);
   return lines.join("\n");
 }
 

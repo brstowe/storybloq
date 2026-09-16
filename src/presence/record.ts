@@ -48,6 +48,7 @@ import {
   type SessionPresence,
 } from "./types.js";
 import { capString } from "./redaction.js";
+import { parseSessionIntel } from "./session-intel-fields.js";
 
 export interface PresenceEventContext {
   readonly event: PresenceHookEvent;
@@ -107,6 +108,7 @@ export function parsePresenceRecord(text: string, sessionId: string): SessionPre
     arrangementPresenceTruncated: r.arrangementPresenceTruncated === true || parseTruncated,
     milestone: parseMilestone(r.milestone),
     ownerIdentity: parseOwnerIdentity(r.ownerIdentity),
+    sessionIntel: parseSessionIntel(r.sessionIntel),
   };
 }
 
@@ -134,7 +136,14 @@ export function applyPresenceEvent(
     arrangementPresenceTruncated: false,
     milestone: null,
     ownerIdentity: null,
+    sessionIntel: null,
   };
+
+  // T-499: `sessionIntel` follows the T-477 rule with one exception --
+  // preserved verbatim on every tool event, Stop, and EVERY SessionStart
+  // source (compact and clear included: the heavy path's own hooks apply the
+  // compaction and capture transitions, and a slim-hook clear here would race
+  // them); cleared only on SessionEnd, with `endedAt`.
 
   // T-477's ONE canonical transition table for the four new fields (stated
   // here so no other section of this codebase restates it and drifts):
@@ -233,6 +242,7 @@ export function applyPresenceEvent(
         suppressed: ctx.suppressed,
         endedAt: ctx.nowIso,
         milestone: null,
+        sessionIntel: null,
       };
   }
 }
@@ -270,6 +280,11 @@ export function serializePresence(record: SessionPresence): string | null {
  * shows, so they go last and never entirely.
  */
 export const PRESENCE_SHED_STEPS: ReadonlyArray<(r: SessionPresence) => SessionPresence> = [
+  // T-499: session intel's derived state goes before anything the panel
+  // shows. The sample is rebuilt by the next scan; the transcript path is a
+  // hint with two fallbacks. The capture and boundary fields are never shed.
+  (r) => (r.sessionIntel ? { ...r, sessionIntel: { ...r.sessionIntel, lastSample: null } } : r),
+  (r) => (r.sessionIntel ? { ...r, sessionIntel: { ...r.sessionIntel, transcriptPath: null } } : r),
   (r) => ({ ...r, closedToolIds: r.closedToolIds.slice(-8) }),
   (r) => ({ ...r, agentIds: r.agentIds.slice(-4) }),
   (r) => ({ ...r, openTools: r.openTools.slice(-2).map((t) => ({ ...t, target: null })) }),

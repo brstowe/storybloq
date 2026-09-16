@@ -1,0 +1,3 @@
+Run the full /story auto workflow for this ticket through the storybloq_autonomous_guide state
+machine. There is no human in this session: where the guide would ask a question, choose the
+safe default the skill documents and continue. Do the work in this directory.

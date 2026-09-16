@@ -1,0 +1,13 @@
+{
+  "id": "T-1006",
+  "title": "Design the v3 config schema",
+  "description": "Draft the v3 config fields before T-1005 can migrate to them.",
+  "type": "task",
+  "status": "open",
+  "phase": "core",
+  "order": 5,
+  "createdDate": "2026-08-01",
+  "completedDate": null,
+  "blockedBy": [],
+  "parentTicket": null
+}

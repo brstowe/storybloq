@@ -12,6 +12,7 @@ import { z } from "zod";
 import { registerAllTools } from "../../src/mcp/tools.js";
 import { buildLensHistoryUpdate } from "../../src/autonomous/stages/types.js";
 import { toolSchema } from "./tool-schema-helpers.js";
+import { schemaForKind } from "../../src/cli/commands/codex-review.js";
 
 function captureGuideSchema(): z.ZodTypeAny {
   const tools = new Map<string, { inputSchema: unknown }>();
@@ -154,4 +155,55 @@ describe("lens fidelity through the report boundary (ISS-724)", () => {
     expect(history).not.toBeNull();
     expect(history![0].lens).toBe("unknown");
   });
+});
+
+/**
+ * ISS-1202 (GitHub #36): OpenAI structured outputs in strict mode (what
+ * `codex exec --output-schema` uses) require every key in an object node's
+ * `properties` to also appear in that node's `required` array -- optional
+ * fields are expressed as required-plus-nullable via `anyOf` with a `null`
+ * branch, not by omission from `required`. The native codex review schema
+ * (`schemaForKind` in codex-review.ts) is handed straight to `codex exec`, so
+ * a single object node that violates this (declares a property but does not
+ * require it) makes Codex reject the schema outright with a 400 before it
+ * ever produces a review -- the whole codex review backend goes silently
+ * dark. This walks every object node in the schema and proves none of them
+ * violate the invariant, rather than pinning only the one field (
+ * `recommendedNextState`) the GitHub report happened to name.
+ */
+interface SchemaNode {
+  readonly type?: string;
+  readonly properties?: Record<string, SchemaNode>;
+  readonly required?: readonly string[];
+  readonly items?: SchemaNode;
+  readonly anyOf?: readonly SchemaNode[];
+}
+
+function collectStrictModeViolations(node: SchemaNode, path: string, violations: string[]): void {
+  if (node.type === "object" && node.properties) {
+    const required = new Set(node.required ?? []);
+    for (const key of Object.keys(node.properties)) {
+      if (!required.has(key)) {
+        violations.push(`${path}.properties.${key} is declared but missing from ${path}.required`);
+      }
+    }
+    for (const [key, child] of Object.entries(node.properties)) {
+      collectStrictModeViolations(child, `${path}.properties.${key}`, violations);
+    }
+  }
+  if (node.items) collectStrictModeViolations(node.items, `${path}.items`, violations);
+  if (node.anyOf) {
+    node.anyOf.forEach((branch, i) => collectStrictModeViolations(branch, `${path}.anyOf[${i}]`, violations));
+  }
+}
+
+describe("ISS-1202: native codex review schema satisfies OpenAI strict-mode structured outputs", () => {
+  for (const kind of ["plan", "code"] as const) {
+    it(`every object node's properties all appear in required, for kind "${kind}"`, () => {
+      const schema = schemaForKind(kind) as SchemaNode;
+      const violations: string[] = [];
+      collectStrictModeViolations(schema, "schema", violations);
+      expect(violations).toEqual([]);
+    });
+  }
 });

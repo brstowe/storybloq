@@ -24,6 +24,8 @@
  * trigger a full project reload on every tool call on someone else's machine.
  */
 
+import type { SessionIntelPresence } from "./session-intel-fields.js";
+
 /** Presence record schema version. Additive changes keep this number. */
 export const PRESENCE_SCHEMA_VERSION = 1;
 
@@ -209,6 +211,13 @@ export interface SessionPresence {
    * a new scanner or identity contract -- see the ticket's section 0.
    */
   readonly ownerIdentity: OwnerIdentity | null;
+  /**
+   * T-499: token-pressure state for this session, written ONLY by the heavy
+   * path (`src/core/session-intel/`) through `applyPresenceEnrichment`. The
+   * hook preserves it on every event and clears it on SessionEnd -- see
+   * record.ts's transition table. Null until the heavy path first writes it.
+   */
+  readonly sessionIntel: SessionIntelPresence | null;
 }
 
 export interface ArrangementPresenceEntry {

@@ -5,20 +5,23 @@
  *   loadProject(root) → build CommandContext → call handler → classify result
  */
 import { z } from "zod";
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { NODE_NAME_REGEX } from "../models/federation-config.js";
 import { CROSS_NODE_REF_REGEX } from "../models/ticket.js";
-import { resolveNodeRoot, checkNodeWritePermission, readOrchestratorConfig, detectNodeCollision, type McpToolResult } from "./node-resolution.js";
+import { resolveNodeRoot, checkNodeWritePermission, readOrchestratorConfig, detectNodeCollision, ORCHESTRATOR_NODE_SENTINEL, type McpToolResult } from "./node-resolution.js";
 import { initProject } from "../core/init.js";
 import { handleNodeList } from "../cli/commands/node.js";
 import { resolveNodePath } from "../federation/resolver.js";
 import { TARGET_WORK_INPUT_REGEX, LENS_FINDING_DISPOSITIONS, OwnerGoneCandidateTakeoverSchema, OwnerGoneCandidateCancelSchema } from "../autonomous/session-types.js";
 import { CLIENT_TASK_ID_PATTERN } from "../autonomous/client-profile.js";
 import { evaluateSessionGuard } from "../core/session-guard.js";
+import { HEALTH_CHECK_IDS } from "../core/health/types.js";
+import type { RegistrationContext } from "./registration-context.js";
+export type { RegistrationContext } from "./registration-context.js";
 import { findActiveSessionMinimal, readSessionResilient, sessionDir, isLeaseExpired, withSessionLock } from "../autonomous/session.js";
 import { citationsForReviewTarget } from "../autonomous/cited-rulings.js";
-import { withStalenessNote } from "../autonomous/binary-staleness.js";
+import { describeBinaryStaleness, withStalenessNote } from "../autonomous/binary-staleness.js";
 import { touchLastMcpCallFile } from "../autonomous/liveness.js";
 import { registerBusTools } from "./bus-tools.js";
 import { withStrictToolSchemas } from "./strict-schemas.js";
@@ -93,6 +96,7 @@ import { withProjectLock } from "../core/project-loader.js";
 
 // Handler imports -- pure functions, no run.ts side effects
 import { handleStatus } from "../cli/commands/status.js";
+import { handleRosterList } from "../cli/commands/roster.js";
 import { handleValidateWithSourceRefs } from "../cli/commands/validate.js";
 import {
   handleHandoverList,
@@ -175,6 +179,7 @@ import { handleExport } from "../cli/commands/export.js";
 import { handleSelftest } from "../cli/commands/selftest.js";
 import { handleHandoverCreate } from "../cli/commands/handover.js";
 import { handleAutonomousGuide } from "../autonomous/guide.js";
+import { applyBannerToMcpText, applyStatusPushesToMcpText, statusPushesFor, tokenPressureBannerFor } from "../core/session-intel/push.js";
 import { handleSessionReport } from "../cli/commands/session-report.js";
 import {
   handlePhaseList,
@@ -221,6 +226,11 @@ export async function runMcpReadTool(
   handler: (ctx: CommandContext) => Promise<CommandResult> | CommandResult,
   effectiveRoot?: string,
   format: OutputFormat = "md",
+  // T-501: the usage-cost advisory is attached by the PRIMING call only
+  // (`storybloq_status`), never by every read tool -- it is a once-per-session
+  // line and any other tool consuming it would spend it where the user is not
+  // looking.
+  pushes: { readonly usageAdvisory?: boolean } = {},
 ): Promise<McpToolResult> {
   // Liveness is always anchored to pinnedRoot (the orchestrator), not the effective node root.
   try { touchMcpLiveness(pinnedRoot); } catch { /* best-effort */ }
@@ -290,6 +300,16 @@ export async function runMcpReadTool(
       }
     }
 
+    // T-499: the token-pressure banner for the CALLER's own session, under
+    // the binding rule; never on an error result (returned above), never at
+    // ok/unknown. md: prefix block; json: sibling key `tokenPressure`.
+    // T-501: on the priming call both pushes come from ONE acquisition under
+    // one deadline (`statusPushesFor`); every other read tool keeps the
+    // pressure banner alone and never touches the advisory.
+    const statusPushes = pushes.usageAdvisory
+      ? statusPushesFor(pinnedRoot, { cwd: pinnedRoot }, "mcp")
+      : { banner: tokenPressureBannerFor(pinnedRoot, { cwd: pinnedRoot }, "mcp"), usage: null };
+    text = applyStatusPushesToMcpText(text, format, statusPushes.banner, statusPushes.usage);
     return { content: [{ type: "text", text }] };
   } catch (err: unknown) {
     if (err instanceof ProjectLoaderError) {
@@ -320,8 +340,12 @@ export async function runMcpWriteTool(
     const result = await handler(writeRoot, "md");
 
     if (result.errorCode && INFRASTRUCTURE_ERROR_CODES.includes(result.errorCode)) {
+      // ISS-1214: an infrastructure failure is one of the shapes a stale
+      // server produces, so this exit needs the note at least as much as the
+      // success one below. `withStalenessNote` is byte-identical when
+      // staleness is not established.
       return {
-        content: [{ type: "text", text: formatMcpError(result.errorCode, result.output) }],
+        content: [{ type: "text", text: withStalenessNote(formatMcpError(result.errorCode, result.output)) }],
         isError: true,
       };
     }
@@ -336,22 +360,44 @@ export async function runMcpWriteTool(
     if (handlerWarnings.length > 0) {
       text = `Warning: ${handlerWarnings.join("; ")}\n\n${text}`;
     }
+    // T-499: same banner as the read pipeline (write tools are always md).
+    text = applyBannerToMcpText(text, "md", tokenPressureBannerFor(pinnedRoot, { cwd: pinnedRoot }, "mcp"));
+    // ISS-1214: a server binary older than the on-disk build keeps serving
+    // writes after a build that changed the presence schema -- the field
+    // report's handover_create stamps never landed for exactly that reason,
+    // and only review_lenses_prepare's session path ever said so. The check
+    // is process-relative (a startup fingerprint against the disk), not
+    // session-scoped, so every write tool can carry it. Appended, so each
+    // handler's own output stays byte-identical above it.
+    const staleNote = describeBinaryStaleness();
+    if (staleNote) text = `${text}\n\n${staleNote}`;
     return { content: [{ type: "text", text }] };
   } catch (err: unknown) {
+    // ISS-1214: same reasoning as the errorCode exit above -- a thrown write
+    // failure is exactly what a stale server produces, so all three throw
+    // shapes carry the note when one is established.
     if (err instanceof ProjectLoaderError) {
-      return { content: [{ type: "text", text: formatMcpError(err.code, err.message) }], isError: true };
+      return { content: [{ type: "text", text: withStalenessNote(formatMcpError(err.code, err.message)) }], isError: true };
     }
     if (err instanceof CliValidationError) {
-      return { content: [{ type: "text", text: formatMcpError(err.code, err.message) }], isError: true };
+      return { content: [{ type: "text", text: withStalenessNote(formatMcpError(err.code, err.message)) }], isError: true };
     }
     const message = err instanceof Error ? err.message : String(err);
-    return { content: [{ type: "text", text: formatMcpError("io_error", message) }], isError: true };
+    return { content: [{ type: "text", text: withStalenessNote(formatMcpError("io_error", message)) }], isError: true };
   }
 }
 
 // --- Tool registration ---
 
-const nodeParam = z.string().regex(NODE_NAME_REGEX).optional().describe("Operate on this node's .story/ instead of the orchestrator's own (orchestrator only).");
+const nodeParam = z
+  .string()
+  .refine((v) => v === ORCHESTRATOR_NODE_SENTINEL || NODE_NAME_REGEX.test(v), {
+    message: `Must be "${ORCHESTRATOR_NODE_SENTINEL}" (the orchestrator's own board) or a node name matching ${NODE_NAME_REGEX}`,
+  })
+  .optional()
+  .describe(
+    `Operate on this node's .story/ instead of the orchestrator's own (orchestrator only). Pass "${ORCHESTRATOR_NODE_SENTINEL}" for the orchestrator's own board.`,
+  );
 
 function resolveEffectiveRoot(pinnedRoot: string, nodeName?: string): { root: string } | McpToolResult {
   if (!nodeName) return { root: pinnedRoot };
@@ -397,7 +443,7 @@ async function checkNodeCollision(
     return {
       content: [{
         type: "text" as const,
-        text: `"${displayId}" exists on more than one board (${boards}) and "node" was not specified. Pass node= to disambiguate.`,
+        text: `"${displayId}" exists on more than one board (${boards}) and "node" was not specified. Pass node="${ORCHESTRATOR_NODE_SENTINEL}" for the orchestrator board or node=<name> for a node.`,
       }],
       isError: true,
     };
@@ -420,7 +466,10 @@ function resolveEffectiveRootForWrite(pinnedRoot: string, nodeName?: string): { 
   if (!config) {
     return { content: [{ type: "text" as const, text: "Cannot read orchestrator config" }], isError: true };
   }
-  if (!checkNodeWritePermission(pinnedRoot, config)) {
+  // ISS-1181: node="." is a write to the orchestrator's OWN board, not a
+  // cross-node write -- it must not be gated behind `federation.allowNodeWrites`,
+  // or enabling federation becomes a prerequisite for editing your own tickets.
+  if (nodeName !== ORCHESTRATOR_NODE_SENTINEL && !checkNodeWritePermission(pinnedRoot, config)) {
     return {
       content: [{ type: "text" as const, text: "Node writes disabled. Set `federation.allowNodeWrites: true` in .story/config.json to enable cross-node writes from this orchestrator." }],
       isError: true,
@@ -433,7 +482,7 @@ function resolveEffectiveRootForWrite(pinnedRoot: string, nodeName?: string): { 
   return { root: resolved.root };
 }
 
-export function registerAllTools(rawServer: McpServer, pinnedRoot: string): void {
+export function registerAllTools(rawServer: McpServer, pinnedRoot: string, ctx?: RegistrationContext): void {
   // ISS-892: every registration below goes through the strict shim, so an
   // argument the tool does not implement is an error naming the key rather than a
   // silently dropped one. Shadowing the parameter is deliberate: there is no
@@ -506,10 +555,20 @@ export function registerAllTools(rawServer: McpServer, pinnedRoot: string): void
         .string()
         .optional()
         .describe("Omit to inherit the client's environment identity (CLAUDE_CODE_SESSION_ID or CODEX_THREAD_ID)."),
+      // T-320 commit 3: reduced payload, per the ticket's schema. JSON only --
+      // set regardless of `format`, since there is no Markdown compact form.
+      compact: z.boolean().optional().describe("Reduced JSON payload (T-320); ignores `format`"),
     },
   }, async (args) => {
-    const format = args.format ?? "md";
-    const result = await runMcpReadTool(pinnedRoot, (ctx) => handleStatus(ctx, args.clientTaskId), undefined, format);
+    // T-320: compact is JSON regardless of `format`, and that has to be
+    // decided HERE, before runMcpReadTool -- its usage-advisory/token-
+    // pressure pushes (applyStatusPushesToMcpText) append Markdown prose to
+    // the text content whenever they fire, which corrupts a compact body if
+    // format is still "md" at that point.
+    const format = args.compact ? "json" : (args.format ?? "md");
+    // T-501: status is the /story priming call, and the only surface that
+    // attaches and consumes the usage-cost advisory.
+    const result = await runMcpReadTool(pinnedRoot, (ctx) => handleStatus(ctx, args.clientTaskId, { compact: args.compact }), undefined, format, { usageAdvisory: true });
     // ISS-570 G2: prepend update-available notice so /story's first MCP
     // call surfaces 'newer storybloq available' proactively. Synchronous
     // cache read; a background refresh is kicked off so the NEXT status
@@ -519,6 +578,8 @@ export function registerAllTools(rawServer: McpServer, pinnedRoot: string): void
       const running = process.env.STORYBLOQ_VERSION ?? "0.0.0-dev";
       const info = readUpdateCacheSync(running);
       refreshUpdateCacheInBackground();
+      // format is never "md" when compact is true (forced above), so this
+      // condition alone already excludes a compact body from the banner.
       if (format === "md" && info?.updateAvailable && result.content[0]?.type === "text") {
         const banner = `A newer storybloq is available (v${info.latestVersion}). Run \`npm install -g @storybloq/storybloq@latest\` -- the CLI will auto-refresh the /story skill on next invocation.\n\n`;
         return {
@@ -576,9 +637,23 @@ export function registerAllTools(rawServer: McpServer, pinnedRoot: string): void
     description: "Content of the most recent handover document(s)",
     inputSchema: {
       count: z.number().int().min(1).max(10).optional().describe("default: 1"),
+      brief: z.boolean().optional().describe(
+        "T-320: return a structured record digest (continuation/blocked/owner-gated/carried items plus a trajectory list) instead of full bodies, for every handover in the window",
+      ),
+      priming: z.boolean().optional().describe(
+        "T-320/T-497: return each handover's full body when it is at or under 12,000 bytes, otherwise the same structured digest brief uses. Combined with brief, brief wins",
+      ),
+      // T-498: brief/priming's structured fields (records, index,
+      // continuationCandidates, trajectory) have no Markdown rendering for
+      // continuationCandidates -- a caller that needs to walk it (or wants
+      // the exact HandoverBriefResult shape for cost-measurement/
+      // reconciliation) requests "json" explicitly. Omitted, this stays
+      // byte-identical to every existing caller (Markdown, as before).
+      format: z.enum(["md", "json"]).optional().describe("default: md"),
     },
   }, (args) => runMcpReadTool(pinnedRoot, (ctx) =>
-    handleHandoverLatest(ctx, args.count ?? 1),
+    handleHandoverLatest(ctx, args.count ?? 1, { brief: args.brief, priming: args.priming }),
+    undefined, args.format ?? "md",
   ));
 
   server.registerTool("storybloq_blocker_list", {
@@ -587,6 +662,9 @@ export function registerAllTools(rawServer: McpServer, pinnedRoot: string): void
 
   registerSessionGuardTool(server, pinnedRoot);
   registerSessionMilestoneTool(server, pinnedRoot);
+  registerRosterGetTool(server, pinnedRoot);
+  registerSessionIntelTool(server, pinnedRoot);
+  registerHealthTool(server, pinnedRoot, ctx?.launchDir ?? realpathSync(process.cwd()));
 
   server.registerTool("storybloq_validate", {
     description: "Reference integrity + schema checks. Works even when corrupt JSON blocks project loading.",
@@ -668,12 +746,19 @@ export function registerAllTools(rawServer: McpServer, pinnedRoot: string): void
     description: "Get a ticket by ID (includes umbrella tickets)",
     inputSchema: {
       id: z.string().refine((v) => TICKET_ID_REGEX.test(v) || TICKET_CANONICAL_ID_REGEX.test(v), "Ticket ID").describe("e.g. T-001, T-079b, t-[canonical]"),
+      format: z.enum(["md", "json"]).optional().describe("default: md"),
+      withActionability: z.boolean().optional(),
       node: nodeParam,
     },
   }, (args) => {
     const eff = resolveEffectiveRoot(pinnedRoot, args.node);
     if ("content" in eff) return eff;
-    return runMcpReadTool(pinnedRoot, (ctx) => handleTicketGet(args.id, ctx), eff.root);
+    return runMcpReadTool(
+      pinnedRoot,
+      (ctx) => handleTicketGet(args.id, ctx, args.withActionability ?? false),
+      eff.root,
+      args.format ?? (args.withActionability ? "json" : "md"),
+    );
   });
 
   server.registerTool("storybloq_ticket_meta_get", {
@@ -721,12 +806,19 @@ export function registerAllTools(rawServer: McpServer, pinnedRoot: string): void
     description: "Get an issue by ID",
     inputSchema: {
       id: IssueRefSchema.describe("Issue ID (e.g. ISS-001, i-[canonical])"),
+      format: z.enum(["md", "json"]).optional().describe("default: md"),
+      withActionability: z.boolean().optional(),
       node: nodeParam,
     },
   }, (args) => {
     const eff = resolveEffectiveRoot(pinnedRoot, args.node);
     if ("content" in eff) return eff;
-    return runMcpReadTool(pinnedRoot, (ctx) => handleIssueGet(args.id, ctx), eff.root);
+    return runMcpReadTool(
+      pinnedRoot,
+      (ctx) => handleIssueGet(args.id, ctx, args.withActionability ?? false),
+      eff.root,
+      args.format ?? (args.withActionability ? "json" : "md"),
+    );
   });
 
   server.registerTool("storybloq_issue_meta_get", {
@@ -741,8 +833,16 @@ export function registerAllTools(rawServer: McpServer, pinnedRoot: string): void
     description: "Content of a specific handover document by filename",
     inputSchema: {
       filename: z.string().describe("e.g. 2026-03-20-session.md"),
+      // T-498: a not_found/io_error result is NOT classified as isError
+      // (not_found is a user error, not an INFRASTRUCTURE_ERROR_CODES
+      // entry) -- a caller that must machine-detect failure (recovery code,
+      // not a human reading Markdown) requests "json" to get the same
+      // {version, error:{code,message}} vs {version, data} discriminant
+      // every other JSON-mode read tool already uses, instead of string-
+      // sniffing an "Error [...]" prefix in Markdown text.
+      format: z.enum(["md", "json"]).optional().describe("default: md"),
     },
-  }, (args) => runMcpReadTool(pinnedRoot, (ctx) => handleHandoverGet(args.filename, ctx)));
+  }, (args) => runMcpReadTool(pinnedRoot, (ctx) => handleHandoverGet(args.filename, ctx), undefined, args.format ?? "md"));
 
   // --- T-084: Recap + Snapshot + Export ---
 
@@ -760,9 +860,14 @@ export function registerAllTools(rawServer: McpServer, pinnedRoot: string): void
   }, (args) => {
     const eff = resolveEffectiveRoot(pinnedRoot, args.node);
     if ("content" in eff) return eff;
+    // ISS-1154: json unconditionally, so actionability/excluded/
+    // unreadableHandoverCount are always reachable to the MCP caller (the
+    // SKILL's Gate B/Part 3 included) -- these are additive JSON fields with
+    // no markdown-rendering opt-in gate at this layer (that gate is the
+    // CLI's --with-actionability flag instead).
     return runMcpReadTool(pinnedRoot, (ctx) =>
       handleRecommend(ctx, args.count ?? 5),
-    eff.root);
+    eff.root, "json");
   });
 
   server.registerTool("storybloq_snapshot", {
@@ -807,7 +912,10 @@ export function registerAllTools(rawServer: McpServer, pinnedRoot: string): void
       });
     }
     return runMcpWriteTool(pinnedRoot, (root) =>
-      handleHandoverCreate(args.content, args.slug ?? "session", "md", root),
+      // ISS-1214: naming the surface is what lets the reply report an unbound
+      // MCP caller (never silent here) and assert a stale server only when
+      // one was actually established.
+      handleHandoverCreate(args.content, args.slug ?? "session", "md", root, { surface: "mcp" }),
     );
   });
 
@@ -1418,9 +1526,12 @@ export function registerAllTools(rawServer: McpServer, pinnedRoot: string): void
   }, (args) => runMcpReadTool(pinnedRoot, (ctx) => handleLessonGet(args.id, ctx)));
 
   server.registerTool("storybloq_lesson_digest", {
-    description: "Compiled ranked digest of active lessons -- primary read interface for context loading",
-    inputSchema: {},
-  }, () => runMcpReadTool(pinnedRoot, (ctx) => handleLessonDigest(ctx)));
+    description: "Compiled ranked digest of active lessons -- primary read interface for context loading. limit/select (T-320): limited one-line form; see `storybloq reference`.",
+    inputSchema: {
+      limit: z.number().int().nonnegative().optional().describe("Cap to top N by reinforcement"),
+      select: z.array(z.string()).optional().describe("phase:<id>/component:<name>/item:<id> selectors"),
+    },
+  }, (args) => runMcpReadTool(pinnedRoot, (ctx) => handleLessonDigest(ctx, { limit: args.limit, select: args.select })));
 
   server.registerTool("storybloq_lesson_create", {
     description: "Create a new lesson. Concurrent creates get distinct sequential IDs.",
@@ -1955,6 +2066,9 @@ export function registerAllTools(rawServer: McpServer, pinnedRoot: string): void
         reviewerSessionId: z.string().optional().describe("Codex session ID"),
         reviewer: z.string().optional().describe("Actual reviewer backend used, e.g. 'agent' when codex was unavailable"),
         reviewId: z.string().optional().describe("From review_lenses_prepare/synthesize; pass on lens-backed review_round reports (ISS-720)."),
+        capReasons: z.array(z.string()).optional().describe(
+          "ISS-950: reviewVerdict.capReasons verbatim. A coverage-only revise routes to a lens re-run, not IMPLEMENT.",
+        ),
         // T-488 provenance. Optional, never inferred: with none supplied the
         // round records source "unknown", evidence "none", which is truthful.
         //
@@ -2350,6 +2464,113 @@ export function registerSessionGuardTool(server: McpServer, root: string) {
     return Promise.resolve({
       content: [{ type: "text" as const, text: JSON.stringify(verdict, null, 2) }],
     });
+  });
+}
+
+/**
+ * T-499: `storybloq_session_intel`. Bypasses `runMcpReadTool` because it
+ * must answer WITHOUT a project (transcript-only, read-only), so it is
+ * registered in both the full and the degraded set (removed on the post-init
+ * swap, the T-446 pattern). Same handler as the CLI: identical numbers.
+ */
+export function registerSessionIntelTool(server: McpServer, root: string | null) {
+  return server.registerTool("storybloq_session_intel", {
+    description:
+      "Context usage, expected auto-compaction point with provenance, pressure state (ok/advisory/imperative/compact-needed) and session facts. Works without .story/; sessionId or transcript inspects another session read-only.",
+    inputSchema: {
+      format: z.enum(["md", "json"]).optional().describe("default: md"),
+      sessionId: z.string().optional(),
+      transcript: z.string().optional().describe("Explicit transcript path"),
+      callerModel: z.string().optional().describe("Reported on mismatch, never overrides"),
+      full: z.boolean().optional().describe("Whole-transcript read, 64 MiB budget"),
+      clientTaskId: z.string().optional(),
+    },
+  }, async (args) => {
+    if (root) { try { touchMcpLiveness(root); } catch { /* best-effort */ } }
+    try {
+      const { handleSessionIntel } = await import("../cli/commands/session-intel.js");
+      const result = handleSessionIntel({
+        cwd: root ?? process.cwd(),
+        format: args.format ?? "md",
+        sessionId: args.sessionId ?? null,
+        transcript: args.transcript ?? null,
+        callerModel: args.callerModel ?? null,
+        full: args.full === true,
+        clientTaskId: args.clientTaskId ?? null,
+        sampledBy: "mcp-refresh",
+      });
+      // A handler-reported failure (no session identity, transcript not
+      // found or not authorized) is an error to the caller, with the
+      // diagnostic output preserved; the CLI sets exit code 1 for the same.
+      return result.errorCode
+        ? { content: [{ type: "text" as const, text: result.output }], isError: true }
+        : { content: [{ type: "text" as const, text: result.output }] };
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      return { content: [{ type: "text" as const, text: formatMcpError("io_error", message, args.format ?? "md") }], isError: true };
+    }
+  });
+}
+
+/**
+ * T-502: `storybloq_health`. Like `storybloq_session_intel` and for the same
+ * reason, this bypasses `runMcpReadTool`: that pipeline requires a STRING root
+ * and loads the ledger, and this tool must answer without a project at all --
+ * the no-project case is exactly where a newcomer most needs to be told their
+ * CLI is stale or their review bridge is missing. So it is registered in both
+ * the full and the degraded set and swapped out on init (the T-446 pattern),
+ * takes no banner, and does no `loadProject`.
+ *
+ * `projectDir` is passed in rather than read here. It is the server's LAUNCH
+ * directory, captured once by the entry point and handed down through a
+ * RegistrationContext: nothing is captured at import time, so two servers in
+ * one process can inspect two different directories, and an init cannot
+ * change the value.
+ */
+export function registerHealthTool(server: McpServer, ledgerRoot: string | null, projectDir: string) {
+  return server.registerTool("storybloq_health", {
+    // Trimmed first, as the T-460 ratchet intends: what remains is the one
+    // sentence that is not already in `storybloq reference` and settings.md,
+    // plus the relay instruction, which is the only part a client acts on.
+    description:
+      "Tooling check: auto-compact window, CLI version, Codex review bridge (launched and answered, not just registered), /story skill, cross-session message delivery. Works without .story/, read-only. Relay each advise message and its fix verbatim.",
+    inputSchema: {
+      format: z.enum(["md", "json"]).optional().describe("default: md"),
+      only: z.array(z.enum(HEALTH_CHECK_IDS)).optional(),
+      refresh: z.boolean().optional().describe("Force the registry lookup past the 24h cache"),
+    },
+  }, async (args) => {
+    if (ledgerRoot) { try { touchMcpLiveness(ledgerRoot); } catch { /* best-effort */ } }
+    const format = args.format ?? "md";
+    try {
+      const { handleHealth } = await import("../cli/commands/health.js");
+      const result = await handleHealth({ ledgerRoot, projectDir }, format, {
+        ...(args.only ? { only: args.only } : {}),
+        ...(args.refresh !== undefined ? { refresh: args.refresh } : {}),
+      });
+      return { content: [{ type: "text" as const, text: result.output }] };
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      return { content: [{ type: "text" as const, text: formatMcpError("io_error", message, format) }], isError: true };
+    }
+  });
+}
+
+/**
+ * T-507: the seat roster, read-only. Writes stay CLI-only (`storybloq roster
+ * start|heartbeat|end`), the Mod's path; an agent that wants the roster
+ * changed by hand shells out, so a hand write is never mistaken for a Mod's.
+ */
+export function registerRosterGetTool(server: McpServer, root: string) {
+  return server.registerTool("storybloq_roster_get", {
+    description:
+      "Seat roster: live sessions and subagents (Bus merged) with live/stale/terminal counts; terminal hidden unless all. Read-only.",
+    inputSchema: {
+      format: z.enum(["md", "json"]).optional().describe("default: md"),
+      all: z.boolean().optional().describe("Include terminal seats"),
+    },
+  }, async (args) => {
+    return runMcpReadTool(root, (ctx) => handleRosterList(ctx, { all: args.all === true }), undefined, args.format ?? "md");
   });
 }
 

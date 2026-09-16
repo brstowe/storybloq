@@ -6,6 +6,7 @@ import { formatReconcileResult, ExitCode, successEnvelope, type ExitCodeValue } 
 import { withProjectLock, runTransactionUnlocked } from "../../core/project-loader.js";
 import { nextNoteID, allocateTeamNoteId, NOTE_NUMERIC_REGEX } from "../../core/id-allocation.js";
 import { listReservations } from "../../core/remote-refs.js";
+import { ENABLE_GIT_REFS_REMEDY } from "../../core/branch-allocation-warning.js";
 import type { ProjectState } from "../../core/project-state.js";
 import type { Note } from "../../models/note.js";
 import type { CommandResult } from "../types.js";
@@ -278,6 +279,9 @@ function formatReconcileOutput(
           phasesRebalanced: rebalance.phasesRebalanced,
         },
       } : {}),
+      // ISS-1190: same one-line remedy the create-time warning and team
+      // doctor print, whenever this run actually found a collision.
+      ...(result.plan.renames.length > 0 ? { remedy: ENABLE_GIT_REFS_REMEDY } : {}),
     }), null, 2);
   }
   const base = formatReconcileResult(result, format);

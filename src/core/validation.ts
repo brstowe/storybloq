@@ -56,6 +56,15 @@ export interface ValidationAux {
    * fail-open the reachability check exists to close.
    */
   readonly citingEntityLoadComplete?: boolean;
+  /**
+   * T-498: whether the NEWEST handover file carries the
+   * `<!-- storybloq-handover v1 -->` marker but has no `Carried forward`
+   * heading. Pre-computed by the CLI/MCP boundary (the one file read this
+   * check needs) -- `validateProject` itself does no I/O, same shape as the
+   * ruling side-store fields above. A legacy handover with no marker at all
+   * never sets this, regardless of its heading content.
+   */
+  readonly handoverNewestMarkedWithoutCarriedForward?: boolean;
 }
 
 // --- Main Validation ---
@@ -491,6 +500,22 @@ export function validateProject(
     }
   }
 
+  // ISS-1203: an open issue with no phase is invisible on the Mac app's
+  // phase-grouped board. Only worth flagging when the roadmap has phases to
+  // sort into -- a phase-less roadmap makes the field moot for everyone.
+  if (phaseIDs.size > 0) {
+    for (const i of state.activeIssues) {
+      if (i.status !== "open") continue;
+      if (i.phase != null) continue;
+      findings.push({
+        level: "info",
+        code: "issue_missing_phase",
+        message: `Issue ${displayIdOf(i)} has no phase and will not appear on the phase-grouped board.`,
+        entity: i.id,
+      });
+    }
+  }
+
   // Duplicate leaf order within same phase (info)
   const orderByPhase = new Map<string | null, Map<number, string[]>>();
   for (const t of state.leafTickets) {
@@ -560,6 +585,20 @@ export function validateProject(
       state,
       findings,
     );
+  }
+
+  // T-498: a marked handover (opted into the v1 scaffold contract) is
+  // expected to carry a Carried forward heading, even an empty one. An
+  // unmarked/legacy handover makes no such promise and never fires this --
+  // the aux flag is only ever true when the marker was actually found.
+  if (aux.handoverNewestMarkedWithoutCarriedForward === true) {
+    findings.push({
+      level: "info",
+      code: "handover_no_carried_forward",
+      message:
+        "The newest handover carries the storybloq-handover v1 marker but has no Carried forward section.",
+      entity: null,
+    });
   }
 
   const errorCount = findings.filter((f) => f.level === "error").length;

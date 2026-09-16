@@ -89,19 +89,32 @@ describe("ISS-1115 R1: the output schema admits provenance", () => {
     }
   });
 
-  it("keeps the provenance keys OPTIONAL, so an older reviewer still validates", () => {
+  /**
+   * ISS-1202 (GitHub #36): OpenAI structured outputs in strict mode reject a
+   * schema where a declared property is absent from `required` -- that is
+   * exactly what made GitHub #36 fail before Codex ever produced output.
+   * "Optional" for these four keys is expressed as required-plus-nullable
+   * (an `anyOf` with a `null` branch), the same way `file`/`line`/`suggestion`
+   * already worked, not by omission from `required`.
+   */
+  it("requires the provenance keys but makes them nullable, so strict-mode output must include them and use null when there is nothing to report", () => {
     for (const kind of ["plan", "code"] as const) {
-      const required = findingProps(kind).required as string[];
+      const props = findingProps(kind);
+      const required = props.required as string[];
       for (const key of ["origin", "originClass", "sinceRound", "dispositionReason"]) {
-        expect(required).not.toContain(key);
+        expect(required).toContain(key);
+        const anyOf = props.properties[key].anyOf as Array<{ type?: string }>;
+        expect(anyOf.some((branch) => branch.type === "null")).toBe(true);
       }
     }
   });
 
   it("constrains the vocabulary it does admit", () => {
     const items = findingProps("code");
-    expect(items.properties.origin.enum).toEqual(["introduced", "pre-existing"]);
-    expect(items.properties.originClass.enum).toEqual([
+    const originBranch = (items.properties.origin.anyOf as Array<{ enum?: string[] }>).find((b) => b.enum);
+    const originClassBranch = (items.properties.originClass.anyOf as Array<{ enum?: string[] }>).find((b) => b.enum);
+    expect(originBranch!.enum).toEqual(["introduced", "pre-existing"]);
+    expect(originClassBranch!.enum).toEqual([
       "new", "reintroduced", "unchanged", "introduced-by-fix",
     ]);
   });
@@ -137,6 +150,32 @@ describe("ISS-1115 R1: normalizeFinding preserves provenance", () => {
     expect(out.origin).toBeUndefined();
     expect(out.sinceRound).toBeUndefined();
     expect("originClass" in out).toBe(false);
+  });
+
+  /**
+   * ISS-1202 (GitHub #36): all four provenance keys become required-plus-
+   * nullable in the schema alongside recommendedNextState (same strict-mode
+   * requirement), so a reviewer with nothing to report for one now emits an
+   * explicit `null`. Null must normalize the same way an absent key always
+   * did -- absent from the output -- not survive as a stored `null`.
+   */
+  it("treats a null provenance field the same as an absent one -- round-trips to absent, not to a stored null", () => {
+    const out = normalizeFinding({
+      ...base,
+      origin: null,
+      originClass: null,
+      sinceRound: null,
+      dispositionReason: null,
+    } as CodexFinding, 0) as Record<string, unknown>;
+
+    expect(out.origin).toBeUndefined();
+    expect(out.originClass).toBeUndefined();
+    expect(out.sinceRound).toBeUndefined();
+    expect(out.dispositionReason).toBeUndefined();
+    expect("origin" in out).toBe(false);
+    expect("originClass" in out).toBe(false);
+    expect("sinceRound" in out).toBe(false);
+    expect("dispositionReason" in out).toBe(false);
   });
 
   it("still defaults disposition and still folds in the file citation", () => {

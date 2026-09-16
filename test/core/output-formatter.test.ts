@@ -7,6 +7,7 @@ import {
   escapeMarkdownInline,
   escapeMarkdownDocument,
   fencedBlock,
+  stripRenderFence,
   formatStatus,
   formatFederatedStatus,
   formatPhaseList,
@@ -23,9 +24,10 @@ import {
   formatInitResult,
   formatRecommendations,
 } from "../../src/core/output-formatter.js";
-import { makeTicket, makeIssue, makeState, makeRoadmap, makePhase } from "./test-factories.js";
+import { makeTicket, makeIssue, makeNote, makeLesson, makeState, makeRoadmap, makePhase } from "./test-factories.js";
 import type { NextTicketOutcome, NextTicketsOutcome } from "../../src/core/queries.js";
 import type { RecommendResult } from "../../src/core/recommend.js";
+import type { TrajectoryEntry } from "../../src/core/markdown-sections.js";
 import type { ValidationResult, ValidationFinding } from "../../src/core/validation.js";
 import type { Ruling } from "../../src/models/ruling.js";
 
@@ -189,6 +191,53 @@ describe("fencedBlock", () => {
     // Should use 4 backticks as fence
     expect(result.startsWith("````")).toBe(true);
     expect(result.endsWith("````")).toBe(true);
+  });
+});
+
+describe("stripRenderFence (ISS-1192)", () => {
+  it("strips a whole-input 4-backtick fence with no info string", () => {
+    const result = stripRenderFence(fencedBlock("has ``` inside"));
+    expect(result).toEqual({ text: "has ``` inside", stripped: true });
+  });
+
+  it("round-trips: fencedBlock then stripRenderFence recovers the exact original, and is idempotent on the result", () => {
+    const original = "line one\nline two with ``` a fence\nline three";
+    const rendered = fencedBlock(original);
+    const first = stripRenderFence(rendered);
+    expect(first).toEqual({ text: original, stripped: true });
+    const second = stripRenderFence(first.text);
+    expect(second).toEqual({ text: original, stripped: false });
+  });
+
+  it("never strips a whole-input 3-backtick fence (named mutant: lowering the threshold to 3 must make this red)", () => {
+    const input = "```\nhello\n```";
+    expect(stripRenderFence(input)).toEqual({ text: input, stripped: false });
+  });
+
+  it("never strips a 4-backtick fence carrying an info string", () => {
+    const input = "````ts\nconst x = 1;\n````";
+    expect(stripRenderFence(input)).toEqual({ text: input, stripped: false });
+  });
+
+  it("never strips when there is text outside the fence", () => {
+    const input = "some prose\n````\nfenced\n````";
+    expect(stripRenderFence(input)).toEqual({ text: input, stripped: false });
+    const input2 = "````\nfenced\n````\nmore prose";
+    expect(stripRenderFence(input2)).toEqual({ text: input2, stripped: false });
+  });
+
+  it("trims only outer whitespace, preserving inner leading/trailing newlines", () => {
+    const input = "  \n````\n\nline one\n\n````\n  ";
+    expect(stripRenderFence(input)).toEqual({ text: "\nline one\n", stripped: true });
+  });
+
+  it("matches the closing fence at the end of input only, never an inner fence of the same length", () => {
+    // The content itself contains a line that is exactly 4 backticks; the true
+    // outer closer is the LAST such line, at the true end of input.
+    const input = "````\nfirst\n````\nsecond\n````";
+    const result = stripRenderFence(input);
+    expect(result.stripped).toBe(true);
+    expect(result.text).toBe("first\n````\nsecond");
   });
 });
 
@@ -719,6 +768,9 @@ describe("formatRecommendations", () => {
         { id: "T-001", kind: "ticket", title: "Task", category: "inprogress_ticket", reason: "In-progress", score: 800 },
       ],
       totalCandidates: 2,
+      excludedCount: 0,
+      excluded: [],
+      unreadableHandoverCount: 0,
     };
     const md = formatRecommendations(result, populatedState, "md");
     expect(md).toContain("# Recommendations");
@@ -729,14 +781,14 @@ describe("formatRecommendations", () => {
   });
 
   it("empty + populated → 'complete or blocked' message", () => {
-    const result: RecommendResult = { recommendations: [], totalCandidates: 0 };
+    const result: RecommendResult = { recommendations: [], totalCandidates: 0, excludedCount: 0, excluded: [], unreadableHandoverCount: 0 };
     const md = formatRecommendations(result, populatedState, "md");
     expect(md).toContain("No recommendations");
     expect(md).toContain("complete or blocked");
   });
 
   it("empty + empty scaffold → setup message", () => {
-    const result: RecommendResult = { recommendations: [], totalCandidates: 0 };
+    const result: RecommendResult = { recommendations: [], totalCandidates: 0, excludedCount: 0, excluded: [], unreadableHandoverCount: 0 };
     const scaffoldState = makeState();
     const md = formatRecommendations(result, scaffoldState, "md");
     expect(md).toContain("No recommendations yet");
@@ -749,6 +801,9 @@ describe("formatRecommendations", () => {
         { id: "T-001", kind: "ticket", title: "Task", category: "quick_win", reason: "Chore", score: 400 },
       ],
       totalCandidates: 5,
+      excludedCount: 0,
+      excluded: [],
+      unreadableHandoverCount: 0,
     };
     const json = formatRecommendations(result, populatedState, "json");
     const parsed = JSON.parse(json);
@@ -759,7 +814,7 @@ describe("formatRecommendations", () => {
   });
 
   it("JSON envelope includes isEmptyScaffold: true for scaffold", () => {
-    const result: RecommendResult = { recommendations: [], totalCandidates: 0 };
+    const result: RecommendResult = { recommendations: [], totalCandidates: 0, excludedCount: 0, excluded: [], unreadableHandoverCount: 0 };
     const scaffoldState = makeState();
     const json = formatRecommendations(result, scaffoldState, "json");
     const parsed = JSON.parse(json);
@@ -772,9 +827,139 @@ describe("formatRecommendations", () => {
         { id: "T-001", kind: "ticket", title: "Task", category: "quick_win", reason: "Chore", score: 400 },
       ],
       totalCandidates: 8,
+      excludedCount: 0,
+      excluded: [],
+      unreadableHandoverCount: 0,
     };
     const md = formatRecommendations(result, populatedState, "md");
     expect(md).toContain("Showing 1 of 8 candidates.");
+  });
+
+  // ISS-1154: --with-actionability rendering
+  describe("withActionability", () => {
+    function actionableRec() {
+      return {
+        id: "T-001",
+        kind: "ticket" as const,
+        title: "Task",
+        category: "quick_win" as const,
+        reason: "Chore",
+        score: 400,
+        actionability: { status: "actionable" as const, reason: "open, no blocking signal", source: "ledger" as const },
+      };
+    }
+    function excludedEntry(id: string) {
+      return {
+        id,
+        kind: "issue" as const,
+        title: "Duplicate bug",
+        actionability: { status: "duplicate" as const, reason: "structured disposition: duplicate", source: "structured" as const },
+      };
+    }
+
+    it("without the flag, markdown is byte-identical to the pre-ISS-1154 shape", () => {
+      const result: RecommendResult = {
+        recommendations: [actionableRec()],
+        totalCandidates: 1,
+        excludedCount: 2,
+        excluded: [excludedEntry("ISS-001"), excludedEntry("ISS-002")],
+        unreadableHandoverCount: 1,
+      };
+      const withoutFlag = formatRecommendations(result, populatedState, "md");
+      const resultNoExtras: RecommendResult = { ...result, excludedCount: 0, excluded: [], unreadableHandoverCount: 0 };
+      const baseline = formatRecommendations(resultNoExtras, populatedState, "md");
+      expect(withoutFlag).toBe(baseline);
+      expect(withoutFlag).not.toContain("actionability");
+      expect(withoutFlag).not.toContain("Excluded");
+    });
+
+    it("appends the actionability suffix to each recommendation row", () => {
+      const result: RecommendResult = {
+        recommendations: [actionableRec()],
+        totalCandidates: 1,
+        excludedCount: 0,
+        excluded: [],
+        unreadableHandoverCount: 0,
+      };
+      const md = formatRecommendations(result, populatedState, "md", true);
+      expect(md).toContain("(actionable -- open, no blocking signal)");
+    });
+
+    it("Excluded section: exact-count header form (N === M)", () => {
+      const result: RecommendResult = {
+        recommendations: [actionableRec()],
+        totalCandidates: 1,
+        excludedCount: 2,
+        excluded: [excludedEntry("ISS-001"), excludedEntry("ISS-002")],
+        unreadableHandoverCount: 0,
+      };
+      const md = formatRecommendations(result, populatedState, "md", true);
+      expect(md).toContain("## Excluded (2)");
+      expect(md).toContain("ISS-001: Duplicate bug (duplicate -- structured disposition: duplicate)");
+      expect(md).toContain("ISS-002: Duplicate bug");
+    });
+
+    it("Excluded section: truncated header form (N !== M)", () => {
+      const result: RecommendResult = {
+        recommendations: [actionableRec()],
+        totalCandidates: 1,
+        excludedCount: 5,
+        excluded: [excludedEntry("ISS-001")],
+        unreadableHandoverCount: 0,
+      };
+      const md = formatRecommendations(result, populatedState, "md", true);
+      expect(md).toContain("## Excluded (5 total, showing 1)");
+    });
+
+    it("all-excluded response reaches the Excluded section instead of the terse empty string", () => {
+      const result: RecommendResult = {
+        recommendations: [],
+        totalCandidates: 2,
+        excludedCount: 2,
+        excluded: [excludedEntry("ISS-001"), excludedEntry("ISS-002")],
+        unreadableHandoverCount: 0,
+      };
+      const md = formatRecommendations(result, populatedState, "md", true);
+      expect(md).not.toContain("No recommendations");
+      expect(md).toContain("## Excluded (2)");
+    });
+
+    it("window-incomplete warning: counted form (positive unreadableHandoverCount)", () => {
+      const result: RecommendResult = {
+        recommendations: [actionableRec()],
+        totalCandidates: 1,
+        excludedCount: 0,
+        excluded: [],
+        unreadableHandoverCount: 3,
+      };
+      const md = formatRecommendations(result, populatedState, "md", true);
+      expect(md).toContain("3 handover file(s) could not be read");
+    });
+
+    it("window-incomplete warning: count-free form (unreadableHandoverCount: null)", () => {
+      const result: RecommendResult = {
+        recommendations: [actionableRec()],
+        totalCandidates: 1,
+        excludedCount: 0,
+        excluded: [],
+        unreadableHandoverCount: null,
+      };
+      const md = formatRecommendations(result, populatedState, "md", true);
+      expect(md).toContain("handover history could not be listed");
+    });
+
+    it("an incomplete window alone (no excluded, empty recommendations) still reaches the warning, not the terse string", () => {
+      const result: RecommendResult = {
+        recommendations: [],
+        totalCandidates: 0,
+        excludedCount: 0,
+        excluded: [],
+        unreadableHandoverCount: null,
+      };
+      const md = formatRecommendations(result, populatedState, "md", true);
+      expect(md).not.toContain("No recommendations");
+      expect(md).toContain("handover history could not be listed");
+    });
   });
 });
 
@@ -1204,6 +1389,165 @@ describe("formatStatus positional compatibility (ISS-943, Codex round 4)", () =>
 });
 
 /**
+ * T-320 commit 3: `compact` is an additive, APPENDED-LAST boolean, same
+ * discipline as `expiredLeaseSessions` (ISS-943) and `arrangements` (T-473)
+ * before it. Omitting it (or passing `false`) must leave every existing
+ * caller byte-identical; the reduction only happens when it is explicitly
+ * `true`, and it renders JSON regardless of the `format` argument -- the
+ * ticket's amendment states compact status is JSON only, so there is no
+ * markdown compact form to keep in sync.
+ */
+describe("formatStatus compact mode (T-320 commit 3)", () => {
+  it("omitting compact (or passing false) is byte-identical to the pre-existing shape", () => {
+    const state = makeState();
+    const bare = formatStatus(state, "json");
+    const explicitFalse = formatStatus(
+      state,
+      "json",
+      [],
+      [],
+      undefined,
+      [],
+      undefined,
+      [],
+      { items: [], warnings: [] },
+      false,
+    );
+    expect(bare).toBe(explicitFalse);
+  });
+
+  it("compact:true renders JSON even when format is md", () => {
+    const state = makeState();
+    const out = formatStatus(state, "md", [], [], undefined, [], undefined, [], undefined, true);
+    expect(() => JSON.parse(out)).not.toThrow();
+  });
+
+  it("compact:true drops archivedNotes, deprecatedLessons, and issueFlow.semantics", () => {
+    const state = makeState({
+      notes: [makeNote({ id: "N-1", status: "archived" })],
+      lessons: [makeLesson({ id: "L-1", status: "deprecated" })],
+      issues: [makeIssue({ id: "ISS-1", discoveredDate: "2026-01-01" })],
+    });
+    const parsed = JSON.parse(
+      formatStatus(state, "json", [], [], undefined, [], undefined, [], undefined, true),
+    ) as { data: Record<string, unknown> };
+    expect(parsed.data.archivedNotes).toBeUndefined();
+    expect(parsed.data.deprecatedLessons).toBeUndefined();
+    expect(parsed.data.activeNotes).toBe(0);
+    const issueFlow = parsed.data.issueFlow as { semantics?: unknown } | null;
+    if (issueFlow) expect(issueFlow.semantics).toBeUndefined();
+  });
+
+  it("compact:true reduces session entries to the eight-field set, dropping ticketId/ticketTitle", () => {
+    const state = makeState();
+    const session = {
+      sessionId: "sess-1",
+      sourceDir: "sess-1",
+      state: "active",
+      mode: "autonomous",
+      ticketId: "T-1",
+      ticketTitle: "Some ticket",
+      ownerTask: null,
+      leaseExpiresAt: null,
+      leaseState: "live",
+      compactPending: false,
+    } as never;
+    const parsed = JSON.parse(
+      formatStatus(state, "json", [session], [], undefined, [], undefined, [], undefined, true),
+    ) as { data: { activeSessions: Record<string, unknown>[] } };
+    const s = parsed.data.activeSessions[0]!;
+    expect(s.ticketId).toBeUndefined();
+    expect(s.ticketTitle).toBeUndefined();
+    expect(s).toMatchObject({
+      sessionId: "sess-1",
+      sourceDir: "sess-1",
+      state: "active",
+      mode: "autonomous",
+      leaseState: "live",
+      compactPending: false,
+    });
+  });
+
+  it("compact:true reduces bus to six fields, dropping participants/wake/hookDelivery/deliveryCapabilities", () => {
+    const state = makeState();
+    const bus = {
+      enabled: true,
+      initialized: true,
+      daemonState: "stopped",
+      setupState: "ready",
+      deliveryMode: "live",
+      participants: [{ id: "p1" }],
+      nextActions: ["do a thing"],
+      endpoints: 2,
+      pendingMessages: 3,
+      unacknowledgedCritical: 1,
+      openThreads: 0,
+      parkedThreads: 0,
+      undeliverable: 0,
+      quarantined: 0,
+      hookDelivery: { claude: true, codex: false },
+      deliveryCapabilities: {},
+      wake: {},
+    } as never;
+    const parsed = JSON.parse(
+      formatStatus(state, "json", [], [], bus, [], undefined, [], undefined, true),
+    ) as { data: { bus: Record<string, unknown> } };
+    expect(parsed.data.bus).toEqual({
+      enabled: true,
+      daemonState: "stopped",
+      deliveryMode: "live",
+      pendingMessages: 3,
+      unacknowledgedCritical: 1,
+      nextActions: ["do a thing"],
+    });
+  });
+
+  it("compact:true keeps limitStops whole (the ticket text calling for a reduction there was a slip)", () => {
+    const state = makeState();
+    const limitStop = {
+      key: "k1",
+      sessionType: "autonomous",
+      storybloqSessionId: "sess-1",
+      clientTaskId: "task-1",
+      status: "deferred",
+      limitType: "usage",
+      reasonCode: null,
+      mode: "headless",
+      nextAttemptAt: "2026-01-01T00:00:00.000Z",
+      wakeAttempts: 1,
+    } as never;
+    const parsed = JSON.parse(
+      formatStatus(state, "json", [], [], undefined, [limitStop], undefined, [], undefined, true),
+    ) as { data: { limitStops: unknown[] } };
+    expect(parsed.data.limitStops).toEqual([limitStop]);
+  });
+
+  it("compact:true keeps sessionDiagnostics and arrangements/arrangementWarnings unreduced", () => {
+    const state = makeState();
+    const diagnostics = [
+      {
+        kind: "state-unreadable",
+        category: "omission",
+        sourceDir: "broken",
+        sourcePath: "/p/.story/sessions/broken/state.json",
+        sessionId: null,
+        reason: "unreadable",
+      },
+    ] as never;
+    const arrangements = {
+      items: [{ route: null, id: "a-1", lifecycle: "active", bounds: ["T-1"], parties: [] }],
+      warnings: ["an advisory warning"],
+    } as never;
+    const parsed = JSON.parse(
+      formatStatus(state, "json", [], [], undefined, [], diagnostics, [], arrangements, true),
+    ) as { data: { sessionDiagnostics: unknown[]; arrangements: unknown[]; arrangementWarnings: unknown[] } };
+    expect(parsed.data.sessionDiagnostics).toEqual(diagnostics);
+    expect(parsed.data.arrangements).toEqual(arrangements.items);
+    expect(parsed.data.arrangementWarnings).toEqual(arrangements.warnings);
+  });
+});
+
+/**
  * T-476 binding ruling, closed structurally per the pen's round-3 acceptor's
  * ruling: the anti-laundering caveat was found missing three separate times
  * across three separate review rounds (formatRuling's JSON chainStatus-less
@@ -1272,5 +1616,120 @@ describe("T-476 binding ruling: every attribution-displaying ruling formatter ou
         );
       }
     }
+  });
+});
+
+/**
+ * ISS-1214: a handover whose stamp did not land used to return exactly
+ * "Created handover: <file>", so an agent read the reply as success while the
+ * presence record kept `handoverWrittenAt: null` and the prompt hook re-fired
+ * the imperative two prompts later with no visible cause.
+ */
+describe("ISS-1214: formatHandoverCreateResult names why an attempted stamp did not land", () => {
+  const FILE = "2026-09-14-01-session.md";
+  const HINT = "Restart the client: an MCP server older than the on-disk build cannot bind the caller, so the stamp has nowhere to land.";
+  const NEUTRAL = "The caller could not be bound to a live presence record; if this repeats, restart the client.";
+  const busy = { reason: "lock busy", kind: "outcome" } as const;
+  const unbound = { reason: "skipped: no presence record for the caller", kind: "binding" } as const;
+
+  it("md: the bare reply is unchanged when there is no failure, and a failure adds one block under it", () => {
+    expect(outputFormatter.formatHandoverCreateResult(FILE, "md")).toBe(`Created handover: ${FILE}`);
+    expect(outputFormatter.formatHandoverCreateResult(FILE, "md", false, null, null, false, null)).toBe(`Created handover: ${FILE}`);
+    expect(outputFormatter.formatHandoverCreateResult(FILE, "md", false, null, null, false, busy)).toBe(
+      `Created handover: ${FILE}\n\nHandover stamp did not land (lock busy): context pressure is not held; the next imperative is expected.`,
+    );
+  });
+
+  it("md: the causal restart hint requires POSITIVE staleness; an unbound caller on a fresh server gets the neutral sentence", () => {
+    const fresh = outputFormatter.formatHandoverCreateResult(FILE, "md", false, null, null, false, unbound, false);
+    expect(fresh).toContain("Handover stamp did not land (skipped: no presence record for the caller): context pressure is not held; the next imperative is expected.");
+    expect(fresh).toContain(NEUTRAL);
+    expect(fresh).not.toContain(HINT);
+
+    const stale = outputFormatter.formatHandoverCreateResult(FILE, "md", false, null, null, false, unbound, true);
+    expect(stale).toContain(HINT);
+    expect(stale).not.toContain(NEUTRAL);
+
+    // Default is false: a caller that cannot establish staleness never asserts it.
+    expect(outputFormatter.formatHandoverCreateResult(FILE, "md", false, null, null, false, unbound)).toContain(NEUTRAL);
+  });
+
+  it("md: outcome, refused and error kinds get neither sentence, stale or not", () => {
+    for (const kind of ["outcome", "refused", "error"] as const) {
+      for (const stale of [false, true]) {
+        const out = outputFormatter.formatHandoverCreateResult(FILE, "md", false, null, null, false, { reason: `r-${kind}`, kind }, stale);
+        expect(out, `${kind}/${String(stale)}`).toBe(
+          `Created handover: ${FILE}\n\nHandover stamp did not land (r-${kind}): context pressure is not held; the next imperative is expected.`,
+        );
+      }
+    }
+  });
+
+  it("json: tokenPressureStampReason carries the reason, and the key is absent when there is none", () => {
+    const withReason = JSON.parse(outputFormatter.formatHandoverCreateResult(FILE, "json", false, null, null, false, busy)) as { data: Record<string, unknown> };
+    expect(withReason.data).toEqual({ filename: FILE, tokenPressureStampReason: "lock busy" });
+    const none = JSON.parse(outputFormatter.formatHandoverCreateResult(FILE, "json", false, null, null, false, null)) as { data: Record<string, unknown> };
+    expect(none.data).toEqual({ filename: FILE });
+    const landed = JSON.parse(outputFormatter.formatHandoverCreateResult(FILE, "json", true)) as { data: Record<string, unknown> };
+    expect(landed.data).toEqual({ filename: FILE, tokenPressureStamped: true });
+  });
+});
+
+describe("ISS-1219: trajectory zero-count rendering", () => {
+  // occurrenceCount counts only continuation/blocked/owner-gated/carried
+  // mentions (buildTrajectory); latest takes any mention. A shipped-only id
+  // therefore has count 0 beside a named latest, and the single-sentence
+  // form read as a contradiction in the field (ISS-1210, 2026-09-14).
+  const zeroShipped = {
+    id: "ISS-1210",
+    occurrenceCount: 0,
+    firstSeenInWindow: "h1.md",
+    latest: "h1.md",
+    latestDisposition: "shipped" as const,
+  };
+  const twoContinuation = {
+    id: "ISS-950",
+    occurrenceCount: 2,
+    firstSeenInWindow: "h2.md",
+    latest: "h1.md",
+    latestDisposition: "continuation" as const,
+  };
+  // Synthetic: the count rule never produces a zero-count entry with a
+  // non-shipped disposition today; this fixture pins that the renderer
+  // reads the disposition from data rather than hardcoding "shipped".
+  const zeroContinuation = {
+    id: "T-999",
+    occurrenceCount: 0,
+    firstSeenInWindow: "h1.md",
+    latest: "h1.md",
+    latestDisposition: "continuation" as const,
+  };
+  const brief = (trajectory: TrajectoryEntry[]) => ({
+    handovers: [{ filename: "h1.md", form: "structured" as const, records: [], index: null }],
+    trajectory,
+    skippedHandovers: 0,
+    missingHandovers: 0,
+  });
+
+  it("renders a zero-count entry as a no-open-mention line, never as 'seen in 0'", () => {
+    const md = outputFormatter.formatHandoverBrief(brief([zeroShipped, twoContinuation]), "md");
+    expect(md).toContain("- ISS-1210: no open mention; last named as shipped in h1.md");
+    expect(md).not.toMatch(/seen in 0 handover\(s\), latest/);
+    expect(md).toContain("- ISS-950: seen in 2 handover(s), latest h1.md (continuation)");
+  });
+
+  it("takes the disposition from the entry, not a literal 'shipped'", () => {
+    const md = outputFormatter.formatHandoverBrief(brief([zeroContinuation]), "md");
+    expect(md).toContain("- T-999: no open mention; last named as continuation in h1.md");
+  });
+
+  it("leaves the json trajectory shape unchanged", () => {
+    const json = JSON.parse(outputFormatter.formatHandoverBrief(brief([zeroShipped, twoContinuation]), "json")) as {
+      data: { trajectory: { id: string; occurrenceCount: number }[] };
+    };
+    expect(json.data.trajectory.map((t) => [t.id, t.occurrenceCount])).toEqual([
+      ["ISS-1210", 0],
+      ["ISS-950", 2],
+    ]);
   });
 });

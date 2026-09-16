@@ -11,6 +11,7 @@ import { findActiveSessionMinimal, sessionDir } from "../../autonomous/session.j
 import { readLastMcpCall, readOwnerHeartbeat } from "../../autonomous/liveness.js";
 import { readSubprocessSummaries } from "../../autonomous/subprocess-registry.js";
 import { writeStatusFile } from "../../autonomous/status-writer.js";
+import { readCoarseTokenPressureForSession } from "../../core/session-intel/status-projection.js";
 import { collectProbes, reduceHealthState } from "../../autonomous/health-model.js";
 import { isStopHookStatusWriteEnabled } from "../../core/limit-config.js";
 import { isPresenceEnabled, removePresenceRecords } from "../../presence/handler.js";
@@ -355,6 +356,8 @@ export function activePayload(session: Parameters<typeof buildActivePayload>[0],
     alive: heartbeat.kind === "unusable" ? null : heartbeat.kind === "alive",
     runningSubprocesses: subprocesses.length > 0 ? subprocesses : null,
     healthState,
+    // T-499: the OWNER's coarse token pressure, same function as the guide writer.
+    tokenPressure: readCoarseTokenPressureForSession(root, session as { claudeCodeSessionId?: string | null }),
   });
 }
 
@@ -525,6 +528,24 @@ export async function handleHookStatus(options: { client?: BusClient } = {}): Pr
     const root = discoverProjectRoot(cwd);
     if (!root) {
       process.exit(0);
+    }
+
+    // T-499: one bounded, lifecycle-bound token-pressure sample for THIS
+    // Claude session, BEFORE the status write so the owner projection below
+    // reads a fresh record when the caller is the owner. Claude only (a Codex
+    // Stop hook carries no transcript). Never throws, never blocks the hook.
+    if ((options.client ?? "claude") === "claude" && isPresenceEnabled(root)) {
+      try {
+        const { handleStopHookSample } = await import("./session-intel.js");
+        handleStopHookSample({
+          root,
+          cwd,
+          sessionId: typeof input!.session_id === "string" ? normalizeClientTaskId(input!.session_id) : null,
+          transcriptPath: typeof input!.transcript_path === "string" ? input!.transcript_path : null,
+        });
+      } catch {
+        // Best-effort; status.json is still written below without the block.
+      }
     }
 
     // Scan for active session. ISS-1012: skipped entirely when this project

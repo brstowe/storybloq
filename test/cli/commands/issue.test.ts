@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { mkdtemp, readdir, rm, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readdir, rm, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -12,12 +12,14 @@ import {
   handleIssueMetaUnset,
   handleIssueDelete,
 } from "../../../src/cli/commands/issue.js";
+import { handleTicketCreate } from "../../../src/cli/commands/ticket.js";
 import { ExitCode } from "../../../src/core/output-formatter.js";
 import { CliValidationError } from "../../../src/cli/helpers.js";
 import { handleTicketCreate } from "../../../src/cli/commands/ticket.js";
 import { initProject } from "../../../src/core/init.js";
 import { loadProject } from "../../../src/core/project-loader.js";
 import { makeState, makeIssue } from "../../core/test-factories.js";
+import { deriveWorkspaceId } from "../../../src/autonomous/session-types.js";
 import type { CommandContext } from "../../../src/cli/run.js";
 
 function makeCtx(overrides: Partial<CommandContext> = {}): CommandContext {
@@ -269,23 +271,6 @@ describe("handleIssueCreate", () => {
     expect(parsed.data.id).toBe("ISS-001");
   });
 
-  it("defaults phase to the current working phase when omitted (fork)", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "issue-create-"));
-    tmpDirs.push(dir);
-    await initProject(dir, { name: "test" });
-    // Seed a ticket into p0 so it becomes the current phase; without leaf
-    // tickets currentPhase() returns null and the fallback keeps phase null.
-    await handleTicketCreate(
-      { title: "Seed", type: "task", phase: "p0", description: "", blockedBy: [], parentTicket: null },
-      "md", dir,
-    );
-    const result = await handleIssueCreate(
-      { title: "Review issue", severity: "high", impact: "x", components: [], relatedTickets: [], location: [] },
-      "json", dir,
-    );
-    expect(JSON.parse(result.output).data.phase).toBe("p0");
-  });
-
   it("leaves phase null when no phase is active (fork)", async () => {
     const dir = await mkdtemp(join(tmpdir(), "issue-create-"));
     tmpDirs.push(dir);
@@ -464,6 +449,138 @@ describe("handleIssueCreate", () => {
       ),
     ).rejects.toThrow("not found in roadmap");
   });
+
+  describe("ISS-1203: phase inference so issues with no explicit phase still appear on the phase-grouped board", () => {
+    it("infers phase from the first related ticket", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "issue-create-"));
+      tmpDirs.push(dir);
+      await initProject(dir, { name: "test" });
+      const ticket = JSON.parse((await handleTicketCreate(
+        { title: "Leaf", type: "task", phase: "p0", description: "x", blockedBy: [], parentTicket: null },
+        "json", dir,
+      )).output).data;
+
+      const result = await handleIssueCreate(
+        { title: "Bug", severity: "high", impact: "x", components: [], relatedTickets: [ticket.id], location: [] },
+        "json", dir,
+      );
+
+      expect(JSON.parse(result.output).data.phase).toBe("p0");
+    });
+
+    it("falls back to the resolved parent's phase when a related child ticket has no phase of its own", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "issue-create-"));
+      tmpDirs.push(dir);
+      await initProject(dir, { name: "test" });
+      const umbrella = JSON.parse((await handleTicketCreate(
+        { title: "Umbrella", type: "feature", phase: "p0", description: "x", blockedBy: [], parentTicket: null },
+        "json", dir,
+      )).output).data;
+      const child = JSON.parse((await handleTicketCreate(
+        { title: "Child", type: "task", phase: null, description: "x", blockedBy: [], parentTicket: umbrella.id },
+        "json", dir,
+      )).output).data;
+      expect(child.phase).toBeNull();
+
+      const result = await handleIssueCreate(
+        { title: "Bug", severity: "high", impact: "x", components: [], relatedTickets: [child.id], location: [] },
+        "json", dir,
+      );
+
+      expect(JSON.parse(result.output).data.phase).toBe("p0");
+    });
+
+    it("stays phase-less with no related tickets and no active session", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "issue-create-"));
+      tmpDirs.push(dir);
+      await initProject(dir, { name: "test" });
+
+      const result = await handleIssueCreate(
+        { title: "Bug", severity: "high", impact: "x", components: [], relatedTickets: [], location: [] },
+        "json", dir,
+      );
+
+      expect(JSON.parse(result.output).data.phase).toBeNull();
+    });
+
+    it("uses the active session's current ticket phase when relatedTickets is empty", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "issue-create-"));
+      tmpDirs.push(dir);
+      await initProject(dir, { name: "test" });
+      const ticket = JSON.parse((await handleTicketCreate(
+        { title: "In progress", type: "task", phase: "p0", description: "x", blockedBy: [], parentTicket: null },
+        "json", dir,
+      )).output).data;
+
+      const sessionId = "aaaaaaaa-0000-0000-0000-000000000001";
+      const sessDir = join(dir, ".story", "sessions", sessionId);
+      await mkdir(sessDir, { recursive: true });
+      const now = new Date().toISOString();
+      await writeFile(join(sessDir, "state.json"), JSON.stringify({
+        schemaVersion: 1,
+        sessionId,
+        recipe: "coding",
+        state: "IMPLEMENT",
+        revision: 1,
+        status: "active",
+        mode: "auto",
+        reviews: { plan: [], code: [] },
+        completedTickets: [],
+        finalizeCheckpoint: null,
+        git: { branch: "main", mergeBase: null },
+        lease: {
+          workspaceId: deriveWorkspaceId(dir),
+          lastHeartbeat: now,
+          expiresAt: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+        },
+        contextPressure: { level: "low", guideCallCount: 0, ticketsCompleted: 0, compactionCount: 0, eventsLogBytes: 0 },
+        pendingProjectMutation: null,
+        resumeFromRevision: null,
+        preCompactState: null,
+        compactPending: false,
+        compactPreparedAt: null,
+        resumeBlocked: false,
+        terminationReason: null,
+        waitingForRetry: false,
+        lastGuideCall: now,
+        startedAt: now,
+        guideCallCount: 0,
+        config: { maxTicketsPerSession: 5, compactThreshold: "high", reviewBackends: ["codex", "agent"] },
+        ticket: { id: ticket.id, title: ticket.title },
+      }));
+      await writeFile(join(sessDir, "events.log"), "");
+
+      const result = await handleIssueCreate(
+        { title: "Deferred finding", severity: "high", impact: "x", components: [], relatedTickets: [], location: [] },
+        "json", dir,
+      );
+
+      expect(JSON.parse(result.output).data.phase).toBe("p0");
+    });
+
+    it("does not override an explicit phase with an inferred one", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "issue-create-"));
+      tmpDirs.push(dir);
+      await initProject(dir, {
+        name: "test",
+        phases: [
+          { id: "p0", label: "PHASE 0", name: "Setup", description: "x" },
+          { id: "p1", label: "PHASE 1", name: "Next", description: "y" },
+        ],
+      });
+      const ticket = JSON.parse((await handleTicketCreate(
+        { title: "Leaf", type: "task", phase: "p0", description: "x", blockedBy: [], parentTicket: null },
+        "json", dir,
+      )).output).data;
+
+      const result = await handleIssueCreate(
+        { title: "Bug", severity: "high", impact: "x", components: [], relatedTickets: [ticket.id], location: [], phase: "p1" },
+        "json", dir,
+      );
+
+      expect(JSON.parse(result.output).data.phase).toBe("p1");
+    });
+  });
 });
 
 describe("handleIssueUpdate", () => {
@@ -488,6 +605,29 @@ describe("handleIssueUpdate", () => {
     const result = await handleIssueUpdate("ISS-001", { severity: "low" }, "json", dir);
     const parsed = JSON.parse(result.output);
     expect(parsed.data.severity).toBe("low");
+  });
+
+  it("strips a whole-input 4+ backtick render fence from impact and warns (ISS-1192)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "issue-update-"));
+    tmpDirs.push(dir);
+    await setupIssue(dir);
+    const inner = "impact line one\n```ts\ncode\n```\nline three";
+    const rendered = `\`\`\`\`\n${inner}\n\`\`\`\``;
+    const result = await handleIssueUpdate("ISS-001", { impact: rendered }, "json", dir);
+    const parsed = JSON.parse(result.output);
+    expect(parsed.data.impact).toBe(inner);
+    expect(result.warnings).toEqual(["outer render fence removed; use --format json for round trips"]);
+  });
+
+  it("leaves a 3-backtick whole-impact fence untouched, with no warning", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "issue-update-"));
+    tmpDirs.push(dir);
+    await setupIssue(dir);
+    const input = "```\nhello\n```";
+    const result = await handleIssueUpdate("ISS-001", { impact: input }, "json", dir);
+    const parsed = JSON.parse(result.output);
+    expect(parsed.data.impact).toBe(input);
+    expect(result.warnings).toBeUndefined();
   });
 
   it("clearEarmarkForSession clears a same-session earmark atomically with the status write", async () => {
@@ -804,5 +944,51 @@ describe("T-476 section 10: setting citesRulings via create/update", () => {
     await expect(
       handleIssueUpdate("ISS-001", { citesRuling: ["not-a-ruling"] }, "json", dir),
     ).rejects.toThrow(CliValidationError);
+  });
+});
+
+describe("handleIssueCreate validation texts and precedence are unchanged by ISS-1221", () => {
+  const tmpDirs: string[] = [];
+  afterEach(async () => {
+    for (const d of tmpDirs) await rm(d, { recursive: true, force: true });
+    tmpDirs.length = 0;
+  });
+  async function project(): Promise<string> {
+    const dir = await mkdtemp(join(tmpdir(), "issue-create-texts-"));
+    tmpDirs.push(dir);
+    await initProject(dir, { name: "test" });
+    return dir;
+  }
+  const base = { title: "Bug", impact: "x", components: [], relatedTickets: [], location: [] };
+
+  it("pins the three invalid_input texts literally", async () => {
+    const dir = await project();
+    await expect(handleIssueCreate({ ...base, severity: "urgent" }, "json", dir))
+      .rejects.toThrow('Unknown issue severity "urgent": must be one of critical, high, medium, low');
+    await expect(handleIssueCreate({ ...base, severity: "high", dedupeKey: "k".repeat(513) }, "json", dir))
+      .rejects.toThrow(/512/);
+    await expect(handleIssueCreate({ ...base, severity: "high", phase: "p9" }, "json", dir))
+      .rejects.toThrow('Phase "p9" not found in roadmap');
+  });
+
+  it("a bad citesRuling still wins over a bad dedupe key (severity, citesRuling, dedupeKey order)", async () => {
+    const dir = await project();
+    const citesOnly = await handleIssueCreate({ ...base, severity: "high", citesRuling: ["nope"] }, "json", dir).catch((e: Error) => e.message);
+    expect(citesOnly).toMatch(/Invalid ruling ID/);
+    const compound = await handleIssueCreate({ ...base, severity: "high", citesRuling: ["nope"], dedupeKey: "k".repeat(513) }, "json", dir).catch((e: Error) => e.message);
+    expect(compound).toBe(citesOnly);
+  });
+
+  it("a repeated dedupe key returns the existing issue before the phase is validated", async () => {
+    const dir = await project();
+    const first = JSON.parse((await handleIssueCreate({ ...base, severity: "high", dedupeKey: "dk-order" }, "json", dir)).output).data;
+    const again = JSON.parse((await handleIssueCreate({ ...base, severity: "high", dedupeKey: "dk-order", phase: "p9" }, "json", dir)).output).data;
+    expect(again.id).toBe(first.id);
+  });
+
+  it("an empty-string phase is still refused by write validation, not by the roadmap check", async () => {
+    const dir = await project();
+    await expect(handleIssueCreate({ ...base, severity: "high", phase: "" }, "json", dir))
+      .rejects.toThrow('references unknown phase ""');
   });
 });

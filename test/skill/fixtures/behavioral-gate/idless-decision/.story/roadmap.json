@@ -1,0 +1,13 @@
+{
+  "title": "behavioral-gate-idless-decision",
+  "date": "2026-08-01",
+  "phases": [
+    {
+      "id": "core",
+      "label": "CORE",
+      "name": "Core plumbing",
+      "description": "Billing ledger maintenance."
+    }
+  ],
+  "blockers": []
+}

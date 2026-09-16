@@ -36,10 +36,11 @@ import {
   type TargetObservation,
   type RecoveryAuthority,
 } from "../../src/autonomous/pending-artifacts.js";
-import { resolvePayloadTicketIdentities } from "../../src/autonomous/pending-artifact-resolution.js";
+import { resolvePayloadTicketIdentities, resolveIssueCreatePayload } from "../../src/autonomous/pending-artifact-resolution.js";
+import { issueCreateArgsFromPayload } from "../../src/autonomous/issue-create-preparation.js";
 import { markResolvedTicketIdentities } from "../../src/autonomous/resolved-identities.js";
 import type {
-  FieldSnapshot, FullSessionState, ResolvedTicketIdentities,
+  FieldSnapshot, FullSessionState, PendingIssueCreatePayload, ResolvedTicketIdentities,
 } from "../../src/autonomous/session-types.js";
 import { StageContext, type ResolvedRecipe } from "../../src/autonomous/stages/types.js";
 import { PickTicketStage } from "../../src/autonomous/stages/pick-ticket.js";
@@ -2465,7 +2466,7 @@ describe("T-450 step 4: the prepare site records what recovery cannot reconstruc
     // as somebody else's issue never converges -- it would replay forever.
     root = buildRepo();
     writeAliasedTicket(root);
-    const payload = {
+    const raw = {
       title: "the issue this transaction was creating",
       severity: "medium",
       impact: "recorded so a replay has something to write",
@@ -2476,6 +2477,12 @@ describe("T-450 step 4: the prepare site records what recovery cannot reconstruc
       location: [],
       dedupeKey: "dk-replay-1",
     };
+    // ISS-1221: the preparer resolves phase the way the create will write it,
+    // so the fingerprint below is of what lands, not of what was typed.
+    const { state: before } = await loadProject(root);
+    const prepared = await resolveIssueCreatePayload(before, raw, root);
+    expect(prepared.ok, "the preparer resolves links and phase the way the create writes them").toBe(true);
+    const payload = (prepared as { ok: true; payload: PendingIssueCreatePayload }).payload;
     const record = {
       type: "issue_create",
       expectedId: "ISS-042",
@@ -2488,7 +2495,6 @@ describe("T-450 step 4: the prepare site records what recovery cannot reconstruc
     // The links are proven canonical the way a real recovery caller proves
     // them: by putting them through the SAME resolver the create will use,
     // against the live ledger. Nothing here compares the record with itself.
-    const { state: before } = await loadProject(root);
     const resolvedPayloadTickets = resolvePayloadTicketIdentities(before, payload.relatedTickets);
     const nothingFound = {
       exists: false, identity: null, dedupeKey: null, dedupeKeyAt: null,
@@ -2500,7 +2506,7 @@ describe("T-450 step 4: the prepare site records what recovery cannot reconstruc
     const stored = readIssueCreatePayload((record.content as { payload: unknown }).payload);
     expect(stored, "the classifier accepted it, so the reader must too").not.toBeNull();
     const { handleIssueCreate } = await import("../../src/cli/commands/issue.js");
-    await handleIssueCreate(stored!, "json", root);
+    await handleIssueCreate(issueCreateArgsFromPayload(stored!), "json", root);
 
     const { state } = await loadProject(root);
     const created = state.issues.find(i => i.dedupeKey === "dk-replay-1");
@@ -2610,7 +2616,7 @@ describe("T-450 step 4: the prepare site records what recovery cannot reconstruc
     // that the resolver returns "T-001" and not that a rule says it may.
     root = buildRepo();
     writeLegacyTicket(root, "T-001");
-    const payload = {
+    const raw = {
       title: "linked to a legacy ticket",
       severity: "medium",
       impact: "x",
@@ -2619,12 +2625,15 @@ describe("T-450 step 4: the prepare site records what recovery cannot reconstruc
       location: [],
       dedupeKey: "dk-legacy",
     };
+    const { state: before } = await loadProject(root);
+    const prepared = await resolveIssueCreatePayload(before, raw, root);
+    expect(prepared.ok, "a legacy link prepares like any other").toBe(true);
+    const payload = (prepared as { ok: true; payload: PendingIssueCreatePayload }).payload;
     const record = {
       type: "issue_create", expectedId: "ISS-042", transitionId: "txn-legacy",
       provenance: { ownerTask: "task-prepare", revision: 12, ticket: null },
       content: { payload, semanticFingerprint: issueCreateFingerprint(payload)! },
     };
-    const { state: before } = await loadProject(root);
     const resolvedPayloadTickets = resolvePayloadTicketIdentities(before, payload.relatedTickets);
     expect(resolvedPayloadTickets, "a legacy ticket resolves to its display-form id")
       .toEqual(["T-001"]);
@@ -2638,7 +2647,7 @@ describe("T-450 step 4: the prepare site records what recovery cannot reconstruc
     ), "a legacy link set is replayable").toEqual({ kind: "replay" });
 
     const { handleIssueCreate } = await import("../../src/cli/commands/issue.js");
-    await handleIssueCreate(payload, "json", root);
+    await handleIssueCreate(issueCreateArgsFromPayload(payload), "json", root);
     const { state } = await loadProject(root);
     const created = state.issues.find(i => i.dedupeKey === "dk-legacy")!;
     expect(created.relatedTickets, "the create left the legacy id alone").toEqual(["T-001"]);

@@ -1,0 +1,13 @@
+[project]
+name = "storybloq-terminal-bench"
+version = "0.1.0"
+description = "Terminal-Bench 2.0 adapter and report tooling for the storybloq harness (not part of the npm package)"
+requires-python = ">=3.12"
+dependencies = ["harbor==0.22.0", "tomli>=2.0"]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

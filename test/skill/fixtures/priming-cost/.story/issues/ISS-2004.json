@@ -1,0 +1,13 @@
+{
+  "id": "ISS-2004",
+  "title": "Build script leaked temp files on Linux runners",
+  "status": "resolved",
+  "severity": "critical",
+  "components": ["build"],
+  "impact": "CI disk usage climbed until the runner ran out of space.",
+  "resolution": "Build script now cleans its temp directory in a finally block.",
+  "location": ["scripts/build.sh:22"],
+  "discoveredDate": "2026-07-20",
+  "resolvedDate": "2026-07-21",
+  "relatedTickets": []
+}

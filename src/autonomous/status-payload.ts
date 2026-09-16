@@ -31,6 +31,7 @@ export function buildActivePayload(
     alive?: boolean | null;
     runningSubprocesses?: ReadonlyArray<{ pid: number; category: string; startedAt: string; stage: string }> | null;
     healthState?: string | null;
+    tokenPressure?: StatusPayloadActive["tokenPressure"] | null;
   },
 ): StatusPayloadActive {
   const issueDisplayIds = isStringRecord(session.resolvedIssueDisplayIds) ? session.resolvedIssueDisplayIds : {};
@@ -83,6 +84,9 @@ export function buildActivePayload(
         severity: session.currentIssue.severity,
       }
       : null,
+    // T-499: optional, omitted (not null) when there is nothing to project, so
+    // the payload shape is unchanged for every consumer that never asked.
+    ...(telemetry?.tokenPressure ? { tokenPressure: telemetry.tokenPressure } : {}),
   };
 }
 

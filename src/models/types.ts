@@ -180,6 +180,9 @@ export const ERROR_CODES = [
   "conflict",
   "version_mismatch",
   "file_exists",
+  // T-507: a command run outside any .story/ ledger (a function-hooks caller runs
+  // in every cwd and caches this answer per cwd).
+  "no_project",
 ] as const;
 export type ErrorCode = (typeof ERROR_CODES)[number];
 

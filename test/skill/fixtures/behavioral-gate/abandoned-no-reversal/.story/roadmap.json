@@ -1,0 +1,13 @@
+{
+  "title": "behavioral-gate-abandoned-no-reversal",
+  "date": "2026-08-01",
+  "phases": [
+    {
+      "id": "reports",
+      "label": "REPORTS",
+      "name": "Reporting pipeline",
+      "description": "Report generation and templating."
+    }
+  ],
+  "blockers": []
+}

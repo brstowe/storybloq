@@ -4,6 +4,7 @@ import type { ProjectState } from "./project-state.js";
 import type { LoadWarning } from "./errors.js";
 import { isClaimStale } from "./claims.js";
 import { compareVersionStrings } from "./team-capabilities.js";
+import { ENABLE_GIT_REFS_REMEDY } from "./branch-allocation-warning.js";
 
 export type DoctorSeverity = "error" | "warning" | "info";
 
@@ -525,7 +526,7 @@ export function checkLocalIdAllocator(state: ProjectState, _ctx: DoctorContext):
   return [{
     severity: "info",
     code: "local_id_allocator",
-    message: "Local id allocator in use: divergent branches can mint duplicate display ids. Run storybloq reconcile after merges (or gate merges with storybloq reconcile --ci); the git-refs allocator prevents collisions at the source.",
+    message: `Local id allocator in use: divergent branches can mint duplicate display ids. Run storybloq reconcile after merges (or gate merges with storybloq reconcile --ci). ${ENABLE_GIT_REFS_REMEDY}`,
     entity: null,
     repair: null,
   }];

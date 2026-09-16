@@ -1,0 +1,13 @@
+{
+  "id": "T-1003",
+  "title": "Add pagination to ticket list",
+  "description": "storybloq_ticket_list returns everything at once; page it for large backlogs.",
+  "type": "feature",
+  "status": "open",
+  "phase": "polish",
+  "order": 10,
+  "createdDate": "2026-08-03",
+  "completedDate": null,
+  "blockedBy": [],
+  "parentTicket": null
+}

@@ -157,6 +157,42 @@ describe("formatRecap", () => {
     expect(md).toContain("Crash");
   });
 
+  it("MD shows only the first five high-severity issues, with a critical issue surfaced ahead of more than five high issues in filesystem order, plus an overflow line reporting omitted counts per severity (T-320 commit 4)", async () => {
+    const state = makeState({
+      issues: [
+        // Six "high" issues filed first (filesystem/insertion order), then one
+        // "critical" issue filed last. A naive slice(0, 5) over unsorted data
+        // would drop the critical issue entirely.
+        ...Array.from({ length: 6 }, (_, n) =>
+          makeIssue({ id: `ISS-1${n}`, severity: "high", discoveredDate: "2026-01-01" }),
+        ),
+        makeIssue({ id: "ISS-200", severity: "critical", title: "Data loss", discoveredDate: "2026-06-01" }),
+      ],
+    });
+    const recap = await buildRecap(state, null, "/tmp");
+    const md = formatRecap(recap, state, "md");
+    expect(md).toContain("ISS-200");
+    expect(md).toContain("Data loss");
+    const shownHighLines = (md.match(/high issue:/g) ?? []).length;
+    // 1 critical + 5 total shown => 4 high shown, 2 high omitted (6 - 4).
+    expect(shownHighLines).toBe(4);
+    expect(md).toMatch(/2 more issues? omitted/);
+    expect(md).toContain("2 high");
+    expect(md).not.toMatch(/\d+ critical/); // no critical issues were omitted
+  });
+
+  it("MD omits the overflow line when five or fewer high-severity issues exist", async () => {
+    const state = makeState({
+      issues: [
+        makeIssue({ id: "ISS-001", severity: "critical" }),
+        makeIssue({ id: "ISS-002", severity: "high" }),
+      ],
+    });
+    const recap = await buildRecap(state, null, "/tmp");
+    const md = formatRecap(recap, state, "md");
+    expect(md).not.toMatch(/omitted/);
+  });
+
   describe("staleness wording (ISS-889)", () => {
     // formatRecap is fed a RecapResult directly: buildRecap would need a real git
     // repo with a specific commit distance, and the defect is purely in rendering.

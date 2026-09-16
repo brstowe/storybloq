@@ -1,0 +1,13 @@
+{
+  "version": 2,
+  "project": "priming-cost-fixture",
+  "type": "coding",
+  "language": "typescript",
+  "features": {
+    "tickets": true,
+    "issues": true,
+    "handovers": true,
+    "roadmap": true,
+    "reviews": true
+  }
+}

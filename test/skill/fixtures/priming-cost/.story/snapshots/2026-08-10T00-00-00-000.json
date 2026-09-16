@@ -1,0 +1,96 @@
+{
+  "version": 1,
+  "createdAt": "2026-08-10T00:00:00.000Z",
+  "project": "priming-cost-fixture",
+  "config": {
+    "version": 2,
+    "project": "priming-cost-fixture",
+    "type": "coding",
+    "language": "typescript",
+    "features": {
+      "tickets": true,
+      "issues": true,
+      "handovers": true,
+      "roadmap": true,
+      "reviews": true
+    }
+  },
+  "roadmap": {
+    "title": "priming-cost-fixture",
+    "date": "2026-08-01",
+    "phases": [
+      {
+        "id": "core",
+        "label": "CORE",
+        "name": "Core plumbing",
+        "description": "Ingest, retry, and config schema work."
+      },
+      {
+        "id": "polish",
+        "label": "POLISH",
+        "name": "Polish and cleanup",
+        "description": "CLI ergonomics and snapshot pruning."
+      }
+    ],
+    "blockers": []
+  },
+  "tickets": [
+    {
+      "id": "T-1001",
+      "title": "Wire the ingest retry queue",
+      "description": "Add a bounded retry queue in front of the ingest worker so a transient failure does not drop the payload.",
+      "type": "task",
+      "status": "open",
+      "phase": "core",
+      "order": 10,
+      "createdDate": "2026-08-01",
+      "completedDate": null,
+      "blockedBy": [],
+      "parentTicket": null
+    }
+  ],
+  "issues": [
+    {
+      "id": "ISS-2001",
+      "title": "Retry queue drops the final byte of a chunked payload",
+      "status": "open",
+      "severity": "high",
+      "components": ["ingest"],
+      "impact": "Confirmed to drop the tail byte of a chunked payload under concurrent retries; actionable now.",
+      "resolution": null,
+      "location": ["src/ingest/queue.ts:88"],
+      "discoveredDate": "2026-08-06",
+      "resolvedDate": null,
+      "relatedTickets": ["T-1001"]
+    },
+    {
+      "id": "ISS-2002",
+      "title": "Flag parser mishandles café, señor, and 🎉 in --page values",
+      "status": "open",
+      "severity": "medium",
+      "components": ["cli"],
+      "impact": "Reproducible with storybloq ticket list --page café; the parser should reject non-numeric input cleanly instead of throwing.",
+      "resolution": null,
+      "location": ["src/cli/args.ts:14"],
+      "discoveredDate": "2026-08-07",
+      "resolvedDate": null,
+      "relatedTickets": ["T-1003"]
+    },
+    {
+      "id": "ISS-2003",
+      "title": "Snapshot pruning may keep stale entries under clock skew",
+      "status": "open",
+      "severity": "low",
+      "components": ["core"],
+      "impact": "OWNER-GATED: pending a decision on the retention policy before any fix lands; do not treat as actionable yet.",
+      "resolution": null,
+      "location": ["src/core/snapshot.ts:108"],
+      "discoveredDate": "2026-08-08",
+      "resolvedDate": null,
+      "relatedTickets": ["T-1004"]
+    }
+  ],
+  "notes": [],
+  "lessons": [],
+  "handoverFilenames": ["2026-08-01-kickoff.md"]
+}

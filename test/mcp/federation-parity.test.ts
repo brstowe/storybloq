@@ -46,7 +46,10 @@ afterEach(async () => {
   await Promise.all(tmpDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true }).catch(() => {})));
 });
 
-async function createOrchestratorProject(nodes: Record<string, { path: string }>): Promise<string> {
+async function createOrchestratorProject(
+  nodes: Record<string, { path: string }>,
+  opts: { allowNodeWrites?: boolean } = {},
+): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), "fed-parity-orch-"));
   tmpDirs.push(dir);
   const storyDir = join(dir, ".story");
@@ -65,7 +68,7 @@ async function createOrchestratorProject(nodes: Record<string, { path: string }>
       version: 2, schemaVersion: 2, project: "orchestrator", type: "orchestrator", language: "typescript",
       features: { tickets: true, issues: true, handovers: true, roadmap: true, reviews: true },
       nodes: nodesConfig,
-      federation: { allowNodeWrites: true },
+      federation: { allowNodeWrites: opts.allowNodeWrites ?? true },
     }),
   );
   await writeFile(join(storyDir, "roadmap.json"), JSON.stringify({
@@ -250,6 +253,146 @@ describe("ISS-1074: omitted-node collision refusal (MCP tools)", () => {
     const tools = captureTools(nodeDir);
     const created = await tools.get("storybloq_ticket_create")!.handler({ title: "x", type: "task", phase: "p0" });
     expect(created.content[0]!.text).not.toContain("Board:");
+  });
+});
+
+describe('ISS-1181: node="." reserved value for the orchestrator\'s own board', () => {
+  async function setup(opts: { allowNodeWrites?: boolean } = {}) {
+    const nodeDir = await createNodeProject("engine");
+    const orchDir = await createOrchestratorProject({ engine: { path: nodeDir } }, opts);
+    const orchId = await createTicketOn(orchDir, "orchestrator's own T-042");
+    const nodeId = await createTicketOn(nodeDir, "engine's own T-042");
+    expect(orchId).toBe(nodeId);
+    return { orchDir, nodeDir, id: orchId };
+  }
+
+  it('(1) updates the ORCHESTRATOR\'s colliding ticket with node=".", leaving the node\'s untouched', async () => {
+    const { orchDir, nodeDir, id } = await setup();
+    const tools = captureTools(orchDir);
+
+    const result = await tools.get("storybloq_ticket_update")!.handler({ id, title: "renamed via dot", node: "." });
+    expect(result.isError).toBeFalsy();
+
+    const orchTicket = JSON.parse(await readFile(join(orchDir, ".story", "tickets", `${id}.json`), "utf-8"));
+    expect(orchTicket.title).toBe("renamed via dot");
+    const nodeTicket = JSON.parse(await readFile(join(nodeDir, ".story", "tickets", `${id}.json`), "utf-8"));
+    expect(nodeTicket.title).toBe("engine's own T-042");
+  });
+
+  it("(2) updates the NODE's colliding ticket with node=<name>, leaving the orchestrator's untouched", async () => {
+    const { orchDir, nodeDir, id } = await setup();
+    const tools = captureTools(orchDir);
+
+    const result = await tools.get("storybloq_ticket_update")!.handler({ id, title: "renamed on node", node: "engine" });
+    expect(result.isError).toBeFalsy();
+
+    const nodeTicket = JSON.parse(await readFile(join(nodeDir, ".story", "tickets", `${id}.json`), "utf-8"));
+    expect(nodeTicket.title).toBe("renamed on node");
+    const orchTicket = JSON.parse(await readFile(join(orchDir, ".story", "tickets", `${id}.json`), "utf-8"));
+    expect(orchTicket.title).toBe("orchestrator's own T-042");
+  });
+
+  it("(3) with node omitted, the colliding update is still refused as ambiguous -- the reserved value does not weaken the guard", async () => {
+    const { orchDir, id } = await setup();
+    const tools = captureTools(orchDir);
+
+    const result = await tools.get("storybloq_ticket_update")!.handler({ id, title: "should not land" });
+    expect(result.isError).toBe(true);
+    expect(result.content[0]!.text).toContain("more than one board");
+  });
+
+  it('(4) the ambiguous-refusal message names the reserved value literally', async () => {
+    const { orchDir, id } = await setup();
+    const tools = captureTools(orchDir);
+
+    const result = await tools.get("storybloq_ticket_update")!.handler({ id, title: "should not land" });
+    expect(result.isError).toBe(true);
+    expect(result.content[0]!.text).toContain('node="."');
+  });
+
+  it('(5) storybloq_ticket_get with node="." on a NON-colliding id returns the orchestrator item -- not collision-only', async () => {
+    const nodeDir = await createNodeProject("engine");
+    const orchDir = await createOrchestratorProject({ engine: { path: nodeDir } });
+    const orchOnlyId = await createTicketOn(orchDir, "orchestrator-only ticket");
+    const tools = captureTools(orchDir);
+
+    const result = await tools.get("storybloq_ticket_get")!.handler({ id: orchOnlyId, node: "." });
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0]!.text).toContain("orchestrator-only ticket");
+  });
+
+  it('(6) on a non-orchestrator project, node="." is refused with the existing not_orchestrator error rather than silently resolving', async () => {
+    const nodeDir = await createNodeProject("engine");
+    const someId = await createTicketOn(nodeDir, "plain project ticket");
+    const tools = captureTools(nodeDir);
+
+    const result = await tools.get("storybloq_ticket_get")!.handler({ id: someId, node: "." });
+    expect(result.isError).toBe(true);
+    expect(result.content[0]!.text).toContain("only supported on orchestrator projects");
+  });
+
+  it('node="." write is NOT gated behind federation.allowNodeWrites (own-board write, not a cross-node write)', async () => {
+    const { orchDir, nodeDir, id } = await setup({ allowNodeWrites: false });
+    const tools = captureTools(orchDir);
+
+    const result = await tools.get("storybloq_ticket_update")!.handler({ id, title: "renamed with writes disabled", node: "." });
+    expect(result.isError).toBeFalsy();
+
+    const orchTicket = JSON.parse(await readFile(join(orchDir, ".story", "tickets", `${id}.json`), "utf-8"));
+    expect(orchTicket.title).toBe("renamed with writes disabled");
+    const nodeTicket = JSON.parse(await readFile(join(nodeDir, ".story", "tickets", `${id}.json`), "utf-8"));
+    expect(nodeTicket.title).toBe("engine's own T-042");
+
+    // codex round-1: a REAL cross-node write must still be gated -- prove the
+    // sentinel's exemption doesn't leak into ordinary node= writes.
+    const nodeWriteResult = await tools.get("storybloq_ticket_update")!.handler({ id, title: "should be refused", node: "engine" });
+    expect(nodeWriteResult.isError).toBe(true);
+    expect(nodeWriteResult.content[0]!.text).toContain("Node writes disabled");
+  });
+
+  // Codex round-1 finding: earmark reserve/assign treated node="." as a real
+  // node name and node-qualified the arrangement-bounds lookup (`.:<id>`),
+  // rejecting a valid ORCHESTRATOR arrangement (which stores unqualified
+  // bounds). These prove reserve and assign both take the single-root path
+  // for ".", with allowNodeWrites=false to confirm the same own-board
+  // exemption as the ticket-write test above.
+  it('reserves an orchestrator item with node=".", authorized by an unqualified arrangement bound, with allowNodeWrites=false', async () => {
+    const { orchDir, id } = await setup({ allowNodeWrites: false });
+    const tools = captureTools(orchDir);
+    const created = await tools.get("storybloq_arrangement_create")!.handler({
+      bounds: [id],
+      parties: PARTIES,
+      onIrreversibleWork: "hold",
+    });
+    expect(created.isError).toBeFalsy();
+
+    const reserved = await tools.get("storybloq_earmark_reserve")!.handler({
+      ref: id, role: "worker", clientTaskId: "worker-task-1", node: ".",
+    });
+    expect(reserved.isError).toBeFalsy();
+
+    const got = await tools.get("storybloq_earmark_get")!.handler({ ref: id, node: "." });
+    expect(got.content[0]!.text).toContain("worker-task-1");
+  });
+
+  it('assigns an orchestrator item with node=".", authorized by an unqualified arrangement bound, with allowNodeWrites=false', async () => {
+    const { orchDir, id } = await setup({ allowNodeWrites: false });
+    const tools = captureTools(orchDir);
+    await tools.get("storybloq_arrangement_create")!.handler({
+      bounds: [id],
+      parties: PARTIES,
+      onIrreversibleWork: "hold",
+    });
+    const sessionId = "77777777-7777-4777-8777-777777777777";
+    await writeLiveSessionOn(orchDir, sessionId, "worker-task-1");
+
+    const assigned = await tools.get("storybloq_earmark_assign")!.handler({
+      ref: id, to: sessionId, role: "worker", clientTaskId: "pen-task-1", node: ".",
+    });
+    expect(assigned.isError).toBeFalsy();
+
+    const got = await tools.get("storybloq_earmark_get")!.handler({ ref: id, node: "." });
+    expect(got.content[0]!.text).toContain(sessionId);
   });
 });
 

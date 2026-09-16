@@ -1,0 +1,13 @@
+{
+  "id": "T-4001",
+  "title": "Add monthly billing ledger rollups",
+  "description": "Aggregate the daily ledger entries into a monthly rollup table for the reporting view.",
+  "type": "task",
+  "status": "inprogress",
+  "phase": "core",
+  "order": 10,
+  "createdDate": "2026-08-01",
+  "completedDate": null,
+  "blockedBy": [],
+  "parentTicket": null
+}

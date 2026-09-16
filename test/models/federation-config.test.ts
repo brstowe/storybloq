@@ -66,6 +66,10 @@ describe("NODE_NAME_REGEX", () => {
   it("rejects spaces", () => {
     expect(NODE_NAME_REGEX.test("my node")).toBe(false);
   });
+
+  it("rejects '.' (ISS-1181: reserved on the node= parameter for the orchestrator's own board, so a real node can never be named this)", () => {
+    expect(NODE_NAME_REGEX.test(".")).toBe(false);
+  });
 });
 
 describe("NodeNameSchema", () => {

@@ -1,0 +1,13 @@
+{
+  "id": "T-5002",
+  "title": "Add a --format=csv option to the report export command",
+  "description": "The report export command only writes PDF today; add a plain CSV path for spreadsheet users.",
+  "type": "chore",
+  "status": "open",
+  "phase": "reports",
+  "order": 20,
+  "createdDate": "2026-08-01",
+  "completedDate": null,
+  "blockedBy": [],
+  "parentTicket": null
+}

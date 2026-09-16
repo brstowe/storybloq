@@ -245,6 +245,29 @@ describe("handleNoteUpdate", () => {
     expect(parsed.data.status).toBe("archived");
   });
 
+  it("strips a whole-input 4+ backtick render fence from content and warns (ISS-1192)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "note-update-"));
+    tmpDirs.push(dir);
+    await setupNote(dir);
+    const inner = "note line one\n```ts\ncode\n```\nline three";
+    const rendered = `\`\`\`\`\n${inner}\n\`\`\`\``;
+    const result = await handleNoteUpdate("N-001", { content: rendered }, "json", dir);
+    const parsed = JSON.parse(result.output);
+    expect(parsed.data.content).toBe(inner);
+    expect(result.warnings).toEqual(["outer render fence removed; use --format json for round trips"]);
+  });
+
+  it("leaves a 3-backtick whole-content fence untouched, with no warning", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "note-update-"));
+    tmpDirs.push(dir);
+    await setupNote(dir);
+    const input = "```\nhello\n```";
+    const result = await handleNoteUpdate("N-001", { content: input }, "json", dir);
+    const parsed = JSON.parse(result.output);
+    expect(parsed.data.content).toBe(input);
+    expect(result.warnings).toBeUndefined();
+  });
+
   it("updates tags", async () => {
     const dir = await mkdtemp(join(tmpdir(), "note-update-"));
     tmpDirs.push(dir);

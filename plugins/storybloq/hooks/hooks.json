@@ -1,0 +1,6 @@
+{
+  "description": "Storybloq Mod: the ledger sidebar (T-508), one hooks module.",
+  "modules": [
+    "../hooks/mod.ts"
+  ]
+}

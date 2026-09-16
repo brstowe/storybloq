@@ -2,6 +2,7 @@ import { displayIdOf } from "../../core/resolver.js";
 import { nextTicket, nextTickets, blockedTickets, currentPhase } from "../../core/queries.js";
 import { nextTicketID, nextOrder, allocateTeamTicketId } from "../../core/id-allocation.js";
 import { reserveDisplayId } from "../../core/remote-refs.js";
+import { checkBranchAllocationWarning } from "../../core/branch-allocation-warning.js";
 import { resolveAndNormalizeTicketRef, RefResolutionError } from "../../core/ref-normalization.js";
 import {
   clearClaimOnComplete,
@@ -17,6 +18,7 @@ import { validateProject } from "../../core/validation.js";
 import { ProjectState } from "../../core/project-state.js";
 import { loadCitationContext } from "../../core/ruling-loader.js";
 import { citationMapFor, resolveEntityCitations, resolveCitesRulingsInput } from "../../core/ruling.js";
+import { computeTargetedActionability } from "../../core/classification-context.js";
 import {
   withProjectLock,
   writeTicketUnlocked,
@@ -31,6 +33,7 @@ import {
   formatError,
   successEnvelope,
   ExitCode,
+  stripRenderFence,
 } from "../../core/output-formatter.js";
 import {
   TICKET_STATUSES,
@@ -125,6 +128,7 @@ export function handleTicketList(
 export function handleTicketGet(
   id: string,
   ctx: CommandContext,
+  withActionability = false,
 ): CommandResult {
   const result = ctx.state.resolveTicketRef(id);
   if (result.kind === "ambiguous") {
@@ -143,7 +147,10 @@ export function handleTicketGet(
     };
   }
   const rulingCtx = loadCitationContext(ctx.root);
-  return { output: formatTicket(result.item, ctx.state, ctx.format, resolveEntityCitations(result.item, rulingCtx)) };
+  const extraJsonFields = withActionability ? computeTargetedActionability(ctx, "ticket", result.item) : undefined;
+  return {
+    output: formatTicket(result.item, ctx.state, ctx.format, resolveEntityCitations(result.item, rulingCtx), extraJsonFields),
+  };
 }
 
 export function handleTicketMetaGet(
@@ -369,12 +376,17 @@ export async function handleTicketCreate(
   }
 
   let createdTicket: Ticket | undefined;
+  let createdInState: ProjectState | undefined;
 
   await withProjectLock(root, { strict: true }, async ({ state }) => {
-    // Fork: when no phase is given, default to the current working phase so
-    // items (esp. review-raised ones) never land unphased and hidden from
-    // phase-filtered views. Falls back to null only when no phase is active.
-    const phase = args.phase ?? currentPhase(state)?.id ?? null;
+    createdInState = state;
+    // Fork: when no phase is given, default a TOP-LEVEL ticket to the current
+    // working phase so review-raised items never land unphased and hidden from
+    // phase-filtered views. Child tickets stay phase-less by design -- they
+    // inherit their umbrella's phase, and upstream's issue-phase inference
+    // resolves through the parent (ISS-1203). Falls back to null when no phase
+    // is active.
+    const phase = args.phase ?? (args.parentTicket != null ? null : currentPhase(state)?.id) ?? null;
     validatePhase(phase, { state });
     if (args.project != null) {
       validateProjectAssignment(args.project, phase, state);
@@ -426,10 +438,14 @@ export async function handleTicketCreate(
   });
 
   if (!createdTicket) throw new Error("Ticket not created");
+  const branchWarning = createdInState
+    ? checkBranchAllocationWarning(root, "ticket", createdInState, displayIdOf(createdTicket))
+    : null;
+  const warnings = branchWarning ? [branchWarning] : undefined;
   if (format === "json") {
-    return { output: JSON.stringify(successEnvelope(createdTicket), null, 2) };
+    return { output: JSON.stringify(successEnvelope(createdTicket), null, 2), ...(warnings && { warnings }) };
   }
-  return { output: `Created ticket ${displayIdOf(createdTicket)}: ${createdTicket.title}` };
+  return { output: `Created ticket ${displayIdOf(createdTicket)}: ${createdTicket.title}`, ...(warnings && { warnings }) };
 }
 
 /**
@@ -509,6 +525,16 @@ export async function handleTicketUpdate(
     "ticket",
     "status, title, type, phase, order, description, blockedBy, crossNodeBlockedBy, parentTicket, citesRuling, clearCitesRulings",
   );
+  // ISS-1192: an agent that reads the md-rendered description back and
+  // writes it verbatim carries the render fence into storage, growing by one
+  // backtick every round trip. Applies to both the CLI --stdin/--description
+  // path and MCP's ticket_update, which share this handler.
+  let descriptionFenceStripped = false;
+  if (updates.description !== undefined) {
+    const stripped = stripRenderFence(updates.description);
+    updates.description = stripped.text;
+    descriptionFenceStripped = stripped.stripped;
+  }
   if (updates.status && !TICKET_STATUSES.includes(updates.status as TicketStatus)) {
     throw new CliValidationError(
       "invalid_input",
@@ -686,10 +712,13 @@ export async function handleTicketUpdate(
   });
 
   if (!updatedTicket) throw new Error("Ticket not updated");
+  const warnings = descriptionFenceStripped
+    ? ["outer render fence removed; use --format json for round trips"]
+    : undefined;
   if (format === "json") {
-    return { output: JSON.stringify(successEnvelope(updatedTicket), null, 2) };
+    return { output: JSON.stringify(successEnvelope(updatedTicket), null, 2), ...(warnings && { warnings }) };
   }
-  return { output: `Updated ticket ${displayIdOf(updatedTicket)}: ${updatedTicket.title}` };
+  return { output: `Updated ticket ${displayIdOf(updatedTicket)}: ${updatedTicket.title}`, ...(warnings && { warnings }) };
 }
 
 export async function handleTicketMetaSet(

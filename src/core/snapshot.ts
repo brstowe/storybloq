@@ -17,6 +17,7 @@ import { ConfigSchema, type Config } from "../models/config.js";
 import { ProjectState, type PhaseStatus } from "./project-state.js";
 import { type LoadWarning } from "./errors.js";
 import { phasesWithStatus, nextTicket, isBlockerCleared } from "./queries.js";
+import { displayIdOf } from "./resolver.js";
 import type { LoadResult } from "./project-loader.js";
 import { atomicWrite, guardPath } from "./project-loader.js";
 import { gitHeadHash, gitIsAncestor, gitCommitDistance } from "../autonomous/git-inspector.js";
@@ -465,12 +466,20 @@ export async function buildRecap(
       ? { id: next.ticket.id, displayId: next.ticket.displayId ?? undefined, title: next.ticket.title, phase: next.ticket.phase }
       : null;
 
+  // T-320 commit 4: sorted critical-before-high, then discoveredDate
+  // ascending, then displayId -- NOT filesystem/load order (named mutant).
   const highSeverityIssues = currentState.issues
     .filter(
       (i) =>
         i.status !== "resolved" &&
         (i.severity === "critical" || i.severity === "high"),
     )
+    .slice()
+    .sort((a, b) => {
+      if (a.severity !== b.severity) return a.severity === "critical" ? -1 : 1;
+      if (a.discoveredDate !== b.discoveredDate) return a.discoveredDate < b.discoveredDate ? -1 : 1;
+      return displayIdOf(a).localeCompare(displayIdOf(b));
+    })
     .map((i) => ({ id: i.id, displayId: i.displayId ?? undefined, title: i.title, severity: i.severity }));
 
   if (!snapshotInfo) {

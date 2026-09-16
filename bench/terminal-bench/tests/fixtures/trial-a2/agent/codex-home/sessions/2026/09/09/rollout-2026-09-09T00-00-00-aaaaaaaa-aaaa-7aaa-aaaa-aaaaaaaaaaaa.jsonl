@@ -1,0 +1,6 @@
+{"type":"turn_context","payload":{"turn_id":"t1","model":"gpt-6-astra"}}
+{"type":"token_usage_record","payload":{"thread_id":"aaaaaaaa-aaaa-7aaa-aaaa-aaaaaaaaaaaa","turn_id":"t1","response_id":"r1","usage":{"input_tokens":1000,"cached_input_tokens":400,"output_tokens":100,"reasoning_output_tokens":10,"total_tokens":1100}}}
+{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":400,"output_tokens":100}}}
+{"type":"turn_context","payload":{"turn_id":"t2","model":"gpt-6-astra"}}
+{"type":"token_usage_record","payload":{"thread_id":"aaaaaaaa-aaaa-7aaa-aaaa-aaaaaaaaaaaa","turn_id":"t2","response_id":"r2","usage":{"input_tokens":2000,"cached_input_tokens":1500,"output_tokens":200,"reasoning_output_tokens":0,"total_tokens":2200}}}
+{"type":"token_count","info":{"total_token_usage":{"input_tokens":3000,"cached_input_tokens":1900,"output_tokens":300}}}

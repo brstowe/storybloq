@@ -122,8 +122,16 @@ Pass the same `sessionId` you gave `prepare`. It is required for the prepare-to-
 
 Include ALL active lenses -- both spawned and cached -- otherwise the missing lenses are disclosed as uncovered and a missing CORE lens caps the verdict below approve.
 
+**Coverage, and what a skip costs (ISS-950).** Each `lensCoverage` entry carries a `basis` for its status, and only one of them is coverage:
+
+- `not-applicable` -- the SERVER checked and the lens had nothing in its domain: every file in the change (the union of your `changedFiles` and every path the diff touches) is non-code, or for `concurrency` no changed line carries a concurrency token. This is full coverage and does NOT cap. A docs-only diff where all four core lenses skip approves.
+- `self-reported` -- the lens declared a skip on a change the server judges applicable. Still caps. A skip is not claimable by prompt alone.
+- `no-submission` -- the lens never submitted. Never coverage.
+
+An entry marked `relabeled` is never coverage whatever its status. The harness sets it when a lens that skipped in an EARLIER synthesize for the same `reviewId` comes back `ok` with zero findings: that is the same analysis under a different label, not a re-review. Do not clear a cap that way. If a lens genuinely has nothing to report, let it say so in its own output and explain why; an `ok` carrying real findings is never flagged.
+
 The tool runs the package merger pipeline programmatically (per-lens schema parsing, evidence anchoring against the reviewed artifact, dedup, blocking policy, tension detection, coverage caps, verdict computation) and returns:
-- `reviewVerdict` -- the full ReviewVerdict envelope (verdict, findings, tensions, severity counts, `lensCoverage`, `coverage`, `errorCodes`, `deferred`, `parseErrors`, anchoring disclosures)
+- `reviewVerdict` -- the full ReviewVerdict envelope (verdict, findings, tensions, severity counts, `lensCoverage`, `coverage`, `capReasons`, `errorCodes`, `deferred`, `parseErrors`, anchoring disclosures)
 - `preExistingFindings` / `preExistingCount` -- findings classified pre-existing off the diff scope (harness output). The MCP tool response additionally carries `filedIssues` when it auto-files those as issues.
 - `lensesCompleted` / `lensesFailed` / `lensesSkipped`
 
@@ -148,6 +156,8 @@ The mapping is deterministic:
 - otherwise -> **approve**
 
 Convergence history damps repeated majors-only recommendations once rounds stabilize (blocking at 0 for two consecutive rounds, major counts stable or decreasing). Coverage gaps are never damped.
+
+The judge also returns `capReasons` (every cap the pipeline fired, verbatim), `coverageOnlyCap`, and `uncoveredCoreLenses`. `coverageOnlyCap: true` means the verdict sits below approve SOLELY because a core lens did not cover its domain: nothing was found, a lens simply did not look. **Report `capReasons` with the round.** Without it the harness cannot tell a coverage cap from a findings cap, and a coverage cap routed to IMPLEMENT is a round with nothing to implement.
 
 ### Step 7: Present output
 
@@ -185,7 +195,7 @@ The lens prompt bodies and merge semantics live exclusively in the `@storybloq/l
 ## Error Handling
 
 - **Lens returns malformed output:** Pass it through anyway -- synthesize records it in `parseErrors[]` and coverage marks the lens `parse_failed`.
-- **Lens agent fails or times out:** Omit it from `lensResults` -- coverage marks it uncovered; a missing CORE lens (security, error-handling, clean-code, concurrency) caps the verdict below approve.
+- **Lens agent fails or times out:** Omit it from `lensResults` -- coverage marks it uncovered with basis `no-submission`; a missing CORE lens (security, error-handling, clean-code, concurrency) caps the verdict below approve. The remedy is re-running that lens, not another full round.
 - **Judge tool errors on the payload:** Re-pass the exact `reviewVerdict` object from synthesize without edits; hand-built verdict objects fail schema validation.
 
 ---

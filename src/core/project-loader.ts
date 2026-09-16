@@ -1072,7 +1072,13 @@ export async function runTransactionUnlocked(
     }
 
     // 6. Remove journal
-    await removeJournal();
+    try {
+      await removeJournal();
+    } catch (err) {
+      if (!isProjectLockFencingError(err)) throw err;
+      // Every entry is already applied and durable. Keep the journal for the
+      // next holder's idempotent forward recovery instead of reporting failure.
+    }
   } catch (err) {
     if (!commitStarted) {
       // Safe to clean up -- no renames have happened
@@ -1539,8 +1545,18 @@ export async function atomicCreate(
     fd = undefined;
     checkProjectLockFencing();
     await link(tempPath, targetPath);
-    const parentFd = await open(dirname(targetPath), "r");
-    try { await parentFd.sync(); } finally { await parentFd.close(); }
+    try {
+      const parentFd = await open(dirname(targetPath), "r");
+      try { await parentFd.sync(); } finally { await parentFd.close(); }
+    } catch (syncErr) {
+      // The link already committed the create. A platform that refuses to
+      // open or sync a directory handle (Windows answers EPERM, some
+      // filesystems EINVAL or ENOTSUP) must not turn a published create into
+      // a reported failure, which a retrying caller answers with a duplicate
+      // id. Any other error (EIO, ENOSPC) still surfaces: the entry may not
+      // be durable and the caller must know.
+      if (!DIRECTORY_SYNC_UNSUPPORTED_CODES.has((syncErr as NodeJS.ErrnoException).code ?? "")) throw syncErr;
+    }
   } catch (err) {
     if (err instanceof ProjectLoaderError) throw err;
     const code = (err as NodeJS.ErrnoException).code;
@@ -1686,6 +1702,19 @@ export async function guardPath(
 // can fence their commit syscall without changing withLock's ~13 internal call
 // sites or withProjectLock/runTransactionUnlocked's external ones.
 const projectLockContext = new AsyncLocalStorage<ProjectLockHandle>();
+/**
+ * Marker carried as the `cause` of every fencing error, so a caller can tell
+ * "the lock was lost before this commit syscall" from any other io_error
+ * without comparing message text.
+ */
+const PROJECT_LOCK_FENCING_CAUSE: unique symbol = Symbol("project-lock-fencing");
+
+/** Error codes a platform answers when a directory handle cannot be opened or synced at all. */
+const DIRECTORY_SYNC_UNSUPPORTED_CODES: ReadonlySet<string> = new Set(["EPERM", "EACCES", "EINVAL", "ENOTSUP"]);
+
+function isProjectLockFencingError(err: unknown): err is ProjectLoaderError {
+  return err instanceof ProjectLoaderError && err.cause === PROJECT_LOCK_FENCING_CAUSE;
+}
 
 /**
  * Fencing check for a commit syscall: does the ambient lock (if any) still
@@ -1699,7 +1728,7 @@ function checkProjectLockFencing(): void {
   const handle = projectLockContext.getStore();
   if (!handle) return;
   if (!verifyProjectLockOwnership(handle)) {
-    throw new ProjectLoaderError("io_error", "Lock ownership lost before commit; write was not applied");
+    throw new ProjectLoaderError("io_error", "Lock ownership lost before commit; write was not applied", PROJECT_LOCK_FENCING_CAUSE);
   }
 }
 

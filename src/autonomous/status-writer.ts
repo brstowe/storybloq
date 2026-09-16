@@ -16,6 +16,7 @@ import {
   type StatusPayload,
 } from "./session-types.js";
 import { buildActivePayload, buildInactivePayload } from "./status-payload.js";
+import { readCoarseTokenPressureForSession } from "../core/session-intel/status-projection.js";
 import { readLastMcpCall, readOwnerHeartbeat } from "./liveness.js";
 import { readSubprocessSummaries } from "./subprocess-registry.js";
 import { collectProbes, reduceHealthState } from "./health-model.js";
@@ -236,6 +237,8 @@ export function refreshStatusForSession(
         alive: heartbeat.kind === "unusable" ? null : heartbeat.kind === "alive",
         runningSubprocesses: subprocesses.length > 0 ? subprocesses : null,
         healthState,
+        // T-499: same projection function as the hook, so the two writers agree.
+        tokenPressure: readCoarseTokenPressureForSession(root, state as { claudeCodeSessionId?: string | null }),
       });
       const payload = { ...activePayload, lastWrittenBy } as StatusPayload;
       return writeStatusFile(root, payload);

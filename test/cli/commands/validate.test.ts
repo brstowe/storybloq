@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { handleValidate, handleValidateWithSourceRefs } from "../../../src/cli/commands/validate.js";
@@ -461,5 +461,84 @@ describe("handleValidate: T-487 review contract", () => {
     const out = handleValidate(makeCtx({ root }));
     expect(out.output).toContain("correctness");
     expect(out.exitCode).toBe(ExitCode.OK);
+  });
+});
+
+describe("handleValidate: T-498 handover_no_carried_forward", () => {
+  const dirs: string[] = [];
+  afterEach(async () => {
+    for (const d of dirs.splice(0)) await rm(d, { recursive: true, force: true });
+  });
+
+  async function handoversDirWith(filename: string, body: string): Promise<string> {
+    const dir = await mkdtemp(join(tmpdir(), "t498-validate-handovers-"));
+    dirs.push(dir);
+    await writeFile(join(dir, filename), body);
+    return dir;
+  }
+
+  it("fires when the newest handover is marked but has no Carried forward heading", async () => {
+    const handoversDir = await handoversDirWith(
+      "2026-06-01-session.md",
+      "<!-- storybloq-handover v1 -->\n\n# Session Handover\n\n## Worker state\n\n- doing things\n",
+    );
+    const ctx = makeCtx({
+      handoversDir,
+      state: makeState({ handoverFilenames: ["2026-06-01-session.md"] }),
+    });
+    const out = handleValidate(ctx);
+    expect(out.output).toContain("handover_no_carried_forward");
+  });
+
+  it("stays silent when a marked handover has a Carried forward heading", async () => {
+    const handoversDir = await handoversDirWith(
+      "2026-06-01-session.md",
+      "<!-- storybloq-handover v1 -->\n\n# Session Handover\n\n## Carried forward\n\n- (nothing carried forward)\n",
+    );
+    const ctx = makeCtx({
+      handoversDir,
+      state: makeState({ handoverFilenames: ["2026-06-01-session.md"] }),
+    });
+    const out = handleValidate(ctx);
+    expect(out.output).not.toContain("handover_no_carried_forward");
+  });
+
+  it("stays silent on an unmarked legacy handover, even without a Carried forward heading", async () => {
+    const handoversDir = await handoversDirWith(
+      "2026-06-01-session.md",
+      "# Session Handover\n\n## Worker state\n\n- doing things\n",
+    );
+    const ctx = makeCtx({
+      handoversDir,
+      state: makeState({ handoverFilenames: ["2026-06-01-session.md"] }),
+    });
+    const out = handleValidate(ctx);
+    expect(out.output).not.toContain("handover_no_carried_forward");
+  });
+
+  it("stays silent when there are no handovers at all", () => {
+    const out = handleValidate(makeCtx());
+    expect(out.output).not.toContain("handover_no_carried_forward");
+  });
+
+  it("pen finding: a symlinked newest filename does not fire the check and is never read", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "t498-validate-handovers-"));
+    dirs.push(dir);
+    const secretPath = join(tmpdir(), `t498-secret-${Date.now()}.md`);
+    await writeFile(
+      secretPath,
+      "<!-- storybloq-handover v1 -->\n\n# Session Handover\n\n## Worker state\n\n- doing things\n",
+    );
+    try {
+      await symlink(secretPath, join(dir, "2026-06-01-session.md"));
+      const ctx = makeCtx({
+        handoversDir: dir,
+        state: makeState({ handoverFilenames: ["2026-06-01-session.md"] }),
+      });
+      const out = handleValidate(ctx);
+      expect(out.output).not.toContain("handover_no_carried_forward");
+    } finally {
+      await rm(secretPath, { force: true });
+    }
   });
 });

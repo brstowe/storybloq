@@ -345,7 +345,52 @@ describe("tool description contract (T-460)", () => {
     // format, measured below 61 KB. Most growth is required field surface
     // (identities, fences, evidence and assignment events), not descriptions;
     // its description was trimmed before raising this explicit budget.
-    // This ceiling leaves ~500 bytes of headroom and fails once an edit gives
+    // T-499 adds storybloq_session_intel: one tool, six optional fields,
+    // measured at 61,920 after its description was cut to the sentence not
+    // already in `storybloq reference` and four field descriptions were
+    // dropped to their names. The remaining growth is field surface, so the
+    // budget is raised from 61,500 to 62,500 as a deliberate act.
+    // T-502 adds storybloq_health: one tool, three optional fields, measured
+    // at 62,587 after its description was cut to the one sentence not already
+    // in `storybloq reference` and settings.md plus the relay instruction, and
+    // two of its three field descriptions were dropped. What remains is field
+    // surface -- `only` cannot be a free string without letting a client ask
+    // for a check that does not exist, and the enum IS the surface. So the
+    // budget is raised from 62,500 to 63,500 as a deliberate act.
+    // T-320 commit 5 then adds two optional fields (limit, select) to
+    // storybloq_lesson_digest after the same trim (its own measurement was
+    // 62,745 without T-502); the combined payload is re-measured at landing.
+    // ISS-1154 Commit A adds `format` and `withActionability` to
+    // storybloq_ticket_get and storybloq_issue_get after the same trim
+    // (`format` described as "default: md", `withActionability` undescribed);
+    // measured at 63,633 on main with T-502 and T-320 present, so the budget
+    // is raised from 63,500 to 64,000 as a deliberate act.
+    // T-498 commit 2 adds one optional `format` field ("default: md") to
+    // storybloq_handover_latest, so a caller can request the JSON envelope
+    // (continuationCandidates/trajectory included) instead of the Markdown
+    // rendering that field has no representation for, and the same field to
+    // storybloq_handover_get so a caller (recovery code, not a human) can
+    // machine-detect a not_found/io_error result via {version, error} vs
+    // {version, data} instead of string-sniffing Markdown error text;
+    // measured at 63,795, still under the existing 64,000 ceiling, no raise
+    // needed.
+    // ISS-950 then added one optional `capReasons` array to the
+    // autonomous_guide report object, so a reviewer can echo
+    // reviewVerdict.capReasons and the stage can tell a coverage-only cap from
+    // a findings cap; measured at 63,997, which is +197 over 63,800 and left
+    // THREE bytes of headroom without raising this budget. That was the
+    // mistake: the growth was honest (field surface plus one describe line),
+    // the silence about it was not, and the next legitimate edit inherited a
+    // ceiling it could not clear. T-509 part 4 was that edit, adding 45 bytes
+    // to storybloq_health's description so it says the Codex bridge is
+    // launched and answered rather than merely registered; measured at 64,042
+    // and red. Both growths were trimmed before this raise, per the ratchet's
+    // own order of operations: `capReasons` can be cut to about 60 characters,
+    // which lands the payload at 63,991, and nine bytes of headroom is the
+    // same trap as three. So the budget is raised from 64,000 to 64,500 as a
+    // deliberate act, restoring ~458 bytes of real headroom and keeping both
+    // descriptions readable.
+    // This ceiling leaves ~458 bytes of headroom and fails once an edit gives
     // back more than that. Raising it is a deliberate act that belongs in a
     // commit message, which is the point. Deliberately NO lower bound: the cues
     // above are what protect against over-trimming, and a floor would fail an
@@ -358,7 +403,7 @@ describe("tool description contract (T-460)", () => {
     // upstream's 61,500 ceiling; the same ~500 bytes of headroom is kept, so
     // this stays a ratchet and raising it again remains a deliberate act.
     const bytes = Buffer.byteLength(await emittedPayload(), "utf8");
-    expect(bytes).toBeLessThan(65_800);
+    expect(bytes).toBeLessThan(69_500);
   });
 
   it("still advertises every tool, so the trim cut prose and not surface", async () => {
@@ -383,11 +428,19 @@ describe("tool description contract (T-460)", () => {
     // storybloq_session_milestone (74 -> 75); no _list tool, matching the
     // arrangement/gate-ack/earmark precedent -- a milestone is a field on
     // the caller's own presence record, not a standalone enumerable entity.
-    // ISS-1155 adds one coordinated operation tool (75 -> 76).
+    // ISS-1155 adds one coordinated operation tool (75 -> 76). T-499 adds
+    // storybloq_session_intel (76 -> 77), registered in the full AND the
+    // degraded set because the no-project case is where an agent most needs
+    // to know its context pressure; no _list tool, nothing to enumerate.
+    // T-502 adds storybloq_health (77 -> 78), registered in the full AND the
+    // degraded set for the same reason: a user with no `.story/` yet is
+    // exactly the one running a stale CLI with no review bridge. No _list
+    // tool; the six check ids are a closed enum in the schema.
+    // T-507 adds storybloq_roster_get (78 -> 79), f2c12b23.
     // FORK: +4 -- storybloq_phase_update (phase state: pending/paused/skipped)
     // and storybloq_project_list/create/update (roadmap projects). No
     // _project_delete tool, per the house policy that destructive operations
-    // stay CLI-only (76 -> 80).
-    expect(result.tools.length).toBe(80);
+    // stay CLI-only (79 -> 83).
+    expect(result.tools.length).toBe(83);
   });
 });

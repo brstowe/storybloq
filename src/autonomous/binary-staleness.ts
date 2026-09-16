@@ -22,12 +22,43 @@
  * `computeBinaryFingerprint` could not resolve a binary (it returns null under
  * vitest, resolving against src/) -- yields silence, never a guessed warning.
  */
-import { computeBinaryFingerprint } from "./liveness.js";
+import { computeBinaryFingerprint, statBinaryTarget } from "./liveness.js";
 
 let startupFingerprint: { sha256: string } | null | undefined;
 
 /** Test seam for the disk side; production always goes through liveness. */
 let diskProbe: (() => { sha256: string } | null) | null = null;
+
+/** Test seam for the stat-only half of the memo key. */
+let statProbe: (() => { path: string; mtimeMs: number; size: number } | null) | null = null;
+
+/**
+ * ISS-1214: memoized disk fingerprint, keyed on the target's identity rather
+ * than held forever. Every MCP write tool asks this question now, and each
+ * unmemoized answer re-read and re-hashed the whole server bundle. A rebuild
+ * writes new bytes, which moves mtime (and almost always size), so the key
+ * changes exactly when the answer can have changed. Deliberately NOT the
+ * process-lifetime cache `health-model.ts` uses for the session-relative
+ * probe: this one must notice a build that lands mid-session, which is the
+ * entire situation it exists to report.
+ */
+let diskCache: { key: string; value: { sha256: string } | null } | null = null;
+
+function readDiskFingerprint(): { sha256: string } | null {
+  const compute = diskProbe ?? computeBinaryFingerprint;
+  const target = (statProbe ?? statBinaryTarget)();
+  // No stat means no key. Answer uncached rather than caching an answer that
+  // nothing can invalidate.
+  if (!target) {
+    diskCache = null;
+    return compute();
+  }
+  const key = `${target.path}\0${target.mtimeMs}\0${target.size}`;
+  if (diskCache && diskCache.key === key) return diskCache.value;
+  const value = compute();
+  diskCache = { key, value };
+  return value;
+}
 
 /**
  * Capture the running binary's fingerprint. Called once from MCP server init;
@@ -48,7 +79,7 @@ export function captureStartupFingerprint(): void {
  */
 export function describeBinaryStaleness(): string | null {
   if (startupFingerprint == null) return null;
-  const disk = (diskProbe ?? computeBinaryFingerprint)();
+  const disk = readDiskFingerprint();
   if (!disk) return null;
   if (disk.sha256 === startupFingerprint.sha256) return null;
   return "Server binary is stale (fingerprint mismatch); restart the client.";
@@ -72,9 +103,16 @@ export const __testing = {
   },
   setDiskProbe(fn: (() => { sha256: string } | null) | null): void {
     diskProbe = fn;
+    diskCache = null;
+  },
+  setStatProbe(fn: (() => { path: string; mtimeMs: number; size: number } | null) | null): void {
+    statProbe = fn;
+    diskCache = null;
   },
   reset(): void {
     startupFingerprint = undefined;
     diskProbe = null;
+    statProbe = null;
+    diskCache = null;
   },
 };

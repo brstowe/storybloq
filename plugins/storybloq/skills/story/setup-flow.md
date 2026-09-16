@@ -630,6 +630,8 @@ Present a brief completion message and tell the user how to start:
 
 Keep it to 2-3 sentences. The system teaches itself through use -- `/story` loads context, shows status, and suggests next work. No need for a manual.
 
+**Hooks note (Claude Code).** When `storybloq setup` registered hooks, the session now carries context-pressure awareness (T-499): a SessionStart hook captures the auto-compact setting for the process, a synchronous UserPromptSubmit hook samples the transcript tail on every prompt and injects one line only when pressure is imperative or compact-needed, and the Stop hook samples at every turn end. Nothing to configure; `storybloq session intel` shows the current numbers. Machine-wide opt-out: `~/.claude/storybloq/config.json` `{"sessionIntel": {"enabled": false}}`, then re-run `storybloq setup` or any CLI command to remove the hooks.
+
 **Design evaluation hint** (show only when project surface is Web app, Mobile app, or Desktop app):
 
 Add one more line after the completion message: "Tip: Run `/story design` anytime to evaluate your frontend against [detected platform] best practices and generate improvement issues."

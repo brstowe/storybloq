@@ -1,0 +1,13 @@
+{
+  "id": "T-1001",
+  "title": "Wire the ingest retry queue",
+  "description": "Add a bounded retry queue in front of the ingest worker so a transient failure does not drop the payload.",
+  "type": "task",
+  "status": "inprogress",
+  "phase": "core",
+  "order": 10,
+  "createdDate": "2026-08-01",
+  "completedDate": null,
+  "blockedBy": [],
+  "parentTicket": null
+}

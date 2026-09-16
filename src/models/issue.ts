@@ -123,6 +123,11 @@ export const IssueSchema = z
     earmark: EarmarkSchema.nullable().optional(),
     // T-476: rulings this issue cites -- see TicketSchema's citesRulings.
     citesRulings: z.array(RulingIdSchema).optional(),
+    // ISS-1154: durable actionability signal -- see computeActionability's
+    // structured tier (src/core/recommend.ts). Additive, no ticket-side
+    // equivalent (issues only).
+    disposition: z.enum(["escalate_only", "owner_gated", "duplicate"]).optional(),
+    duplicateOf: z.union([TicketIdSchema, IssueIdSchema]).optional(),
   })
   .passthrough();
 

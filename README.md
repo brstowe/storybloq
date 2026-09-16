@@ -2,11 +2,11 @@
   <img src="https://raw.githubusercontent.com/Storybloq/storybloq/main/assets/logo.png" width="120" alt="Storybloq logo" />
 </p>
 
-<h1 align="center">storybloq</h1>
+<h1 align="center">Storybloq</h1>
 
 <p align="center">
-  <strong>Cross-session context persistence for AI coding.</strong><br />
-  A file convention, a CLI, an MCP server, and Claude Code/Codex skills that together turn every coding session into a building block instead of a reset.
+  <strong>Your project’s memory. Your agents’ workflow.</strong><br />
+  Project memory and workflows for Claude Code and Codex. Keep stories, plans, handovers, and review evidence beside your code. Pick up work across sessions and follow progress in the optional Mac app.
 </p>
 
 <p align="center">
@@ -24,26 +24,33 @@
   <a href="https://storybloq.com/privacy">Privacy</a>
 </p>
 
-<p align="center">
-  <img src="https://raw.githubusercontent.com/Storybloq/storybloq/main/assets/hero.png" alt="Storybloq Mac app showing a live project sidebar alongside an AI coding terminal" />
-</p>
-
 ---
 
 ## The problem
 
-AI coding assistants are stateless. Every new session starts from zero. The model doesn't know what was built yesterday, what's broken, what decisions were made, or what to work on next. Developers compensate with CLAUDE.md files and scattered notes, but there's no standard structure, no session continuity, and no tooling.
+A new coding session may be missing the decisions and unfinished work from the last. Project instructions describe how to work; handovers, stories, and review records capture what happened and where to continue.
 
 The real cost isn't wasted setup time. It's repeated mistakes, relitigated design decisions, hallucinated context, and linear instead of compounding work.
 
 ## The idea
 
-Every project gets a `.story/` directory of JSON and markdown files. Tickets, issues, roadmap phases, session handovers, and lessons learned all live there, tracked by git, readable by any AI.
+Every project gets a `.story/` directory of JSON and markdown files. Stories, issues, roadmap phases, session handovers, and lessons learned live there as readable files you can track with Git. Stories use ticket records in the CLI and file format.
 
 - **CLI:** `storybloq` - inspect and mutate `.story/` from the terminal.
-- **MCP server:** structured tools Claude Code and Codex can call directly, with five additional tools when the local Bus is enabled. No subprocess spawning.
-- **Skill:** `/story` in Claude Code or `$story` in Codex loads project state at the start of every session.
+- **MCP server:** structured tools Claude Code and Codex can call directly to read and update the project and guide supported workflows.
+- **Skill:** invoke `/story` in Claude Code or `$story` in Codex to load project state at the start of a session.
 - **Mac app:** native sidebar that watches `.story/` and updates live while your AI client works (separate product, free on the App Store).
+
+## From choosing work to the next session
+
+- **Choose the next useful story.** Recommendations account for blockers, unfinished work, and what completing a story would unblock. Recorded decisions and a ranked digest of lessons give the agent context for the choice.
+- **Build against a reviewed plan.** Autonomous mode guides planning, configured independent reviews, tests, and finalization. Approved plan snapshots preserve the approach that advanced to implementation. Confirmed review findings can become durable issues.
+- **See what was approved. Know what was checked.** Gate acknowledgments in duet workflows can pin acceptance to a plan or staged code state. These records help you inspect the work; they do not guarantee correct code or replace tests, CI, and release checks.
+- **Continue with the record intact.** Handovers preserve decisions and next steps. Persisted session state supports guarded continuation; automatic recovery depends on the client and the interruption.
+
+A **lesson** is a recorded pattern or mistake, with reinforcement to help useful guidance surface again. An **approval** records acceptance of particular work, within the workflow that requested it. **Coordination** records participants and assignments; the client or configured transport supplies dispatch and messages. **Recovery** uses saved state and checks before continuing, rather than assuming an interrupted action finished.
+
+Start with one story and a handover. Add [autonomous mode](https://www.storybloq.com/tutorials/auto-mode), [coordination workflows](https://www.storybloq.com/cli), or [federation](https://www.storybloq.com/multi-repo) when the project needs them.
 
 ## Install
 
@@ -54,7 +61,26 @@ storybloq setup --client all
 
 Requires Node.js 20+ and at least one AI client: Claude Code or Codex CLI 0.130.0+. Package lives on npm at [**@storybloq/storybloq**](https://www.npmjs.com/package/@storybloq/storybloq); releases are tagged on this repo at [github.com/Storybloq/storybloq/releases](https://github.com/Storybloq/storybloq/releases).
 
-`setup --client all` installs the Storybloq skill for Claude and Codex, registers this package as an MCP server, and configures available client hooks. Re-running it is safe. Codex reports installed hooks with trust `unknown`; open `/hooks` in Codex to review and trust them. `setup-skill` remains as a compatibility alias for Claude-only setup.
+`setup --client all` installs the Storybloq skill for Claude and Codex, registers this package as an MCP server, and configures available client hooks. It also registers the bundled [codex-claude-bridge](https://www.npmjs.com/package/codex-claude-bridge) review backend as the `codex-bridge` MCP server when Codex is installed; the bridge ships as an optional dependency of this package, so a copy you registered yourself is left alone and `storybloq health` launches whichever one is registered and reports whether it answers. The bridge needs a Codex CLI login to review (or `agy` for its Gemini failover); without one it registers but reviews fail. Re-running it is safe. Codex reports installed hooks with trust `unknown`; open `/hooks` in Codex to review and trust them. `setup-skill` remains as a compatibility alias for Claude-only setup.
+
+Setup also installs the ledger dashboard for Claude Code. On version 2.1.272 or newer, a project with a `.story/` directory draws its tickets, issues, and progress in a pane beside the transcript, with no extra flags on the install command and nothing to configure. Projects without `.story/` show nothing. Turn the dashboard off with `/plugin configure storybloq`.
+
+## Your first two sessions
+
+1. Open your project in Claude Code or Codex. Type `/story` in Claude Code chat or `$story` in Codex chat. For a new project, the skill guides you through setup.
+2. Ask: “Record a story to add an empty calendar state. Record the decision that the API owns availability.”
+3. Before stopping, ask: “Write a handover.”
+4. Start a new chat and invoke `/story` or `$story` again to load the recorded project context.
+
+## See the work
+
+The optional Mac app shows stories, progress, and handovers from your project files. [Explore the Mac app](https://www.storybloq.com/mac) or follow the [tutorials](https://www.storybloq.com/tutorials).
+
+## Add structure as your work grows
+
+Start with one project and one agent. Add autonomous workflows, independent review, or connected repositories when the work calls for them. Review records preserve what was checked; they do not guarantee correctness. Tests, CI, and release checks still matter.
+
+The CLI and MCP server are source-available under PolyForm Shield. Your coding client and optional review backends have their own data handling and costs. See the [privacy policy](https://www.storybloq.com/privacy) and the license below.
 
 ## Upgrading
 
@@ -152,21 +178,25 @@ Prior art: the detection-and-reparse approach is modeled on [unsnooze](https://g
 
 ## Storybloq Bus
 
-Storybloq Bus is an optional local coordination protocol for one implementer task and one reviewer task. Runtime state lives under gitignored `.story/bus/`; confirmed findings still become canonical Storybloq issues with durable source provenance before they are sent as issue notices.
+Storybloq Bus connects two task-bound endpoints in one local checkout. One may implement while the other reviews, but routing follows the paired endpoints rather than role names. Runtime messages live under gitignored `.story/bus/`; confirmed findings remain canonical Storybloq issues.
+
+Run setup from **each participating client task**, using its actual client identity. For example, inside a Codex CLI task:
 
 ```bash
-storybloq bus init
-storybloq bus join implementer --client codex
-storybloq bus join reviewer --client claude
-storybloq bus hooks enable --client codex
-storybloq bus hooks enable --client claude
+storybloq bus setup --client codex --surface codex_cli --delivery poll
+storybloq bus status
+storybloq bus endpoint list
 ```
 
-Bus runtime is local and gitignored, so run `storybloq bus init` once in each checkout that will participate. Status and doctor report a fresh checkout as enabled but not initialized; that healthy inactive state does not block commits or autonomous FINALIZE. Other Bus commands and MCP tools never initialize the runtime implicitly. Initialization rejects symlinked ignore files and negation patterns because it cannot safely prove that Git will exclude the complete runtime otherwise.
+Setup initializes the local runtime and binds the current task id (normally discovered from the client environment). If discovery is unavailable, supply the validated client task id with `--task-id`; do not invent one. A second task runs setup in the same checkout to become the peer. Re-running setup is resumable. `bus init` and `bus join` remain lower-level commands; the legacy role argument to join does not select a message destination.
 
-The foreground protocol includes send, poll, acknowledge, thread state, status, doctor, export, and ship checks. Messages are hash-chained, idempotent, bounded, task-bound, secret-screened, and delivered through crash-recoverable recipient mailboxes. Critical messages require a matching unresolved critical issue by default. Bus text is always peer-agent advice: it never grants owner approval or authorizes merge, push, signing, deployment, credentials, spending, or destructive actions.
+`--delivery poll` uses explicit polling. The default, `--delivery live`, requires supported client hooks and configures guarded delivery. Live injection also depends on the session’s available transport. `bus auto-attach on` is a separate project opt-in for later sessions. Neither configuration guarantees an inactive peer reads a message immediately.
 
-V1 does not include a daemon, process spawning, headless resume, or automatic offline wake as Bus delivery paths. Natural SessionStart/Stop hooks and explicit polling are the delivery paths. Codex Desktop remains non-wakeable. (Usage-limit auto-resume, above, is a scoped exception outside the Bus: its transient waker recovers limit-stopped sessions and is not a message delivery path.)
+Messages are hash-chained, idempotent, bounded, and delivered through recoverable recipient mailboxes. Critical notices participate in ship checks and require canonical issue handling. A message is peer advice; it never grants owner approval to merge, push, deploy, spend, or perform destructive actions. `bus redeliver` can move a hop-cap-parked message to a successor thread using its recorded content.
+
+**Optional idle wake:** `bus setup --wake idle` opts a supported Codex CLI endpoint into a best-effort wake attempt after mail is committed. It requires a reachable compatible Codex app-server, an idle thread, and proven ownership. This implementation accepts app-server version `0.153.4`; other versions are refused. It cannot wake Codex Desktop or Claude endpoints. Omit `--wake` to preserve an existing policy or pass `--wake never` to disable it. There is no Bus retry daemon: a failed attempt waits for a later send, and a wake request is not proof of receipt. `bus endpoint list` reports the policy and last outcome.
+
+Claude usage-limit recovery, described above, is a separate mechanism. It is not Bus message delivery and does not establish equivalent usage-limit recovery in Codex.
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/Storybloq/storybloq/main/assets/autonomous.png" alt="Autonomous mode running a ticket through plan, implement, test, review" />
@@ -261,6 +291,8 @@ All commands accept `--format json|md` (default `md`). Pipe JSON through `jq` fo
 | `storybloq lesson list` · `lesson get` · `lesson create` · `lesson update` · `lesson reinforce` | Reusable patterns and anti-patterns |
 | `storybloq lesson digest` | Compact summary of all active lessons for skill injection |
 
+`--format json` is the round-trip-safe format for editing a ticket description, issue impact, or note/lesson content: piping a `get`'s md rendering into `update --stdin` carries the render fence itself into storage (ISS-1192), since md wraps that field's content in code-fence backticks one longer than any run already inside it. `update` strips a whole-value 4+ backtick outer fence with no info string and warns when it does; `get --format json` never has this problem, since the field is a plain JSON string.
+
 ### Handovers, blockers, snapshots
 
 | Command | Description |
@@ -277,7 +309,9 @@ All commands accept `--format json|md` (default `md`). Pipe JSON through `jq` fo
 | Command | Description |
 |---------|-------------|
 | `storybloq bus init` | Enable the local Bus and create gitignored runtime state |
-| `storybloq bus join implementer\|reviewer [--client] [--replace]` | Bind the current client task to one exclusive role |
+| `storybloq bus setup [--client] [--surface] [--delivery live\|poll]` | Initialize and bind the current task to a paired endpoint |
+| `storybloq bus endpoint list` | Inspect endpoint delivery and wake state |
+| `storybloq bus redeliver --predecessor-thread <id> --refused-entry-hash <hash>` | Redeliver recorded, hop-cap-parked mail |
 | `storybloq bus send ...` | Create a thread or send a reply with a required idempotency key |
 | `storybloq bus poll` | Read unacknowledged messages for the task-bound endpoint |
 | `storybloq bus ack <message-id> --disposition ...` | Record accepted, rejected, or deferred delivery state |
@@ -325,11 +359,13 @@ codex mcp add storybloq --env STORYBLOQ_CLIENT=codex -- storybloq --mcp
 
 The server imports the same TypeScript modules as the CLI directly, so there's no subprocess overhead. It auto-discovers the project root by walking up from the working directory to the nearest `.story/` parent.
 
-The base tools are grouped by responsibility. Bus-enabled projects register five additional tools at MCP process start; restart connected clients after `storybloq bus init`.
+Full-project tools are grouped below. Bus tools are registered even before Bus setup; calls return setup guidance while it is unavailable, so enabling Bus does not require an MCP restart. Run `storybloq reference` for the complete tool inventory and argument names.
 
-### Read (no side effects)
+### Project queries
 
-`storybloq_status` · `storybloq_phase_list` · `storybloq_phase_current` · `storybloq_phase_tickets` · `storybloq_ticket_list` · `storybloq_ticket_get` · `storybloq_ticket_meta_get` · `storybloq_ticket_next` · `storybloq_ticket_blocked` · `storybloq_issue_list` · `storybloq_issue_get` · `storybloq_issue_meta_get` · `storybloq_note_list` · `storybloq_note_get` · `storybloq_lesson_list` · `storybloq_lesson_get` · `storybloq_lesson_digest` · `storybloq_handover_list` · `storybloq_handover_latest` · `storybloq_handover_get` · `storybloq_blocker_list` · `storybloq_validate` · `storybloq_recap` · `storybloq_recommend` · `storybloq_export` · `storybloq_selftest`
+`storybloq_status` · `storybloq_phase_list` · `storybloq_phase_current` · `storybloq_phase_tickets` · `storybloq_ticket_list` · `storybloq_ticket_get` · `storybloq_ticket_meta_get` · `storybloq_ticket_next` · `storybloq_ticket_blocked` · `storybloq_issue_list` · `storybloq_issue_get` · `storybloq_issue_meta_get` · `storybloq_note_list` · `storybloq_note_get` · `storybloq_lesson_list` · `storybloq_lesson_get` · `storybloq_lesson_digest` · `storybloq_handover_list` · `storybloq_handover_latest` · `storybloq_handover_get` · `storybloq_blocker_list` · `storybloq_validate` · `storybloq_recap` · `storybloq_recommend` · `storybloq_export`
+
+Some queries also refresh gitignored runtime or presence metadata. `storybloq_selftest` is a diagnostic that creates, updates, and deletes temporary records.
 
 ### Write (mutate `.story/`)
 
@@ -343,11 +379,11 @@ The base tools are grouped by responsibility. Bus-enabled projects register five
 
 `storybloq_session_report` · `storybloq_register_subprocess` · `storybloq_unregister_subprocess` surface session health to the Mac app.
 
-### Storybloq Bus (feature-gated)
+### Storybloq Bus (runtime opt-in)
 
-`storybloq_bus_send` · `storybloq_bus_poll` · `storybloq_bus_ack` · `storybloq_bus_thread_get` · `storybloq_bus_thread_update`
+`storybloq_bus_send` · `storybloq_bus_redeliver` · `storybloq_bus_poll` · `storybloq_bus_ack` · `storybloq_bus_thread_get` · `storybloq_bus_thread_update`
 
-Every call requires a stable endpoint id and the current validated client task id. Poll and thread outputs mark peer content as advisory authority. `storybloq_bus_poll` and `storybloq_bus_thread_get` are read-only with respect to canonical tracked project state; poll may reconcile gitignored `.story/bus/` runtime metadata. The other three retain normal MCP write approvals.
+Every call requires a stable endpoint id and the current validated client task id. Poll and thread outputs mark peer content as advisory authority. `storybloq_bus_poll` and `storybloq_bus_thread_get` are read-only with respect to canonical tracked project state; poll may reconcile gitignored `.story/bus/` runtime metadata. Mutating tools remain subject to the client’s MCP approval policy.
 
 ### Federation (orchestrator projects)
 
@@ -439,7 +475,7 @@ Full type definitions ship with the package (`exports.types`).
 
 ## File format examples
 
-**Ticket** (`.story/tickets/T-001.json`):
+**Story as a legacy ticket record** (`.story/tickets/T-001.json`):
 
 ```json
 {
@@ -484,7 +520,7 @@ Full type definitions ship with the package (`exports.types`).
 }
 ```
 
-Each record is its own file. IDs are sequential within type (`T-001`, `T-002`, ...). Relationships are single-canonical-owner: a ticket's `blockedBy` field points at blocker tickets, and the reverse (who-blocks-me) is derived by scanning.
+Each record is its own file. Legacy records keep display-ID filenames such as `T-001.json`; newer records use canonical hash filenames such as `t-*.json` with a separate `displayId`. Both forms coexist and are updated in place. Display IDs are sequential within type, but concurrent branches can collide and need reconciliation. Use `git status --porcelain .story/` to identify files to stage. Relationships are single-canonical-owner: a ticket's `blockedBy` field points at blocker tickets, and the reverse (who-blocks-me) is derived by scanning.
 
 Create operations are safe to run in parallel. ID assignment and the create write happen together under a project lock, so concurrent creators are serialized and each receives a distinct sequential ID. A create can never silently overwrite an existing record; under heavy simultaneous contention a creator fails loudly with an error rather than colliding.
 
@@ -508,17 +544,20 @@ storybloq init --name "my-app"
 storybloq phase create --id bootstrap --name "Bootstrap" --label "PHASE 1" \
   --description "Get the app running end-to-end"
 
-# Add a ticket
+# Add a story (the CLI command is ticket)
 storybloq ticket create --title "Scaffold Next.js" --type task --phase bootstrap
 
 # Start Claude Code and type /story, or invoke $story in Codex, then work on it
 # (or go autonomous: /story auto T-001 / $story auto T-001)
 
-# At the end of a session, commit your changes including .story/
-git add .
-git commit -m "T-001: scaffold Next.js"
+# Inspect before committing: autonomous FINALIZE may already have committed
+git status --porcelain
+git log -1 --oneline
 
-# Session ends. Next session starts with /story or $story and picks up with full context.
+# Stage the specific changed source and .story/ files reported by Git, then commit
+# Ask the agent to write a handover before ending a collaborative session
+
+# In the next session, invoke /story or $story to load the recorded context.
 ```
 
 ## Team mode
@@ -569,6 +608,8 @@ Renumbered items keep their old display id in `previousDisplayIds`, so existing 
 | Older clients | any client can create items | clients that do not declare the reservation capability fail closed (see caveat below) |
 
 With `git-refs`, `team init` also adds `remote-ref-reservations` to `team.requiredFeatures`, so clients that do not declare that capability refuse to create items instead of allocating locally against a git-refs team and colliding. One caveat: current Mac app releases predate reservations while still declaring the capability, so until the Mac-side update ships, avoid creating items from the Mac app on git-refs teams. `storybloq team reserve tickets --count 5` reserves a batch of ids up front.
+
+`local` is unsafe specifically when seats create items on their own branches or worktrees (agent orchestration, per-feature branches) rather than one shared working copy (ISS-1190); `create` warns once per branch per 24h when it detects that shape on the local allocator, and `reconcile`/`team doctor` name the same `git-refs` fix when they find or flag a collision.
 
 ### Schema version and older clients
 

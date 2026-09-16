@@ -1,0 +1,1 @@
+{"state":"SESSION_END","status":"completed","currentTicket":{"id":"T-001"},"reviews":{"plan":[{"round":1,"reviewer":"codex","verdict":"approve","reviewerSessionId":"aaaaaaaa-aaaa-7aaa-aaaa-aaaaaaaaaaaa","reviewerModel":"gpt-6-astra"}],"code":[{"round":1,"reviewer":"codex","verdict":"approve","reviewerSessionId":"zzzzzzzz-0000-7000-0000-000000000000"}]}}

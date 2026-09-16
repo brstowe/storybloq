@@ -2411,7 +2411,7 @@ describe("Storybloq Bus store", () => {
     expect((await readdir(join(value.root, ".story", "bus", "threads"))).sort()).toEqual(threadsBefore);
   });
 
-  it("selects the predecessor's OTHER original participant correctly even when a park entry's recorded byEndpoint is not literally one of the predecessor thread's original participants (ISS-953 Codex round 3 finding #10, correctness/hardening)", async () => {
+  it("ISS-1162: automatic park with a byEndpoint forged to a genuine successor's id (not literal) quarantines at fold time, and redeliver refuses on the unverified predecessor rather than selecting a recipient (rewritten from the ISS-953 Codex round 3/4 finding #10 test; the hardening now moves one layer earlier, to fold time)", async () => {
     // Finding #10's literal scenario -- "the dropped message was authored by a
     // successor endpoint" -- is NOT reachable through the exposed send path: an
     // ordinary sendBusMessage reply requires the CALLER to be literally present
@@ -2425,11 +2425,17 @@ describe("Storybloq Bus store", () => {
     // park logic. This test instead hand-forges the park entry's own byEndpoint
     // field (recomputing its entryHash, the same technique repatchSuccessorThread
     // uses elsewhere in this file), representing a hand-tampered/corrupted park
-    // record rather than a legitimately reachable one -- the fix must not
-    // silently select the wrong participant against that shape either, matching
-    // this suite's existing posture of hardening against forged on-disk state
-    // (finding #1's forged-successor tests, the corrupt-chain tests) even where
-    // the ordinary API cannot produce it itself.
+    // record rather than a legitimately reachable one.
+    //
+    // ISS-1162: an AUTOMATIC park's byEndpoint has no succession fallback -- only
+    // a literal participant match is ever legitimate (verified against store.ts's
+    // write path: sendBusMessage's automatic-park caller always already passed
+    // the literal-only readThreadParticipants check, store.ts:1725). So this
+    // forged shape -- a non-literal, successor-only byEndpoint on an AUTOMATIC
+    // park -- is exactly the hash-consistent-but-inauthentic entry ISS-1162
+    // exists to catch: the fold now quarantines it instead of folding it
+    // verified. This supersedes the pre-ISS-1162 expectation (fold verified,
+    // redeliver selected a recipient).
     const value = await fixture();
     const issueId = await createIssue(value.root, "medium");
     const { threadId, parkEntry } = await parkOverCap(value, issueId, "s10-forge");
@@ -2448,7 +2454,8 @@ describe("Storybloq Bus store", () => {
 
     // Forge the park entry's byEndpoint to reviewer2's id: not literally in
     // predecessor.thread.participants (only the ORIGINAL reviewer/implementer
-    // ids are), reachable via reviewer2's genuine succession chain.
+    // ids are), reachable only via reviewer2's succession chain -- which no
+    // longer matters for an AUTOMATIC park under ISS-1162's rule.
     const entriesDir = join(value.root, ".story", "bus", "threads", threadId, "entries");
     const [entryFilename] = (await readdir(entriesDir)).sort().slice(-1);
     const entryPath = join(entriesDir, entryFilename!);
@@ -2456,35 +2463,191 @@ describe("Storybloq Bus store", () => {
     const patchedUnsigned = { ...rawEntry, payload: { ...rawEntry.payload, byEndpoint: reviewer2.endpointId }, entryHash: "0".repeat(64) };
     const patchedEntry = { ...patchedUnsigned, entryHash: hashWithoutKey(patchedUnsigned, "entryHash") };
     await writeFile(entryPath, JSON.stringify(patchedEntry, null, 2) + "\n", "utf-8");
-    const forgedParkEntry = (await foldBusThread(value.root, threadId)).entries.at(-1)!;
-    expect(forgedParkEntry).toMatchObject({ entryHash: patchedEntry.entryHash, payload: { byEndpoint: reviewer2.endpointId } });
 
-    // The correct "other participant" is the ORIGINAL implementer -- never the
-    // original reviewer (the author side, wrongly selected by literal inequality
-    // against reviewer2's id, which matches neither original participant
-    // literally).
-    const result = await redeliverBusMessage(value.root, {
+    const folded = await foldBusThread(value.root, threadId);
+    expect(folded.integrity).toBe("quarantined");
+    expect(folded.finding).toMatch(/park byEndpoint is not a participant/);
+
+    // redeliverBusMessage refuses outright on an unverified predecessor -- it
+    // never reaches its own successor-aware recipient selection at all.
+    await expect(redeliverBusMessage(value.root, {
       endpointId: reviewer2.endpointId,
       clientTaskId: successorTaskId,
       predecessorThreadId: threadId,
-      refusedEntryHash: forgedParkEntry.entryHash,
-    });
-    expect(result.toEndpoint).toBe(value.implementer.endpointId);
+      refusedEntryHash: patchedEntry.entryHash,
+    })).rejects.toMatchObject({ code: "corrupt" });
+    void parkEntry;
+  });
 
-    // ISS-953 Codex round 4 finding #8: the assertion above only checks the
-    // CREATE path's own result (store.ts, already fixed by round 3's finding
-    // #10). It never exercises verifiedSuccessorState's OWN, independently
-    // computed recipient-binding check (fold.ts) on the successor this call
-    // just made -- that is a genuinely separate code path (fold.ts's read-side
-    // classifier, not store.ts's write-side selection), and it can disagree
-    // with the create path's answer without this test noticing.
-    const foldedAfter = await foldBusThread(value.root, threadId, { includeRefusals: true });
-    const refusal = foldedAfter.refusals.find((entry) => entry.entryHash === forgedParkEntry.entryHash);
-    expect(refusal).toMatchObject({
-      markerState: "verified",
-      disposition: "redelivered",
-      successorThreadId: result.threadId,
+  it("ISS-1162 acceptance (b): manual park authored by a genuine successor of a participant folds verified", async () => {
+    const value = await fixture();
+    const first = await reviewSend(value);
+    await forgeOffline(value.root, value.reviewer.endpointId);
+    const successorTaskId = "claude-task-reviewer-successor-iss1162-b";
+    const reviewer2 = await replaceWithSuccessor(value.root, value.reviewer.endpointId, successorTaskId);
+
+    await updateBusThread(value.root, {
+      endpointId: reviewer2.endpointId,
+      clientTaskId: successorTaskId,
+      threadId: first.threadId,
+      action: "park",
+      reason: "Successor parking on behalf of a retired predecessor",
     });
+
+    const folded = await foldBusThread(value.root, first.threadId);
+    expect(folded.integrity).toBe("verified");
+    expect(folded.state).toBe("parked");
+    expect(folded.entries.at(-1)).toMatchObject({ type: "state", payload: { byEndpoint: reviewer2.endpointId } });
+  });
+
+  it("ISS-1162 acceptance (c): manual park by an endpoint with no succession path to either participant quarantines with the named finding", async () => {
+    const value = await fixture();
+    const first = await reviewSend(value);
+    // The Bus enforces a hard two-active-endpoint invariant (endpoints.ts:475-483),
+    // and every `replace` join inherits succession from the endpoint it replaces
+    // -- so a genuinely THIRD, unrelated-to-both endpoint cannot be produced
+    // through the join API at all while this thread's two original participants
+    // exist. Write its registry file directly instead (the same class of
+    // direct-disk forge this suite already uses for park entries and endpoint
+    // corruption): a self-contained endpoint record, cloned from a real one for
+    // schema validity, with a fresh id and no predecessorEndpointId whatsoever.
+    const strangerId = randomUUID();
+    const stranger = { ...value.reviewer, endpointId: strangerId, clientTaskId: "claude-task-stranger-iss1162-c" };
+    delete (stranger as { predecessorEndpointId?: string }).predecessorEndpointId;
+    await writeFile(
+      join(value.root, ".story", "bus", "endpoints", `${strangerId}.json`),
+      JSON.stringify(stranger, null, 2) + "\n",
+      "utf-8",
+    );
+
+    const entriesDir = join(value.root, ".story", "bus", "threads", first.threadId, "entries");
+    const before = await foldBusThread(value.root, first.threadId);
+    const unsigned = {
+      schema: "storybloq-bus-entry/v2" as const,
+      entryId: randomUUID(),
+      threadId: first.threadId,
+      seq: before.validThroughSeq + 1,
+      type: "state" as const,
+      prevHash: before.lastHash,
+      payload: { action: "park" as const, byEndpoint: stranger.endpointId, reason: "Forged manual park by an unrelated stranger" },
+      createdAt: new Date().toISOString(),
+      entryHash: "0".repeat(64),
+    };
+    const entry = { ...unsigned, entryHash: hashWithoutKey(unsigned, "entryHash") };
+    const filename = `${String(entry.seq).padStart(6, "0")}-state-${entry.entryId}.json`;
+    await writeFile(join(entriesDir, filename), JSON.stringify(entry, null, 2) + "\n", "utf-8");
+
+    const folded = await foldBusThread(value.root, first.threadId);
+    expect(folded.integrity).toBe("quarantined");
+    expect(folded.finding).toMatch(/park byEndpoint is not a participant/);
+  });
+
+  it("ISS-1162 acceptance (c, unknown byEndpoint): manual park whose byEndpoint resolves to no known endpoint quarantines with the same named finding", async () => {
+    const value = await fixture();
+    const first = await reviewSend(value);
+    const entriesDir = join(value.root, ".story", "bus", "threads", first.threadId, "entries");
+    const before = await foldBusThread(value.root, first.threadId);
+    const unsigned = {
+      schema: "storybloq-bus-entry/v2" as const,
+      entryId: randomUUID(),
+      threadId: first.threadId,
+      seq: before.validThroughSeq + 1,
+      type: "state" as const,
+      prevHash: before.lastHash,
+      payload: { action: "park" as const, byEndpoint: randomUUID(), reason: "Forged manual park, unknown endpoint" },
+      createdAt: new Date().toISOString(),
+      entryHash: "0".repeat(64),
+    };
+    const entry = { ...unsigned, entryHash: hashWithoutKey(unsigned, "entryHash") };
+    const filename = `${String(entry.seq).padStart(6, "0")}-state-${entry.entryId}.json`;
+    await writeFile(join(entriesDir, filename), JSON.stringify(entry, null, 2) + "\n", "utf-8");
+
+    const folded = await foldBusThread(value.root, first.threadId);
+    expect(folded.integrity).toBe("quarantined");
+    expect(folded.finding).toMatch(/park byEndpoint is not a participant/);
+  });
+
+  it("ISS-1162 (Codex round 1 finding): a genuinely legitimate successor-authored manual park still quarantines when the endpoint REGISTRY itself is corrupt (an unrelated malformed record), proving the registry-findings guard is load-bearing and not merely redundant with the addressees/author checks", async () => {
+    const value = await fixture();
+    const first = await reviewSend(value);
+    await forgeOffline(value.root, value.reviewer.endpointId);
+    const successorTaskId = "claude-task-reviewer-successor-iss1162-registry-corrupt";
+    const reviewer2 = await replaceWithSuccessor(value.root, value.reviewer.endpointId, successorTaskId);
+
+    await updateBusThread(value.root, {
+      endpointId: reviewer2.endpointId,
+      clientTaskId: successorTaskId,
+      threadId: first.threadId,
+      action: "park",
+      reason: "Successor parking on behalf of a retired predecessor",
+    });
+
+    // Corrupt the registry itself, unrelated to reviewer2 or either original
+    // participant: a well-formed endpoint record filed under a filename that
+    // does not match its own endpointId (listEndpoints's own "endpoint id does
+    // not match filename" finding). Without the endpointsMemo.findings.length
+    // check, reviewer2's own lookup and succession chain are both still
+    // perfectly valid, so this thread would verify -- this test exists to prove
+    // that guard, specifically, is what refuses it.
+    await writeFile(
+      join(value.root, ".story", "bus", "endpoints", `${randomUUID()}.json`),
+      JSON.stringify({ ...value.implementer, endpointId: randomUUID() }, null, 2) + "\n",
+      "utf-8",
+    );
+
+    const folded = await foldBusThread(value.root, first.threadId);
+    expect(folded.integrity).toBe("quarantined");
+    expect(folded.finding).toMatch(/park byEndpoint is not a participant/);
+  });
+
+  it("ISS-1162 acceptance (c, corrupt chain): manual park whose byEndpoint resolves to an endpoint with a corrupt succession chain quarantines with the same named finding", async () => {
+    const value = await fixture();
+    const first = await reviewSend(value);
+    await forgeOffline(value.root, value.reviewer.endpointId);
+    const successorTaskId = "claude-task-reviewer-successor-iss1162-corrupt";
+    const reviewer2 = await replaceWithSuccessor(value.root, value.reviewer.endpointId, successorTaskId);
+    await corruptEndpointChain(value.root, reviewer2.endpointId);
+
+    const entriesDir = join(value.root, ".story", "bus", "threads", first.threadId, "entries");
+    const before = await foldBusThread(value.root, first.threadId);
+    const unsigned = {
+      schema: "storybloq-bus-entry/v2" as const,
+      entryId: randomUUID(),
+      threadId: first.threadId,
+      seq: before.validThroughSeq + 1,
+      type: "state" as const,
+      prevHash: before.lastHash,
+      payload: { action: "park" as const, byEndpoint: reviewer2.endpointId, reason: "Forged manual park, corrupt succession chain" },
+      createdAt: new Date().toISOString(),
+      entryHash: "0".repeat(64),
+    };
+    const entry = { ...unsigned, entryHash: hashWithoutKey(unsigned, "entryHash") };
+    const filename = `${String(entry.seq).padStart(6, "0")}-state-${entry.entryId}.json`;
+    await writeFile(join(entriesDir, filename), JSON.stringify(entry, null, 2) + "\n", "utf-8");
+
+    const folded = await foldBusThread(value.root, first.threadId);
+    expect(folded.integrity).toBe("quarantined");
+    expect(folded.finding).toMatch(/park byEndpoint is not a participant/);
+  });
+
+  it("ISS-1162 acceptance (d): a fold of a thread whose parks are all literal never reads the endpoints directory", async () => {
+    const value = await fixture();
+    const first = await reviewSend(value);
+    await updateBusThread(value.root, {
+      endpointId: value.reviewer.endpointId,
+      clientTaskId: value.reviewerTaskId,
+      threadId: first.threadId,
+      action: "park",
+      reason: "Ordinary literal-participant manual park",
+    });
+    const spy = vi.spyOn(endpointsModule, "listEndpoints");
+    try {
+      const folded = await foldBusThread(value.root, first.threadId);
+      expect(folded.integrity).toBe("verified");
+      expect(spy).not.toHaveBeenCalled();
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it("refuses hop_cap_successor redelivery whose content does not exactly match the resolved refused artifact (ISS-953 fix step 11)", async () => {

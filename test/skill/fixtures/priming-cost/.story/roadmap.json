@@ -1,0 +1,19 @@
+{
+  "title": "priming-cost-fixture",
+  "date": "2026-08-01",
+  "phases": [
+    {
+      "id": "core",
+      "label": "CORE",
+      "name": "Core plumbing",
+      "description": "Ingest, retry, and config schema work."
+    },
+    {
+      "id": "polish",
+      "label": "POLISH",
+      "name": "Polish and cleanup",
+      "description": "CLI ergonomics and snapshot pruning."
+    }
+  ],
+  "blockers": []
+}

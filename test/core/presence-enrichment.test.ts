@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
-import { computeArrangementPresence, applyPresenceEnrichment, ownerIdentityOf } from "../../src/core/presence-enrichment.js";
+import { ABORT_ENRICHMENT, computeArrangementPresence, applyPresenceEnrichment, ownerIdentityOf } from "../../src/core/presence-enrichment.js";
 import { acquireLock, releaseLock, ensurePresenceDir, readBoundedNoFollow } from "../../src/presence/io.js";
 import { presenceFileBase, MAX_RECORD_BYTES } from "../../src/presence/types.js";
 import { runPresenceHook } from "../../src/presence/handler.js";
@@ -363,5 +363,45 @@ describe("applyPresenceEnrichment", () => {
         releaseLock(lockPath);
       }
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// T-501: the abort sentinel. "Return the base unchanged" cannot express a
+// failed precondition here, because this helper always serializes and writes
+// and fabricates a fresh record when none exists -- so a callback that found
+// no record would RECREATE the deleted one.
+// ---------------------------------------------------------------------------
+
+describe("applyPresenceEnrichment: ABORT_ENRICHMENT", () => {
+  it("aborting leaves no file at all where there was none", () => {
+    const root = makeRoot();
+    const dir = ensurePresenceDir(root)!;
+    const path = join(dir, `${presenceFileBase("sess-abort")}.json`);
+    let sawBase = false;
+    const outcome = applyPresenceEnrichment(root, "sess-abort", 200, "t501", (base) => {
+      sawBase = base.sessionIntel === null;
+      return ABORT_ENRICHMENT;
+    });
+    expect(sawBase).toBe(true);
+    expect(outcome).toEqual({ status: "aborted" });
+    expect(readBoundedNoFollow(path, MAX_RECORD_BYTES)).toBeNull();
+  });
+
+  it("aborting leaves an existing record byte-identical", () => {
+    const root = makeRoot();
+    const dir = ensurePresenceDir(root)!;
+    const path = join(dir, `${presenceFileBase("sess-abort2")}.json`);
+    expect(applyPresenceEnrichment(root, "sess-abort2", 200, "t501", (base) => ({ ...base, source: "first" })).status).toBe("written");
+    const before = readBoundedNoFollow(path, MAX_RECORD_BYTES);
+    expect(before).not.toBeNull();
+    expect(applyPresenceEnrichment(root, "sess-abort2", 200, "t501", () => ABORT_ENRICHMENT)).toEqual({ status: "aborted" });
+    expect(readBoundedNoFollow(path, MAX_RECORD_BYTES)).toBe(before);
+  });
+
+  it("the lock is released after an abort, so the next call still writes", () => {
+    const root = makeRoot();
+    expect(applyPresenceEnrichment(root, "sess-abort3", 200, "t501", () => ABORT_ENRICHMENT).status).toBe("aborted");
+    expect(applyPresenceEnrichment(root, "sess-abort3", 200, "t501", (base) => base).status).toBe("written");
   });
 });

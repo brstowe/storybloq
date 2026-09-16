@@ -1,6 +1,6 @@
 {
   "name": "@storybloq/storybloq",
-  "version": "1.14.0",
+  "version": "1.15.0",
   "license": "PolyForm-Shield-1.0.0",
   "description": "Project memory for Claude Code and Codex. Storybloq stores tickets, issues, handovers, and lessons in a .story/ folder inside your repo so every session starts where the last one left off. Pairs with the Storybloq Mac app on the App Store.",
   "homepage": "https://storybloq.com",
@@ -38,6 +38,10 @@
   "files": [
     "dist",
     "src/skill",
+    "plugins/storybloq/.claude-plugin/plugin.json",
+    "plugins/storybloq/hooks/hooks.json",
+    "plugins/storybloq/hooks/*.ts",
+    "!plugins/storybloq/hooks/*.test.ts",
     "README.md",
     "NOTICE"
   ],
@@ -53,11 +57,14 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.27.1",
-    "@storybloq/lenses": "^0.5.0",
+    "@storybloq/lenses": "^0.6.0",
     "canonicalize": "^3.0.0",
     "proper-lockfile": "^4.1.2",
     "yargs": "^17",
     "zod": "^3"
+  },
+  "optionalDependencies": {
+    "codex-claude-bridge": "1.8.0"
   },
   "devDependencies": {
     "@types/node": "^20",

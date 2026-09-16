@@ -1,6 +1,12 @@
 import { displayIdOf } from "../../core/resolver.js";
+import {
+  type IssueCreateInput,
+  validateIssueCreateSeverity,
+  validateIssueCreateDedupeKey,
+  validateIssueCreatePhase,
+} from "../../core/issue-create-input.js";
+import { inferIssuePhase } from "../../autonomous/issue-create-preparation.js";
 import { validateProject } from "../../core/validation.js";
-import { currentPhase } from "../../core/queries.js";
 import { validateProjectAssignment, staleProjectClear } from "./ticket.js";
 import { resolveAndNormalizeTicketRef, resolveAndNormalizeIssueRef, RefResolutionError } from "../../core/ref-normalization.js";
 import { ProjectState } from "../../core/project-state.js";
@@ -12,7 +18,9 @@ import {
 import { clearSameSessionEarmark } from "../../core/earmarks.js";
 import { nextIssueID, allocateTeamIssueId } from "../../core/id-allocation.js";
 import { reserveDisplayId } from "../../core/remote-refs.js";
+import { checkBranchAllocationWarning } from "../../core/branch-allocation-warning.js";
 import { loadCitationContext } from "../../core/ruling-loader.js";
+import { computeTargetedActionability } from "../../core/classification-context.js";
 import { citationMapFor, resolveEntityCitations, resolveCitesRulingsInput } from "../../core/ruling.js";
 import {
   formatIssueList,
@@ -20,6 +28,7 @@ import {
   formatError,
   successEnvelope,
   ExitCode,
+  stripRenderFence,
 } from "../../core/output-formatter.js";
 import {
   ISSUE_STATUSES,
@@ -28,7 +37,6 @@ import {
   type IssueSeverity,
 } from "../../models/types.js";
 import {
-  IssueDedupeKeySchema,
   type Issue,
   type IssueSourceRefInput,
 } from "../../models/issue.js";
@@ -48,6 +56,8 @@ import {
   setMetadata,
   unsetMetadata,
 } from "./metadata.js";
+
+export type { IssueCreateInput };
 
 // Re-export for register.ts
 export { ISSUE_STATUSES, ISSUE_SEVERITIES };
@@ -135,6 +145,7 @@ export function handleIssueList(
 export function handleIssueGet(
   id: string,
   ctx: CommandContext,
+  withActionability = false,
 ): CommandResult {
   const result = ctx.state.resolveIssueRef(id);
   if (result.kind === "ambiguous") {
@@ -153,7 +164,10 @@ export function handleIssueGet(
     };
   }
   const rulingCtx = loadCitationContext(ctx.root);
-  return { output: formatIssue(result.item, ctx.format, ctx.state, resolveEntityCitations(result.item, rulingCtx)) };
+  const extraJsonFields = withActionability ? computeTargetedActionability(ctx, "issue", result.item) : undefined;
+  return {
+    output: formatIssue(result.item, ctx.format, ctx.state, resolveEntityCitations(result.item, rulingCtx), extraJsonFields),
+  };
 }
 
 export function handleIssueMetaGet(
@@ -265,46 +279,26 @@ function validatePostWriteIssueState(
 }
 
 export async function handleIssueCreate(
-  args: {
-    title: string;
-    severity: string;
-    impact: string;
-    components: string[];
-    relatedTickets: string[];
-    location: string[];
-    sourceRefs?: IssueSourceRefInput[];
-    dedupeKey?: string;
-    createdBy?: string;
-    phase?: string;
-    project?: string | null;
-    citesRuling?: string[];
-  },
+  args: IssueCreateInput,
   format: string,
   root: string,
 ): Promise<CommandResult> {
-  if (!ISSUE_SEVERITIES.includes(args.severity as IssueSeverity)) {
-    throw new CliValidationError(
-      "invalid_input",
-      `Unknown issue severity "${args.severity}": must be one of ${ISSUE_SEVERITIES.join(", ")}`,
-    );
-  }
+  // ISS-1221: the three input checks below are shared with the recovery-record
+  // preparer (core/issue-create-input.ts) and stay in this order: severity,
+  // the citation check, the dedupe key; the phase once the ledger is locked.
+  const severityRefusal = validateIssueCreateSeverity(args);
+  if (severityRefusal) throw new CliValidationError("invalid_input", severityRefusal.message);
   const citesRulingsResolution = resolveCitesRulingsInput(args.citesRuling, undefined);
   if (!citesRulingsResolution.ok) {
     throw new CliValidationError("invalid_input", citesRulingsResolution.message);
   }
 
-  const dedupeResult = args.dedupeKey === undefined
-    ? null
-    : IssueDedupeKeySchema.safeParse(args.dedupeKey);
-  if (dedupeResult && !dedupeResult.success) {
-    throw new CliValidationError(
-      "invalid_input",
-      dedupeResult.error.issues.map((issue) => issue.message).join("; "),
-    );
-  }
+  const dedupeRefusal = validateIssueCreateDedupeKey(args);
+  if (dedupeRefusal) throw new CliValidationError("invalid_input", dedupeRefusal.message);
 
   let createdIssue: Issue | undefined;
   let deduplicated = false;
+  let createdInState: ProjectState | undefined;
 
   await withProjectLock(root, { strict: true }, async ({ state }) => {
     if (args.dedupeKey) {
@@ -328,20 +322,20 @@ export async function handleIssueCreate(
       throw err;
     }
 
-    // Fork: default to the current working phase when none is given so
-    // review-raised issues never land unphased and hidden from phase-filtered
-    // views. Falls back to null only when no phase is active.
-    const phase = args.phase ?? currentPhase(state)?.id ?? null;
-    if (phase && !state.roadmap.phases.some((p) => p.id === phase)) {
-      throw new CliValidationError("invalid_input", `Phase "${phase}" not found in roadmap`);
-    }
-    if (args.project != null) {
-      validateProjectAssignment(args.project, phase, state);
-    }
+    const phaseRefusal = validateIssueCreatePhase(state, args.phase);
+    if (phaseRefusal) throw new CliValidationError("invalid_input", phaseRefusal.message);
     const resolvedRelated = args.relatedTickets.length > 0
       ? validateAndResolveRelatedTickets(args.relatedTickets, state)
       : [];
+    // ISS-1203 default, ISS-1221 contract: undefined means infer; an explicit
+    // null was resolved by a preparer and is written as is. See inferIssuePhase.
+    const effectivePhase = args.phase !== undefined ? args.phase : await inferIssuePhase(state, resolvedRelated, root);
+    // Fork: validate project against the issue's effective phase.
+    if (args.project != null) {
+      validateProjectAssignment(args.project, effectivePhase, state);
+    }
 
+    createdInState = state;
     const isTeam = state.config.team?.enabled === true;
     let id: string;
     let displayId: string | undefined;
@@ -373,7 +367,7 @@ export async function handleIssueCreate(
       ...(args.createdBy ? { createdBy: args.createdBy } : {}),
       resolvedDate: null,
       relatedTickets: resolvedRelated,
-      phase,
+      phase: effectivePhase,
       ...(args.project != null && { project: args.project }),
       ...(citesRulingsResolution.citesRulings !== undefined && citesRulingsResolution.citesRulings.length > 0
         && { citesRulings: citesRulingsResolution.citesRulings }),
@@ -385,6 +379,10 @@ export async function handleIssueCreate(
   });
 
   if (!createdIssue) throw new Error("Issue not created");
+  const branchWarning = !deduplicated && createdInState
+    ? checkBranchAllocationWarning(root, "issue", createdInState, displayIdOf(createdIssue))
+    : null;
+  const warnings = branchWarning ? [branchWarning] : undefined;
   if (format === "json") {
     const envelope = successEnvelope(createdIssue) as unknown as Record<string, unknown>;
     return {
@@ -393,12 +391,13 @@ export async function handleIssueCreate(
         null,
         2,
       ),
+      ...(warnings && { warnings }),
     };
   }
   if (deduplicated) {
     return { output: `Issue ${displayIdOf(createdIssue)} already exists for dedupe key ${args.dedupeKey}.` };
   }
-  return { output: `Created issue ${displayIdOf(createdIssue)}: ${createdIssue.title}` };
+  return { output: `Created issue ${displayIdOf(createdIssue)}: ${createdIssue.title}`, ...(warnings && { warnings }) };
 }
 
 export async function handleIssueUpdate(
@@ -428,6 +427,15 @@ export async function handleIssueUpdate(
     "issue",
     "status, title, severity, impact, resolution, components, relatedTickets, location, sourceRefs, order, phase, citesRuling, clearCitesRulings",
   );
+  // ISS-1192: same round-trip-growth fix as ticket.ts's description -- an
+  // agent that reads the md-rendered impact back and writes it verbatim
+  // carries the render fence into storage. Shared by CLI and MCP.
+  let impactFenceStripped = false;
+  if (updates.impact !== undefined) {
+    const stripped = stripRenderFence(updates.impact);
+    updates.impact = stripped.text;
+    impactFenceStripped = stripped.stripped;
+  }
   if (updates.status && !ISSUE_STATUSES.includes(updates.status as IssueStatus)) {
     throw new CliValidationError(
       "invalid_input",
@@ -529,10 +537,13 @@ export async function handleIssueUpdate(
   });
 
   if (!updatedIssue) throw new Error("Issue not updated");
+  const warnings = impactFenceStripped
+    ? ["outer render fence removed; use --format json for round trips"]
+    : undefined;
   if (format === "json") {
-    return { output: JSON.stringify(successEnvelope(updatedIssue), null, 2) };
+    return { output: JSON.stringify(successEnvelope(updatedIssue), null, 2), ...(warnings && { warnings }) };
   }
-  return { output: `Updated issue ${displayIdOf(updatedIssue)}: ${updatedIssue.title}` };
+  return { output: `Updated issue ${displayIdOf(updatedIssue)}: ${updatedIssue.title}`, ...(warnings && { warnings }) };
 }
 
 export async function handleIssueMetaSet(

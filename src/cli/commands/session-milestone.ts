@@ -146,5 +146,16 @@ export function handleSessionMilestone(
         message: "This session's presence record exceeds the size limit even after shedding.",
         retryable: false,
       };
+    case "aborted":
+      // T-501 added this outcome for callbacks that abort on a failed
+      // precondition (`ABORT_ENRICHMENT`). This callback never returns it, so
+      // the case is unreachable -- and is still reported as an explicit
+      // failure rather than a false success, per the rule above.
+      return {
+        ok: false,
+        errorCode: "write-failed",
+        message: "Presence record write was aborted before anything was written.",
+        retryable: false,
+      };
   }
 }

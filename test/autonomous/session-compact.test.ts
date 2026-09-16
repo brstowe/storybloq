@@ -988,6 +988,21 @@ describe("readHookStdinContext", () => {
     stream.end(JSON.stringify({ source: "startup", session_id: "bad task id" }));
     expect(await pending).toEqual({ source: "startup" });
   });
+
+  it("T-499: the default 64 KiB cap drops an oversized payload; maxBytes raises it so a UserPromptSubmit payload carrying the prompt still yields identity", async () => {
+    const big = { session_id: "0198e53a-faf0-7000-aead-153710edb757", cwd: "/tmp/p", prompt: "x".repeat(200 * 1024) };
+    const capped = new PassThrough();
+    const pendingCapped = readHookStdinContext(capped, 500);
+    capped.end(JSON.stringify(big));
+    expect(await pendingCapped).toEqual({});
+
+    const raised = new PassThrough();
+    const pendingRaised = readHookStdinContext(raised, 500, { maxBytes: 1024 * 1024 });
+    raised.end(JSON.stringify(big));
+    const ctx = await pendingRaised;
+    expect(ctx).toEqual({ sessionId: "0198e53a-faf0-7000-aead-153710edb757", cwd: "/tmp/p" });
+    expect(ctx).not.toHaveProperty("prompt");
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -26,7 +26,8 @@ import { basename, join } from "node:path";
 
 import { atomicWriteFollowingSymlink } from "./symlink-write.js";
 
-function defaultSettingsPath(): string {
+/** `~/.claude/settings.json`. Exported for T-499's autoCompactWindow reader, which merges it with the project layers. */
+export function defaultSettingsPath(): string {
   return join(homedir(), ".claude", "settings.json");
 }
 
@@ -47,6 +48,16 @@ export const LIMITSTOP_SUBCOMMAND = "session limit-stop";
 export const STOPFAILURE_MATCHER = "rate_limit";
 /** Second SessionStart matcher group for limit wake/reopen handling (same resume-prompt command). */
 export const LIMIT_SESSIONSTART_MATCHER = "resume";
+// T-499 session intel: the process-era capture at SessionStart (every source:
+// startup and resume are a new process, clear transfers the capture, compact
+// reconciles) and the synchronous UserPromptSubmit sample whose
+// additionalContext is the only hook output that reaches the model.
+export const INTELSTART_SUBCOMMAND = "session intel-start";
+export const INTELPROMPT_SUBCOMMAND = "session intel-prompt";
+export const SESSION_INTEL_SESSIONSTART_MATCHER = "startup|resume|clear|compact";
+/** Both intel hooks are synchronous; the client default timeout is 600 s. */
+export const INTELSTART_HOOK_TIMEOUT_SECONDS = 5;
+export const INTELPROMPT_HOOK_TIMEOUT_SECONDS = 10;
 
 // ---------------------------------------------------------------------------
 // ISS-1022: session presence
@@ -275,6 +286,7 @@ export async function migrateLegacyHookVariants(
 
   const hookArray = hooks[hookType] as unknown[];
   let removedCount = 0;
+  const emptied = new Set<MatcherGroup>();
 
   for (const group of hookArray) {
     if (typeof group !== "object" || group === null) continue;
@@ -294,6 +306,15 @@ export async function migrateLegacyHookVariants(
       return false;
     });
     removedCount += before - g.hooks.length;
+    if (before > 0 && g.hooks.length === 0) emptied.add(g);
+  }
+  // ISS-1226: a group this migration emptied is removed with its last row,
+  // never left behind as an empty shell for a later registration to fill.
+  for (let i = hookArray.length - 1; i >= 0; i--) {
+    const group = hookArray[i];
+    if (typeof group !== "object" || group === null) continue;
+    const g = group as MatcherGroup;
+    if (emptied.has(g)) hookArray.splice(i, 1);
   }
 
   if (removedCount === 0) return 0;
@@ -324,6 +345,8 @@ export interface LegacyHookCounts {
   SessionStart: number;
   Stop: number;
   StopFailure: number;
+  /** T-499: counted for the sweep only; the self-heal count gate stays three-term (intel hooks are reconciled un-gated). */
+  UserPromptSubmit: number;
 }
 
 /**
@@ -342,7 +365,7 @@ export async function countLegacyHooks(
   binPath: string,
   settingsPath?: string,
 ): Promise<LegacyHookCounts> {
-  const zero: LegacyHookCounts = { PreCompact: 0, SessionStart: 0, Stop: 0, StopFailure: 0 };
+  const zero: LegacyHookCounts = { PreCompact: 0, SessionStart: 0, Stop: 0, StopFailure: 0, UserPromptSubmit: 0 };
   const path = settingsPath ?? defaultSettingsPath();
   if (!existsSync(path)) return zero;
 
@@ -369,9 +392,10 @@ export async function countLegacyHooks(
     ["SessionStart", SESSIONSTART_SUBCOMMAND],
     ["Stop", STOP_SUBCOMMAND],
     ["StopFailure", LIMITSTOP_SUBCOMMAND],
+    ["UserPromptSubmit", INTELPROMPT_SUBCOMMAND],
   ];
 
-  const counts: LegacyHookCounts = { PreCompact: 0, SessionStart: 0, Stop: 0, StopFailure: 0 };
+  const counts: LegacyHookCounts = { PreCompact: 0, SessionStart: 0, Stop: 0, StopFailure: 0, UserPromptSubmit: 0 };
   for (const [hookType, subcommand] of pairs) {
     if (!(hookType in hooks) || !Array.isArray(hooks[hookType])) continue;
     const newCommand = formatHookCommand(binPath, subcommand).trim();
@@ -406,6 +430,8 @@ export async function sweepLegacyHooks(
   const sessionStart = formatHookCommand(binPath, SESSIONSTART_SUBCOMMAND);
   const stop = formatHookCommand(binPath, STOP_SUBCOMMAND);
   const limitStop = formatHookCommand(binPath, LIMITSTOP_SUBCOMMAND);
+  const intelStart = formatHookCommand(binPath, INTELSTART_SUBCOMMAND);
+  const intelPrompt = formatHookCommand(binPath, INTELPROMPT_SUBCOMMAND);
 
   let total = 0;
   const pairs: Array<[string, string, string]> = [
@@ -413,6 +439,10 @@ export async function sweepLegacyHooks(
     ["SessionStart", SESSIONSTART_SUBCOMMAND, sessionStart],
     ["Stop", STOP_SUBCOMMAND, stop],
     ["StopFailure", LIMITSTOP_SUBCOMMAND, limitStop],
+    // T-499: the intel hooks migrate by basename like the others (a second
+    // SessionStart pair; migrateLegacyHookVariants matches on the subcommand).
+    ["SessionStart", INTELSTART_SUBCOMMAND, intelStart],
+    ["UserPromptSubmit", INTELPROMPT_SUBCOMMAND, intelPrompt],
   ];
   for (const [hookType, subcommand, newCommand] of pairs) {
     try {

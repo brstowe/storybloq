@@ -599,6 +599,35 @@ describe("snapshot", () => {
       expect(ids).toContain("ISS-003");
     });
 
+    it("sorts highSeverityIssues by severity (critical before high), then discoveredDate ascending, then displayId (T-320 commit 4)", async () => {
+      const state = makeState({
+        issues: [
+          makeIssue({ id: "ISS-010", severity: "high", discoveredDate: "2026-01-05" }),
+          makeIssue({ id: "ISS-002", severity: "critical", discoveredDate: "2026-02-01" }),
+          makeIssue({ id: "ISS-001", severity: "critical", discoveredDate: "2026-01-01" }),
+          makeIssue({ id: "ISS-005", severity: "high", discoveredDate: "2026-01-01" }),
+          makeIssue({ id: "ISS-003", severity: "high", discoveredDate: "2026-01-01" }),
+        ],
+      });
+      const recap = await buildRecap(state, null, "/tmp");
+      const ids = recap.suggestedActions.highSeverityIssues.map((i) => i.id);
+      // Named mutant: "sort suggested actions by load order" would instead
+      // yield filesystem/insertion order (ISS-010, ISS-002, ISS-001, ISS-005, ISS-003).
+      expect(ids).toEqual(["ISS-001", "ISS-002", "ISS-003", "ISS-005", "ISS-010"]);
+    });
+
+    it("breaks a severity+discoveredDate tie by displayId, not canonical id", async () => {
+      const state = makeState({
+        issues: [
+          makeIssue({ id: "iss-zzz", displayId: "ISS-003", severity: "high", discoveredDate: "2026-01-01" }),
+          makeIssue({ id: "iss-aaa", displayId: "ISS-001", severity: "high", discoveredDate: "2026-01-01" }),
+        ],
+      });
+      const recap = await buildRecap(state, null, "/tmp");
+      const displayIds = recap.suggestedActions.highSeverityIssues.map((i) => i.displayId);
+      expect(displayIds).toEqual(["ISS-001", "ISS-003"]);
+    });
+
     it("omits staleness when snapshot lacks gitHead", async () => {
       const state = makeState();
       const snapshotInfo = {

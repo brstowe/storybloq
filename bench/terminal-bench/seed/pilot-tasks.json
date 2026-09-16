@@ -1,0 +1,74 @@
+{
+  "dataset": "terminal-bench@2.0",
+  "seed": 500,
+  "n": 10,
+  "rule": "exclude smoke tasks; stratify by metadata.difficulty; largest-remainder proportional allocation, ties by stratum name ascending; random.Random(seed).sample over sorted names per stratum in stratum-name order",
+  "excluded": [
+    "regex-log"
+  ],
+  "strata": {
+    "medium": 54,
+    "hard": 30,
+    "easy": 4
+  },
+  "allocation": {
+    "medium": 6,
+    "hard": 3,
+    "easy": 1
+  },
+  "smoke_tasks": [
+    "regex-log"
+  ],
+  "tasks": [
+    {
+      "name": "db-wal-recovery",
+      "difficulty": "medium",
+      "task_toml_sha256": "1cdc2c615e259bc10265efbe71b518332070c1c002e226566399e9788f18d0aa"
+    },
+    {
+      "name": "extract-elf",
+      "difficulty": "medium",
+      "task_toml_sha256": "14e2c28fd7cc1c9c7b64ab0db5565899fed538e38c55074824647cacc3f7a172"
+    },
+    {
+      "name": "kv-store-grpc",
+      "difficulty": "medium",
+      "task_toml_sha256": "6ff0f30a526bfff86a67b0b53439b9965229c0f368167dc1a5d05f34d82299a3"
+    },
+    {
+      "name": "make-mips-interpreter",
+      "difficulty": "hard",
+      "task_toml_sha256": "3fda43066642fd38516d07b2679f9813bdb3f1a42bc80b0c06151f60b9210e82"
+    },
+    {
+      "name": "model-extraction-relu-logits",
+      "difficulty": "hard",
+      "task_toml_sha256": "eb64dfaf8ae88868911ae28855cdc4f767de464001e2704919015b595be6dc29"
+    },
+    {
+      "name": "path-tracing",
+      "difficulty": "hard",
+      "task_toml_sha256": "cf47013f69bf1b43242da984f231d4daf364fdf44d3845f2eea2ca2cb9308c46"
+    },
+    {
+      "name": "prove-plus-comm",
+      "difficulty": "easy",
+      "task_toml_sha256": "240f3ac0076e3362685c8598c4e56658e3882eb25a14ae6cc7e9ab3a4f6b09ea"
+    },
+    {
+      "name": "pytorch-model-recovery",
+      "difficulty": "medium",
+      "task_toml_sha256": "5e21f208898908b55214de3081406f3c109f95f8d0e9b6ddae3521ba14c55a90"
+    },
+    {
+      "name": "raman-fitting",
+      "difficulty": "medium",
+      "task_toml_sha256": "0f3f6b580d7435954b3a114e77cdfb6cd0a856f15cc0ad83cd1b69c48492dfed"
+    },
+    {
+      "name": "schemelike-metacircular-eval",
+      "difficulty": "medium",
+      "task_toml_sha256": "8dae8eb226183b0ca92331c1106152a7abc93b03b4e5a95291b86a4ddc9b44e0"
+    }
+  ]
+}

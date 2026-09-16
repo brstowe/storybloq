@@ -6,7 +6,9 @@ import {
 } from "../../core/project-loader.js";
 import { nextLessonID, allocateTeamLessonId } from "../../core/id-allocation.js";
 import { reserveDisplayId } from "../../core/remote-refs.js";
+import { checkBranchAllocationWarning } from "../../core/branch-allocation-warning.js";
 import { resolveAndNormalizeLessonRef, RefResolutionError } from "../../core/ref-normalization.js";
+import type { ProjectState } from "../../core/project-state.js";
 import { buildLessonDigest } from "../../core/lessons.js";
 import { inheritedLessonsFor } from "../../federation/inherit.js";
 import {
@@ -33,6 +35,7 @@ import {
   formatError,
   successEnvelope,
   ExitCode,
+  stripRenderFence,
 } from "../../core/output-formatter.js";
 import {
   LESSON_STATUSES,
@@ -159,6 +162,7 @@ export function handleLessonGet(
 
 export function handleLessonDigest(
   ctx: CommandContext,
+  options?: { limit?: number; select?: string[] },
 ): CommandResult {
   // Fork: federation nodes absorb the orchestrator root's active lessons
   // (marked "[root] ...") so shared knowledge reaches every node session.
@@ -166,7 +170,7 @@ export function handleLessonDigest(
   const config = ctx.state.config as Record<string, unknown>;
   const inherited = inheritedLessonsFor(ctx.root, config);
   const attached = attachedKnowledgeFor(ctx.root, config);
-  const digest = buildLessonDigest([...ctx.state.activeLessons, ...inherited, ...attached]);
+  const digest = buildLessonDigest([...ctx.state.activeLessons, ...inherited, ...attached], options);
   return { output: formatLessonDigest(digest, ctx.format) };
 }
 
@@ -198,8 +202,10 @@ export async function handleLessonCreate(
   }
 
   let createdLesson: Lesson | undefined;
+  let createdInState: ProjectState | undefined;
 
   await withProjectLock(root, { strict: true }, async ({ state }) => {
+    createdInState = state;
     const isTeam = state.config.team?.enabled === true;
     let id: string;
     let displayId: string | undefined;
@@ -266,7 +272,13 @@ export async function handleLessonCreate(
   });
 
   if (!createdLesson) throw new Error("Lesson not created");
-  return { output: formatLessonCreateResult(createdLesson, format) };
+  const branchWarning = createdInState
+    ? checkBranchAllocationWarning(root, "lesson", createdInState, displayIdOf(createdLesson))
+    : null;
+  return {
+    output: formatLessonCreateResult(createdLesson, format),
+    ...(branchWarning && { warnings: [branchWarning] }),
+  };
 }
 
 export async function handleLessonUpdate(
@@ -285,6 +297,17 @@ export async function handleLessonUpdate(
   assertUpdateHasFields(updates, "lesson", "title, content, context, tags, clearTags, status");
   if (updates.title !== undefined && !updates.title.trim()) {
     throw new CliValidationError("invalid_input", "Lesson title cannot be empty");
+  }
+  // ISS-1192: same round-trip-growth fix as ticket.ts's description -- an
+  // agent that reads the md-rendered content back and writes it verbatim
+  // carries the render fence into storage. Shared by CLI and MCP. Applied
+  // before the empty check so the check validates what will actually be
+  // stored.
+  let contentFenceStripped = false;
+  if (updates.content !== undefined) {
+    const stripped = stripRenderFence(updates.content);
+    updates.content = stripped.text;
+    contentFenceStripped = stripped.stripped;
   }
   if (updates.content !== undefined && !updates.content.trim()) {
     throw new CliValidationError("invalid_input", "Lesson content cannot be empty");
@@ -327,7 +350,10 @@ export async function handleLessonUpdate(
   });
 
   if (!updatedLesson) throw new Error("Lesson not updated");
-  return { output: formatLessonUpdateResult(updatedLesson, format) };
+  const warnings = contentFenceStripped
+    ? ["outer render fence removed; use --format json for round trips"]
+    : undefined;
+  return { output: formatLessonUpdateResult(updatedLesson, format), ...(warnings && { warnings }) };
 }
 
 export async function handleLessonReinforce(

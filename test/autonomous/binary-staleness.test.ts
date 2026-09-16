@@ -23,7 +23,9 @@ import {
   __testing,
 } from "../../src/autonomous/binary-staleness.js";
 import { describeSessionLookupFailure } from "../../src/autonomous/session.js";
-import { registerAllTools } from "../../src/mcp/tools.js";
+import { registerAllTools, runMcpWriteTool } from "../../src/mcp/tools.js";
+import { ProjectLoaderError } from "../../src/core/errors.js";
+import { CliValidationError } from "../../src/cli/helpers.js";
 import { initProject } from "../../src/core/init.js";
 import { mkdtemp, mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -74,6 +76,53 @@ describe("describeBinaryStaleness establishes, never guesses (ISS-906)", () => {
     captureStartupFingerprint();
     __testing.setDiskProbe(() => ({ sha256: "bbb" }));
     expect(describeBinaryStaleness()).toBeNull();
+  });
+});
+
+/**
+ * ISS-1214 gate item 4: every MCP write tool now asks this question, so the
+ * answer cannot cost a full re-hash of the server bundle per write. The disk
+ * side is memoized on the target's (path, mtime, size); a build that changes
+ * the bundle changes at least its mtime, so the memo re-hashes exactly when
+ * the thing it describes has changed.
+ */
+describe("the disk side is memoized on (path, mtime, size)", () => {
+  it("re-hashes only when the target changes, and answers identically either way", () => {
+    let hashes = 0;
+    const target = { path: "/fake/mcp.js", mtimeMs: 1_000, size: 50 };
+    __testing.setStartupFingerprint({ sha256: "aaa" });
+    __testing.setStatProbe(() => ({ ...target }));
+    __testing.setDiskProbe(() => { hashes++; return { sha256: "bbb" }; });
+
+    expect(describeBinaryStaleness()).toBe(NOTE);
+    expect(describeBinaryStaleness()).toBe(NOTE);
+    expect(describeBinaryStaleness()).toBe(NOTE);
+    expect(hashes).toBe(1);
+
+    // A rebuilt bundle: same path, new mtime.
+    target.mtimeMs = 2_000;
+    expect(describeBinaryStaleness()).toBe(NOTE);
+    expect(hashes).toBe(2);
+
+    // Same mtime, different size -- also a different bundle.
+    target.size = 51;
+    expect(describeBinaryStaleness()).toBe(NOTE);
+    expect(hashes).toBe(3);
+
+    // A different resolved path is a different target.
+    target.path = "/fake/dist/mcp.js";
+    expect(describeBinaryStaleness()).toBe(NOTE);
+    expect(hashes).toBe(4);
+  });
+
+  it("does not memoize when the target cannot be stat-ed -- an unresolvable binary is re-asked, never cached", () => {
+    let hashes = 0;
+    __testing.setStartupFingerprint({ sha256: "aaa" });
+    __testing.setStatProbe(() => null);
+    __testing.setDiskProbe(() => { hashes++; return { sha256: "bbb" }; });
+    expect(describeBinaryStaleness()).toBe(NOTE);
+    expect(describeBinaryStaleness()).toBe(NOTE);
+    expect(hashes).toBe(2);
   });
 });
 
@@ -223,5 +272,61 @@ describe("the mcp/tools.ts session surfaces carry the note too", () => {
     })) as { content: Array<{ text: string }>; isError?: boolean };
     expect(invalid.isError).toBe(true);
     expect(invalid.content[0]!.text).not.toContain(NOTE);
+  });
+});
+
+/**
+ * ISS-1214 gate item 3: a stale server is a leading cause of the write
+ * failures this pipeline reports, so the ERROR replies need the note at
+ * least as much as the success ones. Both exits are covered: the
+ * infrastructure-errorCode return the handler asks for, and the catch.
+ */
+describe("runMcpWriteTool error replies carry the note on both exits", () => {
+  const stale = () => {
+    __testing.setStartupFingerprint({ sha256: "aaa" });
+    __testing.setDiskProbe(() => ({ sha256: "bbb" }));
+  };
+
+  it("an infrastructure errorCode carries it", async () => {
+    stale();
+    const r = await runMcpWriteTool(tmpdir(), () => Promise.resolve({ output: "Project data is corrupt", errorCode: "project_corrupt" }));
+    expect(r.isError).toBe(true);
+    expect(r.content[0]!.text).toContain("Project data is corrupt");
+    expect(r.content[0]!.text).toContain("restart the client");
+  });
+
+  it("a thrown ProjectLoaderError carries it", async () => {
+    stale();
+    const r = await runMcpWriteTool(tmpdir(), () => Promise.reject(new ProjectLoaderError("project_corrupt", "roadmap.json is unparseable")));
+    expect(r.isError).toBe(true);
+    expect(r.content[0]!.text).toContain("roadmap.json is unparseable");
+    expect(r.content[0]!.text).toContain("restart the client");
+  });
+
+  it("a thrown CliValidationError carries it", async () => {
+    stale();
+    const r = await runMcpWriteTool(tmpdir(), () => Promise.reject(new CliValidationError("invalid_input", "slug is required")));
+    expect(r.isError).toBe(true);
+    expect(r.content[0]!.text).toContain("slug is required");
+    expect(r.content[0]!.text).toContain("restart the client");
+  });
+
+  it("a thrown non-loader error carries it", async () => {
+    stale();
+    const r = await runMcpWriteTool(tmpdir(), () => Promise.reject(new Error("disk went away")));
+    expect(r.isError).toBe(true);
+    expect(r.content[0]!.text).toContain("disk went away");
+    expect(r.content[0]!.text).toContain("restart the client");
+  });
+
+  it("without established staleness every one of those replies is byte-identical to its base", async () => {
+    const infra = await runMcpWriteTool(tmpdir(), () => Promise.resolve({ output: "Project data is corrupt", errorCode: "project_corrupt" }));
+    const loader = await runMcpWriteTool(tmpdir(), () => Promise.reject(new ProjectLoaderError("project_corrupt", "roadmap.json is unparseable")));
+    const other = await runMcpWriteTool(tmpdir(), () => Promise.reject(new Error("disk went away")));
+    for (const r of [infra, loader, other]) {
+      expect(r.isError).toBe(true);
+      expect(r.content[0]!.text).not.toContain("restart the client");
+      expect(r.content[0]!.text).not.toContain("stale");
+    }
   });
 });

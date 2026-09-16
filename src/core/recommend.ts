@@ -6,9 +6,13 @@
  * with a human-readable rationale.
  */
 import type { ProjectState } from "./project-state.js";
+import { isActiveLifecycle } from "./project-state.js";
 import type { Ticket } from "../models/ticket.js";
+import type { Issue } from "../models/issue.js";
 import type { IssueSeverity } from "../models/types.js";
 import type { FederationState, FederationNodeEntry } from "../federation/state.js";
+import type { TrajectoryDisposition, IdOccurrence, TrajectoryHandoverInput } from "./markdown-sections.js";
+import { parseHandoverMarkdown, buildTrajectory, firstDispositionPerHandover } from "./markdown-sections.js";
 import {
   nextTicket,
   currentPhase,
@@ -42,7 +46,10 @@ export type RecommendCategory =
   | "debt_trend";
 
 export interface RecommendOptions {
-  readonly latestHandoverContent?: string;
+  /** Successfully-read handovers, last 10 intended, newest first. Replaces `latestHandoverContent`. */
+  readonly recentHandovers?: readonly { filename: string; content: string }[];
+  /** `0` = window fully read; positive = that many intended files failed to read; `null` = the directory itself could not be listed. */
+  readonly unreadableHandoverCount?: number | null;
   readonly previousOpenIssueCount?: number;
   readonly federationState?: FederationState;
   readonly crossNodeRefStatuses?: Record<string, string>;
@@ -61,11 +68,153 @@ export interface Recommendation {
   readonly score: number;
   /** Present when the item is claimed (own or foreign); foreign claims are also downranked. */
   readonly claim?: Claim;
+  /** Ticket/issue kind only -- computed by computeActionability (ISS-1154). */
+  readonly actionability?: Actionability;
+  /** Tickets only. */
+  readonly phase?: string | null;
+  /** Issues only. */
+  readonly severity?: IssueSeverity;
 }
 
 export interface RecommendResult {
   readonly recommendations: readonly Recommendation[];
   readonly totalCandidates: number;
+  /** Full excluded total, including fresh-add candidates rejected before insertion. */
+  readonly excludedCount: number;
+  /** Top `effectiveCount` by pre-exclusion score, descending. */
+  readonly excluded: readonly ExcludedRecommendation[];
+  /** `0` = window fully read; positive = that many handovers failed; `null` = directory listing itself failed. */
+  readonly unreadableHandoverCount: number | null;
+}
+
+// --- ISS-1154: actionability classification ---
+
+export type ActionabilityStatus =
+  | "actionable"
+  | "blocked"
+  | "duplicate"
+  | "escalate_only"
+  | "owner_gated"
+  | "complete";
+
+export interface Actionability {
+  readonly status: ActionabilityStatus;
+  readonly reason: string;
+  readonly source: "ledger" | "structured" | "handover" | "heuristic";
+}
+
+export interface ExcludedRecommendation {
+  readonly id: string;
+  readonly displayId?: string;
+  readonly kind: "ticket" | "issue";
+  readonly title: string;
+  readonly actionability: Actionability;
+}
+
+export interface ActionabilityContext {
+  readonly state: ProjectState;
+  readonly crossNodeRefStatuses?: Record<string, string>;
+  /** Newest-handover disposition per canonical id, over the successfully-read subset (tier 3). */
+  readonly latestDispositionById: ReadonlyMap<string, TrajectoryDisposition>;
+}
+
+// Reference shape only ("duplicate of X" / "superseded by X"), not a bare
+// occurrence of the word -- a bare match demotes real work whose title or
+// resolution merely discusses duplicates (see ISS-1149, ISS-1154 itself).
+const DUPLICATE_TEXT_RE = /\bdup(?:licate)?\s+of\b|\bsuperseded\s+by\b/i;
+
+/**
+ * Four-tier actionability classifier: ledger > structured > handover >
+ * heuristic. Tier 1 (ledger) is a universal precondition for both kinds,
+ * checked first, so every caller (generators, the fresh-add branch, and the
+ * targeted single-id MCP lookup) gets one consistent answer. Tier 2
+ * (structured) is issues-only and always wins outright when present. Tier 3
+ * (handover) decides absent tier 2. Tier 4 (heuristic, demote-only) fires
+ * only when tiers 2-3 produced no exclusion verdict at all.
+ */
+export function computeActionability(
+  kind: "ticket" | "issue",
+  item: Ticket | Issue,
+  ctx: ActionabilityContext,
+): Actionability {
+  // Tier 1: ledger.
+  if (!isActiveLifecycle(item)) {
+    return { status: "complete", reason: "archived or deleted -- not open backlog", source: "ledger" };
+  }
+  if (!notHiddenByEarmark(item)) {
+    return { status: "blocked", reason: "claimed/hidden by an active earmark", source: "ledger" };
+  }
+  if (kind === "ticket") {
+    const ticket = item as Ticket;
+    // Umbrella stored status is ignored project-wide (see phaseStatus/umbrellaStatus);
+    // an umbrella's completion is derived from its descendant leaves instead.
+    const ticketStatus = ctx.state.isUmbrella(ticket)
+      ? ctx.state.umbrellaStatus(ticket.id)
+      : ticket.status;
+    if (ticketStatus === "complete") {
+      return { status: "complete", reason: "ticket is complete", source: "ledger" };
+    }
+    if (ctx.state.isBlocked(ticket) || isCrossNodeBlocked(ticket, ctx.crossNodeRefStatuses)) {
+      return { status: "blocked", reason: "blocked by an incomplete dependency", source: "ledger" };
+    }
+  } else {
+    const issue = item as Issue;
+    if (issue.status === "resolved") {
+      return { status: "complete", reason: "issue is resolved", source: "ledger" };
+    }
+  }
+
+  // Tier 2: structured (issues only).
+  if (kind === "issue") {
+    const disposition = (item as Issue).disposition;
+    if (disposition === "escalate_only" || disposition === "owner_gated" || disposition === "duplicate") {
+      return { status: disposition, reason: `structured disposition: ${disposition}`, source: "structured" };
+    }
+  }
+
+  // Tier 3: handover (readable subset only; caller withholds this map's
+  // entries for anything the window couldn't read).
+  const latestDisposition = ctx.latestDispositionById.get(item.id);
+  if (latestDisposition === "blocked") {
+    return { status: "blocked", reason: "newest handover marks this blocked", source: "handover" };
+  }
+  if (latestDisposition === "owner-gated") {
+    return { status: "owner_gated", reason: "newest handover marks this owner-gated", source: "handover" };
+  }
+
+  // Tier 4: heuristic (demote-only, reached only with no verdict yet).
+  const resolution = kind === "issue" ? (item as Issue).resolution : null;
+  if (DUPLICATE_TEXT_RE.test(item.title) || (resolution && DUPLICATE_TEXT_RE.test(resolution))) {
+    return { status: "duplicate", reason: "title/resolution suggests a duplicate", source: "heuristic" };
+  }
+  if (kind === "issue") {
+    for (const ref of (item as Issue).relatedTickets) {
+      const resolved = ctx.state.resolveTicketRef(ref);
+      if (resolved.kind !== "found") continue;
+      const t = resolved.item;
+      if (ctx.state.umbrellaIDs.has(t.id) && ctx.state.umbrellaStatus(t.id) === "inprogress") {
+        return {
+          status: "duplicate",
+          reason: `related ticket ${t.id} is itself an in-progress umbrella`,
+          source: "heuristic",
+        };
+      }
+      // ISS-1225: a related ticket that is itself finished is evidence the
+      // issue is NOT covered by in-flight work, whatever its umbrella is doing;
+      // the parent clause applies only while the related ticket is still open.
+      if (t.status === "complete") continue;
+      const parent = ctx.state.resolvedParent(t);
+      if (parent && ctx.state.umbrellaIDs.has(parent.id) && ctx.state.umbrellaStatus(parent.id) === "inprogress") {
+        return {
+          status: "duplicate",
+          reason: `related ticket ${t.id}'s parent umbrella ${parent.id} is in progress`,
+          source: "heuristic",
+        };
+      }
+    }
+  }
+
+  return { status: "actionable", reason: "open, no blocking signal", source: "ledger" };
 }
 
 // --- Constants ---
@@ -94,16 +243,44 @@ const CATEGORY_PRIORITY: Record<RecommendCategory, number> = {
   inprogress_ticket: 4,
   fed_unreachable: 5,
   high_impact_unblock: 6,
-  fed_bottleneck: 7,
-  near_complete_umbrella: 8,
-  fed_high_issues: 9,
-  phase_momentum: 10,
-  fed_stale_node: 11,
-  debt_trend: 12,
-  quick_win: 13,
-  handover_context: 14,
+  handover_context: 7,
+  fed_bottleneck: 8,
+  near_complete_umbrella: 9,
+  fed_high_issues: 10,
+  phase_momentum: 11,
+  fed_stale_node: 12,
+  debt_trend: 13,
+  quick_win: 14,
   open_issue: 15,
 };
+
+/**
+ * ISS-1154: partitions a sorted candidate list into actionable vs excluded,
+ * so recommend() can slice each pool independently and never let an
+ * excluded item occupy a recommendation slot. Undefined actionability
+ * (unreachable with today's generators, but not provably impossible for a
+ * future one) is treated as actionable -- never hidden silently -- which is
+ * also why excludedPool's element type carries a guaranteed `actionability`
+ * rather than the optional one on `Recommendation`: nothing downstream
+ * (formatRecommendations included) can dereference an undefined verdict.
+ */
+export function partitionByActionability(
+  recs: readonly Recommendation[],
+): {
+  actionablePool: Recommendation[];
+  excludedPool: (Recommendation & { actionability: Actionability })[];
+} {
+  const actionablePool: Recommendation[] = [];
+  const excludedPool: (Recommendation & { actionability: Actionability })[] = [];
+  for (const rec of recs) {
+    if (rec.kind === "action" || rec.actionability === undefined || rec.actionability.status === "actionable") {
+      actionablePool.push(rec);
+    } else {
+      excludedPool.push(rec as Recommendation & { actionability: Actionability });
+    }
+  }
+  return { actionablePool, excludedPool };
+}
 
 // --- Public API ---
 
@@ -164,9 +341,6 @@ export function recommend(
     }
   }
 
-  // ISS-018: Handover context boost -- tickets referenced in actionable sections get +50
-  applyHandoverBoost(state, dedup, options);
-
   // Phase-distance penalty: tickets in future phases are penalized
   const curPhase = currentPhase(state);
   const curPhaseIdx = curPhase ? phaseIndex.get(curPhase.id) ?? 0 : 0;
@@ -187,6 +361,39 @@ export function recommend(
     }
   }
 
+  // ISS-1154: parse + canonicalize the readable handover window, then
+  // classify every ticket/issue rec currently in dedup (four-tier
+  // computeActionability), then run the rewritten handover-context
+  // promotion pass -- in that order, per the plan.
+  const { latestDispositionById, continuationMentionCount } = buildHandoverClassificationInputs(
+    state,
+    options?.recentHandovers ?? [],
+  );
+
+  for (const [id, rec] of dedup) {
+    if (rec.kind === "action") continue;
+    const item = rec.kind === "ticket" ? state.ticketByID(id) : state.issueByID(id);
+    if (!item) continue;
+    const actionability = computeActionability(rec.kind, item, {
+      state,
+      crossNodeRefStatuses: crossNodeStatuses,
+      latestDispositionById,
+    });
+    dedup.set(id, {
+      ...rec,
+      actionability,
+      phase: rec.kind === "ticket" ? (item as Ticket).phase : rec.phase,
+      severity: rec.kind === "issue" ? (item as Issue).severity : rec.severity,
+    });
+  }
+
+  const windowIncomplete = isHandoverWindowIncomplete(options?.unreadableHandoverCount);
+  applyHandoverBoost(state, dedup, continuationMentionCount, {
+    crossNodeRefStatuses: crossNodeStatuses,
+    latestDispositionById,
+    windowIncomplete,
+  });
+
   const claims = new Map<string, Claim>();
   for (const t of state.tickets) {
     const claim = (t as Record<string, unknown>).claim as Claim | undefined;
@@ -205,10 +412,101 @@ export function recommend(
     return a.id.localeCompare(b.id);
   });
 
+  // ISS-1154: partition BEFORE slicing, so an excluded item can never
+  // occupy a top-N slot regardless of scarcity (2e).
+  const { actionablePool, excludedPool } = partitionByActionability(all);
+
+  const excluded: ExcludedRecommendation[] = excludedPool
+    .slice(0, effectiveCount)
+    .map((rec) => ({
+      id: rec.id,
+      displayId: rec.displayId,
+      kind: rec.kind as "ticket" | "issue",
+      title: rec.title,
+      actionability: rec.actionability,
+    }));
+
   return {
-    recommendations: all.slice(0, effectiveCount),
+    recommendations: actionablePool.slice(0, effectiveCount),
     totalCandidates: all.length,
+    excludedCount: excludedPool.length,
+    excluded,
+    unreadableHandoverCount:
+      options?.unreadableHandoverCount === undefined ? 0 : options.unreadableHandoverCount,
   };
+}
+
+/**
+ * Exact incompleteness predicate (ISS-1154): JS `null`/`0`/`undefined` are
+ * ALL falsy, so "truthy" is the wrong word for this check. `undefined`
+ * (option omitted, e.g. an existing caller not yet passing it) is treated as
+ * complete, for backward compatibility. Explicit `0` is complete. A positive
+ * number, or explicit `null`, is incomplete. Used everywhere this file (and
+ * its CLI/MCP callers) check the flag -- one predicate, never re-derived.
+ */
+export function isHandoverWindowIncomplete(unreadableHandoverCount: number | null | undefined): boolean {
+  return unreadableHandoverCount !== undefined && unreadableHandoverCount !== 0;
+}
+
+export interface HandoverClassificationInputs {
+  readonly latestDispositionById: ReadonlyMap<string, TrajectoryDisposition>;
+  readonly continuationMentionCount: ReadonlyMap<string, number>;
+}
+
+/**
+ * Resolves a raw occurrence id token to its current canonical ticket/issue
+ * id (folding a historical display-id alias into the entity's current
+ * mentions); a `missing`/`ambiguous` token is dropped.
+ */
+function canonicalizeOccurrences(state: ProjectState, occurrences: readonly IdOccurrence[]): IdOccurrence[] {
+  const canonical: IdOccurrence[] = [];
+  for (const occurrence of occurrences) {
+    const asTicket = state.resolveTicketRef(occurrence.id);
+    if (asTicket.kind === "found") {
+      canonical.push({ id: asTicket.item.id, disposition: occurrence.disposition });
+      continue;
+    }
+    const asIssue = state.resolveIssueRef(occurrence.id);
+    if (asIssue.kind === "found") {
+      canonical.push({ id: asIssue.item.id, disposition: occurrence.disposition });
+    }
+  }
+  return canonical;
+}
+
+/**
+ * Exported so the MCP targeted single-id lookup (`withActionability` on
+ * `storybloq_issue_get`/`storybloq_ticket_get`, ISS-1154 2h) can build the
+ * same tier-3 input `recommend()` itself builds, from the same shared
+ * `loadClassificationContext` handover read.
+ */
+export function buildHandoverClassificationInputs(
+  state: ProjectState,
+  recentHandovers: readonly { filename: string; content: string }[],
+): HandoverClassificationInputs {
+  const trajectoryInputs: TrajectoryHandoverInput[] = [];
+  const continuationMentionCount = new Map<string, number>();
+
+  for (const handover of recentHandovers) {
+    const parsed = parseHandoverMarkdown(handover.content, handover.filename);
+    const canonical = canonicalizeOccurrences(state, parsed.orderedIdOccurrences);
+    trajectoryInputs.push({ filename: handover.filename, orderedIdOccurrences: canonical });
+
+    const firstThisHandover = firstDispositionPerHandover(canonical);
+    for (const [id, disposition] of firstThisHandover) {
+      if (disposition === "continuation" || disposition === "carried") {
+        continuationMentionCount.set(id, (continuationMentionCount.get(id) ?? 0) + 1);
+      }
+    }
+  }
+
+  const trajectory = buildTrajectory(trajectoryInputs);
+  const latestDispositionById = new Map<string, TrajectoryDisposition>();
+  for (const entry of trajectory) {
+    latestDispositionById.set(entry.id, entry.latestDisposition);
+  }
+
+  return { latestDispositionById, continuationMentionCount };
 }
 
 // --- Generators (private) ---
@@ -465,83 +763,93 @@ function sortByPhaseAndOrder(
   });
 }
 
-// --- ISS-018: Handover context boost ---
+// --- ISS-1154: handover-context promotion (formerly ISS-018's +50 boost) ---
 
-const TICKET_ID_RE = /\bT-\d{3}[a-z]?\b/g;
-const ACTIONABLE_HEADING_RE = /^#+\s.*(next|open|remaining|todo|blocked)/im;
-const HANDOVER_BOOST = 50;
-const HANDOVER_BASE_SCORE = 350;
+const HANDOVER_CONTEXT_SCORE = 675;
+
+interface HandoverBoostContext {
+  readonly crossNodeRefStatuses?: Record<string, string>;
+  readonly latestDispositionById: ReadonlyMap<string, TrajectoryDisposition>;
+  readonly windowIncomplete: boolean;
+}
 
 /**
- * Boost tickets referenced in the latest handover's actionable sections.
- * Falls back to full-document scan for tickets not already complete/inprogress.
+ * Promotes an id with genuine continuation/carried mentions in >= 2 of the
+ * read handover window to the fixed handover_context/675 band. No
+ * promotion at all (existing-mutate or fresh-add) when the window is
+ * incomplete -- promotion is the one purely additive/optimistic step, so it
+ * alone is withheld under incomplete evidence.
  */
 function applyHandoverBoost(
   state: ProjectState,
   dedup: Map<string, Recommendation>,
-  options?: RecommendOptions,
+  continuationMentionCount: ReadonlyMap<string, number>,
+  ctx: HandoverBoostContext,
 ): void {
-  if (!options?.latestHandoverContent) return;
-  const content = options.latestHandoverContent;
+  if (ctx.windowIncomplete) return;
 
-  // Try to isolate actionable sections (What's Next, Open Items, etc.)
-  let actionableIds = extractTicketIdsFromActionableSections(content);
-
-  // Fallback: full-doc scan, but only boost open tickets
-  if (actionableIds.size === 0) {
-    const allIds = new Set(content.match(TICKET_ID_RE) ?? []);
-    for (const id of allIds) {
-      const ticket = state.ticketByID(id);
-      if (ticket && ticket.status !== "complete" && ticket.status !== "inprogress") {
-        actionableIds.add(id);
-      }
-    }
-  }
-
-  for (const id of actionableIds) {
-    const ticket = state.ticketByID(id);
-    if (!ticket || ticket.status === "complete") continue;
-    // Layer 2: applies to BOTH branches below -- boosting an already-listed
-    // rec and freshly adding one that bypassed the generators entirely.
-    // Never suppresses an already-inprogress ticket referenced in a
-    // handover; only an open one's earmark is a pick temptation here.
-    if (!notHiddenByEarmark(ticket)) continue;
+  for (const [id, count] of continuationMentionCount) {
+    if (count < 2) continue;
 
     const existing = dedup.get(id);
     if (existing) {
-      dedup.set(id, {
-        ...existing,
-        score: existing.score + HANDOVER_BOOST,
-        reason: existing.reason + " (handover context)",
-      });
+      if (existing.actionability?.status === "actionable" && existing.score < HANDOVER_CONTEXT_SCORE) {
+        dedup.set(id, {
+          ...existing,
+          category: "handover_context",
+          score: HANDOVER_CONTEXT_SCORE,
+          reason: existing.reason + " (handover context)",
+        });
+      }
+      continue;
+    }
+
+    const asTicket = state.resolveTicketRef(id);
+    const asIssue = asTicket.kind === "found" ? null : state.resolveIssueRef(id);
+    let kind: "ticket" | "issue";
+    let item: Ticket | Issue;
+    if (asTicket.kind === "found") {
+      kind = "ticket";
+      item = asTicket.item;
+    } else if (asIssue && asIssue.kind === "found") {
+      kind = "issue";
+      item = asIssue.item;
     } else {
-      dedup.set(id, {
-        id,
-        kind: "ticket",
-        title: ticket.title,
-        category: "handover_context",
-        reason: "Referenced in latest handover",
-        score: HANDOVER_BASE_SCORE,
-      });
+      continue; // missing/ambiguous -- nothing to add
     }
-  }
-}
 
-function extractTicketIdsFromActionableSections(content: string): Set<string> {
-  const ids = new Set<string>();
-  const lines = content.split("\n");
-  let inActionable = false;
+    // Silent skip: an archived/deleted item is not real backlog, and an
+    // earmark-hidden item is invisible everywhere else in this file --
+    // neither is recorded into `excluded` either.
+    if (!isActiveLifecycle(item)) continue;
+    if (!notHiddenByEarmark(item)) continue;
 
-  for (const line of lines) {
-    if (/^#+\s/.test(line)) {
-      inActionable = ACTIONABLE_HEADING_RE.test(line);
-    }
-    if (inActionable) {
-      const matches = line.match(TICKET_ID_RE);
-      if (matches) for (const m of matches) ids.add(m);
-    }
+    const actionability = computeActionability(kind, item, {
+      state,
+      crossNodeRefStatuses: ctx.crossNodeRefStatuses,
+      latestDispositionById: ctx.latestDispositionById,
+    });
+
+    // Silent skip, same as archived/earmark-hidden above: a finished item
+    // still named as continuation in stale handovers is not real backlog,
+    // so it neither gets promoted nor inflates excludedCount. Blocked,
+    // duplicate, escalate_only and owner_gated fresh-adds still record into
+    // excluded as designed -- only "complete" is withheld here.
+    if (actionability.status === "complete") continue;
+
+    dedup.set(id, {
+      id,
+      displayId: (item as Record<string, unknown>).displayId as string | undefined,
+      kind,
+      title: item.title,
+      category: "handover_context",
+      reason: "Referenced in latest handover",
+      score: HANDOVER_CONTEXT_SCORE,
+      actionability,
+      phase: kind === "ticket" ? (item as Ticket).phase : undefined,
+      severity: kind === "issue" ? (item as Issue).severity : undefined,
+    });
   }
-  return ids;
 }
 
 // --- Federation generators ---

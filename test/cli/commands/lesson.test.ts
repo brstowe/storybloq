@@ -184,6 +184,145 @@ describe("handleLessonDigest", () => {
     const result = handleLessonDigest(ctx);
     expect(result.output).toContain("No active lessons");
   });
+
+  it("forwards limit/select options to buildLessonDigest (T-320 commit 5)", () => {
+    const ctx = makeCtx({
+      state: makeState({
+        lessons: [
+          makeLesson({ id: "L-001", title: "Matches", tags: ["cli-status"] }),
+          makeLesson({ id: "L-002", title: "Excluded", tags: ["other"] }),
+        ],
+      }),
+    });
+    const result = handleLessonDigest(ctx, { select: ["component:cli-status"] });
+    expect(result.output).toContain("L-001");
+    expect(result.output).not.toContain("L-002");
+  });
+});
+
+describe("lesson digest CLI: --limit and --select (T-320 commit 5)", () => {
+  const tmpDirs: string[] = [];
+  let origCwd: string | undefined;
+
+  afterEach(async () => {
+    if (origCwd) process.chdir(origCwd);
+    origCwd = undefined;
+    for (const d of tmpDirs) {
+      await rm(d, { recursive: true, force: true });
+    }
+    tmpDirs.length = 0;
+  });
+
+  async function setupLessonsProject(): Promise<string> {
+    origCwd = process.cwd();
+    const dir = await mkdtemp(join(tmpdir(), "lesson-digest-cli-"));
+    tmpDirs.push(dir);
+    await initProject(dir, { name: "test" });
+    const lessonsDir = join(dir, ".story", "lessons");
+    await mkdir(lessonsDir, { recursive: true });
+    const lesson = (id: string, title: string, tags: string[]) => ({
+      id,
+      title,
+      content: "content",
+      context: "context",
+      source: "manual",
+      tags,
+      reinforcements: 0,
+      lastValidated: "2026-03-27",
+      createdDate: "2026-03-27",
+      updatedDate: "2026-03-27",
+      supersedes: null,
+      status: "active",
+    });
+    await writeFile(
+      join(lessonsDir, "L-001.json"),
+      JSON.stringify(lesson("L-001", "Matches", ["cli-status"]), null, 2) + "\n",
+    );
+    await writeFile(
+      join(lessonsDir, "L-002.json"),
+      JSON.stringify(lesson("L-002", "Excluded", ["other"]), null, 2) + "\n",
+    );
+    process.chdir(dir);
+    return dir;
+  }
+
+  async function runDigestCli(args: string[]): Promise<{ stdout: string; exitCode: number | undefined }> {
+    const chunks: string[] = [];
+    const spy = vi
+      .spyOn(process.stdout, "write")
+      .mockImplementation(((chunk: string | Uint8Array) => {
+        chunks.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString());
+        return true;
+      }) as typeof process.stdout.write);
+    process.exitCode = undefined;
+    try {
+      await registerLessonCommand(yargs(["lesson", "digest", ...args]))
+        .exitProcess(false)
+        .parseAsync();
+    } finally {
+      spy.mockRestore();
+    }
+    return { stdout: chunks.join(""), exitCode: process.exitCode };
+  }
+
+  it("--select filters through the real registered command", async () => {
+    await setupLessonsProject();
+    const { stdout } = await runDigestCli(["--select", "component:cli-status", "--format", "json"]);
+    const parsed = JSON.parse(stdout);
+    expect(parsed.data.digest).toContain("L-001");
+    expect(parsed.data.digest).not.toContain("L-002");
+  });
+
+  it("--limit caps through the real registered command", async () => {
+    await setupLessonsProject();
+    const { stdout } = await runDigestCli(["--limit", "1", "--format", "json"]);
+    const parsed = JSON.parse(stdout);
+    const lines = (parsed.data.digest as string).split("\n").filter((l: string) => l.trim().length > 0);
+    expect(lines).toHaveLength(1);
+  });
+
+  it("no flags: default output is unchanged through the real registered command", async () => {
+    await setupLessonsProject();
+    const { stdout } = await runDigestCli(["--format", "json"]);
+    const parsed = JSON.parse(stdout);
+    // The default grouped digest form has never included lesson ids, only
+    // titles -- unchanged by T-320.
+    expect(parsed.data.digest).toContain("# Lessons Learned");
+    expect(parsed.data.digest).toContain("**Matches**");
+    expect(parsed.data.digest).toContain("**Excluded**");
+  });
+
+  it("a malformed --select entry surfaces as invalid_input through the real registered command", async () => {
+    await setupLessonsProject();
+    const { stdout, exitCode } = await runDigestCli(["--select", "bogus:x", "--format", "json"]);
+    const parsed = JSON.parse(stdout);
+    expect(parsed.error.code).toBe("invalid_input");
+    expect(exitCode).toBe(ExitCode.USER_ERROR);
+  });
+
+  // Codex R1 finding 2: the CLI's yargs `type: "number"` option accepts any
+  // number (negative, fractional, non-finite) with no schema of its own --
+  // buildLessonDigest's own validation is what has to catch these, and this
+  // proves it does so through the real registered command, not just via a
+  // direct unit call.
+  it.each([["-1"], ["1.5"], ["Infinity"], ["NaN"]])(
+    "--limit %s surfaces as invalid_input through the real registered command",
+    async (limitArg) => {
+      await setupLessonsProject();
+      const { stdout, exitCode } = await runDigestCli(["--limit", limitArg, "--format", "json"]);
+      const parsed = JSON.parse(stdout);
+      expect(parsed.error.code).toBe("invalid_input");
+      expect(exitCode).toBe(ExitCode.USER_ERROR);
+    },
+  );
+
+  it("--limit 0 succeeds through the real registered command (a non-negative integer is valid)", async () => {
+    await setupLessonsProject();
+    const { stdout, exitCode } = await runDigestCli(["--limit", "0", "--format", "json"]);
+    const parsed = JSON.parse(stdout);
+    expect(parsed.data.digest).toBe("");
+    expect(exitCode).toBe(ExitCode.OK);
+  });
 });
 
 // --- Create ---
@@ -311,6 +450,29 @@ describe("handleLessonUpdate", () => {
     const result = await handleLessonUpdate("L-001", { status: "deprecated" }, "json", dir);
     const parsed = JSON.parse(result.output);
     expect(parsed.data.status).toBe("deprecated");
+  });
+
+  it("strips a whole-input 4+ backtick render fence from content and warns (ISS-1192)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "lesson-update-"));
+    tmpDirs.push(dir);
+    await setupLesson(dir);
+    const inner = "lesson line one\n```ts\ncode\n```\nline three";
+    const rendered = `\`\`\`\`\n${inner}\n\`\`\`\``;
+    const result = await handleLessonUpdate("L-001", { content: rendered }, "json", dir);
+    const parsed = JSON.parse(result.output);
+    expect(parsed.data.content).toBe(inner);
+    expect(result.warnings).toEqual(["outer render fence removed; use --format json for round trips"]);
+  });
+
+  it("leaves a 3-backtick whole-content fence untouched, with no warning", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "lesson-update-"));
+    tmpDirs.push(dir);
+    await setupLesson(dir);
+    const input = "```\nhello\n```";
+    const result = await handleLessonUpdate("L-001", { content: input }, "json", dir);
+    const parsed = JSON.parse(result.output);
+    expect(parsed.data.content).toBe(input);
+    expect(result.warnings).toBeUndefined();
   });
 
   it("updates tags", async () => {

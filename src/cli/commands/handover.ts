@@ -1,13 +1,27 @@
 import { readHandover } from "../../core/handover-parser.js";
+import { buildHandoverBrief, isFilenameAdmitted } from "../../core/handover-brief.js";
+import {
+  HANDOVER_TEMPLATE_MARKER,
+  computeCarriedForward,
+  parseCarriedForwardSection,
+  parseOverrideBody,
+  renderHandoverTemplate,
+  type CarriedForwardEntry,
+  type OverrideLine,
+} from "../../core/handover-template.js";
+import type { TrajectoryEntry } from "../../core/markdown-sections.js";
 import { existsSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import {
   formatHandoverList,
   formatHandoverContent,
+  formatHandoverBrief,
+  formatHandoverTemplate,
   formatHandoverCreateResult,
   formatError,
   ExitCode,
+  type HandoverStampFailure,
 } from "../../core/output-formatter.js";
 import {
   withProjectLock,
@@ -24,9 +38,15 @@ export function handleHandoverList(ctx: CommandContext): CommandResult {
   return { output: formatHandoverList(ctx.state.handoverFilenames, ctx.format) };
 }
 
+export interface HandoverLatestOptions {
+  readonly brief?: boolean;
+  readonly priming?: boolean;
+}
+
 export async function handleHandoverLatest(
   ctx: CommandContext,
   count: number = 1,
+  opts: HandoverLatestOptions = {},
 ): Promise<CommandResult> {
   if (ctx.state.handoverFilenames.length === 0) {
     return {
@@ -37,6 +57,50 @@ export async function handleHandoverLatest(
   }
 
   const filenames = ctx.state.handoverFilenames.slice(0, count);
+
+  // T-320 commit 2: brief/priming are additive -- omitting both keeps the
+  // default path below byte-identical to today (always the full raw body).
+  if (opts.brief || opts.priming) {
+    // T-320: the admission gate runs BEFORE any filesystem validation -- an
+    // oversized filename must be skippable (and counted) without ever
+    // reaching parseHandoverFilename's lstat, which throws on a symlink and
+    // would otherwise fail the whole request instead of just dropping it.
+    for (const filename of filenames) {
+      if (isFilenameAdmitted(filename)) {
+        await parseHandoverFilename(filename, ctx.handoversDir);
+      }
+    }
+    try {
+      const result = await buildHandoverBrief(ctx.handoversDir, filenames, {
+        brief: opts.brief ?? false,
+        priming: opts.priming ?? false,
+      });
+      // buildHandoverBrief drops a listed-but-missing file (ENOENT) from the
+      // window itself rather than failing the whole request -- matching the
+      // default path's own tolerance for a missing file when count > 1.
+      // not_found applies only when NOTHING is left to report: an empty
+      // window AND no admission skips. If every filename was instead
+      // rejected for an oversized name (skippedHandovers > 0), that is a
+      // real, observable result (the files exist) and must render through
+      // formatHandoverBrief's own skipped-count message, not collapse into
+      // a misleading "not found".
+      if (result.handovers.length === 0 && result.skippedHandovers === 0) {
+        return {
+          output: formatError("not_found", "No handovers found", ctx.format),
+          exitCode: ExitCode.USER_ERROR,
+          errorCode: "not_found",
+        };
+      }
+      return { output: formatHandoverBrief(result, ctx.format) };
+    } catch (err: unknown) {
+      return {
+        output: formatError("io_error", `Cannot read handover: ${(err as Error).message}`, ctx.format),
+        exitCode: ExitCode.USER_ERROR,
+        errorCode: "io_error",
+      };
+    }
+  }
+
   const parts: string[] = [];
 
   for (const filename of filenames) {
@@ -99,6 +163,92 @@ export async function handleHandoverGet(
   }
 }
 
+export interface HandoverTemplateOptions {
+  /** Body of an `Override:` line, without the `Override: ` prefix (e.g. "recommended=T-1 worked=T-2 because=owner said so"). */
+  readonly override?: string;
+}
+
+/**
+ * T-498 Commit 1: scaffolds a new handover document -- category headings, a
+ * `Carried forward` section derived from the standing `count:10 brief:true`
+ * trajectory (with the earlier-of-two-dates preservation rule against
+ * whatever the CURRENT newest handover already recorded), an optional
+ * validated `Override:` line, and the `<!-- storybloq-handover v1 -->`
+ * marker. Read-only: never writes a file (pipe the output into `handover
+ * create --stdin` to actually save it).
+ */
+export async function handleHandoverTemplate(
+  ctx: CommandContext,
+  opts: HandoverTemplateOptions = {},
+): Promise<CommandResult> {
+  let override: OverrideLine | null = null;
+  if (opts.override !== undefined) {
+    override = parseOverrideBody(opts.override);
+    if (override === null) {
+      throw new CliValidationError(
+        "invalid_input",
+        "Invalid --override grammar. Expected: recommended=<id> worked=<id> because=<text>",
+      );
+    }
+  }
+
+  const filenames = ctx.state.handoverFilenames;
+  let previousCarried: CarriedForwardEntry[] = [];
+  let trajectory: readonly TrajectoryEntry[] = [];
+  const currentLabels = new Map<string, string>();
+
+  if (filenames.length > 0) {
+    const newest = filenames[0] as string;
+    // Same admission + symlink/traversal rejection every other handover read
+    // path runs before touching the file -- an oversized name is skipped
+    // (matching the brief/priming tolerance), but a rejected name (path
+    // traversal, symlink) throws and is NOT silently treated as "no prior
+    // carried state."
+    if (isFilenameAdmitted(newest)) {
+      await parseHandoverFilename(newest, ctx.handoversDir);
+      try {
+        const raw = await readHandover(ctx.handoversDir, newest);
+        if (raw.includes(HANDOVER_TEMPLATE_MARKER)) {
+          previousCarried = parseCarriedForwardSection(raw);
+        }
+      } catch (err: unknown) {
+        // ENOENT (listed but deleted since the state scan) is the one
+        // tolerated case -- proceed with no prior carried state, same as a
+        // brand-new project. Anything else (permission error, etc.) is a
+        // real I/O failure and must not be reported as a successful,
+        // silently-empty scaffold.
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+      }
+    }
+
+    const windowFilenames = filenames.slice(0, 10);
+    for (const filename of windowFilenames) {
+      if (isFilenameAdmitted(filename)) {
+        await parseHandoverFilename(filename, ctx.handoversDir);
+      }
+    }
+    // No blanket catch here: buildHandoverBrief already tolerates a missing
+    // (ENOENT) window entry internally (see handleHandoverLatest's brief
+    // path) -- any error it does throw is a real failure and must propagate
+    // as io_error, not collapse into a falsely-successful empty scaffold.
+    const result = await buildHandoverBrief(ctx.handoversDir, windowFilenames, {
+      brief: true,
+      priming: false,
+    });
+    trajectory = result.trajectory;
+    const first = result.handovers[0];
+    if (first && first.form === "structured") {
+      for (const record of first.records) {
+        if (record.id) currentLabels.set(record.id, record.label);
+      }
+    }
+  }
+
+  const carriedForward = computeCarriedForward(trajectory, previousCarried, currentLabels);
+  const content = renderHandoverTemplate({ carriedForward, override });
+  return { output: formatHandoverTemplate(content, ctx.format) };
+}
+
 // --- Create ---
 
 /**
@@ -145,6 +295,19 @@ export async function handleHandoverCreate(
   slugRaw: string,
   format: OutputFormat,
   root: string,
+  /** T-499: the caller's identity for the handover stamp; `stamp: false` skips it (tests, batch tooling). */
+  intel: {
+    readonly clientTaskId?: string | null;
+    readonly stamp?: boolean;
+    readonly now?: number;
+    readonly projectsDir?: string;
+    /**
+     * ISS-1214: which surface is asking. It decides which skips are worth
+     * reporting (a terminal is never a Claude session; an MCP caller always
+     * should be) and whether a server-staleness claim can be made at all.
+     */
+    readonly surface?: "mcp" | "cli";
+  } = {},
 ): Promise<CommandResult> {
   if (!content.trim()) {
     throw new CliValidationError("invalid_input", "Handover content is empty");
@@ -153,9 +316,9 @@ export async function handleHandoverCreate(
   const slug = normalizeSlug(slugRaw);
   const date = todayISO();
   let filename: string | undefined;
+  const absRoot = resolve(root);
 
   await withProjectLock(root, { strict: false }, async () => {
-    const absRoot = resolve(root);
     const handoversDir = join(absRoot, ".story", "handovers");
     await mkdir(handoversDir, { recursive: true });
     const wrapDir = join(absRoot, ".story");
@@ -238,5 +401,56 @@ export async function handleHandoverCreate(
     }
   });
 
-  return { output: formatHandoverCreateResult(filename!, format) };
+  // T-499: the handover is on disk; record it against the caller's current
+  // compaction boundary so imperative pressure is held at advisory until the
+  // context grows by a step or the next compaction. Best-effort, after the
+  // project lock is released, never affecting the result.
+  let stamped = false;
+  let stampedRoot: string | null = null;
+  // ISS-1197 commit 2: past the compact line the stamp still lands, but it
+  // suppresses nothing, so the reply must not claim it did.
+  let compactNeeded = false;
+  // ISS-1214: why an attempted stamp did not land, so the reply cannot read
+  // as success while the record keeps `handoverWrittenAt: null` and the
+  // prompt hook re-fires the imperative with no visible cause.
+  let stampFailure: HandoverStampFailure | null = null;
+  let serverStale = false;
+  if (intel.stamp !== false) {
+    try {
+      const { describeStampFailure, stampHandoverForCaller } = await import("../../core/session-intel/push.js");
+      const r = stampHandoverForCaller(root, { explicitTaskId: intel.clientTaskId, cwd: root, now: intel.now, projectsDir: intel.projectsDir });
+      // Only a stamp whose locked write LANDED counts: a busy lock, a failed
+      // write, or a refusal under the lock leaves the record unchanged.
+      stamped = r.status === "stamped" && r.outcome.status === "written";
+      if (stamped && r.status === "stamped") {
+        stampedRoot = r.root;
+        compactNeeded = r.pressureState === "compact-needed";
+      } else {
+        stampFailure = describeStampFailure(r, intel.surface ?? "cli");
+      }
+    } catch (err) {
+      // Reached only if the import or the stamp itself throws. Silent before
+      // ISS-1214, which is the exact shape that hid the field-report failure.
+      stampFailure = { reason: `error: ${err instanceof Error ? err.message : String(err)}`, kind: "error" };
+    }
+    // Only the MCP surface can answer this: the staleness question is about a
+    // long-lived server process against the build on disk, and a CLI process
+    // was just spawned from that build. Asked only when there is a failure to
+    // explain, so the ordinary path does not pay for it.
+    if (stampFailure !== null && intel.surface === "mcp") {
+      try {
+        const { describeBinaryStaleness } = await import("../../autonomous/binary-staleness.js");
+        serverStale = describeBinaryStaleness() !== null;
+      } catch {
+        serverStale = false;
+      }
+    }
+  }
+
+  // The continuation line rides only on a landed stamp: an unbound caller
+  // (or a stamp that missed) gets the bare result, so the line never claims
+  // a suppression that did not happen. ISS-1185: stampedRoot is reported
+  // only when it diverges from the MCP root (formatHandoverCreateResult
+  // gates on that itself).
+  return { output: formatHandoverCreateResult(filename!, format, stamped, stampedRoot, absRoot, compactNeeded, stampFailure, serverStale) };
 }

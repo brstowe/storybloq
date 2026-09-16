@@ -23,8 +23,11 @@ import {
   ReviewVerdictSchema,
   LensOutputSchema,
   MergerConfigSchema,
+  changeFileUnion,
+  coreLensApplicability,
   runMergerPipeline,
   type AnchoringInput,
+  type LensCoverageBasis,
   type LensCoverageEntry,
   type LensFinding,
   type LensOutput,
@@ -37,6 +40,12 @@ import {
 } from "@storybloq/lenses";
 import { parseDiffScope, classifyOrigin } from "./diff-scope.js";
 import { writeToCache } from "./cache.js";
+import {
+  ReviewCoverageLockUnavailableError,
+  acquireReviewCoverageLock,
+  readCoverageMemory,
+  updateCoverageMemory,
+} from "./coverage-memory.js";
 import { SECRETS_GATE_FINDING_ID } from "./secrets-gate.js";
 import {
   appendAnchoringTelemetry,
@@ -226,7 +235,86 @@ function citedRulingsMetaFinding(undelivered: Record<string, readonly string[]>)
   };
 }
 
+/**
+ * The basis for a skip, as this harness computes it.
+ *
+ * EXPORTED, and the reason is testability rather than reuse.
+ * `runMergerPipeline` recomputes a supplied `not-applicable` from the anchoring
+ * artifact and demotes what it cannot confirm, so whichever way this function
+ * reads the file set, the SERVER's answer is what reaches the verdict. That is
+ * defense in depth and exactly the right contract, but it also means no test
+ * driving `handleSynthesize` can tell a correct union reading from a broken
+ * one. This seam is where that rule is actually pinned.
+ *
+ * THE UNION IS NOT THE DECLARATION. `coreLensApplicability` ranges over the
+ * caller-declared files UNION every path the diff touches, because a caller
+ * that declares `["NOTES.md"]` while the diff deletes `src/auth.ts` would
+ * otherwise buy four excused core lenses over unreviewed auth code.
+ *
+ * DOWNGRADE ONLY. An earlier call in this review that recorded a
+ * `self-reported` skip pins this lens there: a later call cannot raise it to
+ * `not-applicable` by presenting a narrower diff. The server cannot enforce
+ * this, because the earlier call is not in the session it can see.
+ *
+ * An empty artifact or an empty union can never excuse a lens. "The tables
+ * found nothing" and "there was nothing to look at" are different statements,
+ * and only the first is coverage.
+ */
+export function skipBasisForLens(args: {
+  readonly lensId: string;
+  readonly declaredFiles: readonly string[];
+  readonly artifact: string | undefined;
+  readonly priorBasis?: LensCoverageBasis;
+  /**
+   * Size of `changeFileUnion(declaredFiles, artifact)` when the caller already
+   * computed it. Recomputed here when absent, so the function is correct on its
+   * own and the caller does not pay for the union twice.
+   */
+  readonly unionSize?: number;
+}): LensCoverageBasis {
+  if (args.priorBasis === "self-reported") return "self-reported";
+  if (!args.artifact) return "self-reported";
+  const unionSize = args.unionSize
+    ?? changeFileUnion(args.declaredFiles, args.artifact).length;
+  if (unionSize === 0) return "self-reported";
+  return coreLensApplicability(args.lensId, args.declaredFiles, args.artifact) === "not-applicable"
+    ? "not-applicable"
+    : "self-reported";
+}
+
+/**
+ * ISS-950: ONE review's synthesize is one critical section.
+ *
+ * The lock is taken before the coverage memory is read and released after the
+ * round is persisted, because downgrade-only has to hold for the verdict this
+ * call RETURNS and not merely for what it later writes.
+ * `acquireReviewCoverageLock` carries the sequence that made the narrower
+ * guarantee insufficient.
+ *
+ * A sessionless call has no memory to race over and takes no lock.
+ *
+ * A call that cannot take the lock RUNS NOTHING. It does not compute a verdict
+ * and it does not persist, because a contender that completes writes through
+ * the persist lock, and that write is enough to corrupt the HOLDER's next read
+ * while the holder, having read first, can still return the `not-applicable`
+ * the lock exists to refuse. Degrading the contender's own answer never
+ * addressed that, which is why the earlier revision's stricter-verdict
+ * reasoning did not hold. Refusing is the only answer that does: the agent
+ * retries the identical call once the holder finishes.
+ */
 export function handleSynthesize(input: SynthesizeInput): SynthesizeOutput {
+  const lock = acquireReviewCoverageLock(input.sessionDir, input.metadata.reviewId);
+  if (lock.kind === "unavailable") {
+    throw new ReviewCoverageLockUnavailableError(input.metadata.reviewId);
+  }
+  try {
+    return synthesizeUnderReviewLock(input);
+  } finally {
+    if (lock.kind === "held") lock.release();
+  }
+}
+
+function synthesizeUnderReviewLock(input: SynthesizeInput): SynthesizeOutput {
   const stage: Stage = input.stage ?? "CODE_REVIEW";
   const reviewId = input.metadata.reviewId;
   const meta = readHarnessMeta(input.sessionDir, reviewId);
@@ -422,6 +510,50 @@ export function handleSynthesize(input: SynthesizeInput): SynthesizeOutput {
   const expectedLenses = [
     ...new Set([...input.metadata.activeLenses, ...parsed.keys()]),
   ];
+
+  // ── ISS-950: the basis inputs, read before the loop that needs them ──
+  //
+  // The artifact is HOISTED from the anchoring block below rather than
+  // duplicated: the basis has to be decided against the artifact the lenses
+  // actually saw, which is the same one the anchor pass runs over. Deciding it
+  // against `input.diff` while anchoring used the retained artifact would let
+  // the two disagree about what the change even was.
+  const anchorArtifact = meta?.anchorArtifact ?? input.diff;
+  const declaredFiles = input.changedFiles ?? [];
+  // The set the applicability check ranges over: the caller's declaration union
+  // every path the diff TOUCHES. Computed here for the empty-union case, which
+  // is a different statement from "no files matched" -- a PLAN_REVIEW or a lost
+  // artifact proves nothing about a lens's surface, so it can never excuse one.
+  const fileUnion = anchorArtifact
+    ? changeFileUnion(declaredFiles, anchorArtifact)
+    : [];
+  // Safe to read unguarded HERE and nowhere else: this function only ever runs
+  // with this review's lock held, so no peer can invalidate the snapshot
+  // between this read and the persist at the end of the call.
+  const priorCoverage = readCoverageMemory(input.sessionDir, reviewId);
+
+  const skipBasis = (lens: string): LensCoverageBasis =>
+    skipBasisForLens({
+      lensId: lens,
+      declaredFiles,
+      artifact: anchorArtifact,
+      priorBasis: priorCoverage[lens]?.basis,
+      unionSize: fileUnion.length,
+    });
+
+  /**
+   * Whether an `ok` is this lens renaming the skip it already submitted.
+   *
+   * ZERO findings is the whole test, and it is the right one: an `ok` that
+   * carries findings is work, whatever came before it. Scoped to a lens that
+   * actually skipped earlier IN THIS REVIEW, so a lens with a clean record is
+   * never flagged for reporting nothing.
+   */
+  const isRelabel = (lens: string, status: string, contributed: number): boolean =>
+    priorCoverage[lens]?.everSkipped === true &&
+    (status === "ok" || status === "cached") &&
+    contributed === 0;
+
   const lensCoverage: LensCoverageEntry[] = [];
   const lensesCompleted: string[] = [];
   const lensesFailed: string[] = [];
@@ -436,16 +568,21 @@ export function handleSynthesize(input: SynthesizeInput): SynthesizeOutput {
           : entry.output.status === "skipped"
             ? ("skipped" as const)
             : ("error" as const);
+      const contributedFindings =
+        entry.output.status === "ok" ? entry.output.findings.length : 0;
       lensCoverage.push({
         lensId: lens,
         status,
         attempts: 1,
-        contributedFindings:
-          entry.output.status === "ok" ? entry.output.findings.length : 0,
+        contributedFindings,
+        ...(status === "skipped" ? { basis: skipBasis(lens) } : {}),
+        ...(isRelabel(lens, status, contributedFindings) ? { relabeled: true } : {}),
       });
       if (entry.output.status === "ok") lensesCompleted.push(lens);
       else lensesFailed.push(lens);
     } else if (parseFailed.has(lens)) {
+      // It submitted; the payload was unreadable. That is neither a skip nor a
+      // silence, so it carries no basis: `parse_failed` already says it.
       lensCoverage.push({
         lensId: lens,
         status: "parse_failed",
@@ -454,12 +591,15 @@ export function handleSynthesize(input: SynthesizeInput): SynthesizeOutput {
       });
       lensesFailed.push(lens);
     } else {
-      // Active lens with no submission at all: failed/no result.
+      // Active lens with no submission at all: failed/no result. `no-submission`
+      // is never coverage, and naming it is what lets the cap reason downstream
+      // separate a lens that said nothing from one that said "nothing here".
       lensCoverage.push({
         lensId: lens,
         status: "error",
         attempts: 0,
         contributedFindings: 0,
+        basis: "no-submission",
       });
       lensesFailed.push(lens);
     }
@@ -476,13 +616,14 @@ export function handleSynthesize(input: SynthesizeInput): SynthesizeOutput {
   ];
 
   // ── Anchoring input (T-026): the artifact the lenses actually saw ─
-  const anchorArtifact = meta?.anchorArtifact ?? input.diff;
+  // `anchorArtifact` is resolved above, where the ISS-950 basis computation
+  // needs it; the two must range over the same artifact.
   const anchoring: AnchoringInput | undefined =
     stage === "CODE_REVIEW" && anchorArtifact
       ? {
           stage,
           artifact: anchorArtifact,
-          changedFiles: input.changedFiles ?? [],
+          changedFiles: declaredFiles,
         }
       : undefined;
 
@@ -523,6 +664,14 @@ export function handleSynthesize(input: SynthesizeInput): SynthesizeOutput {
   // Mirror the server: the verdict must satisfy every schema invariant
   // before it leaves the tool boundary.
   const reviewVerdict = ReviewVerdictSchema.parse(rawVerdict);
+
+  // ── ISS-950: record what THIS round established, for the next call ─
+  //
+  // Written from the VERDICT's coverage, not from the entries handed to the
+  // pipeline. The pipeline reconciles a skip's basis against the anchoring
+  // artifact and demotes a `not-applicable` it cannot confirm, so the verdict
+  // is the only place the basis a later call must be held to actually exists.
+  updateCoverageMemory(input.sessionDir, reviewId, reviewVerdict.lensCoverage);
 
   // ── Origin classification for pre-existing filing ─────────────────
   let preExistingFindings: MergedFinding[] = [];

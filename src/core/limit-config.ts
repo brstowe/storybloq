@@ -68,17 +68,44 @@ function intOr(value: unknown, fallback: number, bounds: { min: number; max: num
  * a swap-to-symlink race from re-introducing traversal).
  */
 export function readBoundedFile(path: string, maxBytes = CONFIG_MAX_BYTES): string | null {
-  let target = path;
+  const read = readBoundedFileDetailed(path, maxBytes);
+  // An empty file collapses to null the way it always has: callers here treat
+  // "no usable content" and "nothing there" alike.
+  return read.kind === "ok" && read.text.length > 0 ? read.text : null;
+}
+
+/**
+ * T-502: the same read, with ABSENT and UNREADABLE kept apart.
+ *
+ * `readBoundedFile` collapses both to null, which is right for the hot paths
+ * that just want a config or nothing. It is wrong for `storybloq health`,
+ * which must never turn "I could not read your settings" into "your settings
+ * are fine": there, an unreadable layer has to suppress the verdict and name
+ * the path. Only ENOENT and ENOTDIR count as absent, so an inaccessible
+ * parent directory or a symlink loop is reported as indeterminate rather than
+ * silently behaving like a missing file.
+ */
+export type BoundedRead =
+  | { readonly kind: "absent" }
+  | { readonly kind: "ok"; readonly text: string }
+  | { readonly kind: "indeterminate"; readonly reason: string };
+
+export function readBoundedFileDetailed(path: string, maxBytes = CONFIG_MAX_BYTES): BoundedRead {
+  let target: string;
   try {
     target = fs.realpathSync(path);
-  } catch {
-    return null; // absent or unresolvable
+  } catch (err: unknown) {
+    const code = (err as { code?: string } | null)?.code;
+    return code === "ENOENT" || code === "ENOTDIR"
+      ? { kind: "absent" }
+      : { kind: "indeterminate", reason: code ?? "unresolvable" };
   }
   let fd: number | null = null;
   try {
     fd = fs.openSync(target, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
     const st = fs.fstatSync(fd);
-    if (!st.isFile() || st.size > maxBytes || st.size <= 0) return null;
+    if (!st.isFile()) return { kind: "indeterminate", reason: "not a regular file" };
+    if (st.size > maxBytes) return { kind: "indeterminate", reason: `larger than ${maxBytes} bytes` };
     const buf = Buffer.alloc(st.size);
     let read = 0;
     while (read < buf.length) {
@@ -86,9 +113,10 @@ export function readBoundedFile(path: string, maxBytes = CONFIG_MAX_BYTES): stri
       if (n <= 0) break;
       read += n;
     }
-    return buf.subarray(0, read).toString("utf-8");
-  } catch {
-    return null;
+    return { kind: "ok", text: buf.subarray(0, read).toString("utf-8") };
+  } catch (err: unknown) {
+    const code = (err as { code?: string } | null)?.code;
+    return { kind: "indeterminate", reason: code ?? "unreadable" };
   } finally {
     if (fd != null) {
       try {

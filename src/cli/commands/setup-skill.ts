@@ -1,11 +1,25 @@
 import { mkdir, writeFile, readFile, readdir, copyFile, rm, rename, lstat } from "node:fs/promises";
-import { existsSync, accessSync, readdirSync, constants as fsConstants } from "node:fs";
-import { join, dirname, delimiter as pathDelimiter } from "node:path";
+import { existsSync, accessSync, readdirSync, realpathSync, constants as fsConstants } from "node:fs";
+import { join, dirname, basename, delimiter as pathDelimiter, win32 as winPath, posix as posixPath } from "node:path";
 import { homedir } from "node:os";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { atomicWriteFollowingSymlink, resolveSymlinkTarget } from "../../core/symlink-write.js";
+import { resolveBundledBridge, type BundledBridge } from "../../core/bridge-resolve.js";
+import { cmdExpands, shellArg, winShellArgv } from "../../core/shell-arg.js";
+import { readFileThreeValued } from "../../core/health/deps.js";
+import { CLAUDE_JSON_MAX_BYTES } from "../../core/health/codex-bridge.js";
+import { readJsonObject } from "../../core/health/types.js";
+import {
+  coverageCovers,
+  coverageOverlaps,
+  dedupeHookRows,
+  hookRowKey,
+  matcherCoverage,
+  reconcileDuplicateHookRows,
+  type GlobalCommandFor,
+} from "../../core/hook-duplicates.js";
 
 import {
   PRECOMPACT_SUBCOMMAND,
@@ -14,6 +28,11 @@ import {
   LIMITSTOP_SUBCOMMAND,
   STOPFAILURE_MATCHER,
   LIMIT_SESSIONSTART_MATCHER,
+  INTELSTART_SUBCOMMAND,
+  INTELPROMPT_SUBCOMMAND,
+  SESSION_INTEL_SESSIONSTART_MATCHER,
+  INTELSTART_HOOK_TIMEOUT_SECONDS,
+  INTELPROMPT_HOOK_TIMEOUT_SECONDS,
   PRESENCE_BIN_NAME,
   PRESENCE_SUBCOMMAND,
   PRESENCE_HOOK_TIMEOUT_SECONDS,
@@ -270,6 +289,82 @@ function isExecutableFile(path: string): boolean {
   }
 }
 
+/**
+ * ISS-1222: the global storybloq launcher, established two ways that must
+ * agree. `npm root -g` names the global package root, so the launcher npm
+ * exposes is `<prefix>/bin/storybloq` (`<prefix>/storybloq.cmd` on Windows);
+ * the PATH walk is what `which storybloq` answers. The launcher is accepted
+ * only when both resolve to the same real file. Under npx the PATH walk finds
+ * the cache copy, the two disagree, and the answer is null: a process that
+ * cannot prove which launcher is global never rewrites a hook row.
+ */
+export interface GlobalLauncherProbe {
+  readonly run: (cmd: string, args: readonly string[], timeoutMs: number) => string | null;
+  readonly pathWalk: () => string | null;
+  readonly realpath: (path: string) => string | null;
+  readonly isExecutable: (path: string) => boolean;
+  readonly platform: string;
+}
+
+export const GLOBAL_LAUNCHER_PROBE_TIMEOUT_MS = 3000;
+
+function runNpmRootG(cmd: string, args: readonly string[], timeoutMs: number): string | null {
+  try {
+    return execFileSync(cmd, [...args], { stdio: "pipe", timeout: timeoutMs, encoding: "utf-8", shell: process.platform === "win32" });
+  } catch {
+    return null;
+  }
+}
+
+function realpathOrNull(path: string): string | null {
+  try {
+    return realpathSync(path);
+  } catch {
+    return null;
+  }
+}
+
+export function resolveGlobalStorybloqBin(probe: Partial<GlobalLauncherProbe> = {}): string | null {
+  const platform = probe.platform ?? process.platform;
+  const run = probe.run ?? runNpmRootG;
+  const pathWalk = probe.pathWalk ?? resolveStorybloqBin;
+  const realpath = probe.realpath ?? realpathOrNull;
+  const isExecutable = probe.isExecutable ?? isExecutableFile;
+  const out = run(platform === "win32" ? "npm.cmd" : "npm", ["root", "-g"], GLOBAL_LAUNCHER_PROBE_TIMEOUT_MS);
+  if (out === null) return null;
+  const root = out.trim().split(/\r?\n/).pop()?.trim() ?? "";
+  if (root.length === 0) return null;
+  const launcher = platform === "win32"
+    ? winPath.join(winPath.dirname(root), "storybloq.cmd")
+    : posixPath.join(posixPath.dirname(posixPath.dirname(root)), "bin", "storybloq");
+  if (!isExecutable(launcher)) return null;
+  const walked = pathWalk();
+  if (walked === null) return null;
+  const a = realpath(launcher);
+  const b = realpath(walked);
+  if (a === null || b === null) return null;
+  // Windows realpaths keep whatever drive-letter case each caller used.
+  const same = platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
+  if (!same) return null;
+  return launcher;
+}
+
+/**
+ * Test seam and per-process memo for the validated global launcher. The
+ * probe spawns npm, so it runs at most once per process and only when a
+ * caller actually meets a collision.
+ */
+export const globalLauncher: { override: GlobalCommandFor | null; memo: { value: string | null } | null } = { override: null, memo: null };
+
+export function globalHookCommandFor(): GlobalCommandFor {
+  return (rest) => {
+    if (globalLauncher.override) return globalLauncher.override(rest);
+    if (globalLauncher.memo === null) globalLauncher.memo = { value: resolveGlobalStorybloqBin() };
+    const bin = globalLauncher.memo.value;
+    return bin === null ? null : formatHookCommand(bin, rest);
+  };
+}
+
 function candidatePaths(): string[] {
   const home = homedir();
   const list: string[] = [];
@@ -353,6 +448,8 @@ async function registerHook(
      * (session resume-prompt under "compact" and "resume").
      */
     scopeIdempotencyToMatcher?: boolean;
+    /** ISS-1222 test seam: the validated global launcher's command for a subcommand. */
+    globalCommandFor?: GlobalCommandFor;
   },
 ): Promise<"registered" | "exists" | "skipped"> {
   const path = settingsPath ?? join(homedir(), ".claude", "settings.json");
@@ -409,7 +506,14 @@ async function registerHook(
 
   // Idempotency: scan for existing command (defensive -- skip malformed entries)
   const hookCommand = hookEntry.command;
-  if (hookCommand) {
+  const key = hookCommand ? hookRowKey(hookCommand) : null;
+  // ISS-1222: an owned command is identified by its semantic key (basename
+  // plus subcommand) and by whether an existing row's matcher COVERS the
+  // target's sources, never by the exact path. Rows of other tools (a null
+  // key) keep the exact-string rule.
+  let rewriteInPlace: HookEntry | null = null;
+  let overlapsTarget = false;
+  if (hookCommand && key === null) {
     for (const group of hookArray) {
       if (typeof group !== "object" || group === null) continue;
       const g = group as MatcherGroup;
@@ -419,22 +523,64 @@ async function registerHook(
         if (isHookWithCommand(entry, hookCommand)) return "exists";
       }
     }
-  }
-
-  // Find existing matcher group with valid hooks array, or create one
-  let appended = false;
-  for (const group of hookArray) {
-    if (typeof group !== "object" || group === null) continue;
-    const g = group as MatcherGroup;
-    if ((g.matcher ?? "") === targetMatcher && Array.isArray(g.hooks)) {
-      g.hooks.push(hookEntry);
-      appended = true;
-      break;
+  } else if (hookCommand && key !== null) {
+    const target = matcherCoverage(targetMatcher);
+    const candidate = hookCommand.trim();
+    for (const group of hookArray) {
+      if (typeof group !== "object" || group === null) continue;
+      const g = group as MatcherGroup;
+      if (!Array.isArray(g.hooks)) continue;
+      if (opts?.scopeIdempotencyToMatcher && (g.matcher ?? "") !== targetMatcher) continue;
+      const cov = matcherCoverage(typeof g.matcher === "string" ? g.matcher : "");
+      for (const entry of g.hooks) {
+        if (typeof entry !== "object" || entry === null) continue;
+        const e = entry as HookEntry;
+        if (e.type !== "command" || typeof e.command !== "string") continue;
+        const k = hookRowKey(e.command);
+        if (k === null || k.key !== key.key) continue;
+        // A legacy basename (claudestory) is a row for the migration sweep to
+        // replace, not an installation of this hook: it never blocks the
+        // canonical row, or a user would be left with no hook at all.
+        if (k.binBasename !== key.binBasename) continue;
+        if (coverageCovers(cov, target)) {
+          if (e.command.trim() === candidate) return "exists";
+          if (rewriteInPlace === null) rewriteInPlace = e;
+        } else if (coverageOverlaps(cov, target)) {
+          overlapsTarget = true;
+        }
+      }
+    }
+    if (rewriteInPlace !== null || overlapsTarget) {
+      // Only the validated global launcher may replace or collapse rows; any
+      // other binary (an npx copy, an old install) adds nothing beside them.
+      const globalFor = opts?.globalCommandFor ?? globalHookCommandFor();
+      if (globalFor(key.rest)?.trim() !== candidate) return "exists";
+      if (rewriteInPlace !== null) rewriteInPlace.command = hookCommand;
     }
   }
 
-  if (!appended) {
-    hookArray.push({ matcher: targetMatcher, hooks: [hookEntry] });
+  if (rewriteInPlace === null) {
+    // Find existing matcher group with valid hooks array, or create one
+    let appended = false;
+    for (const group of hookArray) {
+      if (typeof group !== "object" || group === null) continue;
+      const g = group as MatcherGroup;
+      if ((g.matcher ?? "") === targetMatcher && Array.isArray(g.hooks)) {
+        g.hooks.push(hookEntry);
+        appended = true;
+        break;
+      }
+    }
+
+    if (!appended) {
+      hookArray.push({ matcher: targetMatcher, hooks: [hookEntry] });
+    }
+  }
+  if (key !== null && (rewriteInPlace !== null || overlapsTarget)) {
+    // ISS-1222: the write above may have left same-key rows beside the global
+    // one (two stale variants, a partial-overlap group); collapse this event
+    // to exactly one row per collision before the file is written.
+    dedupeHookRows({ hooks: { [hookType]: hookArray } }, opts?.globalCommandFor ?? globalHookCommandFor());
   }
 
   // Atomic write that follows a symlinked settings.json (issue #12)
@@ -570,35 +716,10 @@ export async function registerLimitStopFailureHook(
 ): Promise<"registered" | "exists" | "skipped"> {
   const bin = binPath ?? resolveStorybloqBin() ?? "storybloq";
   const command = formatHookCommand(bin, LIMITSTOP_SUBCOMMAND);
-  const path = settingsPath ?? join(homedir(), ".claude", "settings.json");
-
-  // Coverage-aware idempotency: an existing group whose matcher COVERS
-  // rate_limit (e.g. "" or "rate_limit|server_error") already fires our
-  // command -- adding the exact-matcher group would double-fire it. An
-  // unrelated matcher (server_error only) does NOT cover it, and must not
-  // suppress installing the rate_limit group this feature needs.
-  if (existsSync(path)) {
-    try {
-      const settings = JSON.parse(await readFile(path, "utf-8")) as Record<string, unknown>;
-      const hooks = settings?.hooks as Record<string, unknown> | undefined;
-      const hookArray = hooks && Array.isArray(hooks.StopFailure) ? (hooks.StopFailure as unknown[]) : [];
-      for (const group of hookArray) {
-        if (typeof group !== "object" || group === null) continue;
-        const g = group as MatcherGroup;
-        if (!Array.isArray(g.hooks)) continue;
-        if (!matcherCoversSource(g.matcher, STOPFAILURE_MATCHER)) continue;
-        for (const entry of g.hooks) {
-          if (isHookWithCommand(entry, command)) return "exists";
-        }
-      }
-    } catch {
-      // Unreadable settings: fall through; registerHook applies its own guards.
-    }
-  }
-
-  return registerHook("StopFailure", { type: "command", command }, settingsPath, STOPFAILURE_MATCHER, {
-    scopeIdempotencyToMatcher: true,
-  });
+  // ISS-1222: registerHook itself answers "exists" when a row with the same
+  // semantic command sits in any group whose matcher covers rate_limit, so the
+  // exact-matcher group is never added beside a covering one.
+  return registerHook("StopFailure", { type: "command", command }, settingsPath, STOPFAILURE_MATCHER);
 }
 
 /**
@@ -613,34 +734,10 @@ export async function registerLimitSessionStartHook(
 ): Promise<"registered" | "exists" | "skipped"> {
   const bin = binPath ?? resolveStorybloqBin() ?? "storybloq";
   const command = formatHookCommand(bin, SESSIONSTART_SUBCOMMAND);
-  const path = settingsPath ?? join(homedir(), ".claude", "settings.json");
-
-  if (existsSync(path)) {
-    try {
-      const settings = JSON.parse(await readFile(path, "utf-8")) as Record<string, unknown>;
-      const hooks = settings?.hooks as Record<string, unknown> | undefined;
-      const hookArray = hooks && Array.isArray(hooks.SessionStart) ? (hooks.SessionStart as unknown[]) : [];
-      for (const group of hookArray) {
-        if (typeof group !== "object" || group === null) continue;
-        const g = group as MatcherGroup;
-        if (!Array.isArray(g.hooks)) continue;
-        if (!matcherCoversSource(g.matcher, "resume")) continue;
-        for (const entry of g.hooks) {
-          if (isHookWithCommand(entry, command)) return "exists";
-        }
-      }
-    } catch {
-      // Unreadable settings: fall through; registerHook applies its own guards.
-    }
-  }
-
-  return registerHook(
-    "SessionStart",
-    { type: "command", command },
-    settingsPath,
-    LIMIT_SESSIONSTART_MATCHER,
-    { scopeIdempotencyToMatcher: true },
-  );
+  // ISS-1222: registerHook answers "exists" when a row with the same semantic
+  // command sits in any group covering the resume source (the Bus-broadened
+  // "startup|resume|clear|compact" group included), so no second group is added.
+  return registerHook("SessionStart", { type: "command", command }, settingsPath, LIMIT_SESSIONSTART_MATCHER);
 }
 
 /**
@@ -730,6 +827,119 @@ export async function ensureLimitHooksRegistered(
   return { changed, action: changed ? "installed" : "unchanged" };
 }
 
+// ---------------------------------------------------------------------------
+// T-499: session-intel hooks (SessionStart intel-start + UserPromptSubmit intel-prompt)
+// ---------------------------------------------------------------------------
+
+const SESSION_INTEL_SESSIONSTART_SOURCES: readonly string[] = ["startup", "resume", "clear", "compact"];
+
+/**
+ * Counts the intel-start entries across ALL SessionStart groups and whether
+ * any of them sits in a group whose matcher covers EVERY intel source. The
+ * settled state is exactly one entry in a full-coverage group: anything else
+ * (a partial matcher, several groups that only collectively cover the
+ * sources, a canonical group plus a stray entry, or duplicates within one
+ * group) would fire the hook twice for some source, and is normalized.
+ */
+async function intelStartEntries(command: string, path: string): Promise<{ total: number; inFullCoverageGroup: number }> {
+  const none = { total: 0, inFullCoverageGroup: 0 };
+  if (!existsSync(path)) return none;
+  try {
+    const settings = JSON.parse(await readFile(path, "utf-8")) as Record<string, unknown>;
+    const hooks = settings?.hooks as Record<string, unknown> | undefined;
+    const hookArray = hooks && Array.isArray(hooks.SessionStart) ? (hooks.SessionStart as unknown[]) : [];
+    let total = 0;
+    let inFullCoverageGroup = 0;
+    for (const group of hookArray) {
+      if (typeof group !== "object" || group === null) continue;
+      const g = group as MatcherGroup;
+      if (!Array.isArray(g.hooks)) continue;
+      const full = SESSION_INTEL_SESSIONSTART_SOURCES.every((src) => matcherCoversSource(g.matcher, src));
+      for (const entry of g.hooks) {
+        if (!isHookWithCommand(entry, command)) continue;
+        total += 1;
+        if (full) inFullCoverageGroup += 1;
+      }
+    }
+    return { total, inFullCoverageGroup };
+  } catch {
+    // Unreadable settings: registerHook applies its own guards.
+    return none;
+  }
+}
+
+/** SessionStart `intel-start`, every source, synchronous, 5 s. */
+export async function registerSessionIntelStartHook(
+  settingsPath?: string,
+  binPath?: string,
+): Promise<"registered" | "exists" | "skipped"> {
+  const bin = binPath ?? resolveStorybloqBin() ?? "storybloq";
+  const command = formatHookCommand(bin, INTELSTART_SUBCOMMAND);
+  const path = settingsPath ?? join(homedir(), ".claude", "settings.json");
+  const found = await intelStartEntries(command, path);
+  if (found.total === 1 && found.inFullCoverageGroup === 1) return "exists";
+  // Normalize: every other arrangement of OUR command (a partial matcher,
+  // groups that only collectively cover the sources, a canonical group plus
+  // a stray entry, duplicates) fires the hook twice for some source. Strip
+  // every entry of our command, then install the one canonical group; other
+  // hooks stay where they are.
+  if (found.total > 0) {
+    const stripped = await removeHook("SessionStart", command, settingsPath);
+    if (stripped === "skipped") return "skipped";
+  }
+  return registerHook(
+    "SessionStart",
+    { type: "command", command, timeout: INTELSTART_HOOK_TIMEOUT_SECONDS },
+    settingsPath,
+    SESSION_INTEL_SESSIONSTART_MATCHER,
+    { scopeIdempotencyToMatcher: true },
+  );
+}
+
+/** UserPromptSubmit `intel-prompt`, empty matcher, synchronous, 10 s. */
+export async function registerSessionIntelPromptHook(
+  settingsPath?: string,
+  binPath?: string,
+): Promise<"registered" | "exists" | "skipped"> {
+  const bin = binPath ?? resolveStorybloqBin() ?? "storybloq";
+  const command = formatHookCommand(bin, INTELPROMPT_SUBCOMMAND);
+  return registerHook(
+    "UserPromptSubmit",
+    { type: "command", command, timeout: INTELPROMPT_HOOK_TIMEOUT_SECONDS },
+    settingsPath,
+  );
+}
+
+/**
+ * Idempotent reconcile of the session-intel hooks against the global kill
+ * switch, in the T-424 shape: un-gated (the count-gated legacy sweep can never
+ * install an absent hook type), called from setup-skill, the skill
+ * auto-refresh and housekeeping.
+ *
+ * Enabled  -> ensure both hooks registered.
+ * Disabled -> ensure both removed (every other SessionStart group untouched).
+ */
+export async function ensureSessionIntelHooksRegistered(
+  settingsPath?: string,
+  binPath?: string,
+): Promise<{ changed: boolean; action: "installed" | "removed" | "unchanged" }> {
+  const bin = binPath ?? resolveStorybloqBin();
+  if (!bin) return { changed: false, action: "unchanged" };
+
+  const { isSessionIntelGloballyDisabled } = await import("../../core/limit-ledger.js");
+  if (isSessionIntelGloballyDisabled()) {
+    const r1 = await removeHook("SessionStart", formatHookCommand(bin, INTELSTART_SUBCOMMAND), settingsPath);
+    const r2 = await removeHook("UserPromptSubmit", formatHookCommand(bin, INTELPROMPT_SUBCOMMAND), settingsPath);
+    const changed = r1 === "removed" || r2 === "removed";
+    return { changed, action: changed ? "removed" : "unchanged" };
+  }
+
+  const r1 = await registerSessionIntelStartHook(settingsPath, bin);
+  const r2 = await registerSessionIntelPromptHook(settingsPath, bin);
+  const changed = r1 === "registered" || r2 === "registered";
+  return { changed, action: changed ? "installed" : "unchanged" };
+}
+
 export const CLAUDE_BUS_SESSION_START_MATCHER = "startup|resume|clear|compact";
 
 /**
@@ -768,7 +978,27 @@ export async function enableClaudeBusHooks(
   }
 
   let changed = false;
+  // ISS-1222: locate our rows by semantic command, not exact path, so a row
+  // registered through another launcher path is still the one normalised.
+  const sessionKey = hookRowKey(sessionCommand)?.key ?? null;
+  const stopKey = hookRowKey(stopCommand)?.key ?? null;
+  const isOwnedRow = (entry: unknown, exact: string, key: string | null): boolean => {
+    if (isHookWithCommand(entry, exact)) return true;
+    if (key === null || typeof entry !== "object" || entry === null) return false;
+    const e = entry as HookEntry;
+    if (e.type !== "command" || typeof e.command !== "string") return false;
+    return hookRowKey(e.command)?.key === key;
+  };
   const sessionGroups = hooks.SessionStart as unknown[];
+  // ISS-1222 (post-hoc Codex finding): the normalisation below keeps ONE
+  // owned row per event and matches rows by semantic key, so a stale
+  // launcher row beside the global one must be collapsed to the validated
+  // global command FIRST. With no validated launcher the collision is left
+  // exactly as it is and the normalisation is skipped, rather than promoting
+  // whichever row the scan met last.
+  const collisions = dedupeHookRows({ hooks: { SessionStart: sessionGroups } }, globalHookCommandFor());
+  if (collisions.unresolved.length > 0) return { changed: false, skipped: true };
+  if (collisions.changed) changed = true;
   let sessionEntry: HookEntry | null = null;
   let sessionMatches = 0;
   let canonicalSessionMatches = 0;
@@ -779,7 +1009,7 @@ export async function enableClaudeBusHooks(
     if (!Array.isArray(matcherGroup.hooks)) continue;
     const retained: unknown[] = [];
     for (const entry of matcherGroup.hooks) {
-      if (isHookWithCommand(entry, sessionCommand)) {
+      if (isOwnedRow(entry, sessionCommand, sessionKey)) {
         sessionMatches += 1;
         if ((matcherGroup.matcher ?? "") === CLAUDE_BUS_SESSION_START_MATCHER) {
           canonicalSessionMatches += 1;
@@ -813,7 +1043,7 @@ export async function enableClaudeBusHooks(
     const matcherGroup = group as MatcherGroup;
     if (!Array.isArray(matcherGroup.hooks)) continue;
     for (const entry of matcherGroup.hooks) {
-      if (!isHookWithCommand(entry, stopCommand)) continue;
+      if (!isOwnedRow(entry, stopCommand, stopKey)) continue;
       const hook = entry as HookEntry;
       if ("async" in hook) {
         delete hook.async;
@@ -949,6 +1179,127 @@ export async function removeHook(
 }
 
 // ---------------------------------------------------------------------------
+// T-516: the function-hooks switch in settings.json
+// ---------------------------------------------------------------------------
+
+/**
+ * The environment variable Claude Code reads to decide whether a plugin's
+ * hooks modules (our Mods) load at all. Early access: the client loads them
+ * when this is set in its process environment or when the rollout flag
+ * `tengu_plugin_hooks_modules` is on, and that flag is off by default.
+ * `~/.claude/settings.json`'s `env` block reaches that environment, measured
+ * against 2.1.273, so it is the switch a plain install can write.
+ */
+export const FUNCTION_HOOKS_ENV_KEY = "CLAUDE_CODE_ENABLE_FUNCTION_HOOKS";
+
+/** Reads and parses settings.json defensively, exactly as the hook writers do. */
+async function readSettingsObject(
+  path: string,
+  what: string,
+): Promise<Record<string, unknown> | null> {
+  let raw = "{}";
+  if (existsSync(path)) {
+    try {
+      raw = await readFile(path, "utf-8");
+    } catch {
+      process.stderr.write(`Could not read ${path} -- skipping ${what}.\n`);
+      return null;
+    }
+  }
+
+  try {
+    const settings = JSON.parse(raw) as Record<string, unknown>;
+    if (typeof settings !== "object" || settings === null || Array.isArray(settings)) {
+      process.stderr.write(`${path} is not a JSON object -- skipping ${what}.\n`);
+      return null;
+    }
+    return settings;
+  } catch {
+    process.stderr.write(`${path} contains invalid JSON -- skipping ${what}.\n`);
+    process.stderr.write("  Fix the file manually or delete it to reset.\n");
+    return null;
+  }
+}
+
+/**
+ * Ensures `env.CLAUDE_CODE_ENABLE_FUNCTION_HOOKS` is "1" in settings.json, so
+ * the ledger dashboard appears after a plain `storybloq setup --client all`
+ * (T-516, owner ruling: it ships on in 1.15).
+ *
+ * A value that is already there was chosen by whoever put it there, so it is
+ * left alone whatever it says, "0" and "" included: turning the dashboard off
+ * has to survive the next upgrade. Same atomic, symlink-following write the
+ * hook registrars use, and the same "touch nothing we cannot parse" rule.
+ */
+export async function enableFunctionHooksEnv(
+  settingsPath?: string,
+): Promise<"set" | "exists" | "skipped"> {
+  const path = settingsPath ?? join(homedir(), ".claude", "settings.json");
+  const what = "the function-hooks switch";
+
+  const settings = await readSettingsObject(path, what);
+  if (settings === null) return "skipped";
+
+  if ("env" in settings) {
+    if (typeof settings.env !== "object" || settings.env === null || Array.isArray(settings.env)) {
+      process.stderr.write(`${path} has unexpected env format -- skipping ${what}.\n`);
+      return "skipped";
+    }
+  } else {
+    settings.env = {};
+  }
+
+  const env = settings.env as Record<string, unknown>;
+
+  // The user's own value wins over the default, so the file is not rewritten
+  // at all when the key is present.
+  if (FUNCTION_HOOKS_ENV_KEY in env) return "exists";
+
+  env[FUNCTION_HOOKS_ENV_KEY] = "1";
+
+  try {
+    await atomicWriteFollowingSymlink(path, JSON.stringify(settings, null, 2) + "\n");
+  } catch {
+    return "skipped";
+  }
+
+  return "set";
+}
+
+/**
+ * The counterpart of `enableFunctionHooksEnv` for an uninstall or opt-out
+ * path: removes the key only when it still reads exactly "1", the value the
+ * installer writes. Anything else in there is the user's and stays.
+ */
+export async function removeFunctionHooksEnv(
+  settingsPath?: string,
+): Promise<"removed" | "not_found" | "skipped"> {
+  const path = settingsPath ?? join(homedir(), ".claude", "settings.json");
+
+  if (!existsSync(path)) return "not_found";
+
+  const settings = await readSettingsObject(path, "the function-hooks switch removal");
+  if (settings === null) return "skipped";
+
+  if (typeof settings.env !== "object" || settings.env === null || Array.isArray(settings.env)) {
+    return "not_found";
+  }
+
+  const env = settings.env as Record<string, unknown>;
+  if (env[FUNCTION_HOOKS_ENV_KEY] !== "1") return "not_found";
+
+  delete env[FUNCTION_HOOKS_ENV_KEY];
+
+  try {
+    await atomicWriteFollowingSymlink(path, JSON.stringify(settings, null, 2) + "\n");
+  } catch {
+    return "skipped";
+  }
+
+  return "removed";
+}
+
+// ---------------------------------------------------------------------------
 // Main handler
 // ---------------------------------------------------------------------------
 
@@ -1033,6 +1384,172 @@ function pruneEmptyMatcherGroups(
   return removed;
 }
 
+
+// ---------------------------------------------------------------------------
+// T-509: registering the bundled codex-claude-bridge with Claude Code.
+// ---------------------------------------------------------------------------
+
+/** The MCP server name the bundled bridge is registered under. */
+export const BRIDGE_MCP_NAME = "codex-bridge";
+
+export type BridgeExecResult =
+  | { readonly kind: "ok" }
+  | { readonly kind: "enoent" }
+  | { readonly kind: "failed"; readonly status: number | null; readonly stderr: string };
+
+/** Runs `file args...` with piped stdio; the only spawn seam of the registration. */
+export type BridgeExec = (file: string, args: readonly string[]) => BridgeExecResult;
+
+export type BridgeRegistration = "skipped" | "unusable" | "exists" | "foreign" | "registered" | "unverifiable" | "failed";
+
+export interface RegisterBridgeOptions {
+  readonly bundled: BundledBridge;
+  /** `~/.claude.json`, the user-scope MCP registry. */
+  readonly claudeJsonPath: string;
+  readonly exec: BridgeExec;
+  readonly log: (line: string) => void;
+}
+
+function defaultBridgeExec(file: string, args: readonly string[]): BridgeExecResult {
+  // On win32 the npm-installed claude CLI is a .cmd shim, which needs a shell
+  // (same rule as runNpmRootG). A shell re-splits the argv, so every argument
+  // is quoted with the same formatter used for displayed commands.
+  const win = process.platform === "win32";
+  let argv: string[] = [...args];
+  if (win) {
+    const quoted = winShellArgv(args);
+    if (quoted === null) {
+      return { kind: "failed", status: null, stderr: "an argument contains '%', '!' or a double quote, which cmd.exe would rewrite; register by hand" };
+    }
+    argv = quoted;
+  }
+  try {
+    execFileSync(file, argv, { stdio: "pipe", timeout: 10000, shell: win });
+    return { kind: "ok" };
+  } catch (err: unknown) {
+    const e = err as { code?: unknown; status?: unknown; stderr?: unknown; message?: unknown };
+    if (e.code === "ENOENT") return { kind: "enoent" };
+    const stderr = Buffer.isBuffer(e.stderr) ? e.stderr.toString("utf-8") : typeof e.stderr === "string" ? e.stderr : String(e.message ?? "");
+    return { kind: "failed", status: typeof e.status === "number" ? e.status : null, stderr };
+  }
+}
+
+/**
+ * The recovery instruction. On win32 a path cmd.exe would expand gets no
+ * pasteable command at all (quoting cannot protect it); the user edits the
+ * user-scope JSON entry instead, which is exactly what `claude mcp add` writes.
+ */
+export function manualBridgeAdd(entry: string, claudeJsonPath: string, platform: NodeJS.Platform = process.platform): string {
+  if (platform === "win32" && cmdExpands(entry)) {
+    return `add to ${claudeJsonPath} under "mcpServers": ${JSON.stringify({ [BRIDGE_MCP_NAME]: { command: "node", args: [entry] } })} (the path contains %, ! or a double quote, which cmd.exe would rewrite, so no shell command is shown)`;
+  }
+  return `claude mcp add ${BRIDGE_MCP_NAME} -s user -- node ${shellArg(entry, platform)}`;
+}
+
+function samePath(a: string, b: string): boolean {
+  const real = (p: string): string => {
+    try {
+      return realpathSync(p);
+    } catch {
+      return p;
+    }
+  };
+  return a === b || real(a) === real(b);
+}
+
+type UserBridgeEntry =
+  | { readonly kind: "absent" }
+  | { readonly kind: "indeterminate"; readonly reason: string }
+  | { readonly kind: "present"; readonly command: string; readonly args: readonly string[]; readonly hasCwd: boolean };
+
+/**
+ * Three-valued read of `mcpServers["codex-bridge"]` at user scope. Shares the
+ * health check's bounded reader so both features agree on what is readable.
+ */
+function readUserBridgeEntry(claudeJsonPath: string): UserBridgeEntry {
+  const doc = readJsonObject({ readFile: readFileThreeValued }, claudeJsonPath, CLAUDE_JSON_MAX_BYTES);
+  if (doc.kind === "absent") return { kind: "absent" };
+  if (doc.kind === "indeterminate") return { kind: "indeterminate", reason: doc.reason };
+  const servers = doc.value["mcpServers"];
+  if (servers === undefined || servers === null) return { kind: "absent" };
+  if (typeof servers !== "object" || Array.isArray(servers)) return { kind: "indeterminate", reason: "mcpServers is not an object" };
+  const entry = (servers as Record<string, unknown>)[BRIDGE_MCP_NAME];
+  if (entry === undefined || entry === null) return { kind: "absent" };
+  if (typeof entry !== "object" || Array.isArray(entry)) return { kind: "indeterminate", reason: `${BRIDGE_MCP_NAME} entry is not an object` };
+  const e = entry as Record<string, unknown>;
+  const command = typeof e["command"] === "string" ? e["command"] : "";
+  const rawArgs = e["args"];
+  const args = Array.isArray(rawArgs) ? rawArgs.map((a): string => (typeof a === "string" ? a : JSON.stringify(a) ?? String(a))) : [];
+  return { kind: "present", command, args, hasCwd: e["cwd"] !== undefined };
+}
+
+/**
+ * Registers the bundled bridge as `codex-bridge` at user scope, launched as
+ * `node <entry>` with no cwd (the bridge's own cwd argument governs where a
+ * review runs). An entry already present under that name is never modified:
+ * a matching one is reported as existing, anything else as foreign with the
+ * exact steps to replace it.
+ */
+export function registerBridgeMcp(opts: RegisterBridgeOptions): BridgeRegistration {
+  const { bundled, claudeJsonPath, exec, log } = opts;
+  if (bundled.kind === "absent") {
+    log("Codex review bridge skipped: codex-claude-bridge did not install (optional dependency; see README)");
+    return "skipped";
+  }
+  if (bundled.kind === "unusable") {
+    log(`Codex review bridge skipped: codex-claude-bridge is installed but unusable (${bundled.reason}); reinstall with npm install -g @storybloq/storybloq@latest`);
+    return "unusable";
+  }
+  const { entry, version } = bundled;
+
+  const classify = (existing: Extract<UserBridgeEntry, { kind: "present" }>): "exists" | "foreign" => {
+    const isNode = basename(existing.command) === "node" || basename(existing.command) === "node.exe";
+    // A cwd on the entry breaks the no-cwd contract (the bridge's own cwd
+    // argument must govern where a review runs), so it is foreign even when
+    // the command matches.
+    const matches = isNode && existing.args.length === 1 && samePath(existing.args[0]!, entry) && !existing.hasCwd;
+    if (matches) {
+      log(`  Codex review bridge already registered as ${BRIDGE_MCP_NAME}`);
+      return "exists";
+    }
+    const why = existing.hasCwd && isNode ? "with a cwd, which the bundled registration must not have" : "with a different command";
+    log(`  ${BRIDGE_MCP_NAME} is registered at user scope ${why} (${[existing.command, ...existing.args].map((a) => shellArg(a)).join(" ")}); left alone.`);
+    log(`  To use the bundled bridge: claude mcp remove ${BRIDGE_MCP_NAME} -s user, then re-run storybloq setup-skill`);
+    return "foreign";
+  };
+
+  const unverifiable = (reason: string): "unverifiable" => {
+    log(`Codex review bridge not registered: ${claudeJsonPath} could not be read (${reason}), so an existing ${BRIDGE_MCP_NAME} entry cannot be ruled out.`);
+    log(`  Register by hand: ${manualBridgeAdd(entry, claudeJsonPath)}`);
+    return "unverifiable";
+  };
+
+  const existing = readUserBridgeEntry(claudeJsonPath);
+  if (existing.kind === "present") return classify(existing);
+  if (existing.kind === "indeterminate") return unverifiable(existing.reason);
+
+  const result = exec("claude", ["mcp", "add", BRIDGE_MCP_NAME, "-s", "user", "--", "node", entry]);
+  if (result.kind === "ok") {
+    log(`  Codex review bridge registered as ${BRIDGE_MCP_NAME} (bundled ${version})`);
+    return "registered";
+  }
+  if (result.kind === "enoent") {
+    log("");
+    log("Codex review bridge not registered -- `claude` CLI not found in PATH.");
+    log(`  To register manually: ${manualBridgeAdd(entry, claudeJsonPath)}`);
+    return "failed";
+  }
+  if (result.stderr.includes("already exists")) {
+    const again = readUserBridgeEntry(claudeJsonPath);
+    if (again.kind === "present") return classify(again);
+    return unverifiable(again.kind === "indeterminate" ? again.reason : `claude reported an existing ${BRIDGE_MCP_NAME} entry that the file does not show`);
+  }
+  log("");
+  log(`Codex review bridge registration failed: ${result.stderr.split("\n")[0] ?? ""}`);
+  log(`  To register manually: ${manualBridgeAdd(entry, claudeJsonPath)}`);
+  return "failed";
+}
+
 /**
  * Installs the /story skill globally for Claude Code.
  *
@@ -1071,7 +1588,7 @@ async function handleSetupClaude(options: SetupSkillOptions = {}): Promise<void>
   const skillContent = await readFile(join(srcSkillDir, "SKILL.md"), "utf-8");
   await writeFile(join(skillDir, "SKILL.md"), skillContent, "utf-8");
 
-  const supportFiles = ["setup-flow.md", "autonomous-mode.md", "reference.md", "federation-setup.md", "orchestrator-mode.md", "duet-mode.md", "triage-mode.md", "bus-mode.md", "session-guard-fallback.md", "review-contract-template.md"];
+  const supportFiles = ["setup-flow.md", "settings.md", "autonomous-mode.md", "reference.md", "federation-setup.md", "orchestrator-mode.md", "duet-mode.md", "triage-mode.md", "bus-mode.md", "session-guard-fallback.md", "session-guard.md", "review-contract-template.md"];
   const writtenFiles = ["SKILL.md"];
   const missingFiles: string[] = [];
   for (const filename of supportFiles) {
@@ -1121,6 +1638,36 @@ async function handleSetupClaude(options: SetupSkillOptions = {}): Promise<void>
     process.stderr.write("  This may indicate a corrupt installation. Try: npm install -g @storybloq/storybloq@latest\n");
   }
 
+  // T-507 commit D: the Mods copy (Claude Code function hooks), with
+  // hooks/install.ts generated to answer the absolute path of the global
+  // binary. Non-fatal: the skill and hooks above do not depend on it, and
+  // the version-marker refresh retries it on the next upgrade.
+  try {
+    const { installMods, MODS_DISPLAY_PATH } = await import("../../core/mods-install.js");
+    const modsBin = resolveStorybloqBin();
+    const mods = await installMods({ bin: modsBin });
+    log(`Installed Mods (function hooks) at ${MODS_DISPLAY_PATH}`);
+    log(`  ${mods.written.length} files written; storybloq resolved to ${modsBin ?? "the bare name (not found on PATH)"}`);
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    process.stderr.write(`Warning: Mods copy failed (non-fatal): ${msg}\n`);
+  }
+
+  // T-516: the copy above is inert until the client is allowed to load hooks
+  // modules at all, which the settings `env` block is what switches on. Runs
+  // whether or not the copy succeeded (a later upgrade refreshes the copy and
+  // finds the switch already written) and is silent on every rerun.
+  try {
+    const settingsFile = join(homedir(), ".claude", "settings.json");
+    const envState = await enableFunctionHooksEnv();
+    if (envState === "set") {
+      log(`  Set env.${FUNCTION_HOOKS_ENV_KEY}=1 in ${settingsFile} (draws the ledger dashboard)`);
+    }
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    process.stderr.write(`Warning: could not set ${FUNCTION_HOOKS_ENV_KEY} (non-fatal): ${msg}\n`);
+  }
+
   // Attempt MCP registration -- requires both `storybloq` and `claude` in PATH.
   let mcpRegistered = false;
   let cliInPath = false;
@@ -1164,6 +1711,14 @@ async function handleSetupClaude(options: SetupSkillOptions = {}): Promise<void>
     log("  claude mcp add storybloq -s user -- storybloq --mcp");
   }
 
+  // T-509: the bundled Codex review bridge, registered beside the storybloq server.
+  registerBridgeMcp({
+    bundled: resolveBundledBridge(),
+    claudeJsonPath: join(homedir(), ".claude.json"),
+    exec: defaultBridgeExec,
+    log,
+  });
+
   // Hook registration (ISS-032: hook-driven compaction; ISS-560: absolute bin path)
   // Gate on `resolveStorybloqBin()` -- Claude Code hooks run under a shell
   // whose PATH may differ from this process's at install time (nvm/fnm
@@ -1189,6 +1744,24 @@ async function handleSetupClaude(options: SetupSkillOptions = {}): Promise<void>
     if (migratedStart > 0) log(`  Migrated ${migratedStart} stale SessionStart hook entr${migratedStart === 1 ? "y" : "ies"}`);
     const migratedStop = await migrateLegacyHookVariants("Stop", STOP_SUBCOMMAND, stopCmd);
     if (migratedStop > 0) log(`  Migrated ${migratedStop} stale Stop hook entr${migratedStop === 1 ? "y" : "ies"}`);
+    // ISS-1222: the same hook through two launcher paths (an npx cache copy
+    // beside the global install) runs twice. Collapse each collision to the
+    // validated global launcher's row and say exactly what was removed.
+    const duplicates = await reconcileDuplicateHookRows(join(homedir(), ".claude", "settings.json"), globalHookCommandFor());
+    for (const r of duplicates.reconciled) {
+      for (const d of r.dropped) {
+        log(`  Removed duplicate ${r.hookType} hook row: ${d.command} (matcher "${d.matcher}"); kept ${r.kept.command} (matcher "${r.kept.matcher}")`);
+      }
+    }
+    for (const u of duplicates.unresolved) {
+      log(`  Duplicate ${u.hookType} hook rows left in place, the global storybloq launcher could not be established: ${u.rows.map((row) => row.command).join(", ")}`);
+    }
+    for (const p of duplicates.pruned) {
+      log(`  Removed empty ${p.hookType} hook group (matcher "${p.matcher}")`);
+    }
+    if (duplicates.changed) {
+      log("  Rewrote ~/.claude/settings.json to drop the duplicate rows or empty groups; the file is re-serialised as two-space JSON, so any hand formatting is normalised");
+    }
 
     const precompactResult = await registerPreCompactHook(undefined, resolvedBin);
     switch (precompactResult) {
@@ -1250,6 +1823,16 @@ async function handleSetupClaude(options: SetupSkillOptions = {}): Promise<void>
       log("  StopFailure hook removed - usage-limit auto-resume is disabled globally");
     } else {
       log("  StopFailure hook already configured (or disabled globally)");
+    }
+
+    // T-499: session-intel hooks (SessionStart capture + UserPromptSubmit sample).
+    const intelHooks = await ensureSessionIntelHooksRegistered(undefined, resolvedBin);
+    if (intelHooks.action === "installed") {
+      log("  Session-intel hooks registered - context pressure reaches the agent before auto-compaction");
+    } else if (intelHooks.action === "removed") {
+      log("  Session-intel hooks removed - disabled globally");
+    } else {
+      log("  Session-intel hooks already configured (or disabled globally)");
     }
   } else if (skipHooks) {
     log("  Hook registration skipped (--skip-hooks)");

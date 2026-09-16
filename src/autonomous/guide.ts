@@ -1,4 +1,5 @@
 import { displayIdOf } from "../core/resolver.js";
+import { loadClassificationContext } from "../core/classification-context.js";
 import { readFileSync, writeFileSync, existsSync, unlinkSync, readdirSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { basename, join } from "node:path";
@@ -108,6 +109,7 @@ import { recommend, type RecommendOptions } from "../core/recommend.js";
 import { checkVersionMismatch, getInstalledVersion, getRunningVersion } from "./version-check.js";
 import { writeResumeMarker, removeResumeMarker, type ResumeMarkerRemoval } from "./resume-marker.js";
 import { refreshStatusForSession } from "./status-writer.js";
+import { guideDirectiveFor } from "../core/session-intel/push.js";
 import { writeSessionAndRefresh, emitTelemetry, postStateWrite } from "./guide-effects.js";
 import { withTelemLock } from "./telemetry-writer.js";
 import { readCancellationTransition, type TicketDisposition } from "./cancellation-transition.js";
@@ -325,15 +327,17 @@ export const RECOVERY_MAPPING: Readonly<Record<string, { state: string; resetPla
 // ---------------------------------------------------------------------------
 
 async function buildGuideRecommendOptions(root: string): Promise<RecommendOptions> {
-  const opts: { latestHandoverContent?: string; previousOpenIssueCount?: number; currentUser?: string } = {};
+  const opts: {
+    recentHandovers?: RecommendOptions["recentHandovers"];
+    unreadableHandoverCount?: number | null;
+    previousOpenIssueCount?: number;
+    currentUser?: string;
+  } = {};
 
-  try {
-    const handoversDir = join(root, ".story", "handovers");
-    const files = readdirSync(handoversDir, "utf-8").filter((f: string) => f.endsWith(".md")).sort();
-    if (files.length > 0) {
-      opts.latestHandoverContent = readFileSync(join(handoversDir, files[files.length - 1]), "utf-8");
-    }
-  } catch { /* no handovers */ }
+  const handoversDir = join(root, ".story", "handovers");
+  const classification = loadClassificationContext(root, handoversDir);
+  opts.recentHandovers = classification.recentHandovers;
+  opts.unreadableHandoverCount = classification.unreadableHandoverCount;
 
   try {
     const snapshotsDir = join(root, ".story", "snapshots");
@@ -1088,7 +1092,8 @@ export async function handleAutonomousGuide(
   workspaceLocks.set(wsId, current.then(() => {}, () => {}));
 
   try {
-    return await current;
+    const result = await current;
+    return appendGuideDirective(root, result);
   } catch (err) {
     return guideError(err);
   } finally {
@@ -1105,6 +1110,27 @@ export async function handleAutonomousGuide(
         }
       });
     }
+  }
+}
+
+/**
+ * T-499: the single seam where a guide result is finalised. When the
+ * autonomous OWNER's usable token-pressure sample is imperative, one line is
+ * appended telling the agent to write a handover now. Read from the owner's
+ * presence record only; never on an error result; never a state transition.
+ */
+function appendGuideDirective(root: string, result: McpToolResult): McpToolResult {
+  if (result.isError) return result;
+  try {
+    const state = findActiveSessionFull(root)?.state;
+    const ownerId = state?.ownerTask?.client === "claude" ? state.ownerTask.id : state?.claudeCodeSessionId ?? null;
+    const directive = guideDirectiveFor(root, ownerId);
+    if (!directive) return result;
+    const last = result.content[result.content.length - 1];
+    if (!last) return result;
+    return { ...result, content: [...result.content.slice(0, -1), { type: "text", text: `${last.text}\n\n${directive}` }] };
+  } catch {
+    return result;
   }
 }
 

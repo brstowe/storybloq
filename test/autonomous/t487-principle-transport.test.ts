@@ -101,16 +101,24 @@ describe("G-T1: the native codex schema declares principle", () => {
       const item = findingItemSchema(kind);
       expect(item.additionalProperties).toBe(false);
       expect(item.properties.principle).toBeDefined();
-      expect(item.properties.principle.type).toBe("string");
+      const stringBranch = (item.properties.principle.anyOf as Array<{ type?: string; minLength?: number }>)
+        .find((b) => b.type === "string");
       // Constrains what the REVIEWER is asked for. Absent is the only way to
       // say "names no principle", so an empty string must not be offered as a
       // second way to say it.
-      expect(item.properties.principle.minLength).toBe(1);
+      expect(stringBranch!.minLength).toBe(1);
     });
 
-    it(`does not require principle for kind "${kind}"`, () => {
+    // ISS-1202 (GitHub #36): OpenAI strict-mode structured outputs reject a
+    // schema where a declared property is absent from `required` -- so
+    // `principle` must be required-plus-nullable (anyOf with a null branch),
+    // the same pattern file/line/suggestion already used, not omitted from
+    // `required` the way plain-JSON-Schema "optional" would express it.
+    it(`requires principle (nullable) for kind "${kind}", so strict-mode output must include it and use null when absent`, () => {
       const item = findingItemSchema(kind);
-      expect(item.required).not.toContain("principle");
+      expect(item.required).toContain("principle");
+      const anyOf = item.properties.principle.anyOf as Array<{ type?: string }>;
+      expect(anyOf.some((branch) => branch.type === "null")).toBe(true);
     });
   }
 
@@ -193,7 +201,9 @@ describe("G-T4: blank is not a second way to say absent", () => {
   // the MCP boundary fails a whole review round.
 
   it("seam 1, reviewer schema: an empty principle is not offered as valid", () => {
-    expect(findingItemSchema("code").properties.principle.minLength).toBe(1);
+    const anyOf = findingItemSchema("code").properties.principle.anyOf as Array<{ type?: string; minLength?: number }>;
+    const stringBranch = anyOf.find((b) => b.type === "string");
+    expect(stringBranch!.minLength).toBe(1);
   });
 
   for (const blank of ["", "   ", "\t\n"]) {

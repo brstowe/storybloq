@@ -2,6 +2,7 @@ import { withProjectLock, writeTicketUnlocked, writeIssueUnlocked, loadProject }
 import { loadArrangementsSafe, writeArrangementUnlocked } from "../../core/arrangement-loader.js";
 import { isArrangementConflicted } from "../../core/arrangement-authority.js";
 import { handleDuetGet } from "./duet.js";
+import { compactArrangementCheckpoint, rotateArrangement } from "../../core/duet-coordination.js";
 import { earmarkMatchesArrangement } from "../../core/earmarks.js";
 import { generateCanonicalId } from "../../core/canonical-id.js";
 import { summarizeZodIssues, describeSchemaIssues } from "../../core/zod-issues.js";
@@ -11,6 +12,8 @@ import {
   formatArrangementList,
   formatArrangementCreateResult,
   formatArrangementUpdateResult,
+  formatArrangementCompactResult,
+  formatArrangementRotateResult,
   formatError,
   ExitCode,
 } from "../../core/output-formatter.js";
@@ -138,6 +141,36 @@ export function handleArrangementList(
 
 export function handleArrangementGet(id: string, ctx: CommandContext): CommandResult {
   return handleDuetGet(id, ctx);
+}
+
+/**
+ * ISS-1191 scope item 2: the explicit compaction command. CLI only -- it is
+ * a maintenance operation on coordination state, and the MCP surface stays
+ * the ordinary coordinate/get pair.
+ */
+export async function handleArrangementCompact(
+  id: string,
+  args: { clientTaskId?: string },
+  format: OutputFormat,
+  root: string,
+): Promise<CommandResult> {
+  const result = await compactArrangementCheckpoint(root, id, args.clientTaskId);
+  return { output: formatArrangementCompactResult(result, format) };
+}
+
+/**
+ * ISS-1191 scope item 4: rotation, the escape hatch for an arrangement
+ * compaction can no longer shrink. Destructive family (it closes the
+ * arrangement), CLI only.
+ */
+export async function handleArrangementRotate(
+  id: string,
+  args: { clientTaskId?: string },
+  format: OutputFormat,
+  root: string,
+): Promise<CommandResult> {
+  const result = await rotateArrangement(root, id, args.clientTaskId);
+  return { output: formatArrangementRotateResult(result, format) };
 }
 
 // --- Write handlers ---
@@ -367,6 +400,15 @@ export async function handleArrangementUpdate(
         throw new CliValidationError(
           "invalid_input",
           `Arrangement ${id} has unresolved merge conflicts; resolve with "storybloq resolve ${id}" before updating it`,
+        );
+      }
+      // ISS-1191: rotation is terminal. Reactivating a continued
+      // arrangement would restore its verified runtime and its open
+      // assignments while the successor holds copies of the same work.
+      if (existing.continuedBy) {
+        throw new CliValidationError(
+          "invalid_input",
+          `Arrangement ${id} was continued by ${existing.continuedBy}; its lifecycle is terminal. Update the successor instead`,
         );
       }
       if (closing) {

@@ -244,7 +244,8 @@ describe("deviant-shape annotations match actual output", () => {
   });
 
   it("unannotated commands really do emit the shared envelope", () => {
-    for (const argv of [["status"], ["validate"], ["ticket", "list"], ["reconcile"]]) {
+    // ISS-1223: health printed a bare object while its --help promised the envelope.
+    for (const argv of [["status"], ["validate"], ["ticket", "list"], ["reconcile"], ["health"]]) {
       const keys = topLevelKeys(run(projectDir, ...argv, "--format", "json").out);
       expect(isSharedEnvelope(keys), `${argv.join(" ")} should be the shared envelope`).toBe(true);
       const help = run(projectDir, ...argv, "--help");

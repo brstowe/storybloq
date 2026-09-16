@@ -15,6 +15,8 @@ import { readDuetCoordination } from "../../core/duet-coordination.js";
 import { TICKET_ID_REGEX, TICKET_CANONICAL_ID_REGEX, ISSUE_ID_REGEX, ISSUE_CANONICAL_ID_REGEX } from "../../models/types.js";
 import { sanitizeDisplayText } from "../../core/display-text.js";
 import type { ProjectState } from "../../core/project-state.js";
+import type { ResolvedNode } from "../../federation/resolver.js";
+import type { StatusRoster } from "../../core/roster-view.js";
 import { ownerTaskForCurrentClient } from "../../autonomous/client-profile.js";
 import { computeArrangementPresence, applyPresenceEnrichment, ownerIdentityOf, STATUS_ENRICHMENT_LOCK_BUDGET_MS } from "../../core/presence-enrichment.js";
 import { arrangementGateRiskWarnings } from "../../core/arrangement-bounds.js";
@@ -184,7 +186,39 @@ function enrichPresenceForCaller(root: string, explicitClientTaskId: string | nu
   }
 }
 
-export async function handleStatus(ctx: CommandContext, clientTaskId?: string | null): Promise<CommandResult> {
+/**
+ * T-507: the seat roster, best-effort like every other status side-read. A
+ * throw here becomes an empty roster with one diagnostic, never a failed
+ * status. Single project: the project's roster with the Bus merged in;
+ * orchestrator: the orchestrator's plus every resolved node's, labelled.
+ */
+async function statusRoster(
+  root: string,
+  state: ProjectState,
+  nodes: ReadonlyMap<string, ResolvedNode> | null,
+): Promise<StatusRoster> {
+  try {
+    const { readRosterWithBus, readFederatedRoster, statusRosterFrom } = await import("../../core/roster-view.js");
+    if (nodes !== null) return await readFederatedRoster(root, state.config, nodes);
+    return statusRosterFrom(await readRosterWithBus(root, state.config), null);
+  } catch (err) {
+    return {
+      seats: [], live: 0, stale: 0, terminal: 0, scanTruncated: false, resultTruncated: false, busScanTruncated: false,
+      diagnostics: [`roster unreadable: ${err instanceof Error ? err.message : String(err)}`],
+    };
+  }
+}
+
+export interface StatusOptions {
+  /** T-320 commit 3: compact JSON payload, per the ticket's schema. JSON only -- forwarded to `formatStatus` regardless of `ctx.format`. */
+  readonly compact?: boolean;
+}
+
+export async function handleStatus(
+  ctx: CommandContext,
+  clientTaskId?: string | null,
+  opts: StatusOptions = {},
+): Promise<CommandResult> {
   enrichPresenceForCaller(ctx.root, clientTaskId);
 
   const {
@@ -239,6 +273,9 @@ export async function handleStatus(ctx: CommandContext, clientTaskId?: string | 
     const fedState = buildFederationState(config, resolvedNodes, scanResults);
 
     const resolver = await CrossNodeBlockingResolver.build(ctx.state.tickets, resolvedNodes);
+    // Compact carries no roster: nothing is read for it here either (the
+    // federated read is the orchestrator's plus every node's Bus probes).
+    const roster = opts.compact ? undefined : await statusRoster(ctx.root, ctx.state, resolvedNodes);
 
     try {
       writeFederationCache(join(ctx.root, ".story"), fedState, resolver.resolvedStatuses);
@@ -258,10 +295,14 @@ export async function handleStatus(ctx: CommandContext, clientTaskId?: string | 
         sessionDiagnostics,
         expiredLeaseSessions,
         arrangements,
+        roster,
       ),
     };
   }
 
+  // Compact output carries no roster (T-320's pinned schema), so nothing is
+  // read for it: with the Bus on, the read is up to a scan cap of probes.
+  const roster = opts.compact ? undefined : await statusRoster(ctx.root, ctx.state, null);
   return {
     output: formatStatus(
       ctx.state,
@@ -273,6 +314,8 @@ export async function handleStatus(ctx: CommandContext, clientTaskId?: string | 
       sessionDiagnostics,
       expiredLeaseSessions,
       arrangements,
+      opts.compact ?? false,
+      roster,
     ),
   };
 }

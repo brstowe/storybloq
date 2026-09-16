@@ -36,6 +36,7 @@ import {
   type ArrangementPresenceEntry,
   type SessionPresence,
 } from "../../src/presence/types.js";
+import { emptySessionIntel } from "../../src/presence/session-intel-fields.js";
 
 /** Neutral T-477 defaults, spread into hand-built `SessionPresence` literals below. */
 const NO_T477_STATE = {
@@ -43,6 +44,7 @@ const NO_T477_STATE = {
   arrangementPresenceTruncated: false,
   milestone: null,
   ownerIdentity: null,
+  sessionIntel: null,
 };
 
 const SESSION = "sess-abc123";
@@ -346,10 +348,36 @@ describe("presence bounds (ISS-1022)", () => {
       arrangementPresenceTruncated: false,
       milestone: { kind: "implementing", at: "2026-08-20T12:00:00.000Z" },
       ownerIdentity: { client: "claude", clientTaskId: "task-1" },
+      sessionIntel: {
+        ...emptySessionIntel(),
+        era: "11442:1788000000",
+        captureKind: "startup",
+        autoCompactWindowAtStart: 450_000,
+        transcriptPath: "/home/u/.claude/projects/-p/s.jsonl",
+        lastBoundaryAt: "2026-08-20T11:00:00.000Z",
+        lastSample: {
+          sampledAt: "2026-08-20T12:00:00.000Z", sampledBy: "stop-hook", state: "ok", rawState: "ok", pct: 0.1,
+          contextTokens: 41_000, ceiling: 416_250, ceilingSource: "setting", ceilingConfidence: "high",
+          observation: { era: "11442:1788000000", incarnation: "1:2", sizeAtOpen: 10, consumedOffset: 10, anchor: { offset: 10, sha256: "a".repeat(64) }, authoritative: true, revisionSeen: 0, lastRecordTimestamp: null, epoch: { kind: "unobserved" } },
+          imperativeSince: null, suppressedBy: null,
+        },
+      },
     };
 
-    const [one, two, three, four] = PRESENCE_SHED_STEPS;
-    expect(PRESENCE_SHED_STEPS).toHaveLength(4);
+    // T-499: two intel steps lead the ladder, ahead of everything the panel
+    // shows, and they touch nothing but the two derived intel fields.
+    const [intelSample, intelPath, one, two, three, four] = PRESENCE_SHED_STEPS;
+    expect(PRESENCE_SHED_STEPS).toHaveLength(6);
+    const i1 = intelSample!(rec);
+    expect(i1.sessionIntel!.lastSample).toBeNull();
+    expect(i1.sessionIntel!.transcriptPath).toBe(rec.sessionIntel!.transcriptPath);
+    expect(i1.closedToolIds).toEqual(rec.closedToolIds);
+    const i2 = intelPath!(i1);
+    expect(i2.sessionIntel!.transcriptPath).toBeNull();
+    expect({ ...i2.sessionIntel!, lastSample: null, transcriptPath: null }).toEqual({ ...rec.sessionIntel!, lastSample: null, transcriptPath: null });
+    expect(i2.openTools).toEqual(rec.openTools);
+    // A record with no intel passes through both steps untouched.
+    expect(intelPath!(intelSample!({ ...rec, sessionIntel: null }))).toEqual({ ...rec, sessionIntel: null });
 
     const s1 = one!(rec);
     expect(s1.closedToolIds).toEqual(rec.closedToolIds.slice(-8));

@@ -1,0 +1,13 @@
+{
+  "version": 2,
+  "project": "behavioral-gate-abandoned-no-reversal",
+  "type": "coding",
+  "language": "typescript",
+  "features": {
+    "tickets": true,
+    "issues": true,
+    "handovers": true,
+    "roadmap": true,
+    "reviews": true
+  }
+}

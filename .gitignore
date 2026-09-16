@@ -3,3 +3,4 @@ dist/
 
 # personal fork: local working notes (never committed)
 local/
+.5c-run-output/

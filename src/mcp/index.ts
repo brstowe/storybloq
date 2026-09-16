@@ -21,7 +21,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { serverRegistryBinder } from "../autonomous/mcp-binding.js";
 
 import { discoverProjectRoot } from "../core/project-root-discovery.js";
-import { registerAllTools, registerSessionGuardTool } from "./tools.js";
+import { registerAllTools, registerHealthTool, registerSessionGuardTool, registerSessionIntelTool } from "./tools.js";
+import type { RegistrationContext } from "./registration-context.js";
 import { withStrictToolSchemas } from "./strict-schemas.js";
 import { initProject } from "../core/init.js";
 import { startInboxWatcher, stopInboxWatcher } from "../channel/inbox-watcher.js";
@@ -89,7 +90,7 @@ function tryDiscoverRoot(): string | null {
  * `root` is injectable for tests only; production always passes nothing and the
  * handlers resolve the cwd themselves, exactly as before.
  */
-export function registerDegradedTools(rawServer: McpServer, root?: string): void {
+export function registerDegradedTools(rawServer: McpServer, root?: string, ctx?: RegistrationContext): void {
   // ISS-892: the degraded surface gets the same strict-argument shim as the full
   // one. storybloq_init writes to disk, so a dropped unknown key here has the
   // same consequence it has anywhere else.
@@ -124,6 +125,15 @@ export function registerDegradedTools(rawServer: McpServer, root?: string): void
   // registration, which lands in the catch below and re-registers the degraded
   // surface -- stranding the user in degraded mode after a SUCCESSFUL init.
   const degradedGuard = registerSessionGuardTool(server, root ?? process.cwd());
+  // T-499: session intel answers without a project (transcript-only), so it
+  // is part of the degraded surface too and is swapped out with the rest.
+  const degradedIntel = registerSessionIntelTool(server, null);
+  // T-502: the health check is in the degraded set for the same reason, and
+  // more sharply: a user with no `.story/` yet is exactly the one running a
+  // stale CLI with no review bridge and no idea of it. `launchDir` is the
+  // directory THIS server was started in, captured once by `main`.
+  const degradedLaunchDir = ctx?.launchDir ?? realpathSync(process.cwd());
+  const degradedHealth = registerHealthTool(server, null, degradedLaunchDir);
 
   const degradedInit = server.registerTool("storybloq_init", {
     description: "Initialize a new .story/ project in the current directory",
@@ -153,7 +163,11 @@ export function registerDegradedTools(rawServer: McpServer, root?: string): void
       degradedStatus.remove();
       degradedInit.remove();
       degradedGuard.remove();
-      registerAllTools(server, result.root);
+      degradedIntel.remove();
+      degradedHealth.remove();
+      // The inspected directory does NOT change on init: it is where this
+      // server was launched, which an init does not move.
+      registerAllTools(server, result.root, { launchDir: degradedLaunchDir });
       // T-450: this server now serves a project it did not know about at
       // startup. Without binding here it would stamp its pid on guide calls
       // while staying absent from that project's registry, so it could never
@@ -175,7 +189,7 @@ export function registerDegradedTools(rawServer: McpServer, root?: string): void
       process.stderr.write(`storybloq: tool-swap failed after init: ${swapErr instanceof Error ? swapErr.message : String(swapErr)}\n`);
       // Re-register degraded tools so the server isn't completely toolless.
       // The project was created -- user can restart for full access.
-      try { registerDegradedTools(server); } catch { /* best effort */ }
+      try { registerDegradedTools(server, undefined, { launchDir: degradedLaunchDir }); } catch { /* best effort */ }
       return { content: [{ type: "text" as const, text: `Initialized .story/ project "${args.name}" at ${result.root}\n\nWarning: tool registration failed. Restart the MCP server for full tool access.` }] };
     }
 
@@ -209,6 +223,12 @@ async function main(): Promise<void> {
   // identically.
   captureStartupFingerprint();
   const root = tryDiscoverRoot();
+  // T-502: the ONE capture of this server's launch directory. Claude Code
+  // starts the server in the project directory, so this is where its
+  // `.claude/settings*.json` and `.mcp.json` live -- which is a different
+  // question from where the ledger is, and is answered once here rather than
+  // re-read per call or captured at import time.
+  const ctx: RegistrationContext = { launchDir: realpathSync(process.cwd()) };
 
   const server = new McpServer(
     { name: "storybloq", version },
@@ -226,11 +246,11 @@ async function main(): Promise<void> {
   );
 
   if (root) {
-    registerAllTools(server, root);
+    registerAllTools(server, root, ctx);
     await startInboxWatcher(root, server);
     process.stderr.write(`storybloq MCP server running (root: ${root})\n`);
   } else {
-    registerDegradedTools(server);
+    registerDegradedTools(server, undefined, ctx);
     process.stderr.write("storybloq MCP server running (no project -- storybloq_init available)\n");
   }
 

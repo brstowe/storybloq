@@ -3,6 +3,7 @@ import { loadArrangementsSafe } from "../../core/arrangement-loader.js";
 import { isArrangementConflicted } from "../../core/arrangement-authority.js";
 import { canPlaceEarmark, describeEarmarkHolder } from "../../core/earmarks.js";
 import { arrangementCoversNodeItem } from "../../core/arrangement-bounds.js";
+import { arrangementCapacity, type ArrangementCapacity } from "../../core/arrangement-compaction.js";
 import { withOrchestratorAndItemLocks } from "../../core/orchestrator-item-lock.js";
 import { resolveSessionSelector } from "../../autonomous/session-selector.js";
 import { ownerTaskForCurrentClient } from "../../autonomous/client-profile.js";
@@ -20,7 +21,7 @@ import type { Arrangement } from "../../models/arrangement.js";
 import type { Ticket } from "../../models/ticket.js";
 import type { Issue } from "../../models/issue.js";
 import { CliValidationError, resolveCliNodeRoot } from "../helpers.js";
-import { checkNodeWritePermission } from "../../mcp/node-resolution.js";
+import { checkNodeWritePermission, ORCHESTRATOR_NODE_SENTINEL } from "../../mcp/node-resolution.js";
 import type { CommandContext, CommandResult } from "../types.js";
 import type { ProjectState } from "../../core/project-state.js";
 
@@ -210,7 +211,22 @@ export function handleEarmarkGet(ref: string, ctx: CommandContext): CommandResul
   const target = resolveEarmarkTarget(ref, ctx.state);
   const item = loadTargetItem(target, ctx.state);
   const earmark = item.earmark ?? null;
-  return { output: formatEarmarkGetResult(ref, earmark, ctx.format) };
+  return { output: formatEarmarkGetResult(ref, earmark, ctx.format, earmark === null ? undefined : arrangementCapacityFor(ctx.root, earmark.arrangementId)) };
+}
+
+/**
+ * ISS-1191: the capacity of the arrangement this earmark is authorized by.
+ * Arrangements are owned by the root that holds them, and a federated read
+ * runs against a NODE root while the authorizing arrangement lives on the
+ * orchestrator -- so an unresolvable arrangement reports a reason, never a
+ * fabricated capacity.
+ */
+function arrangementCapacityFor(root: string, arrangementId: string): { capacity: ArrangementCapacity | null; reason?: string } {
+  const arrangement = loadArrangementsSafe(root).arrangements.find((a) => a.id === arrangementId);
+  if (!arrangement) {
+    return { capacity: null, reason: `arrangement ${arrangementId} is not readable from this root` };
+  }
+  return { capacity: arrangementCapacity(arrangement) };
 }
 
 // --- Write handlers ---
@@ -257,7 +273,7 @@ function assertNodeWritePermissionUnderLock(
   orchestratorState: ProjectState,
   nodeName: string | undefined,
 ): void {
-  if (!nodeName) return;
+  if (!nodeName || nodeName === ORCHESTRATOR_NODE_SENTINEL) return;
   if (!checkNodeWritePermission(orchestratorRoot, orchestratorState.config as unknown as Record<string, unknown>)) {
     throw new CliValidationError(
       "invalid_input",
@@ -276,8 +292,12 @@ export async function handleEarmarkReserve(
   let placed: Earmark | undefined;
   let refusalHolder: Earmark | undefined;
 
-  if (!nodeName) {
-    // Single-root path, byte-identical to pre-ISS-1077 behavior.
+  if (!nodeName || nodeName === ORCHESTRATOR_NODE_SENTINEL) {
+    // Single-root path, byte-identical to pre-ISS-1077 behavior. node="."
+    // (ISS-1181) is the orchestrator's OWN board: its arrangements store
+    // UNQUALIFIED bounds, so it must take this branch rather than the
+    // node-scoped one below, which would node-qualify the arrangement
+    // lookup as "."-scoped and reject a valid covering arrangement.
     await withProjectLock(root, { strict: true }, async ({ state }) => {
       const target = resolveEarmarkTarget(args.ref, state);
       const arrangement = resolveCoveringArrangement(args.arrangement, target.id, root);
@@ -433,7 +453,8 @@ export async function handleEarmarkAssign(
   let placed: Earmark | undefined;
   let refusalHolder: Earmark | undefined;
 
-  if (!nodeName) {
+  if (!nodeName || nodeName === ORCHESTRATOR_NODE_SENTINEL) {
+    // node="." (ISS-1181): see the matching comment in handleEarmarkReserve.
     await withProjectLock(root, { strict: true }, async ({ state }) => {
       const target = resolveEarmarkTarget(args.ref, state);
       const arrangement = resolveCoveringArrangement(args.arrangement, target.id, root);
@@ -534,7 +555,12 @@ export async function handleEarmarkRelease(
 ): Promise<CommandResult> {
   const itemRoot = resolveItemRootForNode(root, nodeName);
 
-  if (!nodeName) {
+  if (!nodeName || nodeName === ORCHESTRATOR_NODE_SENTINEL) {
+    // node="." (ISS-1181): see the matching comment in handleEarmarkReserve.
+    // authorizeRelease never node-qualifies its lookup, so this branch isn't
+    // strictly required for correctness here, but taking it keeps release
+    // symmetric with reserve/assign and avoids the node-scoped lock path for
+    // what is, for ".", just the orchestrator's own board.
     await withProjectLock(root, { strict: true }, async ({ state }) => {
       const target = resolveEarmarkTarget(args.ref, state);
       const item = loadTargetItem(target, state);
