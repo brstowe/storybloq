@@ -4,3 +4,6 @@ dist/
 # personal fork: local working notes (never committed)
 local/
 .5c-run-output/
+
+# codex-claude-bridge drops its SQLite store in whatever cwd it starts in
+reviews.db
