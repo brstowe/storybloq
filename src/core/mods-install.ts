@@ -34,11 +34,12 @@
  */
 
 import { existsSync, readFileSync } from "node:fs";
-import { mkdir, mkdtemp, open, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, open, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
+import { assertNoSelfOverlap, resolveSymlinkTarget } from "./symlink-write.js";
 
 export const MODS_DIR_NAME = "storybloq";
 
@@ -309,6 +310,16 @@ export async function installMods(options: InstallModsOptions): Promise<InstallM
       throw new Error(`Mods plugin source at ${sourceDir} is incomplete: hooks/${name} is missing`);
     }
   }
+
+  // ISS-1234: the swap below follows a symlinked destination and compares
+  // the STAGE against it, which never overlaps; the source is what must not.
+  let destTarget = dir;
+  try {
+    if ((await lstat(dir)).isSymbolicLink()) destTarget = await resolveSymlinkTarget(dir);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+  }
+  await assertNoSelfOverlap(sourceDir, dir, destTarget);
 
   const manifest = JSON.parse(readFileSync(manifestPath, "utf-8")) as Record<string, unknown>;
   delete manifest["skills"];

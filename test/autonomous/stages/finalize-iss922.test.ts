@@ -34,13 +34,14 @@ import { FinalizeStage } from "../../../src/autonomous/stages/finalize.js";
 import { prepareForCompact, prepareForLimitStop } from "../../../src/autonomous/session.js";
 import { gitDiffTreeNames } from "../../../src/autonomous/git-inspector.js";
 import type { FullSessionState } from "../../../src/autonomous/session-types.js";
+import { git as fixtureGit } from "../../helpers/git-fixture.js";
 
 const SESSION_ID = "00000000-0000-0000-0000-00000000922a";
 const ISSUE_ID = "ISS-922-fixture";
 const ISSUE_PATH = `.story/issues/${ISSUE_ID}.json`;
 
 function git(root: string, args: string[]): string {
-  return execFileSync("git", args, { cwd: root }).toString().trim();
+  return fixtureGit(root, args);
 }
 
 function head(root: string): string {

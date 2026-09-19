@@ -718,7 +718,29 @@ function statusIssueFlow(state: ProjectState): ReturnType<typeof computeIssueFlo
 /** The md line: the window when we have the records, the plain count when not. */
 function issueLine(state: ProjectState): string {
   const flow = statusIssueFlow(state);
-  return flow === null ? `Issues: ${state.activeIssueCount} open` : formatIssueFlow(flow);
+  const base = flow === null ? `Issues: ${state.activeIssueCount} open` : formatIssueFlow(flow);
+  return `${base}${nonActionableSuffix(state)}`;
+}
+
+/**
+ * ISS-1113: one clause naming how many of those open issues nobody is going to
+ * act on, and why they are still counted as open.
+ *
+ * Printed only when there ARE some. A permanent "0 non-actionable" would be
+ * noise on every project that never files one, and the number it would be
+ * reporting is already implied by the open count it sits beside.
+ *
+ * Guarded on the field being a number because several callers here pass a
+ * partial state carrying only counts (the same reason `statusIssueFlow`
+ * returns null rather than fabricating a window), and a fabricated zero here
+ * would claim the ledger was read when it was not.
+ */
+function nonActionableSuffix(state: ProjectState): string {
+  const actionable = state.actionableOpenIssueCount;
+  if (typeof actionable !== "number" || typeof state.activeIssueCount !== "number") return "";
+  const nonActionable = state.activeIssueCount - actionable;
+  if (nonActionable <= 0) return "";
+  return ` (${nonActionable} non-actionable, not ranked as work)`;
 }
 
 /**
@@ -798,6 +820,13 @@ export function buildCompactStatusData(
     openTickets: state.leafTicketCount - state.completeLeafTicketCount,
     blockedTickets: state.blockedCount,
     openIssues: state.activeIssueCount,
+    // ISS-1113: `actionableOpenIssues` is deliberately NOT here, only in the
+    // full payload below. T-320 pinned this key list as an exact contract --
+    // `status-roster.test.ts` asserts `Object.keys(...)` equals it verbatim --
+    // and widening another ticket's reduced shape is not this slice's to do.
+    // Nothing reads the number programmatically; the markdown line carries it
+    // for a reader either way.
+    //
     // No `semantics` here (unlike full status): the compact schema explicitly
     // omits `issueFlow.semantics`.
     issueFlow: statusIssueFlow(state),
@@ -895,6 +924,9 @@ export function formatStatus(
     openTickets: state.leafTicketCount - state.completeLeafTicketCount,
     blockedTickets: state.blockedCount,
     openIssues: state.activeIssueCount,
+    // ISS-1113: the subset that is work. ADDED beside `openIssues`, never
+    // folded into it -- see the field's own comment on ProjectState.
+    actionableOpenIssues: state.actionableOpenIssueCount,
     // T-432: the same numbers the md line prints, so the two cannot disagree.
     // `semantics` travels WITH them because "opened / resolved" is a balance of
     // record dates, not a backlog delta, and a consumer reading only the numbers
@@ -3306,6 +3338,7 @@ export function formatReference(
   lines.push("1. `npm install -g @storybloq/storybloq@latest` - install CLI");
   lines.push("2. `storybloq setup --client all` - install Storybloq skill, MCP, and hooks for Claude Code and Codex");
   lines.push("3. `storybloq init --name my-project` - initialize .story/ in your project");
+  lines.push("4. `storybloq update` - later: install the newest version and re-run setup in one step, then restart the client");
   lines.push("");
   lines.push("## Troubleshooting");
   lines.push("");

@@ -10,11 +10,12 @@ import {
   validateIssueSourceRefs,
 } from "../../src/core/issue-source-ref.js";
 import { makeIssue } from "./test-factories.js";
+import { git as fixtureGit } from "../helpers/git-fixture.js";
 
 const tempDirs: string[] = [];
 
 function git(root: string, ...args: string[]): string {
-  return execFileSync("git", args, { cwd: root, encoding: "utf8" }).trim();
+  return fixtureGit(root, args);
 }
 
 async function makeRepo(content: string): Promise<{ root: string; revision: string }> {

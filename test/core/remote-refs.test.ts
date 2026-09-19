@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { ConfigSchema } from "../../src/models/config.js";
 import { allocateDisplayId, listReservations, reserveDisplayId } from "../../src/core/remote-refs.js";
 import { makeTicket, makeState, minimalConfig } from "../core/test-factories.js";
+import { git as fixtureGit } from "../helpers/git-fixture.js";
 
 describe("config schema idAllocator", () => {
   it("accepts idAllocator: git-refs", () => {
@@ -70,12 +71,14 @@ describe("reserveDisplayId", () => {
     const dir = mkdtempSync(join(tmpdir(), "story-remote-refs-"));
     const remote = join(dir, "remote.git");
     const root = join(dir, "work");
-    execFileSync("git", ["init", "--bare", remote]);
-    execFileSync("git", ["init", root]);
-    execFileSync("git", ["config", "user.email", "test@test.com"], { cwd: root });
-    execFileSync("git", ["config", "user.name", "Test"], { cwd: root });
-    execFileSync("git", ["commit", "--allow-empty", "-m", "init"], { cwd: root });
-    execFileSync("git", ["remote", "add", "origin", remote], { cwd: root });
+    // ISS-1220: the first two had NO cwd, so they inherited process.cwd() --
+    // the real checkout. Both now run against an explicit fixture root.
+    fixtureGit(dir, ["init", "--bare", remote]);
+    fixtureGit(dir, ["init", root]);
+    fixtureGit(root, ["config", "user.email", "test@test.com"]);
+    fixtureGit(root, ["config", "user.name", "Test"]);
+    fixtureGit(root, ["commit", "--allow-empty", "-m", "init"]);
+    fixtureGit(root, ["remote", "add", "origin", remote]);
     return { root, remote };
   }
 

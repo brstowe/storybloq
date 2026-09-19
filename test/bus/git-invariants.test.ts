@@ -13,6 +13,7 @@ import {
   pollBus,
   sendBusMessage,
 } from "../../src/bus/index.js";
+import { assertFixtureCwd, fixtureGitEnv } from "../helpers/git-fixture.js";
 
 const exec = promisify(execFile);
 const roots: string[] = [];
@@ -22,7 +23,8 @@ afterEach(async () => {
 });
 
 async function git(root: string, args: string[]): Promise<string> {
-  return (await exec("git", args, { cwd: root })).stdout.trim();
+  const cwd = assertFixtureCwd(root, `git ${args[0] ?? ""}`);
+  return (await exec("git", args, { cwd, env: fixtureGitEnv(cwd) })).stdout.trim();
 }
 
 function digest(value: Buffer): string {

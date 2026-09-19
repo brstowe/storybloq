@@ -24,9 +24,10 @@ import { createSession, writeSessionSync } from "../../../src/autonomous/session
 import { killSidecarsInRoot } from "../_sidecar-cleanup.js";
 import { PickTicketStage } from "../../../src/autonomous/stages/pick-ticket.js";
 import type { FullSessionState } from "../../../src/autonomous/session-types.js";
+import { git as fixtureGit } from "../../helpers/git-fixture.js";
 
 function git(root: string, args: string[]): string {
-  return execFileSync("git", args, { cwd: root }).toString().trim();
+  return fixtureGit(root, args);
 }
 const head = (root: string): string => git(root, ["rev-parse", "HEAD"]);
 const branchOf = (root: string): string => git(root, ["rev-parse", "--abbrev-ref", "HEAD"]);

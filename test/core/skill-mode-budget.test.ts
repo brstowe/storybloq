@@ -88,7 +88,13 @@ const CEILINGS: Readonly<Record<string, number>> = {
   // same one-step headroom as before.
   "reference.md": 39000,
   "federation-setup.md": 14000,
-  "orchestrator-mode.md": 47000,
+  // Was 47000 (measured 46,936 before this issue). ISS-1240 adds the roster
+  // pointer to the pen priming order: live seats come from
+  // storybloq_roster_get / `roster list`, not a committed contacts.json.
+  // 47,358 measured after that; 48,000 keeps the same one-step headroom,
+  // per this table's own rule that a ceiling is the measured size rounded
+  // up to the next 1,000 and pins regrowth rather than setting a target.
+  "orchestrator-mode.md": 48000,
   // Was 9000 (T-496 post-split measurement). The file was already at
   // 11,102 measured bytes at HEAD before this ticket touched it (confirmed
   // via `git show HEAD:.../duet-mode.md | wc -c`); ISS-1190's branch-seats

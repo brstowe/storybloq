@@ -12,9 +12,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { gitParentOf, gitTreeOf, gitWriteTree, gitObjectFormat } from "../../src/autonomous/git-inspector.js";
+import { git as fixtureGit } from "../helpers/git-fixture.js";
 
 function git(root: string, args: string[]): string {
-  return execFileSync("git", args, { cwd: root }).toString().trim();
+  return fixtureGit(root, args);
 }
 
 describe("gitParentOf / gitTreeOf / gitWriteTree (T-474 D2)", () => {

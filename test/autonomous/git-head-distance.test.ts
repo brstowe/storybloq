@@ -7,11 +7,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execSync } from "node:child_process";
 import { gitHeadHash, gitCommitDistance } from "../../src/autonomous/git-inspector.js";
+import { gitShell } from "../helpers/git-fixture.js";
 
 let repo: string;
 
 function git(cmd: string): string {
-  return execSync(`git ${cmd}`, { cwd: repo, encoding: "utf-8" }).trim();
+  return gitShell(repo, cmd);
 }
 
 beforeEach(() => {

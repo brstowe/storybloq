@@ -268,8 +268,8 @@ export const COMMANDS: readonly CommandEntry[] = [
     // Fork: storyknow knowledge packs.
     name: "lesson promote",
     description: "Promote a lesson into an attached storyknow knowledge pack (fork). The pack gains a K-entry (reinforcement count carried, origin stamped); the local lesson is superseded with a pointer.",
-    usage: "storybloq lesson promote <id> --to <pack-name-or-path> [--force] [--format json|md]",
-    flags: ["--to", "--force"],
+    usage: "storybloq lesson promote <id> --to <pack-name-or-path> [--force] [--format <json|md>]",
+    flags: ["--to", "--force", "--format"],
   },
   {
     name: "lesson delete",
@@ -277,21 +277,53 @@ export const COMMANDS: readonly CommandEntry[] = [
     usage: "storybloq lesson delete <id> [--hard] [--format <json|md>]",
     flags: ["--hard", "--format"],
   },
+  // Fork: storyknow knowledge packs. K-NNN entries live inside a knowledge pack
+  // (a project created with `storybloq init --type knowledge`); consumers attach
+  // packs via the `knowledge: ["<name-or-path>"]` config key (bare names resolve
+  // under $STORYKNOW_HOME, default ~/dev/storyknow) and see attached entries in
+  // `lesson digest` marked [<pack>]. One entry per subcommand so the generator's
+  // positional/flag parse holds; the pack-vs-consumer split lives on `digest`.
   {
-    // Fork: storyknow knowledge packs. One entry documents the whole subcommand
-    // group -- the pack/consumer split is the thing a reader needs, not seven
-    // near-identical headings.
-    name: "knowledge (storyknow packs, fork)",
-    description: 'Manage shared K-NNN knowledge entries inside a knowledge pack (a project created with `storybloq init --type knowledge`). Consumer projects attach packs via the `knowledge: ["<name-or-path>"]` config key (bare names resolve under `$STORYKNOW_HOME`, default `~/dev/storyknow`); attached entries appear in `lesson digest` marked `[<pack>]`. `knowledge digest` is dual-mode: inside a pack it digests the pack\'s own entries; inside a consumer project it digests all attached knowledge.',
-    usage: [
-      "storybloq knowledge list [--status <s>] [--tag <t>] [--source <src>] [--format json|md]",
-      "storybloq knowledge get <id> [--format json|md]",
-      "storybloq knowledge digest [--format json|md]",
-      "storybloq knowledge create --title <t> --content <c> --context <ctx> --source <src> [--tags <tags>] [--supersedes <id>]",
-      "storybloq knowledge update <id> [--title <t>] [--content <c>] [--context <ctx>] [--tags <tags>] [--status <s>]",
-      "storybloq knowledge reinforce <id>",
-      "storybloq knowledge delete <id>",
-    ].join("\n"),
+    name: "knowledge list",
+    description: "List knowledge entries in this pack (fork)",
+    usage: "storybloq knowledge list [--status <value>] [--tag <value>] [--source <value>] [--format <json|md>]",
+    flags: ["--status", "--tag", "--source", "--format"],
+  },
+  {
+    name: "knowledge get",
+    description: "Get a knowledge entry by ID (fork)",
+    usage: "storybloq knowledge get <id> [--format <json|md>]",
+    flags: ["--format"],
+  },
+  {
+    name: "knowledge digest",
+    description: "Ranked digest of knowledge (fork): inside a pack, the pack's own entries; inside a consumer project, all attached knowledge",
+    usage: "storybloq knowledge digest [--format <json|md>]",
+    flags: ["--format"],
+  },
+  {
+    name: "knowledge create",
+    description: "Create a knowledge entry in this pack (fork)",
+    usage: "storybloq knowledge create --title <value> --context <value> --source <value> [--content <value>] [--tags <value>] [--supersedes <id>] [--stdin] [--format <json|md>]",
+    flags: ["--title", "--context", "--source", "--content", "--tags", "--supersedes", "--stdin", "--format"],
+  },
+  {
+    name: "knowledge update",
+    description: "Update a knowledge entry (fork)",
+    usage: "storybloq knowledge update <id> [--title <value>] [--content <value>] [--context <value>] [--tags <value>] [--clear-tags] [--status <value>] [--stdin] [--format <json|md>]",
+    flags: ["--title", "--content", "--context", "--tags", "--clear-tags", "--status", "--stdin", "--format"],
+  },
+  {
+    name: "knowledge reinforce",
+    description: "Reinforce a knowledge entry: increment count and update lastValidated (fork)",
+    usage: "storybloq knowledge reinforce <id> [--format <json|md>]",
+    flags: ["--format"],
+  },
+  {
+    name: "knowledge delete",
+    description: "Delete a knowledge entry (fork)",
+    usage: "storybloq knowledge delete <id> [--format <json|md>]",
+    flags: ["--format"],
   },
   {
     name: "ruling list",
@@ -418,6 +450,12 @@ export const COMMANDS: readonly CommandEntry[] = [
     description: "Compatibility alias for `storybloq setup --client claude`",
     usage: "storybloq setup-skill [--skip-hooks]",
     flags: ["--skip-hooks"],
+  },
+  {
+    name: "update",
+    description: "Install the newest storybloq into the running Node's prefix, re-run setup for your AI clients, and say when to restart (on Windows it prints the two manual steps instead)",
+    usage: "storybloq update [--client <claude|codex|all>]",
+    flags: ["--client"],
   },
   {
     name: "reconcile",
@@ -580,6 +618,12 @@ export const COMMANDS: readonly CommandEntry[] = [
     description: "Add a federation node to an orchestrator project",
     usage: "storybloq node add <name> --path <value> [--stack <value>] [--role <value>] [--kind <value>] [--summary <value>] [--depends-on <value>] [--link <value>] [--format <json|md>]",
     flags: ["--path", "--stack", "--role", "--kind", "--summary", "--depends-on", "--link", "--format"],
+  },
+  {
+    name: "node link",
+    description: "Record which orchestrator this project belongs to (run from the node)",
+    usage: "storybloq node link [orchestrator] [--format <json|md>]",
+    flags: ["--format"],
   },
   {
     name: "node update",

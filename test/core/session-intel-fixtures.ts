@@ -4,10 +4,11 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { git as fixtureGit } from "../helpers/git-fixture.js";
 
 /** ISS-1185: a real two-root git fixture -- a main checkout plus a second worktree. */
 export function git(cwd: string, args: string[]): string {
-  return execFileSync("git", ["-C", cwd, ...args], { encoding: "utf-8" }).trim();
+  return fixtureGit(cwd, args);
 }
 
 export interface WorktreePair {

@@ -15,6 +15,7 @@ import {
   writeProjectSettingsNoFollow,
 } from "../../src/core/project-settings.js";
 import { BusError } from "../../src/bus/errors.js";
+import { assertFixtureCwd, fixtureGitEnv } from "../helpers/git-fixture.js";
 
 const execFileAsync = promisify(execFile);
 const roots: string[] = [];
@@ -30,7 +31,8 @@ async function tempRoot(): Promise<string> {
 }
 
 async function git(root: string, args: string[]): Promise<string> {
-  const { stdout } = await execFileAsync("git", args, { cwd: root });
+  const cwd = assertFixtureCwd(root, `git ${args[0] ?? ""}`);
+  const { stdout } = await execFileAsync("git", args, { cwd, env: fixtureGitEnv(cwd) });
   return stdout;
 }
 

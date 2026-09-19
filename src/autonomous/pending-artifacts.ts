@@ -284,6 +284,32 @@ function entitySnapshot(value: unknown): Record<string, unknown> | null {
 }
 
 /**
+ * ISS-1113: the one canonicalization of an `issue_create` payload's `metadata`.
+ *
+ * Returns `null` for a value that cannot be canonicalized at all (a quarantine
+ * on both sides), `{ present: false }` when the key is absent, and the deep
+ * own-data copy otherwise. Absent is reported as a FLAG rather than as
+ * `undefined`, because the two sides key off the difference between an absent
+ * metadata and a present-but-empty one and a bare `undefined` return would
+ * make a refusal and an absence the same answer.
+ *
+ * Both the digest and the reader call this, so a payload one of them accepts
+ * is never one the other refuses.
+ */
+function canonicalMetadata(
+  value: unknown,
+): { readonly present: false } | { readonly present: true; readonly value: Record<string, unknown> } | null {
+  if (value === undefined) return { present: false };
+  const snapshot = safeCanonicalSnapshot(value);
+  if (snapshot === null) return null;
+  const snapped = snapshot.value;
+  // A bag, specifically. An array or a scalar survives canonicalization
+  // perfectly well and is still not a metadata object.
+  if (typeof snapped !== "object" || snapped === null || Array.isArray(snapped)) return null;
+  return { present: true, value: snapped as Record<string, unknown> };
+}
+
+/**
  * The SEMANTIC digest of an issue create: only the fields a create controls.
  *
  * Deliberately not a digest of the whole entity. A create cannot be aimed, so
@@ -322,9 +348,38 @@ export function issueCreateFingerprint(value: unknown): IssueCreateSemanticFinge
   // two must not digest the same.
   if (v.phase !== undefined && v.phase !== null && typeof v.phase !== "string") return null;
   const phase = typeof v.phase === "string" ? v.phase : null;
+  // ISS-1113: the two new payload fields are digested ONLY WHEN PRESENT, which
+  // is deliberately NOT how `phase` above is handled.
+  //
+  // `phase` is digested unconditionally as null when absent. Doing the same
+  // here would change the digest of every `issue_create` record already on
+  // disk, and `resolveIssueCreatePayload` recomputes this digest and
+  // quarantines a record whose stored fingerprint does not match -- so every
+  // record written by an older build would come back as `malformed-record` on
+  // the next resume. A key that is simply not there leaves those payloads
+  // digesting byte-identically while still covering the field on new ones, so
+  // a disposition edited on disk after the record was written stops matching.
+  //
+  // There is exactly one representation of absent (the key is missing), so
+  // "absent" and "present but empty" remain distinguishable, the property the
+  // phase handling above spells out its own reason for.
+  if (v.disposition !== undefined && typeof v.disposition !== "string") return null;
+  // `safeCanonicalSnapshot`, NOT `ownFields`. `metadata` is a free-form bag of
+  // arbitrary depth read off disk, and `ownFields` guards the top level only:
+  // it copies nested values BY REFERENCE, so a getter, a cycle or a BigInt one
+  // level down would survive it and then be walked by `stableStringify` --
+  // invoked, recursed into forever, or thrown on. A throw here is the outcome
+  // this module exists to prevent, because it takes the recovering session
+  // with it instead of quarantining one record. Every other field digested
+  // above is a scalar or a string array, which is why nothing needed this
+  // before.
+  const metadata = canonicalMetadata(v.metadata);
+  if (metadata === null) return null;
   return canonicalContentFingerprint({
     title, severity, dedupeKey, components, location, impact: v.impact, phase,
     relatedTickets: [...new Set(relatedTickets)].sort(),
+    ...(v.disposition !== undefined ? { disposition: v.disposition } : {}),
+    ...(metadata.present ? { metadata: metadata.value } : {}),
   }) as IssueCreateSemanticFingerprint;
 }
 
@@ -695,9 +750,21 @@ export function readIssueCreatePayload(value: unknown): UnverifiedIssueCreatePay
   const dedupeKey = nonEmptyString(v.dedupeKey);
   if (dedupeKey === null) return null;
   if (v.phase !== undefined && v.phase !== null && typeof v.phase !== "string") return null;
+  // ISS-1113: same conditional shape as the digest above, and refused rather
+  // than coerced -- a non-string disposition is corrupt data, and reading it
+  // as absent would make it digest like a record that never had one.
+  if (v.disposition !== undefined && typeof v.disposition !== "string") return null;
+  // Through the same canonicalization as the digest, for the reason the two
+  // are the same function everywhere else in this file: a payload the reader
+  // accepts and the digest refuses could never be matched against its own
+  // fingerprint.
+  const metadata = canonicalMetadata(v.metadata);
+  if (metadata === null) return null;
   return {
     title, severity, impact, components, relatedTickets, location, dedupeKey,
     ...(v.phase !== undefined ? { phase: v.phase as string | null } : {}),
+    ...(v.disposition !== undefined ? { disposition: v.disposition as string } : {}),
+    ...(metadata.present ? { metadata: metadata.value } : {}),
   };
 }
 

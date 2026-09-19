@@ -2,6 +2,7 @@ import type { WorkflowStage, StageResult, StageAdvance, StageContext } from "./t
 import type { GuideReportInput } from "../session-types.js";
 import type { Issue } from "../../models/issue.js";
 import { isDeleted } from "../../core/project-state.js";
+import { isNonActionableDisposition } from "../../core/issue-disposition.js";
 import { tryAcquireEarmark, clearSameSessionEarmark } from "../../core/earmarks.js";
 import { loadCitationContext } from "../../core/ruling-loader.js";
 import { resolveEntityCitations } from "../../core/ruling.js";
@@ -99,7 +100,20 @@ export class IssueSweepStage implements WorkflowStage {
       // Can't load issues -- skip sweep, proceed to HANDOVER
       return { action: "goto", target: "HANDOVER" };
     }
-    const allIssues = projectState.issues.filter(i => i.status === "open");
+    // ISS-1113: an open issue whose disposition says nobody is going to act on
+    // it is not sweepable work. This stage sets the issue it picks to
+    // `inprogress` and then refuses to advance until that issue reaches
+    // `resolved`, so handing it one of these does not merely rank badly -- the
+    // stage cannot finish. Filtered at the source, before the queue is built,
+    // so a non-actionable issue is never acquired and never earmarked.
+    //
+    // The predicate is the shared one, so this covers ISS-1154's three values
+    // as well as the three ISS-1113 adds. That widening is deliberate: the
+    // sweep had no disposition awareness at all, so `owner_gated` and
+    // `escalate_only` issues were being handed out as work too.
+    const allIssues = projectState.issues.filter(
+      i => i.status === "open" && !isNonActionableDisposition(i.disposition),
+    );
 
     if (allIssues.length === 0) {
       // No open issues -- goto HANDOVER directly (not advance, which would

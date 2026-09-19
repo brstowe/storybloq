@@ -414,7 +414,7 @@ describe("persistSample end to end", () => {
   it("a handover stamped between compute and persist is honoured: suppression is recomputed on the SAME validated scan and the persisted observation is the one that passed", () => {
     withRoot((root) => {
       seed(root, { era: "1:2" });
-      const tokens = Math.ceil(0.85 * 417_737) - 25_000;
+      const tokens = Math.ceil(0.9 * 417_737) - 25_000;
       const path = writeTranscript(join(root, "projects"), "p", SID, [assistantRecord({ ts: at(0), read: tokens - 2 })]);
       const scan = scanTail({ path, sessionId: SID, era: "1:2", revisionSeen: 0, epochSince: null })!;
       const computed = computeSample({ scan, ceiling: ceiling(), cfg, sampledBy: "query", sampledAt: at(0), record: null, usage: USAGE });

@@ -33,9 +33,66 @@
  */
 
 import { lstat, mkdir, readlink, realpath, rename, unlink, writeFile } from "node:fs/promises";
-import { dirname, isAbsolute, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 const MAX_SYMLINK_DEPTH = 40;
+
+/**
+ * The real path of `path`, or, where it does not exist yet, the real path of
+ * its first existing ancestor with the missing tail joined back on. A
+ * dangling-link target (the fresh-stow case above) has no realpath of its own
+ * but still has a definite place on disk.
+ */
+async function realpathLenient(path: string): Promise<string> {
+  const missing: string[] = [];
+  let cur = resolve(path);
+  for (;;) {
+    try {
+      const real = await realpath(cur);
+      return missing.length === 0 ? real : join(real, ...missing.reverse());
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+      const parent = dirname(cur);
+      if (parent === cur) throw e;
+      missing.push(basename(cur));
+      cur = parent;
+    }
+  }
+}
+
+/** `b` is `a` or somewhere under it. A path test, not a string prefix: /x/storybloq does not contain /x/storybloq-x. */
+function containsPath(a: string, b: string): boolean {
+  const rel = relative(a, b);
+  return rel === "" || (!isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${sep}`));
+}
+
+/**
+ * ISS-1234: refuses a directory copy whose destination resolves to the very
+ * tree it is copying from. Following a symlinked destination is deliberate
+ * (issue #12 above), and the copy REPLACES the target whole, so a link that
+ * points back into the package's own source turns a refresh into a sync
+ * that deletes every file the stage does not carry. That happened once, to
+ * the repository plugin directory.
+ *
+ * Overlap in either direction counts: the target inside the source, or the
+ * source inside the target. A link to anywhere else is still followed.
+ * `destDir` is the path as the caller named it (the link); `destTarget` is
+ * where it resolves, which is what is compared.
+ */
+export async function assertNoSelfOverlap(sourceDir: string, destDir: string, destTarget: string = destDir): Promise<void> {
+  const source = await realpathLenient(sourceDir);
+  const target = await realpathLenient(destTarget);
+  // The swap stages at `<target>.tmp`, backs up at `<target>.bak`, and REMOVES
+  // both before it copies: a source sitting at either is deleted before a
+  // single file is read from it, so they count as the target here.
+  const swapPaths = [target, `${target}.tmp`, `${target}.bak`];
+  if (!swapPaths.some((path) => containsPath(source, path) || containsPath(path, source))) return;
+  const via = destTarget === destDir ? "" : ` -> ${destTarget}`;
+  throw new Error(
+    `refusing to install into ${destDir}${via}: it is the package's own source directory (${sourceDir}); ` +
+    "remove the link or point it elsewhere",
+  );
+}
 
 /**
  * Resolves the real path to WRITE THROUGH to, preserving the symlink at

@@ -713,6 +713,18 @@ export interface PendingIssueCreatePayload {
    */
   readonly dedupeKey: string;
   readonly phase?: string | null;
+  /**
+   * ISS-1113: the filing classification and its provenance, carried so that a
+   * replayed create writes the issue the record was fingerprinted against.
+   *
+   * OPTIONAL and absent-by-default, unlike `phase`, which is written as an
+   * explicit null. The digest treats a missing key as missing rather than as
+   * null for exactly this reason: a record prepared before these fields
+   * existed must keep digesting to the value it was stored with, or every one
+   * of them quarantines on the next resume. See `issueCreateFingerprint`.
+   */
+  readonly disposition?: string;
+  readonly metadata?: Record<string, unknown>;
 }
 
 /**
@@ -1368,6 +1380,25 @@ export const SessionStateSchema = z.object({
     category: z.string(),
     description: z.string(),
     reviewKind: z.enum(["plan", "code"]),
+    // ISS-1113: what the producer said about this finding, and where it came
+    // from. All three are optional and all three are written by the CALLER;
+    // `drainDeferrals` invents none of them.
+    //
+    // `disposition` is THREE-VALUED on purpose, and the distinction is the
+    // whole reason this field is nullable rather than just optional:
+    //   - a string: a non-actionable classification (accepted_out_of_scope,
+    //     forced_landing)
+    //   - null: explicitly ACTIONABLE -- the round ceiling saying "this is a
+    //     blocker I am parking on", which must not be overwritten by a
+    //     deferral that happens to share a fingerprint
+    //   - absent: nothing was said. This is every entry persisted before this
+    //     change, and it must drain exactly as it drains today. It is never
+    //     coerced into a non-actionable value, and it never overwrites a
+    //     producer that did have an opinion.
+    // The rank that settles a collision lives in stages/types.ts.
+    disposition: z.string().nullable().optional(),
+    origin: z.string().optional(),
+    reviewId: z.string().optional(),
   })).default([]),
   deferralsUnfiled: z.boolean().default(false),
 

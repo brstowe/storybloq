@@ -32,6 +32,7 @@ import { wakeClaimPath } from "../../src/autonomous/wake-claim.js";
 import { handleAutonomousGuide } from "../../src/autonomous/guide.js";
 import type { FullSessionState } from "../../src/autonomous/session-types.js";
 import { E2ECliFixture } from "../helpers/e2e-cli.js";
+import { git as fixtureGit } from "../helpers/git-fixture.js";
 
 const pkgRoot = resolve(fileURLToPath(import.meta.url), "../../..");
 const cliPath = join(pkgRoot, "dist", "cli.js");
@@ -139,8 +140,7 @@ function setupProject(config: Record<string, unknown> = {}): void {
   // A REAL git repo (not a hand-written .git) so the in-process guide resume
   // validates HEAD against expectedHead cleanly instead of erroring on git.
   const git = (...a: string[]): void => {
-    const r = spawnSync("git", a, { cwd: root, encoding: "utf-8" });
-    if (r.status !== 0) throw new Error(`git ${a.join(" ")} failed: ${r.stderr}`);
+    fixtureGit(root, a);
   };
   git("init", "-q");
   git("config", "user.email", "e2e@test.local");

@@ -114,6 +114,21 @@ describe("npm-registry fetch gating (ISS-777)", () => {
     expect(fetchSpy).toHaveBeenCalledTimes(1);
   });
 
+  it("treats a cache older than six hours as stale, and one younger as fresh (ISS-1237)", async () => {
+    // A machine that checked before a release believed itself current for a
+    // whole day (the Air, 2026-09-17). Six hours bounds that to a work gap.
+    const HOUR_MS = 60 * 60 * 1000;
+    writeCacheFile(Date.now() - 5 * HOUR_MS);
+    refreshUpdateCacheInBackground();
+    await flush();
+    expect(fetchSpy).not.toHaveBeenCalled();
+
+    writeCacheFile(Date.now() - 7 * HOUR_MS);
+    refreshUpdateCacheInBackground();
+    await flush();
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
   it("does NOT fetch when NO_UPDATE_NOTIFIER is set", async () => {
     process.env.NO_UPDATE_NOTIFIER = "1";
     refreshUpdateCacheInBackground();

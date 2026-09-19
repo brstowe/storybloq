@@ -19,6 +19,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { assertFixtureCwd, GIT_ESCAPE_VARS } from "./git-fixture.js";
 
 const pkgRoot = resolve(fileURLToPath(import.meta.url), "../../..");
 export const CLI_PATH = join(pkgRoot, "dist", "cli.js");
@@ -77,7 +78,7 @@ export class E2ECliFixture {
         );
       }
     }
-    return {
+    const env: NodeJS.ProcessEnv = {
       ...process.env,
       ...overrides,
       HOME: this.home,
@@ -87,6 +88,12 @@ export class E2ECliFixture {
       XDG_CONFIG_HOME: this.xdgConfigHome,
       STORYBLOQ_DISABLE_WAKER_SPAWN: "1",
     };
+    // ISS-1220: a CLI subprocess runs git of its own. An inherited GIT_DIR (or
+    // friend) would point that git at whatever repository the *parent* vitest
+    // process belongs to -- the real checkout. Scrubbed here so every call
+    // site using `fixture.env()` directly is covered, not just `runE2ECli`.
+    for (const key of GIT_ESCAPE_VARS) delete env[key];
+    return env;
   }
 
   /** Registers a captured child result with the F6 notice-pattern registry. */
@@ -142,8 +149,20 @@ export interface RunE2ECliOptions {
  * can't serve every call site.
  */
 export function runE2ECli(fixture: E2ECliFixture, args: string[], opts: RunE2ECliOptions = {}): RunE2ECliResult {
+  // ISS-1220: scrubbing the environment is NOT sufficient on its own -- git
+  // still discovers a repository by walking UP from cwd. Proven against this
+  // checkout: with no GIT_* set, `git -C storybloq/test rev-parse
+  // --git-common-dir` resolves to the production `.git`. So a CLI subprocess
+  // whose cwd sits inside the repo can reach the real repository even fully
+  // scrubbed, which is why the cwd is asserted here too.
+  //
+  // An OMITTED cwd is the dangerous case, not the safe one: spawnSync would
+  // inherit process.cwd(), which under vitest is the real checkout. Guarding
+  // only when a cwd was supplied would leave precisely that hole open, so the
+  // default is the fixture's own temp root and the assertion is unconditional.
+  const cwd = assertFixtureCwd(opts.cwd ?? fixture.root, "runE2ECli");
   const result = spawnSync("node", [CLI_PATH, ...args], {
-    cwd: opts.cwd,
+    cwd,
     encoding: "utf-8",
     input: opts.input,
     // Every migrated call site's original helper explicitly ignored stdin

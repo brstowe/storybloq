@@ -112,7 +112,7 @@ Do NOT search source code for this. The full config.json schema is shown below. 
   "sessionIntel": {
     "enabled": "boolean (default true). false disables sampling, banners, the prompt-hook line, the guide directive and the status projection for this project; `session intel` still answers read-only",
     "advisoryPct": "number 0.5-0.95 (default 0.70) of the expected auto-compact ceiling",
-    "imperativePct": "number 0.6-0.99 (default 0.85), must exceed advisoryPct; applied after the jump allowance",
+    "imperativePct": "number 0.6-0.99 (default 0.90), must exceed advisoryPct; applied after the jump allowance",
     "compactNeededPct": "number 0.85-1.0 (default 0.95), must exceed imperativePct; past it the state is compact-needed and every surface says to run /compact instead of writing a handover, and no handover suppresses it",
     "ceilingFraction": "number 0.8-1.0 (default 0.925; measured fire point over autoCompactWindow)",
     "boundarySampleCount": "integer 1-50 (default 20) recent auto-compaction boundaries used for the measured ceiling",
@@ -247,7 +247,7 @@ The six checks, with the advice each one pins:
 | Check | When it advises | What it tells you to do |
 |-------|-----------------|-------------------------|
 | `usage-window` | Claude Code's `autoCompactWindow` is above `sessionIntel.recommendedWindowMax`, or a 1M-context model is running with no window observed | The same advisory `storybloq status` carries; see the auto-compact section above |
-| `cli-version` | A newer `@storybloq/storybloq` is published | "Update with `npm install -g @storybloq/storybloq@latest`, then run `storybloq setup`." |
+| `cli-version` | A newer `@storybloq/storybloq` is published | "Update with `storybloq update` (installs it and re-runs setup)." |
 | `codex-bridge` | Codex is installed and the registered codex-claude-bridge does not answer an MCP `initialize`, or none is registered while the bundled copy is installed or unusable | Not registered, bundle installed: "Run `storybloq setup-skill`". Bundle unusable: reinstall with `npm install -g @storybloq/storybloq@latest`. Bundle absent (the optional dependency did not install): the check skips. Not answering: the advice names the failing registration by scope and name with the fix: the rebuild command for a native-module failure, the registered command that was not found, or the remove-and-setup steps |
 | `skill-version` | An installed `/story` skill is older than the running CLI | "Run `storybloq setup --client <claude\|codex\|all>` to refresh it." |
 | `cross-session-inbound` | Claude Code's `crossSessionInbound` is unset, or resolves to `hold` or `refuse` | Set it to `accept` in `~/.claude/settings.json`; remove it from, or set it to `accept` in, any repository file that tightens it; if managed settings set it, ask your admin |
@@ -279,3 +279,5 @@ Turn checks off in `.story/config.json`. Omitted keys default to on; a non-boole
 Setting `enabled` to `false` skips every check with reason `disabled in .story/config.json`. There is also a global off switch in `~/.claude/storybloq/config.json` (`healthCheck.enabled = false`) for machines where the command should stay quiet everywhere.
 
 When the skill runs `/story health`: relay each `advise` message and its fix verbatim, list the `skip` reasons in one line, and then stop. Do not offer to make the changes; they are the user's files.
+
+`/story` priming runs this once per session, relaying only `advise` lines; the registry lookup is cached six hours (ISS-1237).

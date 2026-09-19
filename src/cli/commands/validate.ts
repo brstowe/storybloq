@@ -4,9 +4,10 @@ import {
   mergeValidation,
   type ValidationFinding,
   type ValidationResult,
+  citingEntitiesOf,
 } from "../../core/validation.js";
 import { validateIssueSourceRefs } from "../../core/issue-source-ref.js";
-import { loadRulingsSafe } from "../../core/ruling-loader.js";
+import { loadRulingsSafe, loadUpwardBoardFor } from "../../core/ruling-loader.js";
 import { INTEGRITY_WARNING_TYPES } from "../../core/errors.js";
 import { loadArrangementsSafe } from "../../core/arrangement-loader.js";
 import { readDuetCoordination } from "../../core/duet-coordination.js";
@@ -190,6 +191,11 @@ function validateWithRulings(ctx: CommandContext): ValidationResult {
       || path.startsWith("tickets/") || path.startsWith("issues/");
   });
   const baseResult = validateProject(ctx.state, undefined, {
+    // T-520: the orchestrator's board, read once, and only when this project
+    // is a linked node with something actually cited.
+    // The population is taken from `citingEntitiesOf`, the same function the
+    // citation loop iterates, so the read-gate and the loop cannot drift.
+    upwardBoard: loadUpwardBoardFor(ctx.root, citingEntitiesOf(ctx.state)),
     rulings,
     unavailableRulingIds: unavailableIds,
     rulingScanCompleteness: scanCompleteness,

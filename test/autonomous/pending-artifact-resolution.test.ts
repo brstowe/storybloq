@@ -21,12 +21,13 @@ import { resolveIssueCreatePayload, resolvePayloadTicketIdentities } from "../..
 import { issueCreateArgsFromPayload } from "../../src/autonomous/issue-create-preparation.js";
 import { deriveWorkspaceId, type PendingIssueCreatePayload, type PendingProjectMutation } from "../../src/autonomous/session-types.js";
 import type { RecoveryAuthority } from "../../src/autonomous/pending-artifacts.js";
+import { git as fixtureGit } from "../helpers/git-fixture.js";
 
 const P2_TICKET = "t-p2abcdefgh234567";
 const NO_AUTHORITY: RecoveryAuthority = { kind: "none" } as unknown as RecoveryAuthority;
 
 function git(cwd: string, args: string[]): void {
-  execFileSync("git", args, { cwd, stdio: "ignore" });
+  fixtureGit(cwd, args);
 }
 
 function buildRepo(): string {

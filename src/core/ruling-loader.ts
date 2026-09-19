@@ -6,8 +6,9 @@ import { atomicCreate, atomicWrite, guardPath, serializeJSON } from "./project-l
 import { ProjectLoaderError } from "./errors.js";
 import { sanitizeDisplayText } from "./display-text.js";
 import { readBoundedFile } from "./limit-config.js";
-import { buildCitationResolutionContext, type CitationResolutionContext } from "./ruling.js";
+import { buildCitationResolutionContext, type CitationResolutionContext, type UpwardBoard } from "./ruling.js";
 import { readdirSafe, verifyContainment, verifyDirIdentity } from "./readdir-safe.js";
+import { resolveOrchestratorRoot } from "../federation/resolver.js";
 
 /**
  * A ruling is a short attributed quote plus a handful of scalar fields -- a
@@ -195,6 +196,103 @@ export function loadRulingsSafe(root: string): LoadRulingsResult {
 export function loadCitationContext(root: string): CitationResolutionContext {
   const { rulings, unavailableIds, scanCompleteness, hasUnrecoverableEntries } = loadRulingsSafe(root);
   return buildCitationResolutionContext(rulings, unavailableIds, scanCompleteness, hasUnrecoverableEntries);
+}
+
+/**
+ * T-520: the ONE function in this feature that reads another board.
+ *
+ * Returns the ordinary local context, plus the orchestrator's board when --
+ * and only when -- both of these hold:
+ *
+ *   1. something is actually cited. No citations, no conclusions to draw, so
+ *      there is nothing an orchestrator read could change. This is what keeps
+ *      the cost off every project that does not cite rulings.
+ *   2. this project records an `orchestrator` pointer. That field was declared
+ *      but never written before this ticket, so "no pointer" is the state of
+ *      every existing project and it takes the early return: byte-identical to
+ *      the behaviour before the leg existed.
+ *
+ * The gate is deliberately NOT "did a citation miss locally". It cannot be:
+ * both the unreadable-orchestrator taint and the cross-board supersession
+ * check apply to citations that resolved perfectly well on this board, and
+ * both are facts you only learn BY READING the other one. Gating on a miss
+ * would have silently disabled both for exactly the citations that look
+ * healthiest.
+ *
+ * What the gate buys, and nothing more: zero orchestrator IO for a project
+ * with no citations or no pointer, and ONE bounded read per call rather than
+ * one per citation.
+ *
+ * Read-only throughout: `loadRulingsSafe` never writes, never locks, and never
+ * throws, so no lock is taken on a board this project does not own.
+ */
+export function buildCitationInputs(
+  root: string,
+  citedIds: readonly string[],
+): CitationResolutionContext {
+  const local = loadCitationContext(root);
+  if (citedIds.length === 0) return local;
+
+  const upward = loadUpwardBoard(root);
+  return upward ? { ...local, upward } : local;
+}
+
+/**
+ * T-520: the orchestrator's board, or `undefined` when this project is not a
+ * linked node.
+ *
+ * Split out from `buildCitationInputs` because `validateProject` is pure and
+ * takes the board through its `aux` bag rather than building a context, so
+ * both shapes have to come from ONE loader. The gate on "is anything cited"
+ * lives in the callers, which is where the citation list is.
+ */
+export function loadUpwardBoard(root: string): UpwardBoard | undefined {
+  const pointer = resolveOrchestratorRoot(root);
+  if (!pointer.ok) {
+    // Not a linked node: the overwhelmingly common case, and the one that must
+    // not change. A RECORDED pointer we could not follow is a different thing
+    // and is reported, because a federation seat is entitled to know that the
+    // board it was told to consult is not there.
+    if (pointer.code === "no-pointer") return undefined;
+    return {
+      kind: "unreadable",
+      ...(pointer.attempted !== undefined && { attemptedPath: pointer.attempted }),
+      reason: pointer.reason,
+    };
+  }
+
+  const scan = loadRulingsSafe(pointer.root);
+  if (scan.scanCompleteness !== "complete") {
+    // The directory itself could not be enumerated. Partial knowledge of
+    // another board is not knowledge of it: treated exactly like a pointer we
+    // could not follow, never as an empty board (which would turn every
+    // upward citation into a confident `missing`).
+    return { kind: "unreadable", attemptedPath: pointer.root, reason: "ruling ledger could not be read" };
+  }
+  return {
+    kind: "board",
+    root: pointer.root,
+    ctx: buildCitationResolutionContext(
+      scan.rulings, scan.unavailableIds, scan.scanCompleteness, scan.hasUnrecoverableEntries,
+    ),
+  };
+}
+
+/**
+ * T-520: the board for a caller that holds the citing entities rather than a
+ * list of ids -- `validateProject`'s three call sites, all of which have
+ * tickets and issues in hand and none of which should read another board when
+ * nothing on this one cites anything.
+ *
+ * Takes the entities structurally rather than a `ProjectState` so this module
+ * keeps its current import surface.
+ */
+export function loadUpwardBoardFor(
+  root: string,
+  entities: ReadonlyArray<{ readonly citesRulings?: readonly string[] }>,
+): UpwardBoard | undefined {
+  const cites = entities.some((e) => (e.citesRulings?.length ?? 0) > 0);
+  return cites ? loadUpwardBoard(root) : undefined;
 }
 
 /**

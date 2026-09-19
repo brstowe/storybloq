@@ -18,13 +18,14 @@ import { StageContext, type ResolvedRecipe } from "../../../src/autonomous/stage
 import { PickTicketStage } from "../../../src/autonomous/stages/pick-ticket.js";
 import type { FullSessionState } from "../../../src/autonomous/session-types.js";
 import type { Earmark } from "../../../src/models/types.js";
+import { git as fixtureGit } from "../../helpers/git-fixture.js";
 
 const SESSION_ID = "00000000-0000-0000-0000-000000000475";
 const OTHER_SESSION = "00000000-0000-0000-0000-000000009999";
 const ARRANGEMENT_ID = "a-0123456789abcdef";
 
 function git(root: string, args: string[]): string {
-  return execFileSync("git", args, { cwd: root }).toString().trim();
+  return fixtureGit(root, args);
 }
 
 function buildRepo(): string {

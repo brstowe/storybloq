@@ -131,7 +131,16 @@ describe("presence entry import graph (ISS-1022)", () => {
       f.startsWith("src/presence/") ||
       f === "src/core/project-root-shared.ts" ||
       f === "src/autonomous/session-ownership.ts" ||
-      f === "src/autonomous/client-profile.ts";
+      f === "src/autonomous/client-profile.ts" ||
+      // ISS-1240, by the same reasoning as the two autonomous files above and
+      // not drift: this binary is the roster's WRITER, and the seat rules
+      // (the generation CAS, the terminal table, the file naming) have exactly
+      // one home in `core/roster.ts`. Hand-rolling a second copy inside
+      // `src/presence/` to keep this list short is the outcome that comment
+      // already rejects. Its own closure adds no package: it reaches
+      // `client-profile.ts` (already allowed, and deliberately the zod-free
+      // copy) and `presence/io.ts`, which this graph owns anyway.
+      f === "src/core/roster.ts";
 
     expect(closure.files.filter((f) => !allowed(f))).toEqual([]);
     // Positive assertion too, so a refactor that empties the closure by
@@ -153,7 +162,11 @@ describe("presence entry import graph (ISS-1022)", () => {
   it("imports no package at all -- only node builtins", () => {
     const { packages } = importClosure(join(REPO, "src", "hooks", "presence-entry.ts"));
     expect(packages.filter((p) => !p.startsWith("node:"))).toEqual([]);
-    expect(packages).toEqual(["node:fs", "node:path", "node:string_decoder"]);
+    // `node:crypto` arrives with `core/roster.ts` (ISS-1240): `rosterFileBase`
+    // hashes the seat tuple. A BUILTIN, so it costs nothing to load and the
+    // claim this test actually protects -- no package in the bundle -- is
+    // unchanged; the assertion above it still pins that to zero.
+    expect(packages).toEqual(["node:crypto", "node:fs", "node:path", "node:string_decoder"]);
   });
 
   /** Proof the walker sees the forms it claims to, rather than silently matching nothing. */

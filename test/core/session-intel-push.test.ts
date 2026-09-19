@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { initProject } from "../../src/core/init.js";
 import { ensureCapture } from "../../src/core/session-intel/capture.js";
-import { applyBannerToMcpText, applyStatusPushesToMcpText, cliBannerFor, cliStatusPushesFor, describeStampFailure, guideDirectiveFor, renderUsageAdvisory, stampHandoverForCaller, statusPushesFor, tokenPressureBannerFor, usageAdvisoryFor } from "../../src/core/session-intel/push.js";
+import { applyBannerToMcpText, applyStatusPushesToMcpText, basisText, cliBannerFor, cliStatusPushesFor, describeStampFailure, guideDirectiveFor, renderUsageAdvisory, stampHandoverForCaller, statusPushesFor, tokenPressureBannerFor, usageAdvisoryFor } from "../../src/core/session-intel/push.js";
 import type { UsageAdvisory } from "../../src/core/session-intel/types.js";
 import { markCompactPending, readPresenceRecord, stampHandover, type HandoverStampObservation } from "../../src/core/session-intel/presence-bridge.js";
 import { resolveSessionIntelConfig } from "../../src/core/session-intel/config.js";
@@ -102,7 +102,7 @@ const T0 = Date.parse("2026-09-09T12:00:00Z");
 const at = (m: number) => new Date(T0 + m * 60_000).toISOString();
 const CEILING = 0.925 * 450_000;
 const ADVISORY_TOKENS = Math.ceil(0.7 * CEILING) + 1_000;
-const IMPERATIVE_TOKENS = Math.ceil(0.85 * CEILING) - 25_000 + 1_000;
+const IMPERATIVE_TOKENS = Math.ceil(0.9 * CEILING) - 25_000 + 1_000;
 /** ISS-1197 commit 2: past the default compactNeededPct of 0.95. */
 const COMPACT_TOKENS = Math.ceil(0.95 * CEILING) + 1_000;
 
@@ -161,6 +161,24 @@ function primed(f: Fx, tokens: number, now = T0 + 5 * 60_000): string {
 }
 
 const seams = (f: Fx) => ({ cwd: f.root, projectsDir: f.projects, userSettingsPath: f.userSettings });
+
+describe("basisText (ISS-1249)", () => {
+  // Only the sampler-reason shape is reachable from renderPromptDirective today
+  // (a suppressed sample is advisory and a null reason is state ok, both silent);
+  // the other two shapes are pinned here so they cannot rot unnoticed.
+  it("wraps a sampler reason with the rule it applied", () => {
+    expect(basisText("350625 + jump allowance 25000 >= 0.9 x 416250")).toBe(
+      " Basis: 350625 + jump allowance 25000 >= 0.9 x 416250 (threshold minus the next-turn jump allowance).",
+    );
+  });
+  it("states the rule in words when the sample carries no reason", () => {
+    expect(basisText(null)).toBe(" Basis: the imperative threshold minus the next-turn jump allowance.");
+    expect(basisText(undefined)).toBe(basisText(null));
+  });
+  it("states a suppression reason without the threshold parenthetical", () => {
+    expect(basisText("suppressed by handover stamp 2 prompts ago")).toBe(" Basis: suppressed by handover stamp 2 prompts ago.");
+  });
+});
 
 describe("tokenPressureBannerFor", () => {
   it("advisory and imperative produce a banner from a fresh stored sample; ok produces none; the sample must be the caller's own bound record", async () => {

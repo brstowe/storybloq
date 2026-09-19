@@ -4,6 +4,7 @@ import { mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
+import { git as fixtureGit } from "../../helpers/git-fixture.js";
 
 describe("codex-review helpers", () => {
   let tempDir: string;
@@ -21,11 +22,7 @@ describe("codex-review helpers", () => {
   });
 
   function git(args: string[]): string {
-    return execFileSync("git", args, {
-      cwd: tempDir,
-      encoding: "utf-8",
-      stdio: "pipe",
-    });
+    return fixtureGit(tempDir, args);
   }
 
   it("builds a code-review diff artifact with tracked and untracked file contents", async () => {

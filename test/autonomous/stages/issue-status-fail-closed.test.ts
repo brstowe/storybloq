@@ -29,9 +29,10 @@ vi.mock("../../../src/cli/commands/issue.js", async (importOriginal) => {
 import { StageContext, type ResolvedRecipe } from "../../../src/autonomous/stages/types.js";
 import { PickTicketStage } from "../../../src/autonomous/stages/pick-ticket.js";
 import type { FullSessionState } from "../../../src/autonomous/session-types.js";
+import { git as fixtureGit } from "../../helpers/git-fixture.js";
 
 function git(root: string, args: string[]): string {
-  return execFileSync("git", args, { cwd: root }).toString().trim();
+  return fixtureGit(root, args);
 }
 
 function buildRepo(): string {

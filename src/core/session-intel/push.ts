@@ -64,6 +64,19 @@ const pctText = (p: number | null) => (p === null ? "n/a" : `${Math.round(p * 10
 export const COMPACT_NEEDED_ADVICE =
   "Context is past the point where another handover helps: write no further handovers. A session cannot compact itself; finish the step in flight and keep working, auto-compaction is expected and the session continues through it. If the user wants it sooner, they can run /compact in this session.";
 
+/**
+ * ISS-1249: the imperative fires at imperativePct MINUS the next-turn jump
+ * allowance, so the printed percentage sits below the configured threshold.
+ * Saying so on the line is what stops it reading as a bug. Used by the
+ * UserPromptSubmit directive, which holds the live sample; the MCP banner is
+ * built from the persisted presence sample, which carries no reason.
+ */
+export function basisText(reason: string | null | undefined): string {
+  if (!reason) return " Basis: the imperative threshold minus the next-turn jump allowance.";
+  if (reason.includes("suppressed")) return ` Basis: ${reason}.`;
+  return ` Basis: ${reason} (threshold minus the next-turn jump allowance).`;
+}
+
 export function renderBannerText(sample: SessionIntelSample, surface: "mcp" | "cli"): string {
   const where = surface === "mcp" ? "storybloq_handover_create" : "storybloq handover create";
   const head = `Context pressure ${sample.state.toUpperCase()}: ${pctText(sample.pct)} of the expected auto-compact point (${sample.contextTokens?.toLocaleString() ?? "n/a"} tokens; source ${sample.ceilingSource}${sample.ceilingConfidence ? `, ${sample.ceilingConfidence} confidence` : ""}).`;

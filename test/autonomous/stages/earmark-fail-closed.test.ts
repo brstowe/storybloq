@@ -29,9 +29,10 @@ import { StageContext, type ResolvedRecipe } from "../../../src/autonomous/stage
 import { PickTicketStage } from "../../../src/autonomous/stages/pick-ticket.js";
 import { IssueSweepStage } from "../../../src/autonomous/stages/issue-sweep.js";
 import type { FullSessionState } from "../../../src/autonomous/session-types.js";
+import { git as fixtureGit } from "../../helpers/git-fixture.js";
 
 function git(root: string, args: string[]): string {
-  return execFileSync("git", args, { cwd: root }).toString().trim();
+  return fixtureGit(root, args);
 }
 
 function buildRepo(): string {

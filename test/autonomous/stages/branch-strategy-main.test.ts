@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { StageContext, type ResolvedRecipe } from "../../../src/autonomous/stages/types.js";
 import type { FullSessionState } from "../../../src/autonomous/session-types.js";
 import { PickTicketStage } from "../../../src/autonomous/stages/pick-ticket.js";
+import { git as fixtureGit } from "../../helpers/git-fixture.js";
 
 /**
  * T-328 / D2: `branchStrategy: "main"`.
@@ -23,7 +24,7 @@ import { PickTicketStage } from "../../../src/autonomous/stages/pick-ticket.js";
  */
 
 function git(root: string, args: string[]): string {
-  return execFileSync("git", args, { cwd: root }).toString().trim();
+  return fixtureGit(root, args);
 }
 
 function currentBranch(root: string): string {

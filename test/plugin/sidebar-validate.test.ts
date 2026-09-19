@@ -22,7 +22,7 @@ import { CALLS, EVENTS, CLIENT_API_VERSION } from "../../plugins/storybloq/hooks
 
 const PLUGIN_DIR = join(__dirname, "..", "..", "plugins", "storybloq");
 
-/** The six events the Mod hooks, from the pinned names in client-api.ts. */
+/** The eight events the Mod hooks, from the pinned names in client-api.ts. */
 const EXPECTED_HOOKS = [
   EVENTS.uiRender,
   EVENTS.sessionStart,
@@ -30,6 +30,8 @@ const EXPECTED_HOOKS = [
   EVENTS.toolCall,
   EVENTS.sessionCompact,
   EVENTS.uiClose,
+  EVENTS.configSet,
+  EVENTS.promptSubmit,
 ];
 
 /**
@@ -89,6 +91,70 @@ function listAfter(output: string, label: string): string[] {
     .filter((entry) => entry.length > 0);
 }
 
+/**
+ * ISS-1241: how the installed client compares to the pin.
+ *
+ * The old check was `version.startsWith(CLIENT_API_VERSION)`, a string PREFIX
+ * test rather than a version comparison, so every client auto-update left this
+ * suite permanently red (2.1.274 pinned, machine on 2.1.277). A suite that is
+ * always one-red trains everyone to read "1 failed" as normal, which is how a
+ * real regression gets waved through.
+ *
+ * Three outcomes, and the asymmetry is the point:
+ *   - OLDER installed than the pin: "fail", unconditionally. The pin claims the
+ *     contract was read from an API this machine does not have, so the lists it
+ *     pins may describe surface that does not exist here.
+ *   - NEWER installed: "skip", because the Mod is not wrong, the pin is merely
+ *     behind. `STORYBLOQ_CLIENT_API_PIN_STRICT=1` turns it back into "fail" so
+ *     the release gate cannot let the pin rot.
+ *   - Unparseable either side: "fail". An unreadable version is not a pass.
+ *
+ * Compared numerically per component, never lexicographically: 2.1.9 precedes
+ * 2.1.10, and 2.2.0 follows 2.1.999. Hand-rolled rather than via `semver`,
+ * which is present only TRANSITIVELY here; importing it would be an undeclared
+ * dependency that disappears on any dependency update, which is a worse trade
+ * than comparing three integers.
+ */
+export type PinVerdict = "ok" | "skip" | "fail";
+
+export interface PinVersion {
+  readonly parts: readonly number[];
+  /** The `-alpha.1` of `2.1.277-alpha.1`, or "" for a plain release. */
+  readonly prerelease: string;
+}
+
+export function parsePinVersion(text: string): PinVersion | null {
+  // The `-` is required before a prerelease, because `claude --version` prints
+  // `2.1.277 (Claude Code)`: without it every real version string would look
+  // like it carried a suffix.
+  const match = /^(\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z.-]+)?/.exec(text.trim());
+  if (match === null) return null;
+  return {
+    parts: [Number(match[1]), Number(match[2]), Number(match[3])],
+    prerelease: match[4] ?? "",
+  };
+}
+
+export function pinVerdict(installedText: string, pinText: string, strict: boolean): PinVerdict {
+  const installed = parsePinVersion(installedText);
+  const pinned = parsePinVersion(pinText);
+  if (installed === null || pinned === null) return "fail";
+  for (let i = 0; i < 3; i += 1) {
+    if (installed.parts[i]! < pinned.parts[i]!) return "fail";
+    if (installed.parts[i]! > pinned.parts[i]!) return strict ? "fail" : "skip";
+  }
+  // Same triple. Under semver a prerelease is strictly OLDER than its release,
+  // so `2.1.277-alpha` against a `2.1.277` pin is the older case and must fail;
+  // treating the two as equal was a fail-OPEN in the one direction this check
+  // exists to catch. Two different prereleases are not ordered here on purpose:
+  // guessing at `alpha` versus `beta` would be a second way to be wrong, so an
+  // unequal pair fails closed.
+  if (installed.prerelease === pinned.prerelease) return "ok";
+  if (installed.prerelease !== "" && pinned.prerelease === "") return "fail";
+  if (installed.prerelease === "" && pinned.prerelease !== "") return strict ? "fail" : "skip";
+  return "fail";
+}
+
 const available = clientAvailable();
 
 describe("sidebar Mod contract, as the client scans it (T-508)", () => {
@@ -107,7 +173,7 @@ describe("sidebar Mod contract, as the client scans it (T-508)", () => {
     expect(output).toContain("Validation passed");
   });
 
-  it("hooks exactly the six events the design names", () => {
+  it("hooks exactly the eight events the design names", () => {
     expect(listAfter(output, "mod.ts hooks")).toEqual(EXPECTED_HOOKS);
   });
 
@@ -124,12 +190,26 @@ describe("sidebar Mod contract, as the client scans it (T-508)", () => {
     }
   });
 
-  it("was read from the client version the pin names", () => {
+  it("was read from the client version the pin names", (ctx) => {
     const version = execFileSync("claude", ["--version"], { encoding: "utf8" }).trim();
+    const strict = process.env.STORYBLOQ_CLIENT_API_PIN_STRICT === "1";
+    const verdict = pinVerdict(version, CLIENT_API_VERSION, strict);
+    if (verdict === "skip") {
+      // The client moved ahead of the pin. Everything this file actually
+      // protects -- the hooks list, the calls list, the forbidden calls --
+      // asserted hard above regardless of version; what is unproven is only
+      // that the pin was read from THIS client, so this one assertion stands
+      // down rather than reporting a failure the Mod did not cause.
+      console.warn(
+        `client-api.ts pins ${CLIENT_API_VERSION} but this machine runs ${version}: re-read the API and update the pin. Set STORYBLOQ_CLIENT_API_PIN_STRICT=1 to make this fail (the release gate does).`,
+      );
+      ctx.skip();
+      return;
+    }
     expect(
-      version.startsWith(CLIENT_API_VERSION),
+      verdict,
       `client-api.ts pins ${CLIENT_API_VERSION} but this machine runs ${version}; re-read the API and update the pin`,
-    ).toBe(true);
+    ).toBe("ok");
   });
 
   it("declares the Mod on by default (T-516)", () => {
@@ -156,5 +236,57 @@ describe("sidebar Mod contract, as the client scans it (T-508)", () => {
 
   it("ships the Mod's own tests beside it", () => {
     expect(existsSync(join(PLUGIN_DIR, "hooks", "sidebar.test.ts"))).toBe(true);
+  });
+});
+
+describe("ISS-1241 client version pin verdict", () => {
+  it("passes on an exact match", () => {
+    expect(pinVerdict("2.1.274 (Claude Code)", "2.1.274", false)).toBe("ok");
+  });
+
+  it("FAILS when the installed client is older than the pin", () => {
+    // The pin would be describing an API this machine does not have.
+    expect(pinVerdict("2.1.273 (Claude Code)", "2.1.274", false)).toBe("fail");
+    // Strict changes nothing here: the older case is unconditional.
+    expect(pinVerdict("2.1.273 (Claude Code)", "2.1.274", true)).toBe("fail");
+  });
+
+  it("skips when the installed client is newer, and fails under strict", () => {
+    expect(pinVerdict("2.1.277 (Claude Code)", "2.1.274", false)).toBe("skip");
+    expect(pinVerdict("2.1.277 (Claude Code)", "2.1.274", true)).toBe("fail");
+  });
+
+  it("orders numerically, not lexicographically", () => {
+    // The bug the old `startsWith` check could never catch.
+    expect(pinVerdict("2.1.10", "2.1.9", false)).toBe("skip");
+    expect(pinVerdict("2.1.9", "2.1.10", false)).toBe("fail");
+    expect(pinVerdict("2.2.0", "2.1.999", false)).toBe("skip");
+    expect(pinVerdict("2.1.999", "2.2.0", false)).toBe("fail");
+    expect(pinVerdict("10.0.0", "9.9.9", false)).toBe("skip");
+  });
+
+  it("fails closed on anything it cannot parse", () => {
+    expect(pinVerdict("not a version", "2.1.274", false)).toBe("fail");
+    expect(pinVerdict("2.1.274", "unreleased", false)).toBe("fail");
+    expect(pinVerdict("", "2.1.274", false)).toBe("fail");
+  });
+
+  it("parses the shape `claude --version` actually prints", () => {
+    expect(parsePinVersion("2.1.277 (Claude Code)")).toEqual({ parts: [2, 1, 277], prerelease: "" });
+    // ` (Claude Code)` must NOT read as a prerelease, or every real version
+    // string on this machine would look suffixed.
+    expect(parsePinVersion("2.1.277-alpha.1 (Claude Code)")).toEqual({ parts: [2, 1, 277], prerelease: "-alpha.1" });
+  });
+
+  it("treats a prerelease as OLDER than its release", () => {
+    // Semver: 2.1.277-alpha precedes 2.1.277. Reading them as equal would pass
+    // an older client against a release pin, which is the fail-open this whole
+    // assertion exists to prevent.
+    expect(pinVerdict("2.1.277-alpha (Claude Code)", "2.1.277", false)).toBe("fail");
+    expect(pinVerdict("2.1.277 (Claude Code)", "2.1.277-alpha", false)).toBe("skip");
+    expect(pinVerdict("2.1.277 (Claude Code)", "2.1.277-alpha", true)).toBe("fail");
+    // Two different prereleases are not ordered; fail closed rather than guess.
+    expect(pinVerdict("2.1.277-beta", "2.1.277-alpha", false)).toBe("fail");
+    expect(pinVerdict("2.1.277-alpha", "2.1.277-alpha", false)).toBe("ok");
   });
 });

@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { execFileSync } from "node:child_process";
 import { TicketSchema } from "../../src/models/ticket.js";
 import { E2ECliFixture, runE2ECli, CLI_PATH } from "../helpers/e2e-cli.js";
+import { git as fixtureGit, gitAllowFailure } from "../helpers/git-fixture.js";
 
 const cliPath = CLI_PATH;
 const driverCmd = `node ${cliPath} merge-driver %O %A %B %P`;
@@ -65,17 +66,12 @@ function cli(dir: string, ...args: string[]): { exitCode: number; stdout: string
 }
 
 function git(dir: string, ...args: string[]): string {
-  return execFileSync("git", args, { cwd: dir, encoding: "utf-8", env: { ...process.env, GIT_MERGE_AUTOEDIT: "no" } }).trim();
+  return fixtureGit(dir, args, { env: { GIT_MERGE_AUTOEDIT: "no" } });
 }
 
 function gitMerge(dir: string, branch: string): { exitCode: number; output: string } {
-  try {
-    const output = execFileSync("git", ["merge", "--no-edit", branch], { cwd: dir, encoding: "utf-8", env: { ...process.env, GIT_MERGE_AUTOEDIT: "no" } });
-    return { exitCode: 0, output };
-  } catch (err: unknown) {
-    const e = err as { status?: number; stdout?: string };
-    return { exitCode: e.status ?? 1, output: e.stdout ?? "" };
-  }
+  const r = gitAllowFailure(dir, ["merge", "--no-edit", branch], { env: { GIT_MERGE_AUTOEDIT: "no" } });
+  return { exitCode: r.status, output: r.stdout };
 }
 
 function writeTicket(dir: string, id: string, overrides: Record<string, unknown> = {}): void {

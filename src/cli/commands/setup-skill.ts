@@ -5,7 +5,7 @@ import { homedir } from "node:os";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-import { atomicWriteFollowingSymlink, resolveSymlinkTarget } from "../../core/symlink-write.js";
+import { assertNoSelfOverlap, atomicWriteFollowingSymlink, resolveSymlinkTarget } from "../../core/symlink-write.js";
 import { resolveBundledBridge, type BundledBridge } from "../../core/bridge-resolve.js";
 import { cmdExpands, shellArg, winShellArgv } from "../../core/shell-arg.js";
 import { readFileThreeValued } from "../../core/health/deps.js";
@@ -67,6 +67,19 @@ export type { HookEntry, MatcherGroup };
 function log(msg: string): void {
   process.stdout.write(msg + "\n");
 }
+
+/**
+ * ISS-1235: said once at the end of setup, and never measured. Where the pane
+ * sits is the client renderer's call (ISS-1247: docked under the fullscreen
+ * renderer, inline above the prompt on the main screen), and the client
+ * places a plugin's own open only from 144 columns, which the person's first
+ * prompt lifts (ISS-1251). `process.stdout.columns` here is the shell setup
+ * ran in, not the window claude will run in, and the version-marker refresh
+ * runs setup with stdout piped, so a measured verdict would be wrong as often
+ * as right.
+ */
+export const MODS_WIDTH_NOTE =
+  "The Storybloq board docks beside the transcript under Claude Code's fullscreen renderer (/tui fullscreen) and sits above the prompt otherwise; a session started narrower than 144 columns shows a one-line summary until your first prompt.";
 
 /**
  * Resolves the directory containing bundled skill files.
@@ -150,6 +163,7 @@ async function runCopyDir(srcDir: string, destDir: string, testHooks?: CopyDirTe
     }
   }
 
+  await assertNoSelfOverlap(srcDir, destDir, targetDir);
   return copyDirSwap(srcDir, targetDir, testHooks);
 }
 
@@ -1847,6 +1861,7 @@ async function handleSetupClaude(options: SetupSkillOptions = {}): Promise<void>
   log("");
   if (mcpRegistered) {
     log("Done! Restart Claude Code, then type /story in any project.");
+    log(MODS_WIDTH_NOTE);
   } else {
     log("Skill installed. After registering MCP, restart Claude Code and type /story.");
   }

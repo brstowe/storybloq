@@ -14,7 +14,7 @@ describe("T-502 cli-version check", () => {
     const check = await checkCliVersion(ctxFor({ cliVersion: "1.14.0" }), deps);
     expect(check.status).toBe("advise");
     expect(check.message).toBe(
-      "storybloq 1.14.0 is installed; 1.15.0 is published. Update with `npm install -g @storybloq/storybloq@latest`, then run `storybloq setup`.",
+      "storybloq 1.14.0 is installed; 1.15.0 is published. Update with `storybloq update` (installs it and re-runs setup).",
     );
     expect(check.advice).toBe(check.message);
   });

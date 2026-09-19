@@ -80,6 +80,27 @@ export type IssueSourceRef = z.infer<typeof IssueSourceRefSchema>;
 
 export const IssueDedupeKeySchema = opaqueId(512);
 
+/**
+ * ISS-1154, extended by ISS-1113. See the field comment on `IssueSchema`.
+ *
+ * Named and exported because the create path validates against it BEFORE the
+ * ledger lock, beside severity: a disposition this schema would refuse must be
+ * rejected at the boundary rather than written and then dropped at load. One
+ * enum, two checks, no second copy of the list.
+ */
+export const ISSUE_DISPOSITIONS = [
+  "escalate_only",
+  "owner_gated",
+  "duplicate",
+  "pre_existing",
+  "accepted_out_of_scope",
+  "forced_landing",
+] as const;
+
+export const IssueDispositionSchema = z.enum(ISSUE_DISPOSITIONS);
+
+export type IssueDisposition = z.infer<typeof IssueDispositionSchema>;
+
 export const IssueSchema = z
   .object({
     id: IssueIdSchema,
@@ -126,7 +147,14 @@ export const IssueSchema = z
     // ISS-1154: durable actionability signal -- see computeActionability's
     // structured tier (src/core/recommend.ts). Additive, no ticket-side
     // equivalent (issues only).
-    disposition: z.enum(["escalate_only", "owner_gated", "duplicate"]).optional(),
+    //
+    // ISS-1113 EXTENDED this enum rather than adding a second field: the three
+    // values below are set at the moment a review path FILES an issue, so the
+    // reason it is not work travels with it from birth instead of being
+    // inferred later from its title. Snake_case to match the originals. The
+    // non-actionable subset and the guard every consumer asks live in
+    // src/core/issue-disposition.ts.
+    disposition: IssueDispositionSchema.optional(),
     duplicateOf: z.union([TicketIdSchema, IssueIdSchema]).optional(),
   })
   .passthrough();

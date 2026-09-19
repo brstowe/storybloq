@@ -59,5 +59,10 @@ export function issueCreateArgsFromPayload(payload: UnverifiedIssueCreatePayload
     location: [...payload.location],
     dedupeKey: payload.dedupeKey,
     phase: payload.phase,
+    // ISS-1113: carried through only when the payload has them, so a record
+    // prepared before this change replays into exactly the create it was
+    // fingerprinted against.
+    ...(payload.disposition !== undefined ? { disposition: payload.disposition } : {}),
+    ...(payload.metadata !== undefined ? { metadata: payload.metadata } : {}),
   };
 }

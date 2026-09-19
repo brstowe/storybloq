@@ -71,12 +71,48 @@ function toView(ruling: Ruling): RulingView {
 }
 
 export type CitationResolution =
-  | { status: "resolved"; citedId: string; cited: RulingView; current: RulingView; chain: readonly string[]; stale: boolean }
+  | {
+      status: "resolved"; citedId: string; cited: RulingView; current: RulingView;
+      chain: readonly string[]; stale: boolean;
+      /**
+       * T-520: which board the ruling was found on. ABSENT means the current
+       * project's own, which is every resolution this function produced before
+       * the upward leg existed -- so no existing consumer has to learn a new
+       * value to keep being right.
+       */
+      board?: "orchestrator";
+    }
+  // `missing` carries NO board on purpose: it means the id is on NEITHER
+  // board, so naming one would attribute the absence to a place that is no
+  // more responsible for it than this one.
   | { status: "missing"; citedId: string }
-  | { status: "unreadable"; citedId: string }
-  | { status: "indeterminate"; citedId: string; reason: "unreadable-successor" | "incomplete-scan" }
-  | { status: "branch"; citedId: string; chain: readonly string[]; competingSuccessors: readonly string[] }
-  | { status: "cycle"; citedId: string; chain: readonly string[] };
+  | { status: "unreadable"; citedId: string; board?: "orchestrator" }
+  | {
+      status: "indeterminate"; citedId: string;
+      reason:
+        | "unreadable-successor"
+        | "incomplete-scan"
+        // T-520: a RECORDED orchestrator whose board could not be read. Not the
+        // same as `unreadable-successor`: that one is about this board's own
+        // files, this one is about a board we were told to consult and could
+        // not.
+        | "unreadable-orchestrator"
+        // T-520: both boards claim the supersedes chain for this id. Never
+        // merged -- merging would invent an ordering neither board defines.
+        | "cross-board-supersession"
+      /**
+       * T-520: an unverifiable state on the ORCHESTRATOR's ledger, not this
+       * one. Without it a node reader is told its chain is unverifiable and
+       * goes looking through its own `.story/rulings/`, which is fine -- the
+       * broken file is one board up.
+       */
+      board?: "orchestrator";
+    }
+  | {
+      status: "branch"; citedId: string; chain: readonly string[];
+      competingSuccessors: readonly string[]; board?: "orchestrator";
+    }
+  | { status: "cycle"; citedId: string; chain: readonly string[]; board?: "orchestrator" };
 
 export interface SuccessorIndex {
   readonly successorsByTarget: ReadonlyMap<string, readonly string[]>;
@@ -119,6 +155,37 @@ export interface CitationResolutionContext {
    * behavior unchanged).
    */
   readonly hasUnrecoverableEntries: boolean;
+  /**
+   * T-520: the ORCHESTRATOR's board, for a node that records a pointer to one.
+   *
+   * DATA, not a callback: `resolveCitation` stays pure and synchronous and
+   * does no IO, so every caller that builds a context the old way is
+   * unchanged, and the one function that reads the other board
+   * (`buildCitationInputs`) is the only place the feature touches a disk.
+   *
+   * Absent on the orchestrator's own context -- the leg is one hop and never
+   * recurses.
+   */
+  readonly upward?: UpwardBoard;
+}
+
+export type UpwardBoard =
+  | { readonly kind: "board"; readonly root: string; readonly ctx: CitationResolutionContext }
+  | {
+      readonly kind: "unreadable";
+      /**
+       * The path we TRIED, which is the orchestrator's root when we got far
+       * enough to resolve one and the recorded string when we did not. Never
+       * this project's own root: a message naming that would send a reader to
+       * the one directory that is definitely not the problem.
+       */
+      readonly attemptedPath?: string;
+      readonly reason: string;
+    };
+
+/** True when any id in `ids` has a successor recorded on `index`. */
+function supersededOn(index: SuccessorIndex, ids: readonly string[]): boolean {
+  return ids.some((id) => (index.successorsByTarget.get(id)?.length ?? 0) > 0);
 }
 
 export function buildCitationResolutionContext(
@@ -155,6 +222,11 @@ export function resolveCitation(citedId: string, ctx: CitationResolutionContext)
   }
   const citedRuling = ctx.rulingsById.get(citedId);
   if (!citedRuling) {
+    // T-520: not here. If this project records an orchestrator, the id may
+    // live on that board -- which is the whole feature: a node seat citing a
+    // root ruling was getting `missing` and, per ISS-1180, minting a local
+    // COPY of the ruling to get past the plan-pin gate.
+    if (ctx.upward) return resolveUpward(citedId, ctx, ctx.upward);
     return { status: "missing", citedId };
   }
 
@@ -195,6 +267,21 @@ export function resolveCitation(citedId: string, ctx: CitationResolutionContext)
     return { status: "indeterminate", citedId, reason: "unreadable-successor" };
   }
 
+  // T-520, and the SAME rule as the paragraph above applied one board over.
+  // An orchestrator ruling whose `supersedes` names a local id is a successor
+  // of this chain that is visible ONLY on that board, so a board we were told
+  // to consult and could not read leaves "nothing supersedes this" exactly as
+  // unverifiable as an unreadable local file does. Pen ruling of 2026-09-18,
+  // which overrides the ticket's narrower text. Note the entry condition: a
+  // project with no pointer never reaches here, so nothing changes for any
+  // project that has not opted in by recording one.
+  if (ctx.upward?.kind === "unreadable") {
+    return { status: "indeterminate", citedId, reason: "unreadable-orchestrator" };
+  }
+  if (ctx.upward && supersededOn(ctx.upward.ctx.index, [citedId, ...chain])) {
+    return { status: "indeterminate", citedId, reason: "cross-board-supersession" };
+  }
+
   const currentRuling = ctx.rulingsById.get(current)!;
   return {
     status: "resolved",
@@ -205,6 +292,46 @@ export function resolveCitation(citedId: string, ctx: CitationResolutionContext)
     stale: current !== citedId,
   };
 }
+
+/**
+ * T-520: one hop up, for an id this board does not have.
+ *
+ * The orchestrator's chain is walked on the ORCHESTRATOR's own context, so a
+ * superseded root ruling comes back `stale` with the successor that board
+ * records -- the node does not need its own copy of the chain, which is the
+ * copying this feature exists to stop.
+ *
+ * Anything other than a clean resolution is returned AS IT CAME BACK: a
+ * `missing` means the id is on neither board, and the other board's own taints
+ * are that board's honest answer and are not re-labelled here.
+ */
+function resolveUpward(
+  citedId: string,
+  local: CitationResolutionContext,
+  upward: UpwardBoard,
+): CitationResolution {
+  if (upward.kind === "unreadable") {
+    return { status: "indeterminate", citedId, reason: "unreadable-orchestrator" };
+  }
+  const resolved = resolveCitation(citedId, upward.ctx);
+  if (resolved.status === "missing") return resolved;
+  if (resolved.status !== "resolved") {
+    // Everything else is a statement about the ORCHESTRATOR's ledger -- an
+    // unreadable file there, a branched or cyclic chain there -- and is
+    // labelled with the board it is about. `missing` above is the exception:
+    // it is a statement about both boards at once.
+    return { ...resolved, board: "orchestrator" };
+  }
+  // The mirror of the check on the local-hit path: a LOCAL ruling claiming to
+  // supersede something that lives on the root board. Unconstructible through
+  // `ruling supersede`, which refuses a target absent from the local ledger,
+  // but `.story/` is hand-editable by design.
+  if (supersededOn(local.index, [citedId, ...resolved.chain])) {
+    return { status: "indeterminate", citedId, reason: "cross-board-supersession" };
+  }
+  return { ...resolved, board: "orchestrator" };
+}
+
 
 export function resolveCitedRulings(
   citedIds: readonly string[],

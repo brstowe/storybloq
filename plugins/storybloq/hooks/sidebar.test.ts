@@ -148,7 +148,13 @@ function harness(fixture: Fixture): Harness {
     failNextInvalidate: false,
     failTimer: false,
     failUsage: false,
+    failSettings: false,
+    failConfig: false,
+    /** The client's `theme` row as `$.config.list()` answers it (ISS-1238). */
+    theme: "dark" as string,
     usage: { context: { window: 200_000, tokens: 40_000 }, rateLimits: [] } as any,
+    /** What `$.settings.read()` answers: the merged settings, empty by default. */
+    settings: {} as Record<string, unknown>,
   };
   const counters = { timers: 0, storeSets: 0 };
 
@@ -218,6 +224,21 @@ function harness(fixture: Fixture): Harness {
         return state.usage;
       },
     },
+    settings: {
+      read: async () => {
+        if (state.failSettings) throw new Error("the host refused settings.read");
+        return state.settings;
+      },
+    },
+    config: {
+      list: async () => {
+        if (state.failConfig) throw new Error("the host refused config.list");
+        return [
+          { key: "verbose", label: "Verbose", kind: "boolean", value: false },
+          { key: "theme", label: "Theme", kind: "choice", value: state.theme },
+        ];
+      },
+    },
     store: {
       get: async (key: string): Promise<unknown> => stored[key],
       set: async (key: string, value: unknown): Promise<void> => {
@@ -272,6 +293,30 @@ function harness(fixture: Fixture): Harness {
     },
     set usage(value: any) {
       state.usage = value;
+    },
+    get settings() {
+      return state.settings;
+    },
+    set settings(value: Record<string, unknown>) {
+      state.settings = value;
+    },
+    get failSettings() {
+      return state.failSettings;
+    },
+    set failSettings(value: boolean) {
+      state.failSettings = value;
+    },
+    get theme() {
+      return state.theme;
+    },
+    set theme(value: string) {
+      state.theme = value;
+    },
+    get failConfig() {
+      return state.failConfig;
+    },
+    set failConfig(value: boolean) {
+      state.failConfig = value;
     },
     get reads() {
       return state.reads;
@@ -669,8 +714,165 @@ test("falls back to one line above the prompt on a narrow terminal", async () =>
   expect(narrow).toContain("Storybloq:");
   expect(narrow).toContain("issues");
 
-  // Wide enough to dock: the pane carries it and the band stays out of the way.
+  // Wide enough to dock, and the pane HAS been drawn: it carries the numbers
+  // and the band stays out of the way.
+  await h.render(paneEvent(160));
   expect(textOf(await h.render(abovePromptEvent(160)))).toBe("");
+});
+
+// ISS-1235: the client docks a pane the plugin opened on its own only from
+// 144 columns; 110 is the floor for a pane the person asked for, which ours
+// never is. Gating the band on 110 left 110-143 columns with nothing drawn.
+test("draws the band up to 143 columns, and says what width the board needs (ISS-1235)", async () => {
+  const h = harness(newFixture());
+  await started(h);
+
+  for (const columns of [80, 108, 110, 143]) {
+    const band = textOf(await h.render(abovePromptEvent(columns)));
+    expect(band, `${columns} columns`).toContain("Storybloq:");
+    expect(cells(band), `${columns} columns`).toBeLessThanOrEqual(columns);
+  }
+  // The hint rides along only where the whole summary fits beside it: at 80
+  // the numbers win (the issues count stays), from 108 both fit.
+  expect(textOf(await h.render(abovePromptEvent(80)))).toContain("issues");
+  for (const columns of [108, 110, 143]) {
+    expect(textOf(await h.render(abovePromptEvent(columns))), `${columns} columns`).toContain("board opens at your next prompt");
+  }
+});
+
+// ISS-1235: a session started narrow and resized wide showed nothing. The
+// pane was opened once at session.start and parked undrawn by the client;
+// after the resize the band saw a wide viewport and stood down, and nothing
+// re-placed the pane. The band now stands down only once the pane has
+// actually rendered.
+test("keeps the band until the pane has actually been drawn, whatever the width (ISS-1235)", async () => {
+  const h = harness(newFixture());
+  await started(h);
+
+  const before = textOf(await h.render(abovePromptEvent(80)));
+  expect(before).toContain("Storybloq:");
+
+  // Resized past the dock width with no Pane render in between: still the band,
+  // without the width hint (the terminal is wide enough now).
+  const wide = textOf(await h.render(abovePromptEvent(200)));
+  expect(wide).toContain("Storybloq:");
+  expect(wide).not.toContain("board opens at your next prompt");
+
+  // The pane draws: the band stands down. The first draw asks for one redraw
+  // so a band drawn on the same pass (a reload starts this flag false while
+  // the client keeps the pane up) stands down too; a second draw asks nothing.
+  const asked = h.invalidated.length;
+  await h.render(paneEvent(200));
+  expect(h.invalidated.slice(asked)).toEqual(["ui.render"]);
+  await h.render(paneEvent(200));
+  expect(h.invalidated.length).toBe(asked + 1);
+  expect(textOf(await h.render(abovePromptEvent(200)))).toBe("");
+
+  // Narrow again while the pane counts as drawn: the client undraws it below
+  // the dock width without a close event, so the band draws by width alone
+  // (M-DRAWN-ONLY).
+  expect(textOf(await h.render(abovePromptEvent(100)))).toContain("Storybloq:");
+
+  // The person closes the pane: there is nothing else drawn, so the band is
+  // back at any width.
+  await h.fire("ui.close", { requestId: "storybloq" });
+  expect(textOf(await h.render(abovePromptEvent(200)))).toContain("Storybloq:");
+});
+
+test("asks the client to place the parked pane again, once per crossing into the dock width (ISS-1235)", async () => {
+  const h = harness(newFixture());
+  await started(h);
+  expect(h.opened).toHaveLength(1);
+
+  // Narrow: the pane is parked, the band draws, nothing is re-asked.
+  await h.render(abovePromptEvent(80));
+  expect(h.opened).toHaveLength(1);
+
+  // Resized wide with the pane never drawn: the client judges the width at
+  // each open (2.1.274 d.ts, `$.ui.open`), so one repeat open re-places it.
+  // The band still draws on this pass; the pane's own render stands it down.
+  expect(textOf(await h.render(abovePromptEvent(200)))).toContain("Storybloq:");
+  expect(h.opened).toHaveLength(2);
+  expect(h.opened[1]).toEqual({ id: "storybloq", title: "Storybloq" });
+
+  // The same width again asks nothing more (M-REOPEN-EVERY-RENDER).
+  await h.render(abovePromptEvent(200));
+  await h.render(abovePromptEvent(220));
+  expect(h.opened).toHaveLength(2);
+
+  // Back below and across again: a fresh crossing, one more ask.
+  await h.render(abovePromptEvent(100));
+  await h.render(abovePromptEvent(160));
+  expect(h.opened).toHaveLength(3);
+
+  // Once the pane has drawn, a wide AbovePrompt render asks nothing.
+  await h.render(paneEvent(160));
+  await h.render(abovePromptEvent(160));
+  expect(h.opened).toHaveLength(3);
+
+  // The person closed it: the band is back, and no re-open is asked for a
+  // pane the person dismissed (M-REOPEN-AFTER-CLOSE).
+  await h.fire("ui.close", { requestId: "storybloq" });
+  expect(textOf(await h.render(abovePromptEvent(200)))).toContain("Storybloq:");
+  expect(h.opened).toHaveLength(3);
+});
+
+/** Every Text node of a tree, nested children included. */
+function allTexts(node: any, out: any[] = []): any[] {
+  if (Array.isArray(node)) {
+    for (const child of node) allTexts(child, out);
+    return out;
+  }
+  if (!node || typeof node !== "object") return out;
+  if (node.element === "Text") out.push(node);
+  allTexts(node.props?.children, out);
+  return out;
+}
+
+test("colours every pane text for the client's theme, not the terminal's default foreground (ISS-1238)", async () => {
+  const h = harness(newFixture());
+  await started(h);
+  // The Air: a light terminal whose default foreground is dark, and a dark
+  // client theme whose pane is dark. A Text with no colour vanished. On a
+  // dark theme every Text is white unless it sets its own tone; the tones
+  // stay. M-DEFAULT-FOREGROUND drops the fill and this goes red.
+  const texts = allTexts(await h.render(paneEvent()));
+  expect(texts.length).toBeGreaterThan(10);
+  for (const t of texts) expect(t.props.color, JSON.stringify(t.props)).toBeDefined();
+  expect(texts.some((t) => t.props.color === "yellow")).toBe(true);
+  expect(texts.filter((t) => t.props.color === "white").length).toBeGreaterThan(5);
+});
+
+test("a light client theme fills with black, by prefix (ISS-1238)", async () => {
+  const h = harness(newFixture());
+  h.theme = "light-daltonized";
+  await started(h);
+  const texts = allTexts(await h.render(paneEvent()));
+  expect(texts.filter((t) => t.props.color === "black").length).toBeGreaterThan(5);
+  expect(texts.some((t) => t.props.color === "white")).toBe(false);
+});
+
+test("follows a theme change through config.set with one redraw (ISS-1238)", async () => {
+  const h = harness(newFixture());
+  await started(h);
+  await h.render(paneEvent());
+  const asked = h.invalidated.length;
+  await h.fire("config.set", { key: "theme", value: "light", previous: "dark" });
+  expect(h.invalidated.slice(asked)).toEqual(["ui.render"]);
+  const texts = allTexts(await h.render(paneEvent()));
+  expect(texts.filter((t) => t.props.color === "black").length).toBeGreaterThan(5);
+  // Another row changing is not ours.
+  await h.fire("config.set", { key: "verbose", value: true, previous: false });
+  expect(h.invalidated.length).toBe(asked + 1);
+});
+
+test("a refused config read keeps the dark default and still draws the board (ISS-1238)", async () => {
+  const h = harness(newFixture());
+  h.failConfig = true;
+  await started(h);
+  const tree = await h.render(paneEvent());
+  expect(textOf(tree)).toContain("Storybloq");
+  expect(allTexts(tree).filter((t) => t.props.color === "white").length).toBeGreaterThan(5);
 });
 
 test("keeps the fallback line inside the terminal's width", async () => {
@@ -781,7 +983,7 @@ test("shows the context pressure once a turn has reported it", async () => {
   const h = harness(newFixture());
   await started(h);
   await h.fire("session.compact", {});
-  expect(textOf(await h.render(paneEvent()))).toContain("context 20%");
+  expect(textOf(await h.render(paneEvent()))).toContain("context 22%");
 });
 
 test("keeps the ledger cache in the store, so the next session starts warm", async () => {
@@ -989,19 +1191,96 @@ test("works out the context fill from the fields the usage actually carries", as
   // `percent` only once the window has had an API response, so the header
   // stayed empty against a read that wanted `percent`. M-PERCENT-ONLY puts
   // that read back and this goes red.
+  // 50_000 over the compaction ceiling of 200_000 (0.925 * 200_000 = 185_000)
+  // is 27.03, the figure the pressure banner would state; over the raw window
+  // it would read 25.
   h.usage = { context: { window: 200_000, tokens: 50_000 }, rateLimits: [] };
   await h.fire("turn.complete", {});
-  expect(textOf(nodeByKey(await h.render(paneEvent()), "footer"))).toContain("context 25%");
+  expect(textOf(nodeByKey(await h.render(paneEvent()), "footer"))).toContain("context 27%");
 });
 
-test("prefers the percent the engine states over its own arithmetic", async () => {
+test("measures the tokens itself even when the engine states a percent, since the engine's is over the raw window (ISS-1236)", async () => {
   const h = harness(newFixture());
   await started(h);
-  // The engine's own figure counts the window the way the status line does,
-  // so where it exists it wins.
-  h.usage = { context: { window: 200_000, tokens: 50_000, percent: 73 }, rateLimits: [] };
+  // `percent` is tokens over the model's window, the 1M figure that made the
+  // pane read 22% while the banner said 28%. Tokens present, the pane does its
+  // own arithmetic against the compaction ceiling. M-PERCENT-WINS puts the
+  // engine's figure back and this goes red.
+  h.usage = { context: { window: 200_000, tokens: 50_000, percent: 25 }, rateLimits: [] };
+  await h.fire("turn.complete", {});
+  expect(textOf(nodeByKey(await h.render(paneEvent()), "footer"))).toContain("context 27%");
+});
+
+test("falls back to the engine's percent only when it has no token count", async () => {
+  const h = harness(newFixture());
+  await started(h);
+  h.usage = { context: { window: 200_000, percent: 73 }, rateLimits: [] };
   await h.fire("turn.complete", {});
   expect(textOf(nodeByKey(await h.render(paneEvent()), "footer"))).toContain("context 73%");
+});
+
+test("divides by the autoCompactWindow the settings carry, times the compaction ceiling, so it matches the pressure banner (ISS-1236)", async () => {
+  const h = harness(newFixture());
+  // The owner's screen: a 1M model window, 226_269 tokens, and
+  // `autoCompactWindow: 800000` in settings. The banner reads
+  // 226_269 / (0.925 * 800_000) = 30.6; the pane read 226_269 / 1_000_000 = 23.
+  // M-RAW-WINDOW ignores the setting and draws 24 (over 925_000).
+  h.settings = { autoCompactWindow: 800_000 };
+  await started(h);
+  h.usage = { context: { window: 1_000_000, tokens: 226_269 }, rateLimits: [] };
+  await h.fire("turn.complete", {});
+  expect(textOf(nodeByKey(await h.render(paneEvent()), "footer"))).toContain("context 31%");
+
+  // A setting that changes mid-session is picked up by the next turn, the
+  // cadence the header's other figures already have.
+  h.settings = {};
+  await h.fire("turn.complete", {});
+  expect(textOf(nodeByKey(await h.render(paneEvent()), "footer"))).toContain("context 24%");
+});
+
+test("reads the settings once per attach and per turn, never per render (ISS-1236)", async () => {
+  const h = harness(newFixture());
+  let reads = 0;
+  h.settings = new Proxy({} as Record<string, unknown>, {
+    get(target, key) {
+      reads += 1;
+      return Reflect.get(target, key);
+    },
+  });
+  await started(h);
+  const afterStart = reads;
+  expect(afterStart).toBeGreaterThan(0);
+  await h.render(paneEvent());
+  await h.render(paneEvent());
+  await h.render(paneEvent());
+  expect(reads).toBe(afterStart);
+});
+
+test("a refused or malformed settings read costs the window figure, never the pane (ISS-1236)", async () => {
+  const h = harness(newFixture());
+  h.failSettings = true;
+  await started(h);
+  h.usage = { context: { window: 200_000, tokens: 50_000 }, rateLimits: [] };
+  await h.fire("turn.complete", {});
+  let footer = textOf(nodeByKey(await h.render(paneEvent()), "footer"));
+  expect(footer).toContain("context 27%");
+
+  // Out of the CLI reader's bounds, or not a number: the model window stands.
+  h.failSettings = false;
+  for (const bad of ["800000", 12.5, 1_000, 20_000_000, -1, null]) {
+    h.settings = { autoCompactWindow: bad };
+    await h.fire("turn.complete", {});
+    footer = textOf(nodeByKey(await h.render(paneEvent()), "footer"));
+    expect(footer, `autoCompactWindow ${String(bad)}`).toContain("context 27%");
+  }
+});
+
+test("caps the context figure at 100 once the window is past its ceiling", async () => {
+  const h = harness(newFixture());
+  await started(h);
+  h.usage = { context: { window: 200_000, tokens: 199_000 }, rateLimits: [] };
+  await h.fire("turn.complete", {});
+  expect(textOf(nodeByKey(await h.render(paneEvent()), "footer"))).toContain("context 100%");
 });
 
 test("says nothing about context on a window that has had no response yet", async () => {
@@ -1189,11 +1468,11 @@ test("marks a severe issue on its id and nowhere else", async () => {
   const critical = rowFor("board-open", "ISS-011");
   expect(idOf(critical).props.color).toBe("red");
   expect(idOf(critical).props.dimColor).toBe(true);
-  expect(titleOf(critical).props.color).toBeUndefined();
+  expect(titleOf(critical).props.color).toBe("white");
   expect(idOf(rowFor("board-inprogress", "ISS-012")).props.color).toBe("yellow");
-  expect(idOf(rowFor("board-open", "ISS-010")).props.color).toBeUndefined();
-  expect(idOf(rowFor("board-done", "ISS-013")).props.color).toBeUndefined();
-  expect(idOf(rowFor("board-open", "T-010")).props.color).toBeUndefined();
+  expect(idOf(rowFor("board-open", "ISS-010")).props.color).toBe("white");
+  expect(idOf(rowFor("board-done", "ISS-013")).props.color).toBe("white");
+  expect(idOf(rowFor("board-open", "T-010")).props.color).toBe("white");
   expect(idOf(rowFor("board-open", "T-010")).props.dimColor).toBe(true);
 });
 
@@ -1247,10 +1526,10 @@ test("draws one bordered card per column, its heading ruled off from the body", 
   await started(h);
   const keys = ["board-blocked", "board-open", "board-inprogress", "board-done"];
 
-  // Below the stacking threshold each card takes the pane's whole width;
-  // above it the four share it, less the three gaps. The bound is the event's
-  // own bodyColumns, not a number fitted to one terminal.
-  for (const columns of [50, 110, 144, 158, 160]) {
+  // Side by side the four share the width, less the three gaps. The bound is
+  // the event's own bodyColumns, not a number fitted to one terminal; below
+  // 60 body columns the narrow board draws instead (ISS-1252, its own test).
+  for (const columns of [110, 144, 158, 160]) {
     const bodyColumns = columns - 4;
     const stacked = bodyColumns < 60;
     const tree = await h.render(paneEvent(columns, 30));
@@ -1321,10 +1600,10 @@ test("emphasises the column being worked, and lets the finished one recede", asy
   expect(heading("board-inprogress").bold).toBe(true);
   expect(heading("board-blocked").color).toBe("yellow");
   expect(heading("board-blocked").bold).toBeUndefined();
-  expect(heading("board-open").color).toBeUndefined();
+  expect(heading("board-open").color).toBe("white");
   expect(heading("board-open").bold).toBeUndefined();
   expect(heading("board-done").dimColor).toBe(true);
-  expect(heading("board-done").color).toBeUndefined();
+  expect(heading("board-done").color).toBe("white");
   expect(heading("board-done").bold).toBeUndefined();
 });
 
@@ -1561,10 +1840,10 @@ test("colours the severities that exist and dims the ones that do not", async ()
   expect(parts[1].props.color).toBe("yellow");
   expect(parts[2].props.children).toBe("0 medium");
   expect(parts[2].props.dimColor).toBe(true);
-  expect(parts[2].props.color).toBeUndefined();
+  expect(parts[2].props.color).toBe("white");
   expect(parts[3].props.dimColor).toBe(true);
   // The context fill stays neutral.
-  expect(nodeByKey(tree, "context").props.color).toBeUndefined();
+  expect(nodeByKey(tree, "context").props.color).toBe("white");
 });
 
 test("shortens the severity labels when the row is too narrow for them", async () => {
@@ -1579,7 +1858,7 @@ test("shortens the severity labels when the row is too narrow for them", async (
   const text = textOf(nodeByKey(narrow, "issues"));
   expect(text).toContain("1 crit");
   expect(text).not.toContain("critical");
-  expect(textOf(nodeByKey(narrow, "context"))).toBe("context 20%");
+  expect(textOf(nodeByKey(narrow, "context"))).toBe("context 22%");
 });
 
 test("keeps the issues line to one row when the counts outgrow the room", async () => {
@@ -1598,7 +1877,7 @@ test("keeps the issues line to one row when the counts outgrow the room", async 
   // One row, not two. M-FOOTER-WRAPS drops the truncation and the row wraps,
   // which spends a row the budget counted for the board.
   const tree = await h.render(paneEvent(40, 30));
-  expect(textOf(nodeByKey(tree, "context"))).toBe("context 20%");
+  expect(textOf(nodeByKey(tree, "context"))).toBe("context 22%");
   expect(paneHeight(nodeByKey(tree, "footer"), 40)).toBe(1);
   // And the numbers are still there to be cut, not quietly dropped first.
   expect(textOf(nodeByKey(tree, "issues"))).toContain("101 crit");
@@ -1617,7 +1896,7 @@ test("keeps the header clear of the cell the engine draws its close mark in", as
   // it. The foot of the pane needs none: the mark is a top-right thing.
   expect(nodeByKey(tree, "header").props.marginRight).toBeGreaterThanOrEqual(3);
   expect(nodeByKey(tree, "footer").props.marginRight).toBeUndefined();
-  expect(textOf(nodeByKey(tree, "footer"))).toContain("context 20%");
+  expect(textOf(nodeByKey(tree, "footer"))).toContain("context 22%");
 });
 
 test("moves a ticket on the board during the turn that moved it", async () => {
@@ -2202,4 +2481,106 @@ test("register turns the dashboard on when the option is explicitly true", () =>
 
 test("register stays silent when the option is explicitly false", () => {
   expect(registeredEvents({ sidebar: false })).toEqual([]);
+});
+
+// ISS-1251: a session started under 144 columns opened its pane at
+// session.start, which is the plugin's own open and waits undrawn; nothing
+// re-asked until the window crossed 144. The person's prompt is an open
+// "answering their input", placed at any width, so the Mod asks again there.
+test("re-opens the parked pane on the person's prompt, at any width (ISS-1251)", async () => {
+  const h = harness(newFixture());
+  await started(h);
+  expect(h.opened).toHaveLength(1);
+
+  // Narrow: parked, the band draws and says the board opens at the prompt.
+  const band = textOf(await h.render(abovePromptEvent(120)));
+  expect(band).toContain("Storybloq:");
+  expect(band).toContain("board opens at your next prompt");
+
+  // The prompt: one more open with the same id, the prompt passed on as it came.
+  const prompt = { text: "hello", turnId: "t1" };
+  expect(await h.fire("prompt.submit", prompt)).toBe(prompt);
+  expect(h.opened).toHaveLength(2);
+  expect(h.opened[1]).toEqual({ id: "storybloq", title: "Storybloq" });
+
+  // The client places it and it draws. At this width the band stays under
+  // the pane with the counts (a placed pane keeps its inline seat), but
+  // without the hint; a further prompt asks nothing (M-REOPEN-EVERY-PROMPT).
+  await h.render(paneEvent(120));
+  const under = textOf(await h.render(abovePromptEvent(120)));
+  expect(under).toContain("Storybloq:");
+  expect(under).not.toContain("board opens at your next prompt");
+  expect(await h.fire("prompt.submit", prompt)).toBe(prompt);
+  expect(h.opened).toHaveLength(2);
+});
+
+test("never re-opens on a prompt a pane the person closed (ISS-1251)", async () => {
+  const h = harness(newFixture());
+  await started(h);
+  await h.render(abovePromptEvent(120));
+  await h.fire("ui.close", { requestId: "storybloq", origin: "person" });
+  const prompt = { text: "hello" };
+  expect(await h.fire("prompt.submit", prompt)).toBe(prompt);
+  expect(h.opened).toHaveLength(1);
+  // The band is still the sidebar at this width.
+  expect(textOf(await h.render(abovePromptEvent(120)))).toContain("Storybloq:");
+});
+
+test("asks nothing on a prompt in a project with no ledger (ISS-1251)", async () => {
+  const h = harness({ files: {}, mtimes: {} });
+  await started(h);
+  expect(h.opened).toHaveLength(0);
+  const prompt = { text: "hello" };
+  expect(await h.fire("prompt.submit", prompt)).toBe(prompt);
+  expect(h.opened).toHaveLength(0);
+});
+
+// ISS-1252: below 60 body columns the four framed columns stacked into a
+// scrolling strip. The owner: "in that view we can just show top 3 in
+// progress and context pressure."
+test("draws the narrow board below 60 body columns: In progress, three cards, a tail, the footer (ISS-1252)", async () => {
+  const h = harness(manyInProgress(5));
+  h.usage = { context: { window: 200_000, tokens: 40_000, percent: 20 }, rateLimits: [] };
+  await started(h);
+
+  const tree = await h.render(paneEvent(49, 20));
+  const text = textOf(tree);
+  // Five in the fixture's five plus T-001, which is also in progress: six.
+  expect(nodeByKey(tree, "narrow-heading")).toBeTruthy();
+  expect(textOf(nodeByKey(tree, "narrow-heading"))).toBe("In progress 6");
+  expect(nodeByKey(tree, "narrow-card-0")).toBeTruthy();
+  expect(nodeByKey(tree, "narrow-card-2")).toBeTruthy();
+  expect(nodeByKey(tree, "narrow-card-3")).toBeNull();
+  expect(textOf(nodeByKey(tree, "narrow-tail"))).toBe("... 3 more");
+  expect(text).toContain("context 20%");
+  // Nothing else of the four-column board.
+  for (const key of ["board-blocked", "board-open", "board-inprogress", "board-done", "header-gap", "issues-gap"]) {
+    expect(nodeByKey(tree, key), key).toBeNull();
+  }
+  expect(text).not.toContain("Blocked");
+  expect(text).not.toContain("Done");
+  // Every row fits the body.
+  for (const node of allTexts(tree)) {
+    const row = textOf(node);
+    expect(cells(row), row).toBeLessThanOrEqual(45);
+  }
+});
+
+test("narrow board with nothing in progress says so in a word, then the footer (ISS-1252)", async () => {
+  const h = harness(newFixture());
+  h.fixture.files[".story/tickets/T-001.json"] = ticketText({ id: "T-001", status: "open", title: "Not started" });
+  await started(h);
+  const tree = await h.render(paneEvent(49, 20));
+  expect(textOf(nodeByKey(tree, "narrow-heading"))).toBe("In progress 0");
+  expect(textOf(nodeByKey(tree, "narrow-none"))).toBe("none");
+  expect(nodeByKey(tree, "narrow-tail")).toBeNull();
+  expect(textOf(tree)).toContain("issues");
+});
+
+test("the four-column board is unchanged from 60 body columns up (ISS-1252 boundary)", async () => {
+  const h = harness(newFixture());
+  await started(h);
+  const tree = await h.render(paneEvent(64, 30));
+  expect(nodeByKey(tree, "board-inprogress")).toBeTruthy();
+  expect(nodeByKey(tree, "narrow-heading")).toBeNull();
 });

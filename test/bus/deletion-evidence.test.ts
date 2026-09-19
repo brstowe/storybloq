@@ -35,6 +35,7 @@ import { formatStatus } from "../../src/core/output-formatter.js";
 import { loadProject } from "../../src/core/project-loader.js";
 import { createBusFixture, type BusFixture } from "./helpers.js";
 import { runBusCli } from "./cli-harness.js";
+import { assertFixtureCwd, fixtureGitEnv } from "../helpers/git-fixture.js";
 
 const exec = promisify(execFile);
 const fixtures: BusFixture[] = [];
@@ -79,7 +80,10 @@ async function exists(path: string): Promise<boolean> {
 }
 
 async function git(root: string, args: string[]): Promise<string> {
-  return (await exec("git", args, { cwd: root })).stdout;
+  // ISS-1220: guard + scrub only. The exec() call itself is preserved so
+  // this helper keeps throwing exec-shaped errors ({ code }), which callers assert on.
+  const cwd = assertFixtureCwd(root, `git ${args[0] ?? ""}`);
+  return (await exec("git", args, { cwd, env: fixtureGitEnv(cwd) })).stdout;
 }
 
 async function initGitRepo(root: string): Promise<void> {

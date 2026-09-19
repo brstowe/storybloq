@@ -7,7 +7,7 @@ import { isTeamModeConfig } from "./team-capabilities.js";
 import { isTicketEarmarkStale, isIssueEarmarkStale } from "./earmarks.js";
 import type { Ruling } from "../models/ruling.js";
 import type { RulingScanCompleteness } from "./ruling-loader.js";
-import { buildSuccessorIndex, buildCitationResolutionContext, resolveCitation } from "./ruling.js";
+import { buildSuccessorIndex, buildCitationResolutionContext, resolveCitation, type UpwardBoard } from "./ruling.js";
 
 const DEFAULT_EARMARK_STALE_THRESHOLD_HOURS = 48;
 
@@ -20,6 +20,12 @@ export interface ValidationFinding {
   readonly code: string;
   readonly message: string;
   readonly entity: string | null;
+  /**
+   * T-520: which board the cited ruling was found on. Present only on citation
+   * findings that had to leave this project, absent everywhere else, so
+   * `--format json` gains a key rather than changing one.
+   */
+  readonly board?: "orchestrator";
 }
 
 export interface ValidationResult {
@@ -38,6 +44,15 @@ export interface ValidationResult {
  * that populates this.
  */
 export interface ValidationAux {
+  /**
+   * T-520: the ORCHESTRATOR's board, when this project records a pointer to
+   * one and something is actually cited. Supplied BY THE CALLER, never loaded
+   * here: this function is pure and synchronous and runs on every ticket and
+   * issue write, so the decision to pay for another board's read belongs to
+   * whoever is calling. A caller that passes nothing gets exactly today's
+   * behaviour, which is what every non-federated call site relies on.
+   */
+  readonly upwardBoard?: UpwardBoard;
   readonly rulings?: readonly Ruling[];
   readonly unavailableRulingIds?: ReadonlySet<string>;
   readonly rulingScanCompleteness?: RulingScanCompleteness;
@@ -584,6 +599,7 @@ export function validateProject(
       aux.citingEntityLoadComplete === true,
       state,
       findings,
+      aux.upwardBoard,
     );
   }
 
@@ -840,6 +856,37 @@ function detectSupersedesCycles(
  * caller that loads the side-store; every other `validateProject` call site
  * is unaffected).
  */
+/**
+ * T-520: " on the orchestrator board", or nothing at all when the resolution
+ * never left this project -- so every message a single-project reader sees is
+ * byte-identical to the one they saw before this ticket.
+ */
+function boardSuffix(board: "orchestrator" | undefined): string {
+  return board === "orchestrator" ? " on the orchestrator board" : "";
+}
+
+/**
+ * The entities whose `citesRulings` this file actually resolves.
+ *
+ * Arrangements ALSO carry a `citesRulings` field, and are deliberately not
+ * here: they are off the strict `ProjectState` load path (T-473 binding item
+ * 2) and `ProjectState` does not carry them at all, so their citations are not
+ * checked by this function.
+ *
+ * Exported because T-520's read-gate (`loadUpwardBoardFor`) must ask about
+ * EXACTLY this population. Two hand-maintained lists would drift, and the
+ * failure mode of drift is silent and bad in both directions: a gate wider
+ * than the loop reads another board for citations nobody checks, and a gate
+ * narrower than the loop reports a resolvable citation as a dangling error.
+ * If arrangements are ever brought into the loop, changing this one function
+ * moves both.
+ */
+export function citingEntitiesOf(
+  state: ProjectState,
+): ReadonlyArray<{ id: string; citesRulings?: readonly string[] }> {
+  return [...state.tickets, ...state.issues];
+}
+
 function validateRulings(
   rulings: readonly Ruling[],
   unavailableIds: ReadonlySet<string>,
@@ -848,6 +895,9 @@ function validateRulings(
   citingEntityLoadComplete: boolean,
   state: ProjectState,
   findings: ValidationFinding[],
+  // T-520: the orchestrator's board, passed down from `aux` rather than read
+  // here -- this file does no IO.
+  upwardBoard: UpwardBoard | undefined,
 ): void {
   const rulingsById = new Map(rulings.map((r) => [r.id, r]));
 
@@ -914,12 +964,12 @@ function validateRulings(
   // Citation checks: every ticket/issue citesRulings entry, resolved to its
   // current state. Arrangements are off the strict ProjectState load path
   // (T-473 binding item 2) and are not part of this pure function's input.
-  const ctx = buildCitationResolutionContext(rulings, unavailableIds, scanCompleteness, hasUnrecoverableEntries);
+  const baseCtx = buildCitationResolutionContext(rulings, unavailableIds, scanCompleteness, hasUnrecoverableEntries);
+  // T-520: attached rather than folded into the builder's signature, so every
+  // other caller of `buildCitationResolutionContext` is untouched.
+  const ctx = upwardBoard ? { ...baseCtx, upward: upwardBoard } : baseCtx;
   const reachedCurrentIds = new Set<string>();
-  const citingEntities: ReadonlyArray<{ id: string; citesRulings?: readonly string[] }> = [
-    ...state.tickets,
-    ...state.issues,
-  ];
+  const citingEntities = citingEntitiesOf(state);
   for (const entity of citingEntities) {
     for (const citedId of entity.citesRulings ?? []) {
       const resolution = resolveCitation(citedId, ctx);
@@ -927,8 +977,14 @@ function validateRulings(
         findings.push({
           level: "warning",
           code: "superseded_ruling_citation",
-          message: `${entity.id} cites ${citedId}, which has been superseded by ${resolution.current.id}.`,
+          // T-520: the board is named only when the ruling is not this
+          // project's, so a reader who sees no board is looking at a
+          // single-project message that reads exactly as it did before.
+          message: `${entity.id} cites ${citedId}, which has been superseded by ${resolution.current.id}${
+            resolution.board === "orchestrator" ? " on the orchestrator board" : ""
+          }.`,
           entity: entity.id,
+          ...(resolution.board !== undefined && { board: resolution.board }),
         });
       } else if (resolution.status === "missing") {
         findings.push({
@@ -941,15 +997,73 @@ function validateRulings(
         findings.push({
           level: "warning",
           code: "unreadable_ruling_citation",
-          message: `${entity.id} cites ${citedId}, which is currently unreadable.`,
+          // T-520: says WHOSE ledger, for the same reason the resolution
+          // carries the board -- a reader told "unreadable" with no board goes
+          // through their own `.story/rulings/`, which is the one directory
+          // that is fine.
+          message: `${entity.id} cites ${citedId}, which is currently unreadable${boardSuffix(resolution.board)}.`,
           entity: entity.id,
+          ...(resolution.board !== undefined && { board: resolution.board }),
+        });
+      } else if (resolution.status === "indeterminate" && resolution.reason === "unreadable-orchestrator") {
+        // T-520: this project records an orchestrator and that board could not
+        // be read. A WARNING, never the `dangling_ruling_citation` error: the
+        // id may well exist one board up, and calling it nonexistent is the
+        // false claim this ticket exists to stop.
+        findings.push({
+          level: "warning",
+          code: "citation_unresolved_upward",
+          // The REASON comes off the board, never a hardcoded phrase. Two
+          // different failures land here -- a recorded orchestrator whose
+          // ledger could not be read, and this project's own config failing to
+          // parse so we cannot even tell whether it records one -- and a fixed
+          // message saying "this project records an orchestrator" would be a
+          // confident false claim in the second case, on a plain project that
+          // has no federation at all.
+          message: `${entity.id} cites ${citedId}, which could not be checked: the federation context is unverifiable (${
+            upwardBoard?.kind === "unreadable" ? upwardBoard.reason : "reason unavailable"
+          }).`,
+          entity: entity.id,
+        });
+      } else if (resolution.status === "indeterminate" && resolution.reason === "cross-board-supersession") {
+        // T-520: both boards claim the chain. Reported rather than resolved --
+        // picking one would invent an ordering neither board defines.
+        findings.push({
+          level: "warning",
+          code: "cross_board_supersession",
+          message: `${entity.id} cites ${citedId}, which is superseded on both this board and the orchestrator's. Neither claim is authoritative; reconcile them by hand.`,
+          entity: entity.id,
+        });
+      } else if (
+        (resolution.status === "branch" || resolution.status === "cycle")
+        && resolution.board === "orchestrator"
+      ) {
+        // T-520: a branched or cyclic chain is normally reported ONCE from the
+        // ruling graph above (`ruling_supersedes_branch`), not per citation --
+        // which is why these two statuses were never handled here. That
+        // reasoning holds only for THIS board's graph. Nothing validates the
+        // ORCHESTRATOR's graph from here, so before this branch a citation
+        // into a branched or cyclic root chain produced no finding at all: the
+        // corruption was swallowed and the node was told nothing.
+        //
+        // Guarded on the board precisely so the local case keeps falling
+        // through to the graph-level finding and is not reported twice.
+        findings.push({
+          level: "warning",
+          code: resolution.status === "branch" ? "cross_board_branch_citation" : "cross_board_cycle_citation",
+          message: resolution.status === "branch"
+            ? `${entity.id} cites ${citedId}, whose supersedes chain branches${boardSuffix(resolution.board)}: ${resolution.competingSuccessors.join(", ")} each claim to supersede it. Reconcile it there.`
+            : `${entity.id} cites ${citedId}, whose supersedes chain is cyclic${boardSuffix(resolution.board)}: ${resolution.chain.join(" -> ")}. Reconcile it there.`,
+          entity: entity.id,
+          board: resolution.board,
         });
       } else if (resolution.status === "indeterminate") {
         findings.push({
           level: "warning",
           code: "ruling_indeterminate_citation",
-          message: `${entity.id} cites ${citedId}: chain state unverifiable (${resolution.reason}).`,
+          message: `${entity.id} cites ${citedId}: chain state unverifiable (${resolution.reason})${boardSuffix(resolution.board)}.`,
           entity: entity.id,
+          ...(resolution.board !== undefined && { board: resolution.board }),
         });
       }
       // "branch" and "cycle" resolutions are already reported once, keyed by

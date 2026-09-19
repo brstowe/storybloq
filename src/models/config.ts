@@ -93,7 +93,7 @@ export type StatusWriterConfig = z.infer<typeof StatusWriterConfigSchema>;
 export const SessionIntelConfigSchema = z.object({
   enabled: z.boolean().optional(),                                   // default true
   advisoryPct: z.number().min(0.5).max(0.95).optional(),             // default 0.70
-  imperativePct: z.number().min(0.6).max(0.99).optional(),           // default 0.85; must exceed advisoryPct
+  imperativePct: z.number().min(0.6).max(0.99).optional(),           // default 0.90; must exceed advisoryPct
   ceilingFraction: z.number().min(0.8).max(1).optional(),            // default 0.925 (measured, T-499)
   boundarySampleCount: z.number().int().min(1).max(50).optional(),   // default 20; also per-session ledger retention
   jumpAllowanceFloorTokens: z.number().int().min(0).max(10_000_000).optional(), // default 25000

@@ -297,3 +297,132 @@ describe("copyDirRecursive symlinked destination (issue #12)", () => {
     expect(await readFile(realFile, "utf-8")).toBe("F");
   });
 });
+
+// ISS-1234: following a symlinked destination (issue #12 above) turned a
+// refresh into a sync that DELETED whatever the link's target held that the
+// stage did not, and the target was the package's own source tree. The copy
+// still follows a link to anywhere else; it refuses only when the resolved
+// destination is, contains, or is inside the source it is copying from.
+describe("copyDirRecursive self-overlap guard (ISS-1234)", () => {
+  let dir: string;
+
+  beforeEach(async () => {
+    dir = join(tmpdir(), `storybloq-self-overlap-${randomUUID()}`);
+    await mkdir(dir, { recursive: true });
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  async function sourceTree(root: string): Promise<void> {
+    await mkdir(join(root, "sub"), { recursive: true });
+    await writeFile(join(root, "a.md"), "A", "utf-8");
+    await writeFile(join(root, "sub", "b.md"), "B", "utf-8");
+    // A file a sync would delete: present in the target, never in the stage.
+    await writeFile(join(root, "only-in-target.md"), "keep me", "utf-8");
+  }
+
+  async function tree(root: string): Promise<Record<string, string>> {
+    const out: Record<string, string> = {};
+    for (const entry of await readdir(root, { withFileTypes: true, recursive: true })) {
+      if (!entry.isFile()) continue;
+      const parent = (entry as { parentPath?: string; path?: string }).parentPath ?? (entry as { path?: string }).path ?? root;
+      const rel = join(parent, entry.name).slice(root.length + 1);
+      out[rel] = await readFile(join(root, rel), "utf-8");
+    }
+    return out;
+  }
+
+  it("refuses a destination symlink whose target IS the source, naming both, and leaves the source byte-identical", async () => {
+    if (process.platform === "win32") return;
+    const src = join(dir, "source");
+    await sourceTree(src);
+    const link = join(dir, "dest");
+    await symlink(src, link);
+    const before = await tree(src);
+
+    const { copyDirRecursive } = await import(SKILL);
+    await expect(copyDirRecursive(src, link)).rejects.toThrow(/refusing to install/);
+    await expect(copyDirRecursive(src, link)).rejects.toThrow(src);
+    await expect(copyDirRecursive(src, link)).rejects.toThrow(link);
+
+    expect((await lstat(link)).isSymbolicLink()).toBe(true);
+    expect(await tree(src)).toEqual(before);
+    expect(await noTmpArtifacts(dir)).toBe(true);
+    expect(existsSync(join(dir, "source.bak"))).toBe(false);
+  });
+
+  it("refuses when the target is INSIDE the source, and when the source is inside the target", async () => {
+    if (process.platform === "win32") return;
+    const src = join(dir, "source");
+    await sourceTree(src);
+    const { copyDirRecursive } = await import(SKILL);
+
+    const intoSub = join(dir, "dest-sub");
+    await symlink(join(src, "sub"), intoSub);
+    await expect(copyDirRecursive(src, intoSub)).rejects.toThrow(/refusing to install/);
+    expect(await readFile(join(src, "sub", "b.md"), "utf-8")).toBe("B");
+
+    const parent = join(dir, "dest-parent");
+    await symlink(dir, parent);
+    await expect(copyDirRecursive(src, parent)).rejects.toThrow(/refusing to install/);
+    expect(await readFile(join(src, "only-in-target.md"), "utf-8")).toBe("keep me");
+  });
+
+  it("refuses a plain (non-symlink) destination that is the source itself", async () => {
+    const src = join(dir, "source");
+    await sourceTree(src);
+    const before = await tree(src);
+    const { copyDirRecursive } = await import(SKILL);
+    await expect(copyDirRecursive(src, src)).rejects.toThrow(/refusing to install/);
+    expect(await tree(src)).toEqual(before);
+  });
+
+  it("still writes through a symlink to an unrelated directory (issue #12 stays)", async () => {
+    if (process.platform === "win32") return;
+    const src = join(dir, "source");
+    await sourceTree(src);
+    const real = join(dir, "dotfiles", "story");
+    await mkdir(real, { recursive: true });
+    await writeFile(join(real, "stale.md"), "old", "utf-8");
+    const link = join(dir, "dest");
+    await symlink(real, link);
+
+    const { copyDirRecursive } = await import(SKILL);
+    const written = await copyDirRecursive(src, link);
+
+    expect(written.sort()).toEqual(["a.md", "only-in-target.md", "sub/b.md"]);
+    expect((await lstat(link)).isSymbolicLink()).toBe(true);
+    expect(await readFile(join(real, "a.md"), "utf-8")).toBe("A");
+    expect(existsSync(join(real, "stale.md"))).toBe(false);
+  });
+
+  it("refuses a source that sits where the swap stages or backs up (<dest>.tmp, <dest>.bak): the swap removes both first", async () => {
+    const { copyDirRecursive } = await import(SKILL);
+    for (const suffix of [".tmp", ".bak"]) {
+      const dest = join(dir, `dest${suffix.replace(".", "-")}`);
+      const src = `${dest}${suffix}`;
+      await sourceTree(src);
+      const before = await tree(src);
+      await expect(copyDirRecursive(src, dest)).rejects.toThrow(/refusing to install/);
+      expect(await tree(src)).toEqual(before);
+      expect(existsSync(dest)).toBe(false);
+    }
+  });
+
+  it("a sibling whose name merely starts with the source's name is not an overlap", async () => {
+    if (process.platform === "win32") return;
+    const src = join(dir, "storybloq");
+    await sourceTree(src);
+    const sibling = join(dir, "storybloq-x");
+    await mkdir(sibling, { recursive: true });
+    const link = join(dir, "dest");
+    await symlink(sibling, link);
+
+    const { copyDirRecursive } = await import(SKILL);
+    await expect(copyDirRecursive(src, link)).resolves.toBeDefined();
+    expect(await readFile(join(sibling, "a.md"), "utf-8")).toBe("A");
+    expect(await readFile(join(src, "a.md"), "utf-8")).toBe("A");
+  });
+});

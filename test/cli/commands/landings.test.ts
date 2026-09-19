@@ -8,6 +8,7 @@ import { handleTicketCreate } from "../../../src/cli/commands/ticket.js";
 import { initProject } from "../../../src/core/init.js";
 import { loadProject } from "../../../src/core/project-loader.js";
 import type { CommandContext } from "../../../src/cli/types.js";
+import { git as fixtureGit } from "../../helpers/git-fixture.js";
 
 /**
  * T-477 section 4.3: `storybloq landings`, end to end -- a real git repo, a
@@ -18,7 +19,7 @@ import type { CommandContext } from "../../../src/cli/types.js";
  */
 
 function git(cwd: string, ...args: string[]): string {
-  return execFileSync("git", ["-C", cwd, ...args], { encoding: "utf-8" }).trim();
+  return fixtureGit(cwd, args);
 }
 
 const tmpDirs: string[] = [];

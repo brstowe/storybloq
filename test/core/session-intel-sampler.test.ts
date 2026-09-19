@@ -37,13 +37,16 @@ describe("computeSample states", () => {
     expect(s.jumpAllowanceBasis).toMatch(/floor 25000 \(0 deltas/);
   });
 
-  it("advisory at 70%, imperative when tokens + jump allowance reach 85%", () => {
+  it("advisory at 70%, imperative when tokens + jump allowance reach 90% (ISS-1249: 83% is still advisory)", () => {
     expect(sample(Math.ceil(0.7 * 417_737)).state).toBe("advisory");
     expect(sample(Math.ceil(0.7 * 417_737) - 1).state).toBe("ok");
-    const imperativeAt = Math.ceil(0.85 * 417_737) - 25_000;
+    // ISS-1249: the owner's rule is no handover before 90%; 0.85 minus the
+    // allowance fired "IMPERATIVE: 83%" and read as a bug.
+    expect(sample(Math.ceil(0.83 * 417_737)).state).toBe("advisory");
+    const imperativeAt = Math.ceil(0.9 * 417_737) - 25_000;
     expect(sample(imperativeAt).state).toBe("imperative");
     expect(sample(imperativeAt - 1).state).toBe("advisory");
-    expect(sample(imperativeAt).reason).toMatch(/\+ jump allowance 25000 >= 0.85/);
+    expect(sample(imperativeAt).reason).toMatch(/\+ jump allowance 25000 >= 0.9/);
   });
 
   it("jump allowance is p90 of deltas since the epoch, clamped, floor under 5 deltas", () => {
@@ -54,7 +57,7 @@ describe("computeSample states", () => {
     expect(jumpAllowanceFor([1, 1, 1, 1, 1], cfg)).toMatchObject({ value: 25_000, basis: expect.stringMatching(/raised to floor/) });
     expect(jumpAllowanceFor([1e6, 1e6, 1e6, 1e6, 1e6], cfg)).toMatchObject({ value: 150_000, basis: expect.stringMatching(/capped/) });
     // A big p90 pulls imperative earlier.
-    const tokens = Math.ceil(0.85 * 417_737) - 100_000;
+    const tokens = Math.ceil(0.9 * 417_737) - 100_000;
     expect(sample(tokens).state).toBe("ok");
     expect(sample(tokens, { deltas: [90_000, 100_000, 100_000, 100_000, 100_000] }).state).toBe("imperative");
   });
@@ -72,7 +75,7 @@ describe("computeSample states", () => {
 });
 
 describe("handover suppression", () => {
-  const imperativeTokens = Math.ceil(0.85 * 417_737) - 25_000;
+  const imperativeTokens = Math.ceil(0.9 * 417_737) - 25_000;
   const withHandover = (over: Partial<SessionIntelPresence>): SessionIntelPresence => ({
     ...emptySessionIntel(),
     handoverWrittenAt: "2026-09-09T12:20:00.000Z",

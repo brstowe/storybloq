@@ -50,7 +50,15 @@ Run `storybloq <command>`. Positional arguments appear after the command; ? mark
 - **lesson create** (--title, --content?, --context, --source, --supersedes?, --stdin?, --tags?, --format?) - Create a new lesson
 - **lesson update <id>** (--title?, --content?, --context?, --clear-tags?, --status?, --stdin?, --tags?, --format?) - Update a lesson
 - **lesson reinforce <id>** (--format?) - Reinforce a lesson: increment count and update lastValidated
+- **lesson promote <id>** (--to, --force?, --format?) - Promote a lesson into an attached storyknow knowledge pack (fork). The pack gains a K-entry (reinforcement count carried, origin stamped); the local lesson is superseded with a pointer.
 - **lesson delete <id>** (--hard?, --format?) - Delete a lesson
+- **knowledge list** (--status?, --tag?, --source?, --format?) - List knowledge entries in this pack (fork)
+- **knowledge get <id>** (--format?) - Get a knowledge entry by ID (fork)
+- **knowledge digest** (--format?) - Ranked digest of knowledge (fork): inside a pack, the pack's own entries; inside a consumer project, all attached knowledge
+- **knowledge create** (--title, --context, --source, --content?, --tags?, --supersedes?, --stdin?, --format?) - Create a knowledge entry in this pack (fork)
+- **knowledge update <id>** (--title?, --content?, --context?, --tags?, --clear-tags?, --status?, --stdin?, --format?) - Update a knowledge entry (fork)
+- **knowledge reinforce <id>** (--format?) - Reinforce a knowledge entry: increment count and update lastValidated (fork)
+- **knowledge delete <id>** (--format?) - Delete a knowledge entry (fork)
 - **ruling list** (--scope-tag?, --superseded?, --format?) - List owner-ruling attestation records
 - **ruling get <id>** (--format?) - Get a ruling by ID
 - **ruling create** (--text, --attribution, --date, --client-task-id?, --scope-tag?, --cites?, --format?) - Record a ruling verbatim and cite it from the tickets or issues it binds
@@ -72,6 +80,7 @@ Run `storybloq <command>`. Positional arguments appear after the command; ? mark
 - **session intel** (--session-id?, --transcript?, --caller-model?, --full?, --client-task-id?, --format?) - Context usage, expected auto-compaction point with provenance, pressure state (ok/advisory/imperative/compact-needed), session facts. Works without .story/. --transcript must be ~/.claude/projects/<project>/<sessionId>.jsonl (a regular file, not a symlink); a refusal names the rule that failed
 - **setup** (--client?, --skip-hooks?, --skip-skill?) - Install Storybloq skill, MCP, and hooks for Claude, Codex, or both
 - **setup-skill** (--skip-hooks?) - Compatibility alias for `storybloq setup --client claude`
+- **update** (--client?) - Install the newest storybloq into the running Node's prefix, re-run setup for your AI clients, and say when to restart (on Windows it prints the two manual steps instead)
 - **reconcile** (--dry-run?, --ci?, --rebalance-ranks?, --format?) - Detect and fix duplicate displayIds across all entity types
 - **conflicts list** (--format?) - List all items with unresolved merge conflicts
 - **conflicts show <id>** (--format?) - Show field-level conflict detail for an item
@@ -99,6 +108,7 @@ Run `storybloq <command>`. Positional arguments appear after the command; ? mark
 - **bus check** (--ship, --format?) - Run the critical Bus release gate
 - **bus export <thread-id>** (--format?) - Explicitly export one Bus transcript
 - **node add <name>** (--path, --stack?, --role?, --kind?, --summary?, --depends-on?, --link?, --format?) - Add a federation node to an orchestrator project
+- **node link [orchestrator]** (--format?) - Record which orchestrator this project belongs to (run from the node)
 - **node update <name>** (--path?, --stack?, --role?, --kind?, --summary?, --clear-depends-on?, --clear-links?, --depends-on?, --link?, --format?) - Update a federation node's metadata
 - **node remove <name>** (--force?, --prune?, --format?) - Remove a federation node from an orchestrator project
 - **arrangement coordinate <id>** (--json, --client-task-id?, --format?) - Record a pen-owned duet coordination operation
@@ -326,6 +336,7 @@ Coordinate an owner-paired manager and worker with a proved return route and dur
 1. `npm install -g @storybloq/storybloq@latest` - install CLI
 2. `storybloq setup --client all` - install Storybloq skill, MCP, and hooks for Claude Code and Codex
 3. `storybloq init --name my-project` - initialize .story/ in your project
+4. `storybloq update` - later: install the newest version and re-run setup in one step, then restart the client
 
 ## Troubleshooting
 

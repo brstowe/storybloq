@@ -17,9 +17,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { gitCommitterEmail } from "../../src/autonomous/git-inspector.js";
+import { git as fixtureGit } from "../helpers/git-fixture.js";
 
 function git(root: string, args: string[]): string {
-  return execFileSync("git", args, { cwd: root }).toString().trim();
+  return fixtureGit(root, args);
 }
 
 describe("gitCommitterEmail (ISS-982/R4-F1)", () => {

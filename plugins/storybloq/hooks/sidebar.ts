@@ -28,10 +28,17 @@
  * already running: four `$.fs.stat` calls every two seconds, and nothing
  * further unless one of those four mtimes moved.
  *
- * WIDTH. The client will not draw a pane a plugin opened on its own below 144
- * terminal columns, or below 110 once the person has asked for that id. Below
- * that the same numbers go out as one `AbovePrompt` line, which is how the
- * ticket's 80-column acceptance is met.
+ * WIDTH AND PLACEMENT (ISS-1247, ISS-1251; the 2.1.277 declarations). Two
+ * client rules, neither ours to set. WHERE a pane sits is the renderer's: the
+ * fullscreen (alternate-screen) layout docks it beside the transcript from 110
+ * columns, the main-screen layout seats it inline above the prompt at any
+ * width; `e.props.placement` says which on every Pane render. WHETHER it draws
+ * is judged at each `$.ui.open`: an open answering the person's input (a
+ * prompt they entered, a command, a press) is placed at any width; one the
+ * plugin makes on its own waits undrawn below 144 columns (110 once asked).
+ * The `session.start` open is the plugin's own, so a session started narrow
+ * shows the one `AbovePrompt` line instead, and the person's first prompt
+ * re-opens the pane (`prompt.submit`), which the client then places.
  *
  * EVENT NAMES AND `$`. Every event name is a string literal at its `on()` call
  * and every call is spelled `$.noun.member(...)` inline, because the client
@@ -57,12 +64,17 @@ const PANE_ID = "storybloq";
 const PANE_TITLE = "Storybloq";
 
 /**
- * The narrowest terminal the client will dock a pane into, from the API's own
- * rule: a plugin's unasked open "waits undrawn below 144 columns (110 once
- * asked)". Below this the pane may not be on screen at all, so the one-line
- * fallback draws instead.
+ * The narrowest terminal the client will place a plugin's OWN open into, from
+ * the API's rule: an unasked open "waits undrawn below 144 columns (110 once
+ * asked)". The `session.start` open is that kind, so below this a narrow
+ * start has no pane and the one-line fallback draws instead; the person's
+ * first prompt re-opens it as an open answering their input, which is placed
+ * at any width (ISS-1251). 110 was the wrong floor and left 110-143 columns
+ * with nothing drawn at all (ISS-1235). This is not the dock width: whether
+ * a placed pane docks or sits inline is the renderer's call (ISS-1247).
  */
-const DOCK_MIN_COLUMNS = 110;
+const DOCK_COLUMNS = 144;
+const BAND_HINT = ", board opens at your next prompt";
 
 const STORE_KEY = "sidebar-ledger-cache-v1";
 /** Under the store's 4 MiB, with room for whatever else the plugin keeps. */
@@ -182,11 +194,14 @@ const PANE_EDGE_CLEARANCE = 3;
 
 /**
  * Narrower than this and four columns are shredded rather than laid out, so
- * the same four sections stack instead. Well below the 110 the client needs
- * to dock a pane at all, so this is the in-between case: a pane that exists
- * but is too narrow to be a board.
+ * the pane draws the narrow board instead (ISS-1252): the work in hand and
+ * the footer, nothing else. A placed pane keeps its seat when the window
+ * shrinks (inline on the main screen, docked in fullscreen), so this is the
+ * in-between case: a pane that exists but is too narrow to be a board.
  */
 const BOARD_MIN_COLUMNS = 60;
+/** Cards the narrow board shows before it says how many more there are. */
+const NARROW_BOARD_CARDS = 3;
 
 /**
  * How a ledger write is recognised at `tool.call`. The MCP names arrive
@@ -302,8 +317,38 @@ let timerStarted = false;
 /** The Mod is on and something is drawn: not the same as the pane existing. */
 let sidebarEnabled = false;
 let paneOpen = false;
+/**
+ * The pane has actually RENDERED, which `paneOpen` does not say: the client
+ * parks an unasked open undrawn below the dock width, and a session started
+ * narrow and resized wide keeps that parked pane (ISS-1235). The band stands
+ * down only once this is true.
+ */
+let paneDrawn = false;
+/**
+ * A repeat `$.ui.open` was asked for this crossing into the dock width
+ * (ISS-1235). The client judges the width at each open, so one repeat open
+ * re-places a pane parked by a narrow start; one per crossing, never per
+ * render. Cleared below the dock width, when the pane draws, and on close.
+ */
+let reopenAsked = false;
+/**
+ * The client's theme is light (ISS-1238). The pane background is painted by
+ * the client from ITS theme, while a Text with no colour draws in the
+ * TERMINAL's default foreground: on a light terminal with a dark client theme
+ * that is dark on dark. So every pane Text gets an explicit colour for the
+ * client's theme. Read at attach from `$.config.list()`, followed through
+ * `config.set`; the dark default is the safe one (the pane was dark in every
+ * screenshot so far).
+ */
+let themeLight = false;
 let sessionActive = false;
 let contextPercent: number | null = null;
+/**
+ * `autoCompactWindow` from the merged settings, or null when none is set or
+ * the read was refused (ISS-1236). Read at attach and refreshed per turn,
+ * never per render: `ui.render` runs on every resize and invalidate.
+ */
+let autoCompactWindow: number | null = null;
 let warm = false;
 let uiAvailable = true;
 /** The project has no `.story/` at all, so the Mod draws nothing anywhere. */
@@ -311,6 +356,27 @@ let noLedger = false;
 let saidNoUi = false;
 let saidNoLedger = false;
 let saidScanFailed = false;
+let saidRootUnresolved = false;
+
+/**
+ * ISS-1239: where the ledger IS, decided once at `session.start`.
+ *
+ * The Mod used to address the ledger with bare relative constants, which the
+ * client resolves against the session's CURRENT working directory. One `cd`
+ * in the session and `.story/tickets` pointed somewhere with no ledger in it,
+ * the scan listed nothing, and the board silently cleared. So the root is
+ * resolved once from the directory the session STARTED in and everything is
+ * addressed from it; the working directory may wander and the pane does not
+ * notice.
+ *
+ * `initialCwd` is kept separately from `ledgerRoot` because late attachment
+ * (a project that gains a `.story/` mid-session) has to re-walk from the same
+ * fixed origin. Re-walking from the live cwd would search wherever the person
+ * last cd-ed to and attach to an unrelated nested ledger, which is the same
+ * class of bug.
+ */
+let initialCwd: string | null = null;
+let ledgerRoot: string | null = null;
 
 /** Reset between tests; a session only ever loads this module once. */
 function forgetEverything(): void {
@@ -330,14 +396,21 @@ function forgetEverything(): void {
   timerStarted = false;
   sidebarEnabled = false;
   paneOpen = false;
+  paneDrawn = false;
+  reopenAsked = false;
+  themeLight = false;
   sessionActive = false;
   contextPercent = null;
+  autoCompactWindow = null;
   warm = false;
   uiAvailable = true;
   noLedger = false;
   saidNoUi = false;
   saidNoLedger = false;
   saidScanFailed = false;
+  saidRootUnresolved = false;
+  initialCwd = null;
+  ledgerRoot = null;
 }
 
 function isTicketRecord(record: SidebarRecord): record is SidebarTicket {
@@ -498,17 +571,29 @@ function summaryLine(withContext: boolean): string {
   return `Storybloq: ${parts.join(", ")}`;
 }
 
+/**
+ * The band, cut to the terminal. Below the dock width it ends with what width
+ * the board needs, since that is the moment the question comes up, but only
+ * when the whole summary fits beside it: the numbers are the band's job and
+ * the hint never costs one of them (80 columns keeps the issues count).
+ */
+function bandText(columns: number, narrow: boolean): string {
+  const line = summaryLine(true);
+  const hint = narrow && cellWidth(line) + cellWidth(BAND_HINT) <= columns ? BAND_HINT : "";
+  return truncate(`${line}${hint}`, columns);
+}
+
 /** config.json, roadmap.json, the handover names and the session flag. */
 async function readHeader($: any): Promise<void> {
   try {
-    const configText = await $.fs.read(CONFIG_PATH);
+    const configText = await $.fs.read(p(CONFIG_PATH));
     const parsed = JSON.parse(configText) as { project?: unknown };
     project = typeof parsed.project === "string" ? parsed.project : "";
   } catch {
     project = "";
   }
   try {
-    const roadmapText = await $.fs.read(ROADMAP_PATH);
+    const roadmapText = await $.fs.read(p(ROADMAP_PATH));
     const parsed = JSON.parse(roadmapText) as { phases?: readonly { id?: unknown; name?: unknown }[] };
     const found: { id: string; name: string }[] = [];
     for (const phase of parsed.phases ?? []) {
@@ -521,7 +606,7 @@ async function readHeader($: any): Promise<void> {
     phases = [];
   }
   try {
-    const entries = await $.fs.list(HANDOVERS_DIR);
+    const entries = await $.fs.list(p(HANDOVERS_DIR));
     handoverFilenames = entries
       .filter((entry: { kind: string }) => entry.kind === "file")
       .map((entry: { name: string }) => entry.name);
@@ -531,9 +616,9 @@ async function readHeader($: any): Promise<void> {
   // status.json is a session flag and nothing else; the ledger numbers do
   // not come from it.
   sessionActive = false;
-  if (await $.fs.exists(STATUS_PATH)) {
+  if (await $.fs.exists(p(STATUS_PATH))) {
     try {
-      const parsed = JSON.parse(await $.fs.read(STATUS_PATH)) as { sessionActive?: unknown };
+      const parsed = JSON.parse(await $.fs.read(p(STATUS_PATH))) as { sessionActive?: unknown };
       sessionActive = parsed.sessionActive === true;
     } catch {
       sessionActive = false;
@@ -634,22 +719,98 @@ function finalizeScan($: any, outcome: "done" | "failed"): void {
  * Many requests during one scan collapse into the single scan that follows it.
  */
 /**
- * Does this project have a ledger at all?
+ * Joins a pinned root to one of the ledger suffixes with exactly one
+ * separator.
  *
- * The directory itself, not `tickets/`: a fresh `storybloq init` leaves
- * `.story/` with empty subdirectories, and that IS a ledger. A board of four
- * "none" columns is the right answer there and the wrong one in a repo that
- * never ran init.
- *
- * A host that refuses the question answers yes: the Mod hiding itself because
- * `$.fs.exists` threw would be a worse failure than one empty board.
+ * The trailing-separator trim deliberately refuses to shorten a bare drive
+ * root: on Windows `C:\` trimmed to `C:` stops being absolute and becomes
+ * drive-RELATIVE, which would reintroduce the very bug this pins down. `/`
+ * has the same shape and is left alone for the same reason.
  */
-async function ledgerPresent($: any): Promise<boolean> {
-  try {
-    return (await $.fs.exists(LEDGER_DIR)) !== false;
-  } catch {
-    return true;
+function joinRoot(root: string, suffix: string): string {
+  const bareDriveRoot = /^[A-Za-z]:[/\\]$/.test(root);
+  const trimmed = root.length > 1 && !bareDriveRoot ? root.replace(/[/\\]+$/, "") : root;
+  const separated = trimmed.endsWith("/") || trimmed.endsWith("\\");
+  return separated ? `${trimmed}${suffix}` : `${trimmed}/${suffix}`;
+}
+
+/**
+ * A ledger suffix as an absolute path under the pinned root.
+ *
+ * Every `$.fs` call that touches the ledger goes through here. The seven
+ * suffix constants are left exactly as they are, so the ledger-write detector
+ * further down, which matches command TEXT rather than filesystem paths, is
+ * untouched by this change.
+ */
+function p(suffix: string): string {
+  return ledgerRoot === null ? suffix : joinRoot(ledgerRoot, suffix);
+}
+
+/** The parent of a directory, or the directory itself once it is a root. */
+function parentDir(dir: string): string {
+  const cut = Math.max(dir.lastIndexOf("/"), dir.lastIndexOf("\\"));
+  if (cut < 0) return dir;
+  if (cut === 0) return dir.slice(0, 1);
+  const parent = dir.slice(0, cut);
+  return /^[A-Za-z]:$/.test(parent) ? `${parent}\\` : parent;
+}
+
+/** An errno off a rejected `$.fs` call, when the host supplied one. */
+function errnoOf(error: unknown): string {
+  const code = (error as { code?: unknown } | null)?.code;
+  return typeof code === "string" ? code : "";
+}
+
+/** A missing path, as opposed to one the host refused to answer for. */
+function isMissing(error: unknown): boolean {
+  return errnoOf(error) === "ENOENT";
+}
+
+/** How far up the walk will look before calling the question unanswerable. */
+const MAX_ROOT_WALK = 64;
+
+type RootResolution =
+  | { readonly kind: "pinned"; readonly root: string }
+  | { readonly kind: "absent" }
+  | { readonly kind: "unresolved"; readonly reason: string };
+
+/**
+ * Walks up from `start` for the nearest directory holding a `.story/`.
+ *
+ * Three ANSWERS, and keeping them apart is the point. "pinned" is a root.
+ * "absent" is a clean walk that reached the filesystem root without finding
+ * one, which is a project that never ran `storybloq init` and is not a
+ * failure. "unresolved" is the host refusing the question, which is a failure
+ * and must never be mistaken for the second.
+ *
+ * The directory itself is what counts, not `tickets/`: a fresh `storybloq
+ * init` leaves `.story/` with empty subdirectories, and that IS a ledger.
+ *
+ * The walk stops when a directory is its own parent, so a filesystem root
+ * cannot loop, and is bounded anyway: a bound that is never reached costs
+ * nothing and a walk that never ends costs the session.
+ */
+async function resolveLedgerRoot($: any, start: string): Promise<RootResolution> {
+  // A trailing separator would make the first step ask about `/repo//.story`
+  // and the second, after `parentDir` trims it, ask about the same directory
+  // again. Same shape as `joinRoot`: a bare drive root keeps its separator,
+  // because without it it stops being absolute.
+  const bareDriveRoot = /^[A-Za-z]:[/\\]$/.test(start);
+  let dir = start.length > 1 && !bareDriveRoot ? start.replace(/[/\\]+$/, "") : start;
+  for (let step = 0; step < MAX_ROOT_WALK; step += 1) {
+    try {
+      if ((await $.fs.exists(joinRoot(dir, LEDGER_DIR))) !== false) {
+        return { kind: "pinned", root: dir };
+      }
+    } catch (error) {
+      const code = errnoOf(error);
+      return { kind: "unresolved", reason: code === "" ? "the client refused the read" : code };
+    }
+    const parent = parentDir(dir);
+    if (parent === dir) return { kind: "absent" };
+    dir = parent;
   }
+  return { kind: "absent" };
 }
 
 /**
@@ -663,6 +824,12 @@ async function ledgerPresent($: any): Promise<boolean> {
  */
 async function attach($: any): Promise<void> {
   if (!paneOpen) {
+    // T-519: the pane's background is the client's. As of the 2.1.273 d.ts,
+    // `PaneOpenArgs` is { id, title, focus, closeOnEscape, holdToasts, rows }
+    // and the `Pane` props are read-only placement data: nothing names a
+    // theme or background. `Box`/`Text` take `backgroundColor`, but that
+    // fixes a colour rather than following the terminal, so none is set and
+    // the tones below are chosen for the client's own pane background.
     await $.ui.open({ id: PANE_ID, title: PANE_TITLE });
     paneOpen = true;
   }
@@ -671,6 +838,7 @@ async function attach($: any): Promise<void> {
   // response. Reading them only on `turn.complete` is why the owner's header
   // was blank after a reload, with the fill only appearing a turn later.
   contextPercent = await readContextFill($);
+  themeLight = await readThemeLight($);
   await readHeader($);
   await loadCache($);
   // The idle poll's baseline (T-517). Taken before the timer starts and before
@@ -691,7 +859,13 @@ async function attach($: any): Promise<void> {
  * one `$.fs.exists` on a project that has no ledger to read anyway.
  */
 async function attachIfLedgerArrived($: any): Promise<void> {
-  if (!(await ledgerPresent($))) return;
+  // From the ORIGIN, never from the live working directory: the session may
+  // have cd-ed anywhere by now, and resolving from there would either miss
+  // the project's ledger or attach to an unrelated nested one.
+  if (initialCwd === null) return;
+  const resolution = await resolveLedgerRoot($, initialCwd);
+  if (resolution.kind !== "pinned") return;
+  ledgerRoot = resolution.root;
   noLedger = false;
   await attach($);
 }
@@ -717,29 +891,44 @@ async function beginScan($: any): Promise<void> {
   scanInitializing = true;
   try {
     const items: ScanItem[] = [];
+    // ISS-1239: a directory that is MISSING and one the host refused to read
+    // are different facts, and the purge below may only act on the first.
+    // `$.fs` rejects with the OS errno, so they are separable.
+    let refused = false;
     try {
-      for (const entry of await $.fs.list(TICKETS_DIR)) {
+      for (const entry of await $.fs.list(p(TICKETS_DIR))) {
         if (entry.kind === "file" && entry.name.endsWith(".json")) {
           items.push({ path: `${TICKETS_DIR}/${entry.name}`, kind: "ticket" });
         }
       }
-    } catch {
+    } catch (error) {
       // No tickets directory: nothing to read from it.
+      if (!isMissing(error)) refused = true;
     }
     try {
-      for (const entry of await $.fs.list(ISSUES_DIR)) {
+      for (const entry of await $.fs.list(p(ISSUES_DIR))) {
         if (entry.kind === "file" && entry.name.endsWith(".json")) {
           items.push({ path: `${ISSUES_DIR}/${entry.name}`, kind: "issue" });
         }
       }
-    } catch {
+    } catch (error) {
       // Same.
+      if (!isMissing(error)) refused = true;
     }
     // A file the ledger no longer has must leave the cache, or a deleted
     // ticket would keep being counted.
-    const present = new Set(items.map((item) => item.path));
-    for (const path of Object.keys(cache)) {
-      if (!present.has(path)) delete cache[path];
+    //
+    // Skipped on a refusal. Purging then would turn "I could not read this"
+    // into "this was deleted" and empty the board on a transient failure,
+    // which is this issue's bug wearing a different hat. Keeping a stale
+    // record costs a board that is briefly behind; purging costs the board.
+    // An empty scan that really is an empty ledger still clears, because that
+    // path throws ENOENT and leaves `refused` false.
+    if (!refused) {
+      const present = new Set(items.map((item) => item.path));
+      for (const path of Object.keys(cache)) {
+        if (!present.has(path)) delete cache[path];
+      }
     }
     queue = items;
     scanActive = true;
@@ -793,7 +982,7 @@ async function ledgerMtimes($: any): Promise<Record<string, number>> {
   const seen: Record<string, number> = {};
   for (const path of POLLED_PATHS) {
     try {
-      const stat = await $.fs.stat(path);
+      const stat = await $.fs.stat(p(path));
       seen[path] = typeof stat?.mtimeMs === "number" ? stat.mtimeMs : 0;
     } catch {
       seen[path] = 0;
@@ -856,10 +1045,10 @@ async function drainChunk($: any): Promise<void> {
       const item = queue.shift()!;
       read += 1;
       try {
-        const stat = await $.fs.stat(item.path);
+        const stat = await $.fs.stat(p(item.path));
         const cached = cache[item.path];
         if (cached && cached.mtimeMs === stat.mtimeMs) continue;
-        const record = extractRecord(item.kind, await $.fs.read(item.path));
+        const record = extractRecord(item.kind, await $.fs.read(p(item.path)));
         if (record === null) delete cache[item.path];
         else cache[item.path] = { mtimeMs: stat.mtimeMs, record };
       } catch {
@@ -892,16 +1081,89 @@ async function drainChunk($: any): Promise<void> {
  * "from the first API response of the live window": a fresh session or one
  * just compacted has neither until its next response. Live, the owner's
  * header stayed empty because this read `percent` alone, so the percent is
- * computed from `tokens` over `window` whenever the engine did not state it,
- * and null (draw nothing) only when there is no reading at all.
+ * computed from `tokens` whenever they exist, the engine's `percent` stands
+ * in only when they do not, and null (draw nothing) only when there is no
+ * reading at all. `compactWindow` is the settings' auto-compact window, or
+ * null for the model's own.
  */
-function contextFill(usage: any): number | null {
+function contextFill(usage: any, compactWindow: number | null): number | null {
   const context = usage?.context;
-  if (typeof context?.percent === "number") return Math.round(context.percent);
   const tokens = context?.tokens;
-  const window = context?.window;
-  if (typeof tokens !== "number" || typeof window !== "number" || window <= 0) return null;
-  return Math.round((tokens / window) * 100);
+  const window = typeof compactWindow === "number" ? compactWindow : context?.window;
+  if (typeof tokens === "number" && typeof window === "number" && window > 0) {
+    // ISS-1236: the same arithmetic as the pressure banner (session intel):
+    // tokens over the compaction ceiling of the auto-compact window, not over
+    // the model's raw window. The engine's `percent` is the raw figure, which
+    // is why the pane said 22% while the banner said 28% on the same screen.
+    return Math.min(100, Math.round((tokens / (COMPACT_CEILING * window)) * 100));
+  }
+  if (typeof context?.percent === "number") return Math.round(context.percent);
+  return null;
+}
+
+/**
+ * The fraction of the auto-compact window at which compaction runs, the
+ * ceiling the pressure banner measures against
+ * (`src/core/session-intel/config.ts`, `ceilingFraction`). The plugin has no
+ * import path to that module, so the figure is restated here; a test pins
+ * the arithmetic against the banner's numbers.
+ */
+const COMPACT_CEILING = 0.925;
+
+/**
+ * The bounds the CLI's settings reader accepts for `autoCompactWindow`
+ * (`src/core/claude-settings.ts`, `AUTO_COMPACT_WINDOW_BOUNDS`); a figure
+ * outside them is treated as unset there, and so here.
+ */
+const AUTO_COMPACT_WINDOW_MIN = 10_000;
+const AUTO_COMPACT_WINDOW_MAX = 10_000_000;
+
+/**
+ * `autoCompactWindow` from the merged settings, or null: unset, out of the
+ * CLI reader's bounds, not a safe integer, or the host refused the read. The
+ * merge is the engine's own (user, project, local, flag, policy), the same
+ * layers the CLI reader walks. One call at attach and one per turn; never
+ * from `ui.render`.
+ */
+/** Whether a theme name is a light one: `light`, `light-daltonized`, `light-ansi`. */
+function isLightTheme(value: unknown): boolean {
+  return typeof value === "string" && value.startsWith("light");
+}
+
+/**
+ * The client's `theme` row, as `$.config.list()` answers it (ISS-1238). A
+ * refused or unexpected answer keeps the dark default, never the board.
+ */
+async function readThemeLight($: any): Promise<boolean> {
+  try {
+    const rows = await $.config.list();
+    const row = Array.isArray(rows) ? rows.find((r: any) => r?.key === "theme") : undefined;
+    return isLightTheme(row?.value);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * A pane Text with an explicit colour for the client's theme (ISS-1238):
+ * white on a dark theme, black on a light one, unless the props already
+ * carry a tone (`yellow`, `cyan`). Never the terminal's default foreground,
+ * which does not know what the client painted behind it.
+ */
+function paneText(Text: (props: Record<string, unknown>) => unknown, props: Record<string, unknown>): unknown {
+  return Text({ color: themeLight ? "black" : "white", ...props });
+}
+
+async function readAutoCompactWindow($: any): Promise<number | null> {
+  try {
+    const settings = await $.settings.read();
+    const value = settings?.autoCompactWindow;
+    if (!Number.isSafeInteger(value)) return null;
+    if (value < AUTO_COMPACT_WINDOW_MIN || value > AUTO_COMPACT_WINDOW_MAX) return null;
+    return value;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -914,9 +1176,12 @@ function contextFill(usage: any): number | null {
  * for all three call sites so the shape cannot drift between them.
  */
 async function readContextFill($: any): Promise<number | null> {
+  // The window setting rides along on the same cadence (attach, turn,
+  // compact) so the two figures can never disagree between refreshes.
+  autoCompactWindow = await readAutoCompactWindow($);
   try {
     const usage = await $.session.usage();
-    return contextFill(usage);
+    return contextFill(usage, autoCompactWindow);
   } catch {
     return null;
   }
@@ -1437,13 +1702,13 @@ function cardRow(elements: any, card: SidebarBoardCard, width: number): unknown 
   const idProps: Record<string, unknown> = { dimColor: true, children: truncate(card.id, width) };
   const tone = card.kind === "issue" && card.severity !== null ? SEVERITY_TONES[card.severity] : undefined;
   if (tone !== undefined) idProps["color"] = tone;
-  return elements.Text({
+  return paneText(elements.Text, {
     wrap: "truncate",
     children: [
       // The id whole, never cut: a half id is worse than no id. The title
       // takes what is left, and the eye runs down the titles.
-      elements.Text(idProps),
-      elements.Text({ children: title === "" ? "" : ` ${title}` }),
+      paneText(elements.Text, idProps),
+      paneText(elements.Text, { children: title === "" ? "" : ` ${title}` }),
     ],
   });
 }
@@ -1467,12 +1732,12 @@ function bodyRowsOf(
 ): unknown[] {
   const rows: unknown[] = [];
   if (cards.length === 0) {
-    rows.push(elements.Text({ dimColor: true, wrap: "truncate", children: truncate(EMPTY_COLUMN, width) }));
+    rows.push(paneText(elements.Text, { dimColor: true, wrap: "truncate", children: truncate(EMPTY_COLUMN, width) }));
   } else {
     for (const card of cards.slice(0, shown)) rows.push(cardRow(elements, card, width));
-    if (cards.length > shown) rows.push(elements.Text({ dimColor: true, wrap: "truncate", children: COLUMN_TAIL }));
+    if (cards.length > shown) rows.push(paneText(elements.Text, { dimColor: true, wrap: "truncate", children: COLUMN_TAIL }));
   }
-  while (rows.length < height) rows.push(elements.Text({ children: " " }));
+  while (rows.length < height) rows.push(paneText(elements.Text, { children: " " }));
   return rows;
 }
 
@@ -1514,13 +1779,13 @@ function boardColumn(
     width,
     overflow: "hidden",
     children: [
-      elements.Text({
+      paneText(elements.Text, {
         key: `${key}-heading`,
         ...style,
         wrap: "truncate",
         children: headingText(heading, cards.length, textWidth),
       }),
-      elements.Text({ key: `${key}-rule`, dimColor: true, wrap: "truncate", children: HEADING_RULE.repeat(textWidth) }),
+      paneText(elements.Text, { key: `${key}-rule`, dimColor: true, wrap: "truncate", children: HEADING_RULE.repeat(textWidth) }),
       ...bodyRowsOf(elements, cards, textWidth, shown, height),
     ],
   });
@@ -1534,7 +1799,7 @@ function compactBoard(elements: any, board: any, width: number): unknown {
     style: Readonly<Record<string, unknown>>,
     cards: readonly SidebarBoardCard[],
   ): unknown =>
-    elements.Text({ key, ...style, wrap: "truncate", children: headingText(label, cards.length, width) });
+    paneText(elements.Text, { key, ...style, wrap: "truncate", children: headingText(label, cards.length, width) });
   return elements.Box({
     key: "board",
     flexDirection: "column",
@@ -1545,6 +1810,46 @@ function compactBoard(elements: any, board: any, width: number): unknown {
       line("board-done", "Done", COLUMN_STYLES.done, board.done),
     ],
   });
+}
+
+/**
+ * The narrow board (ISS-1252): below BOARD_MIN_COLUMNS the four framed
+ * columns stacked into a strip the person had to scroll, past a cut-off Open
+ * card and an empty In progress frame. Owner: "in that view we can just show
+ * top 3 in progress and context pressure." So this draws the work in hand
+ * only: the In progress heading with its count, up to NARROW_BOARD_CARDS
+ * cards, a tail when more exist, or the dim word for none. Blocked, Open and
+ * Done keep their counts in the band's summary line under the pane. At most
+ * five rows, so the client's inline block shows it whole, without a budget.
+ */
+function narrowBoard(elements: any, board: any, width: number): unknown {
+  const cards = board.inProgress as readonly SidebarBoardCard[];
+  const rows: unknown[] = [
+    paneText(elements.Text, {
+      key: "narrow-heading",
+      ...COLUMN_STYLES.inProgress,
+      wrap: "truncate",
+      children: headingText("In progress", cards.length, width),
+    }),
+  ];
+  if (cards.length === 0) {
+    rows.push(paneText(elements.Text, { key: "narrow-none", dimColor: true, wrap: "truncate", children: truncate(EMPTY_COLUMN, width) }));
+  } else {
+    cards.slice(0, NARROW_BOARD_CARDS).forEach((card, index) => {
+      rows.push(elements.Box({ key: `narrow-card-${index}`, children: [cardRow(elements, card, width)] }));
+    });
+    if (cards.length > NARROW_BOARD_CARDS) {
+      rows.push(
+        paneText(elements.Text, {
+          key: "narrow-tail",
+          dimColor: true,
+          wrap: "truncate",
+          children: truncate(`... ${cards.length - NARROW_BOARD_CARDS} more`, width),
+        }),
+      );
+    }
+  }
+  return elements.Box({ key: "board", flexDirection: "column", children: rows });
 }
 
 /**
@@ -1614,7 +1919,7 @@ function headerNode(elements: any): unknown {
     flexDirection: "row",
     alignItems: "center",
     marginRight: PANE_EDGE_CLEARANCE,
-    children: [elements.Text({ bold: true, children: "Storybloq" })],
+    children: [paneText(elements.Text, { bold: true, children: "Storybloq" })],
   });
 }
 
@@ -1658,9 +1963,9 @@ function footerNode(
           flexDirection: "row",
           width: Math.min(room, cellWidth(NO_ISSUES)),
           overflow: "hidden",
-          children: [elements.Text({ dimColor: true, wrap: "truncate", children: NO_ISSUES })],
+          children: [paneText(elements.Text, { dimColor: true, wrap: "truncate", children: NO_ISSUES })],
         }),
-        elements.Text({ key: "context", wrap: "truncate", children: contextText }),
+        paneText(elements.Text, { key: "context", wrap: "truncate", children: contextText }),
       ],
     });
   }
@@ -1669,7 +1974,7 @@ function footerNode(
   const abbreviated = cellWidth(long) > room;
 
   const parts: unknown[] = [];
-  if (!abbreviated) parts.push(elements.Text({ children: "issues: " }));
+  if (!abbreviated) parts.push(paneText(elements.Text, { children: "issues: " }));
   SEVERITY_ORDER.forEach((severity, index) => {
     const count = counts[index] ?? 0;
     const props: Record<string, unknown> = {
@@ -1678,9 +1983,9 @@ function footerNode(
     if (count === 0) props["dimColor"] = true;
     else if (severity.tone !== null) props["color"] = severity.tone;
     if (index > 0) {
-      parts.push(elements.Text({ dimColor: true, children: abbreviated ? " " : ", " }));
+      parts.push(paneText(elements.Text, { dimColor: true, children: abbreviated ? " " : ", " }));
     }
-    parts.push(elements.Text(props));
+    parts.push(paneText(elements.Text, props));
   });
 
   return elements.Box({
@@ -1700,9 +2005,9 @@ function footerNode(
         flexDirection: "row",
         width: Math.min(room, cellWidth(abbreviated ? short : long)),
         overflow: "hidden",
-        children: [elements.Text({ wrap: "truncate", children: parts })],
+        children: [paneText(elements.Text, { wrap: "truncate", children: parts })],
       }),
-      elements.Text({ key: "context", wrap: "truncate", children: contextText }),
+      paneText(elements.Text, { key: "context", wrap: "truncate", children: contextText }),
     ],
   });
 }
@@ -1718,6 +2023,14 @@ export function registerSidebar(on: On, _options: Options): void {
     // to render into, and the band's line would be the empty board in one row.
     if (noLedger) return next(e);
     if (e.component === "Pane" && e.requestId === PANE_ID) {
+      if (!paneDrawn) {
+        // The band may have drawn on this same pass believing the pane
+        // parked (a reload runs `register` fresh, so this flag starts false
+        // while the client keeps the pane up). One redraw and it stands down.
+        paneDrawn = true;
+        reopenAsked = false;
+        $.ui.invalidate("ui.render");
+      }
       const elements = $.ui.resolve(e);
       const { Box, Text } = elements;
       const width: number = typeof e.props?.bodyColumns === "number" ? e.props.bodyColumns : 40;
@@ -1726,37 +2039,73 @@ export function registerSidebar(on: On, _options: Options): void {
       // space and not an empty string, because an empty Text collapses to no
       // row at all in this client and the break simply did not draw.
       const stacked = isStacked(width);
-      const budget = rowBudget(e, stacked);
+      // The narrow board is at most five rows and skips the blank rows, so it
+      // needs no budget: a pane too narrow for four columns is also the one
+      // seated inline on a small window, where every row is paid for.
+      const budget = stacked ? { body: 0, gaps: false, compact: false } : rowBudget(e, false);
       const rows: unknown[] = [headerNode(elements)];
-      if (budget.gaps) rows.push(Text({ key: "header-gap", children: " " }));
+      if (budget.gaps) rows.push(paneText(Text, { key: "header-gap", children: " " }));
       if (projection === null) {
         // Nothing to draw a board from yet: the one line that says why.
-        rows.push(Text({ children: truncate(summaryLine(false), width) }));
+        rows.push(paneText(Text, { children: truncate(summaryLine(false), width) }));
+      } else if (stacked) {
+        rows.push(narrowBoard(elements, projection.board, width));
+        rows.push(footerNode(elements, projection.issuesBySeverity, contextPercent, width));
+        if (sessionActive) {
+          rows.push(paneText(elements.Text, { dimColor: true, wrap: "truncate", children: "an autonomous session is active" }));
+        }
       } else {
         rows.push(
           budget.compact
             ? compactBoard(elements, projection.board, width)
             : boardNode(elements, projection.board, width, stacked, budget.body),
         );
-        if (budget.gaps) rows.push(Text({ key: "issues-gap", children: " " }));
+        if (budget.gaps) rows.push(paneText(Text, { key: "issues-gap", children: " " }));
         rows.push(footerNode(elements, projection.issuesBySeverity, contextPercent, width));
         if (sessionActive) {
-          rows.push(Text({ dimColor: true, wrap: "truncate", children: "an autonomous session is active" }));
+          rows.push(paneText(Text, { dimColor: true, wrap: "truncate", children: "an autonomous session is active" }));
         }
       }
       return Box({ flexDirection: "column", children: rows });
     }
     // The narrow fallback: the client leaves a plugin's pane undrawn on a
     // small terminal, so the same numbers go out as one line above the prompt.
-    // Gated on the Mod being on and on the width, and deliberately NOT on
-    // the pane existing. Below DOCK_MIN_COLUMNS the client draws no pane at
-    // all, so this line IS the sidebar; tying it to `paneOpen` would let a
-    // close of something never drawn turn off the only thing that was.
+    // Gated on the Mod being on, and deliberately NOT on the pane being OPEN:
+    // below DOCK_COLUMNS the client draws no pane at all, so this line IS the
+    // sidebar, and tying it to `paneOpen` would let a close of something never
+    // drawn turn off the only thing that was. It IS tied to the pane having
+    // been DRAWN: a pane opened narrow stays parked after a resize (ISS-1235),
+    // and a wide terminal with a parked pane still has to show the numbers.
     if (e.component === "AbovePrompt" && sidebarEnabled) {
       const columns: number = typeof e.viewport?.columns === "number" ? e.viewport.columns : 0;
-      if (columns > 0 && columns < DOCK_MIN_COLUMNS) {
+      const narrow = columns < DOCK_COLUMNS;
+      if (narrow) {
+        reopenAsked = false;
+      } else if (paneOpen && !paneDrawn && !reopenAsked) {
+        // Wide, open, parked: ask the client to place it again. The width is
+        // judged at each open (ISS-1235), so this is what a narrow-then-wide
+        // session needs; once per crossing, and never for a pane the person
+        // closed (`paneOpen` is false then). A refusal costs nothing: the
+        // band below is still drawn on this pass.
+        // Not awaited: a render never waits on an open, and the hook is sync.
+        reopenAsked = true;
+        Promise.resolve()
+          .then(() => {
+            // Re-checked on the microtask: a close or a draw that landed in
+            // between makes the ask stale, and a closed pane must stay closed.
+            if (!paneOpen || paneDrawn) return;
+            return $.ui.open({ id: PANE_ID, title: PANE_TITLE });
+          })
+          .catch(() => {
+            // The band stands in; the next crossing asks again.
+          });
+      }
+      if (columns > 0 && (narrow || !paneDrawn)) {
         const { Text } = $.ui.resolve(e);
-        return Text({ dimColor: true, children: truncate(summaryLine(true), columns) });
+        // The hint only while there is no board on screen: a placed pane keeps
+        // its seat when the window shrinks (inline, ISS-1247), and the band
+        // under it carries the counts the narrow board leaves out (ISS-1252).
+        return Text({ dimColor: true, children: bandText(columns, narrow && !paneDrawn) });
       }
     }
     return next(e);
@@ -1782,11 +2131,35 @@ export function registerSidebar(on: On, _options: Options): void {
     // On, whatever happens next: the refresh hooks stay armed so the pane can
     // appear the moment a ledger does.
     sidebarEnabled = true;
-    // No `.story/` means no pane, by the owner's ruling. A project that never
-    // ran `storybloq init` was getting four bordered "none" columns and an
-    // all-zero issues line, which is a dashboard reporting on nothing; the Mod
-    // hides instead, and says so once in the log rather than every turn.
-    if (!(await ledgerPresent($))) {
+    // ISS-1239: pin the root for the session, here and nowhere else. A reload
+    // fires this event again and re-pins against the new directory, which is
+    // wanted; `turn.complete` and `tool.call` must never re-resolve, which is
+    // why neither of them touches these three.
+    ledgerRoot = null;
+    // Said-once flags are per SESSION START, not per module load: a reload
+    // fires this event again without re-registering, and leaving them set
+    // would silently swallow the diagnostic the second time around.
+    saidNoLedger = false;
+    saidRootUnresolved = false;
+    initialCwd = typeof e.cwd === "string" && e.cwd.length > 0 ? e.cwd : null;
+    if (initialCwd === null) {
+      // No absolute origin to address from. Falling back to relative paths
+      // here is precisely the defect, so the Mod stays closed and says why
+      // rather than drawing a board that empties on the first `cd`.
+      noLedger = true;
+      if (!saidNoLedger) {
+        saidNoLedger = true;
+        $.ui.log("storybloq sidebar: this session start carried no working directory, so the pane stays closed");
+      }
+      return next(e);
+    }
+    const resolution = await resolveLedgerRoot($, initialCwd);
+    if (resolution.kind === "absent") {
+      // No `.story/` means no pane, by the owner's ruling. A project that
+      // never ran `storybloq init` was getting four bordered "none" columns
+      // and an all-zero issues line, which is a dashboard reporting on
+      // nothing; the Mod hides instead, and says so once in the log rather
+      // than every turn.
       noLedger = true;
       if (!saidNoLedger) {
         saidNoLedger = true;
@@ -1794,6 +2167,24 @@ export function registerSidebar(on: On, _options: Options): void {
       }
       return next(e);
     }
+    if (resolution.kind === "unresolved") {
+      // The host refused the walk, so there is no root to address from. An
+      // earlier draft pinned the origin as a guess and carried on; that is
+      // wrong, because `attachIfLedgerArrived` only runs while `noLedger` is
+      // set, so guessing would lock the session to a possibly-wrong root for
+      // good and disable its own recovery. Hiding costs one board until the
+      // refusal lifts; the retry loop then re-walks and pins properly. What
+      // is never done either way is falling back to relative addressing.
+      noLedger = true;
+      if (!saidRootUnresolved) {
+        saidRootUnresolved = true;
+        $.ui.log(
+          `storybloq sidebar: could not resolve the ledger root (${resolution.reason}), so the pane stays closed until it can be read`,
+        );
+      }
+      return next(e);
+    }
+    ledgerRoot = resolution.root;
     noLedger = false;
     // `session.start` fires again on a reload, and an open of an open id only
     // retitles it, but asking twice is still asking twice: `attach` asks once.
@@ -1849,7 +2240,45 @@ export function registerSidebar(on: On, _options: Options): void {
   // later `session.start` may open it again. This does not turn the Mod off,
   // which is why it touches `paneOpen` and not `sidebarEnabled`.
   on("ui.close", ($: any, e: any, next: (e: any) => unknown) => {
-    if (e.requestId === PANE_ID) paneOpen = false;
+    if (e.requestId === PANE_ID) {
+      paneOpen = false;
+      paneDrawn = false;
+      reopenAsked = false;
+    }
+    return next(e);
+  });
+
+  // The person switches theme in /config: the pane's text follows on the next
+  // draw (ISS-1238). The event fires before the write, so the new value is
+  // `e.value`, and any other row is not ours.
+  on("config.set", ($: any, e: any, next: (e: any) => unknown) => {
+    if (e?.key === "theme" && uiAvailable && sidebarEnabled) {
+      const light = isLightTheme(e.value);
+      if (light !== themeLight) {
+        themeLight = light;
+        $.ui.invalidate("ui.render");
+      }
+    }
+    return next(e);
+  });
+
+  // The person entered a prompt (ISS-1251). An open made here answers their
+  // input, which the client places at any width, where the session.start open
+  // (the plugin's own) waits undrawn below 144 columns. So a pane that is
+  // open but has never drawn is asked for again, once per prompt, and the
+  // client seats it (inline on the main screen, docked in fullscreen). A pane
+  // the person closed stays closed (`paneOpen` is false then), and a drawn
+  // one is left alone. The prompt itself is never touched: `next(e)` runs
+  // with `e` as it came, and the open is not awaited, so a refused or failing
+  // open cannot delay the turn.
+  on("prompt.submit", ($: any, e: any, next: (e: any) => unknown) => {
+    if (uiAvailable && sidebarEnabled && !noLedger && paneOpen && !paneDrawn) {
+      Promise.resolve()
+        .then(() => $.ui.open({ id: PANE_ID, title: PANE_TITLE }))
+        .catch(() => {
+          // The band stands in; the next prompt asks again.
+        });
+    }
     return next(e);
   });
 }

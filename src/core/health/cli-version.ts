@@ -3,7 +3,7 @@
  *
  * The registry answer is shared, not private: this reads and writes the same
  * `~/.claude/storybloq/update-check.json` the startup banner and
- * `storybloq_status` already use, so the once-per-day contract holds across
+ * `storybloq_status` already use, so the once-per-six-hours contract holds across
  * every entry point and a health run adds no traffic when the cache is fresh.
  *
  * The rule that matters here is NEVER A STALE CLAIM. A failed fetch with no
@@ -86,7 +86,7 @@ export async function checkCliVersion(
   if (cmp < 0) {
     return adviseCheck(
       ID,
-      `storybloq ${installed} is installed; ${latest} is published. Update with \`npm install -g @storybloq/storybloq@latest\`, then run \`storybloq setup\`.`,
+      `storybloq ${installed} is installed; ${latest} is published. Update with \`storybloq update\` (installs it and re-runs setup).`,
       detail,
     );
   }

@@ -7,6 +7,7 @@ import type { Config } from "../models/config.js";
 import type { IssueSeverity } from "../models/types.js";
 import { resolveRef, buildPrevDisplayIndex, type ResolveResult } from "./resolver.js";
 import { compareByRank } from "./fractional-index.js";
+import { isNonActionableDisposition } from "./issue-disposition.js";
 
 export type PhaseStatus = "notstarted" | "inprogress" | "complete";
 
@@ -61,6 +62,22 @@ export class ProjectState {
   readonly openTicketCount: number;
   readonly completeTicketCount: number;
   readonly activeIssueCount: number;
+  /**
+   * ISS-1113: the subset of `activeIssueCount` that is actual work.
+   *
+   * ADDED beside `activeIssueCount`, never folded into it. That number is
+   * published as `openIssues` and `ISSUE_FLOW_SEMANTICS.open` states its
+   * definition ("status !== resolved") as a contract; the federation scanner,
+   * its cache and the backlog-pressure ratio in `recommend` all read it, so
+   * narrowing it would change federation recommendations without anything
+   * saying so.
+   *
+   * Scope, precisely: this accounts for the STRUCTURED tier only, the durable
+   * `disposition` field. `computeActionability`'s handover and heuristic tiers
+   * are resolved at ranking time against a handover window, which is not
+   * something a count carried on loaded state can honestly claim to have read.
+   */
+  readonly actionableOpenIssueCount: number;
   readonly issuesBySeverity: ReadonlyMap<IssueSeverity, number>;
   readonly activeNoteCount: number;
   readonly archivedNoteCount: number;
@@ -271,6 +288,11 @@ export class ProjectState {
     ).length;
     this.activeIssueCount = this.activeIssues.filter(
       (i) => i.status !== "resolved",
+    ).length;
+    // ISS-1113: same population, minus the ones a disposition says nobody is
+    // going to act on.
+    this.actionableOpenIssueCount = this.activeIssues.filter(
+      (i) => i.status !== "resolved" && !isNonActionableDisposition(i.disposition),
     ).length;
 
     const bySev = new Map<IssueSeverity, number>();

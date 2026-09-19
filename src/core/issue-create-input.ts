@@ -7,7 +7,12 @@
  * define it in terms of the other (ISS-1221).
  */
 import { ISSUE_SEVERITIES, type IssueSeverity } from "../models/types.js";
-import { IssueDedupeKeySchema, type IssueSourceRefInput } from "../models/issue.js";
+import {
+  IssueDedupeKeySchema,
+  IssueDispositionSchema,
+  ISSUE_DISPOSITIONS,
+  type IssueSourceRefInput,
+} from "../models/issue.js";
 import type { ProjectState } from "./project-state.js";
 
 export interface IssueCreateInput {
@@ -29,11 +34,31 @@ export interface IssueCreateInput {
   citesRuling?: string[];
   /** Fork: optional project assignment (must belong to the issue's phase). */
   project?: string | null;
+  /**
+   * ISS-1113: the reason this issue is not work, set by the path that FILES
+   * it. Validated against `IssueSchema`'s enum before the ledger lock, the
+   * same way severity is, so a bad value is refused rather than written and
+   * then rejected at load.
+   *
+   * Omitted means actionable, and the writer omits the FIELD entirely in that
+   * case. An issue filed today must stay byte-identical to one filed
+   * yesterday, which `disposition: null` on every record would not be.
+   */
+  disposition?: string;
+  /**
+   * ISS-1113: passthrough provenance, written under `metadata.review` by the
+   * review filing paths (origin, review/session id, the finding's own
+   * disposition). `IssueSchema` is `.passthrough()` so this needs no schema
+   * change, but the WRITER still has to emit it -- the issue literal in
+   * `handleIssueCreate` builds a fixed field list and drops anything it does
+   * not name.
+   */
+  metadata?: Record<string, unknown>;
 }
 
 /** One refused field, named the way the writer names it in its invalid_input message. */
 export interface IssueCreateRefusal {
-  readonly field: "severity" | "dedupeKey" | "phase";
+  readonly field: "severity" | "dedupeKey" | "phase" | "disposition" | "metadata";
   readonly message: string;
 }
 
@@ -42,6 +67,47 @@ export function validateIssueCreateSeverity(input: Pick<IssueCreateInput, "sever
   return {
     field: "severity",
     message: `Unknown issue severity "${input.severity}": must be one of ${ISSUE_SEVERITIES.join(", ")}`,
+  };
+}
+
+/**
+ * ISS-1113: refused pre-lock, beside severity, and against the SCHEMA's enum
+ * rather than a second copy of the list -- a value this accepted and the
+ * schema refused would be written and then dropped at load, which is worse
+ * than either check alone.
+ */
+export function validateIssueCreateDisposition(
+  input: Pick<IssueCreateInput, "disposition">,
+): IssueCreateRefusal | null {
+  if (input.disposition === undefined) return null;
+  const parsed = IssueDispositionSchema.safeParse(input.disposition);
+  if (parsed.success) return null;
+  return {
+    field: "disposition",
+    message: `Unknown issue disposition "${input.disposition}": must be one of ${ISSUE_DISPOSITIONS.join(", ")}`,
+  };
+}
+
+/**
+ * ISS-1113: `metadata` is written into a `.passthrough()` schema, so nothing
+ * downstream would refuse an array or a primitive -- it would simply land in
+ * the ledger and every later reader would have to defend against it. Refused
+ * here instead, at the same boundary as the other three, because a bag whose
+ * shape is never checked is a bag whose shape is eventually wrong.
+ *
+ * Only the TOP level is checked. The contents are deliberately unconstrained:
+ * that is the entire point of a passthrough bag shared with writers this
+ * module knows nothing about.
+ */
+export function validateIssueCreateMetadata(
+  input: Pick<IssueCreateInput, "metadata">,
+): IssueCreateRefusal | null {
+  if (input.metadata === undefined) return null;
+  const value: unknown = input.metadata;
+  if (typeof value === "object" && value !== null && !Array.isArray(value)) return null;
+  return {
+    field: "metadata",
+    message: `Issue metadata must be an object, received ${Array.isArray(value) ? "array" : value === null ? "null" : typeof value}`,
   };
 }
 

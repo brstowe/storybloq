@@ -23,6 +23,7 @@ import {
 } from "./queries.js";
 import { validateProject } from "./validation.js";
 import { notHiddenByEarmark } from "./earmarks.js";
+import { isNonActionableDisposition } from "./issue-disposition.js";
 import { applyClaimAnnotations } from "./claims.js";
 import type { Claim } from "../models/types.js";
 
@@ -95,6 +96,12 @@ export type ActionabilityStatus =
   | "duplicate"
   | "escalate_only"
   | "owner_gated"
+  // ISS-1113: the structured tier returns the disposition itself, so these
+  // three joined the union with the enum. Additive at every consumer: nothing
+  // switches exhaustively on this type, it is interpolated as a string.
+  | "pre_existing"
+  | "accepted_out_of_scope"
+  | "forced_landing"
   | "complete";
 
 export interface Actionability {
@@ -164,11 +171,18 @@ export function computeActionability(
     }
   }
 
-  // Tier 2: structured (issues only).
+  // Tier 2: structured (issues only). The list is shared rather than spelled
+  // out here (ISS-1113): the issue sweep and COMPLETE ask the same question,
+  // and a value wired into one consumer and not the others is exactly the gap
+  // that let ISSUE_SWEEP keep handing out owner-gated issues as work.
   if (kind === "issue") {
     const disposition = (item as Issue).disposition;
-    if (disposition === "escalate_only" || disposition === "owner_gated" || disposition === "duplicate") {
-      return { status: disposition, reason: `structured disposition: ${disposition}`, source: "structured" };
+    if (isNonActionableDisposition(disposition)) {
+      return {
+        status: disposition,
+        reason: `structured disposition: ${disposition}`,
+        source: "structured",
+      };
     }
   }
 

@@ -1,8 +1,9 @@
 import { displayIdOf } from "../../core/resolver.js";
-import { accessSync, realpathSync, constants } from "node:fs";
+import { accessSync, realpathSync, constants, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { withProjectLock, writeConfigUnlocked } from "../../core/project-loader.js";
+import { writeOrchestratorPointer } from "../../core/orchestrator-link.js";
 import {
   NodeNameSchema,
   NodeSchema,
@@ -210,18 +211,133 @@ export async function handleNodeAdd(
       ? `\nWarnings: ${overlay.warnings.join("; ")}`
       : "";
 
+    // T-520: the node's own config needs an `orchestrator` back-pointer before
+    // citations to root rulings resolve from it -- and this command does NOT
+    // write it. The node is a separate git checkout, so writing there from here
+    // would leave an uncommitted change in a working tree its owner did not
+    // touch. The command is printed for them to run instead.
+    const linkHint = `Run \`storybloq node link ${root}\` in ${storedPath} so citations to rulings on this board resolve from that node.`;
     if (format === "json") {
       result = {
-        output: JSON.stringify(successEnvelope({ name: opts.name, path: storedPath, warnings: overlay.warnings }), null, 2),
+        output: JSON.stringify(
+          successEnvelope({ name: opts.name, path: storedPath, warnings: overlay.warnings, linkCommand: `storybloq node link ${root}` }),
+          null,
+          2,
+        ),
       };
     } else {
       result = {
-        output: `Added node "${opts.name}" (${storedPath})${warnings}`,
+        output: `Added node "${opts.name}" (${storedPath})${warnings}\n${linkHint}`,
       };
     }
   });
 
   return result;
+}
+
+export interface NodeLinkOptions {
+  /** Absent means "revalidate and rewrite whatever is already recorded". */
+  orchestrator?: string;
+}
+
+/**
+ * T-520: turn the path the user TYPED into one this command can act on.
+ *
+ * A path given at a shell is relative to the shell's directory, not to the
+ * project it happens to be inside. From `node/src/` the whole point of
+ * `storybloq node link ../../orchestrator` is that it names the directory two
+ * up from THERE, and resolving it against the node root instead would either
+ * error with a path the user never typed or, where a directory happens to
+ * exist at both readings, record the wrong board.
+ *
+ * `node add` resolves its `--path` against the project root and is left
+ * alone: changing it would move an existing command's argument out from under
+ * anyone scripting it. Both commands store an absolute realpath, so nothing
+ * downstream depends on either base, and a new command has no reason to
+ * inherit the trap.
+ *
+ * Note what is NOT resolved here: the pointer already recorded in the node's
+ * config, which `handleNodeLink` falls back to when no argument is given. That
+ * one is root-relative on purpose, because it is read back by
+ * `resolveOrchestratorRoot` in sessions that have no idea what directory it
+ * was written from. The two bases differ because the two paths have different
+ * authors.
+ *
+ * A leading tilde is passed through untouched rather than expanded here:
+ * `resolve()` would turn `~/orch` into `<cwd>/~/orch`, and `resolveNodePath`
+ * already expands it correctly further down. Two copies of that expansion is
+ * how two copies drift.
+ */
+export function resolveOrchestratorArg(raw: unknown, cwd: string): string | undefined {
+  if (typeof raw !== "string" || raw.trim() === "") return undefined;
+  if (raw.startsWith("~")) return raw;
+  return resolve(cwd, raw);
+}
+
+/**
+ * T-520: record which orchestrator THIS project belongs to.
+ *
+ * Deliberately run FROM THE NODE, by whoever owns that checkout. The
+ * orchestrator knows every node's path and could write this itself in one
+ * sweep, and that is exactly what it must not do: a node is a separate git
+ * repository, so the sweep would leave an uncommitted config change in
+ * somebody else's working tree that they did not make. `node add` prints this
+ * command instead of running it.
+ *
+ * This is also the BACKFILL. `config.orchestrator` was declared but never
+ * written, so every federation that predates this feature has no pointer and
+ * no upward citation resolution until this is run once per node.
+ *
+ * Unlike every other command in this file, it is NOT orchestrator-only: it is
+ * the one node-side federation command, and requiring an orchestrator config
+ * here would make it impossible to run where it is meant to be run.
+ */
+export async function handleNodeLink(
+  opts: NodeLinkOptions,
+  format: OutputFormat,
+  root: string,
+): Promise<CommandResult> {
+  const config = readConfigForLink(root);
+  const target = opts.orchestrator ?? (typeof config?.orchestrator === "string" ? config.orchestrator : undefined);
+  if (!target) {
+    return {
+      output: formatError(
+        "invalid_input",
+        "No orchestrator recorded and none given. Run this from the node with the orchestrator's path: storybloq node link <path>",
+        format,
+      ),
+      exitCode: ExitCode.USER_ERROR,
+    };
+  }
+
+  const result = await writeOrchestratorPointer(root, target);
+  if (!result.ok) {
+    return { output: formatError("invalid_input", result.reason, format), exitCode: ExitCode.USER_ERROR };
+  }
+  if (format === "json") {
+    return {
+      output: JSON.stringify(
+        successEnvelope({ orchestrator: result.orchestratorRoot, unchanged: result.unchanged }),
+        null,
+        2,
+      ),
+    };
+  }
+  return {
+    output: result.unchanged
+      ? `Already linked to orchestrator ${result.orchestratorRoot}.`
+      : `Linked to orchestrator ${result.orchestratorRoot}. Citations to rulings on that board now resolve from here.`,
+  };
+}
+
+function readConfigForLink(root: string): Record<string, unknown> | null {
+  try {
+    return JSON.parse(
+      readFileSync(join(root, ".story", "config.json"), "utf-8"),
+    ) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
 }
 
 export interface NodeRemoveOptions {

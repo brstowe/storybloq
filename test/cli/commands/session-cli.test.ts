@@ -35,6 +35,7 @@ import {
 } from "../../../src/autonomous/session.js";
 import { deriveWorkspaceId, type FullSessionState } from "../../../src/autonomous/session-types.js";
 import { scanSessionSummaries } from "../../../src/core/session-scan.js";
+import { fixtureShell } from "../../helpers/git-fixture.js";
 
 // ---------------------------------------------------------------------------
 // Fixture helpers
@@ -87,7 +88,7 @@ function setupRoot(opts: { initGit?: boolean } = {}): string {
 }
 
 function run(cmd: string, cwd: string): string {
-  return execSync(cmd, { cwd, encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+  return fixtureShell(cwd, cmd);
 }
 
 function gitInit(root: string): string {

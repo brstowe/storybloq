@@ -1,6 +1,13 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { resolveNodePath } from "../federation/resolver.js";
+// T-520: the upward pointer's resolver lives with the downward one in
+// `federation/resolver.ts` (it is the same discipline over the same pair of
+// checkouts) and is re-exported here, the home the ticket names, because this
+// is where every other node-root resolution is reached from. `core/` imports
+// it from `federation/` directly -- core importing `mcp/` would invert the
+// layering and close a cycle through `core/project-loader`.
+export { resolveOrchestratorRoot, type OrchestratorRootResult } from "../federation/resolver.js";
 import { NodesMapSchema } from "../models/federation-config.js";
 import { loadProject } from "../core/project-loader.js";
 

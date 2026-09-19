@@ -13,7 +13,7 @@ import { isPresenceEnabled } from "../../presence/handler.js";
 import { ensureCapture, type CaptureOutcome, type CaptureSource } from "../../core/session-intel/capture.js";
 import { readSessionIntelConfig } from "../../core/session-intel/config.js";
 import { findPresenceRecordAcrossWorktrees, readPresenceRecord, reconcileUnderLock, type ReconcileOutcome } from "../../core/session-intel/presence-bridge.js";
-import { COMPACT_NEEDED_ADVICE, renderUsageAdvisory } from "../../core/session-intel/push.js";
+import { COMPACT_NEEDED_ADVICE, basisText, renderUsageAdvisory } from "../../core/session-intel/push.js";
 import { sampleSession, type SessionIntelResult } from "../../core/session-intel/query.js";
 import { authorizeTranscriptPath, locateTranscript } from "../../core/session-intel/transcript-locate.js";
 import { scanTail } from "../../core/session-intel/transcript-scan.js";
@@ -310,7 +310,7 @@ export function renderPromptDirective(p: NonNullable<SessionIntelResult["pressur
   // ISS-1197 commit 2: this hook fires on EVERY prompt, so it is the surface
   // that would nag for handovers forever past the compact line.
   if (p.state === "compact-needed") return `${head} ${COMPACT_NEEDED_ADVICE}`;
-  return `${head} Write a handover now via storybloq_handover_create (or \`storybloq handover create\`), then keep working in this same turn. The handover makes compaction safe: do not stop, do not defer the next step to a later turn, and do not ask the user whether to continue. Any auto-compaction that follows is expected and safe: the session continues through it, and one handover covers it.`;
+  return `${head}${basisText(p.reason)} Write a handover now via storybloq_handover_create (or \`storybloq handover create\`), then keep working in this same turn. The handover makes compaction safe: do not stop, do not defer the next step to a later turn, and do not ask the user whether to continue. Any auto-compaction that follows is expected and safe: the session continues through it, and one handover covers it.`;
 }
 
 /**

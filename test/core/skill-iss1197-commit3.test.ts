@@ -71,7 +71,7 @@ describe("ISS-1197 commit 3: the handover cadence ruling reaches the skill text"
 
 describe("ISS-1197 commit 3: the state enumerations name compact-needed", () => {
   it("SKILL.md lists the fourth state with its threshold", () => {
-    expect(read("SKILL.md")).toContain("`imperative` (85% minus a per-turn jump allowance) or `compact-needed` (95%)");
+    expect(read("SKILL.md")).toContain("`imperative` (90% minus a per-turn jump allowance) or `compact-needed` (95%)");
   });
 
   it("SKILL.md says the prompt line fires at imperative AND at compact-needed", () => {

@@ -3,15 +3,15 @@
  *
  * On every CLI invocation and in storybloq_status, we want to know whether
  * a newer @storybloq/storybloq exists on the npm registry. We cache the
- * registry answer for 24 hours in a small JSON file so the check costs at
- * most one HTTP request per day per machine across ALL entry points, and
+ * registry answer for 6 hours in a small JSON file so the check costs at
+ * most four HTTP requests per day per machine across ALL entry points, and
  * zero requests when NO_UPDATE_NOTIFIER or CI is set (ISS-777).
  *
  * Cache location: ~/.claude/storybloq/update-check.json
  *   (hidden from git-scoped .story/ by being outside the project)
  *
  * Design:
- * - The 24h freshness gate lives in one helper (isCacheFresh) and is applied
+ * - The 6h freshness gate lives in one helper (isCacheFresh) and is applied
  *   at the FETCH layer (refreshUpdateCacheInBackground), not just when reading
  *   the cache, so no caller can accidentally phone the registry per-invocation.
  * - The NO_UPDATE_NOTIFIER/CI opt-out lives in one helper
@@ -33,7 +33,7 @@ import { homedir } from "node:os";
 import { readBoundedFile } from "./limit-config.js";
 
 const NPM_REGISTRY_URL = "https://registry.npmjs.org/@storybloq/storybloq/latest";
-const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+const CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours (ISS-1237: a day hid a same-day release)
 const FETCH_TIMEOUT_MS = 2000; // Short timeout so CLI startup is never delayed.
 
 interface UpdateCache {
@@ -54,10 +54,10 @@ export function cachePath(): string {
 }
 
 /**
- * Whether a cache entry is still within the 24-hour freshness window.
+ * Whether a cache entry is still within the 6-hour freshness window.
  * Single source of the age math (ISS-777): shared by readCache (which backs
  * checkForUpdate + readUpdateCacheSync) and refreshUpdateCacheInBackground so
- * no entry point can drift from the once-per-day contract.
+ * no entry point can drift from the once-per-six-hours contract.
  */
 function isCacheFresh(cache: UpdateCache): boolean {
   return Date.now() - cache.fetchedAt <= CACHE_TTL_MS;
@@ -205,7 +205,7 @@ function compareVersions(a: string, b: string): number {
 
 /**
  * Check whether a newer @storybloq/storybloq is available.
- * Uses a 24-hour cache. Returns null on network failure or when running a
+ * Uses a 6-hour cache. Returns null on network failure or when running a
  * dev version ("0.0.0-dev") where comparison is meaningless.
  */
 export async function checkForUpdate(currentVersion: string): Promise<UpdateInfo | null> {
@@ -255,7 +255,7 @@ export function readUpdateCacheSync(currentVersion: string): UpdateInfo | null {
  * refresh is actually due. It (a) honors the NO_UPDATE_NOTIFIER/CI opt-outs
  * (also enforced at the fetch site itself; the early return here just avoids
  * pointless work), and (b) skips the fetch entirely while the cache is still
- * fresh -- enforcing the once-per-day, opt-out-respecting contract at the
+ * fresh -- enforcing the once-per-six-hours, opt-out-respecting contract at the
  * FETCH layer across all entry points.
  */
 export function refreshUpdateCacheInBackground(): void {
@@ -320,7 +320,7 @@ export function formatUpdateBanner(info: UpdateInfo | null): string {
   if (!info || !info.updateAvailable) return "";
   return (
     `\nstorybloq v${info.latestVersion} is available (you have v${info.currentVersion}).\n` +
-    `Update: npm install -g @storybloq/storybloq@latest\n`
+    `Update: storybloq update\n`
   );
 }
 

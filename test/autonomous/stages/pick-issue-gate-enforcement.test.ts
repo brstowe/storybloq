@@ -14,6 +14,7 @@ import { StageContext, type ResolvedRecipe } from "../../../src/autonomous/stage
 import { PickTicketStage } from "../../../src/autonomous/stages/pick-ticket.js";
 import type { FullSessionState } from "../../../src/autonomous/session-types.js";
 import { handleArrangementCreate } from "../../../src/cli/commands/arrangement.js";
+import { git as fixtureGit } from "../../helpers/git-fixture.js";
 
 const PARTIES = [
   { role: "pen" as const, client: "claude" as const, identityAnchor: "pen-session" },
@@ -21,7 +22,7 @@ const PARTIES = [
 ];
 
 function git(root: string, args: string[]): string {
-  return execFileSync("git", args, { cwd: root }).toString().trim();
+  return fixtureGit(root, args);
 }
 
 function buildRepo(): string {

@@ -3,6 +3,7 @@ import type { GuideReportInput } from "../session-types.js";
 import { evaluatePressure, pressureMeetsThreshold } from "../context-pressure.js";
 import { nextTickets } from "../../core/queries.js";
 import { isEarmarkVisible } from "../../core/earmarks.js";
+import { isNonActionableDisposition } from "../../core/issue-disposition.js";
 import { findFirstPostComplete, type NextStageResult } from "./registry.js";
 import { isTargetedMode, getRemainingTargets, buildTargetedCandidatesText, buildTargetedPickInstruction, buildTargetedStuckHandover } from "../target-work.js";
 import { detectBranchAffinity, buildAffinityAnnotation } from "../branch-affinity.js";
@@ -97,7 +98,15 @@ export class CompleteStage implements WorkflowStage {
       if (nextResult.kind === "found") {
         nextTarget = "PICK_TICKET";
       } else {
-        const openIssues = projectState.issues.filter(i => i.status === "open" && isEarmarkVisible(i));
+        // ISS-1113: same predicate as ISSUE_SWEEP, and here for the same
+        // reason T-475 added the earmark check beside it -- routing to
+        // PICK_TICKET over an issue nothing will pick sends the session
+        // somewhere with no work waiting for it.
+        const openIssues = projectState.issues.filter(
+          i => i.status === "open"
+            && isEarmarkVisible(i)
+            && !isNonActionableDisposition(i.disposition),
+        );
         nextTarget = openIssues.length > 0 ? "PICK_TICKET" : "HANDOVER";
       }
     }

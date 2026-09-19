@@ -25,6 +25,7 @@ import {
 } from "../../src/autonomous/session.js";
 import { deriveWorkspaceId, type FullSessionState } from "../../src/autonomous/session-types.js";
 import { killSidecarsInRoot } from "./_sidecar-cleanup.js";
+import { fixtureShell } from "../helpers/git-fixture.js";
 
 // ---------------------------------------------------------------------------
 // Shared fixture helpers
@@ -136,7 +137,7 @@ function writeIssue(root: string, id: string, status: "open" | "inprogress" | "r
 }
 
 function run(cmd: string, cwd: string): string {
-  return execSync(cmd, { cwd, encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+  return fixtureShell(cwd, cmd);
 }
 
 /** Allocate a pid known to be absent, verified rather than guessed (ISS-941). */

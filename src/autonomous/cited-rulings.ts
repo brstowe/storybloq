@@ -12,7 +12,7 @@
  * were still current).
  */
 import { loadProject } from "../core/project-loader.js";
-import { loadCitationContext } from "../core/ruling-loader.js";
+import { buildCitationInputs } from "../core/ruling-loader.js";
 import { resolveEntityCitations } from "../core/ruling.js";
 import type { CitationResolution } from "../core/ruling.js";
 
@@ -49,7 +49,18 @@ export async function citationsForReviewTarget(
     // themselves (`indeterminate`, `unreadable`), so it flows to the reviewer as
     // a per-citation line rather than as an absence. Only a failure to get that
     // far reaches the `unavailable` branch above.
-    return { kind: "resolved", citations: resolveEntityCitations(resolvedItem, loadCitationContext(root)) };
+    // T-520: `buildCitationInputs` rather than `loadCitationContext`, so this
+    // gate resolves an id that lives on the orchestrator board. This is the
+    // ISS-1180 fix: a node plan naming a root ruling's CURRENT id used to be
+    // refused as missing, and the documented workaround was minting a local
+    // copy of the ruling -- which is precisely the staleness the plan-pin gate
+    // exists to prevent. The ids are passed so no other board is read when
+    // this item cites nothing.
+    const cited = (resolvedItem as { citesRulings?: readonly string[] }).citesRulings ?? [];
+    return {
+      kind: "resolved",
+      citations: resolveEntityCitations(resolvedItem, buildCitationInputs(root, cited)),
+    };
   } catch (err) {
     return { kind: "unavailable", reason: `the ledger could not be read (${(err as Error).message})` };
   }

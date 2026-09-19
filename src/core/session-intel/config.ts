@@ -64,7 +64,7 @@ export interface SessionIntelConfig {
 export const DEFAULT_SESSION_INTEL_CONFIG: Omit<SessionIntelConfig, "notes"> = {
   enabled: true,
   advisoryPct: 0.7,
-  imperativePct: 0.85,
+  imperativePct: 0.9,
   ceilingFraction: 0.925,
   boundarySampleCount: 20,
   jumpAllowanceFloorTokens: 25_000,
@@ -148,9 +148,9 @@ export function resolveSessionIntelConfig(rawBlock: unknown): SessionIntelConfig
   // the two pair rules below can each MOVE imperativePct, so neither one alone
   // establishes it. The compact rule runs first (it can lower imperativePct to
   // the default, which the advisory rule then judges); the advisory rule can
-  // RAISE imperativePct to the default 0.85, which is inside compactNeededPct's
+  // RAISE imperativePct to the default 0.9, which is inside compactNeededPct's
   // legal range, so a third check repairs that case afterwards. The defaults
-  // (0.7 / 0.85 / 0.95) satisfy the chain, so the repair always terminates.
+  // (0.7 / 0.9 / 0.95) satisfy the chain, so the repair always terminates.
   if (compactNeededPct <= imperativePct) {
     notes.push(`sessionIntel.compactNeededPct (${compactNeededPct}) must exceed imperativePct (${imperativePct}); defaults ${d.imperativePct}/${d.compactNeededPct} used for the pair`);
     imperativePct = d.imperativePct;

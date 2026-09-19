@@ -251,6 +251,47 @@ export async function resumeCeilingEscalation(ctx: StageContext): Promise<StageA
  * Multi-write: CODE_REVIEW → PLAN redirect resets both review histories.
  * StageContext handles state consistency across these writes.
  */
+/**
+ * ISS-1113: the findings this round hands to `fileDeferredFindings`, each
+ * carrying WHY it is being filed.
+ *
+ * The `disposition: "deferred"` rewrite is NOT decoration and is deliberately
+ * kept: `fileDeferredFindings` files only findings whose disposition is
+ * "deferred", so rewriting it is the admission ticket a forced landing needs
+ * for findings the reviewer left `open`. Removing it files nothing at all,
+ * which is the regression `code-review-landing.test.ts` catches.
+ *
+ * What DID change is the duplication. The round used to pass
+ * `[...findings, ...forcedCopies]` -- the same finding twice, once untagged
+ * and once rewritten, sharing one fingerprint (the fingerprint is the finding
+ * tuple and excludes the disposition). The queue keeps the first, so for a
+ * finding the reviewer had ALREADY deferred, the untagged copy won and the
+ * forced claim was silently dropped. Harmless while every entry filed
+ * identically; the moment the filing carries a classification it is the
+ * difference between `forced_landing` and `accepted_out_of_scope`. So: one
+ * entry per finding, rewritten in place.
+ *
+ * `filingDisposition` is a SEPARATE field from `disposition` because they
+ * answer different questions -- the review's verdict versus this round's
+ * reason for filing -- and only the first is what the filter reads.
+ *
+ * The blocking predicate is passed in rather than recomputed: it is the
+ * round's own `roundBlockerPredicate(provenanceGate)`, and a second derivation
+ * of "is this blocking" is a second answer waiting to disagree.
+ */
+export function forcedLandingFilingSet<T extends { severity: string }>(
+  findings: readonly T[],
+  forcedLanding: boolean,
+  isBlockingFinding: (finding: T) => boolean,
+): (T & { disposition?: string; filingDisposition?: string })[] {
+  if (!forcedLanding) return findings.map((f) => ({ ...f }));
+  return findings.map((f) =>
+    (f.severity === "major" || f.severity === "minor") && isBlockingFinding(f)
+      ? { ...f, disposition: "deferred", filingDisposition: "forced_landing" }
+      : { ...f },
+  );
+}
+
 export class CodeReviewStage implements WorkflowStage {
   readonly id = "CODE_REVIEW";
 
@@ -1382,15 +1423,7 @@ export class CodeReviewStage implements WorkflowStage {
       ctx.appendEvent("landing_decision", landingDecision);
     }
 
-    const forcedDeferredFindings = forcedLanding
-      ? findings
-          .filter((f) =>
-            (f.severity === "major" || f.severity === "minor") && isBlockingFinding(f)
-          )
-          .map((f) => ({ ...f, disposition: "deferred" }))
-      : [];
-
-    await ctx.fileDeferredFindings([...findings, ...forcedDeferredFindings], "code");
+    await ctx.fileDeferredFindings(forcedLandingFilingSet(findings, forcedLanding, isBlockingFinding), "code");
 
     // T-470: the ceiling fires from the SAME site as every other transition,
     // after the round has been persisted exactly like any other round.

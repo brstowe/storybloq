@@ -48,7 +48,12 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import { join } from "node:path";
 
-import { CLIENT_TASK_ID_PATTERN } from "../models/types.js";
+// ISS-1240: from the zod-free copy, NOT `models/types.js`, whose first line is
+// `import { z } from "zod"`. `storybloq-presence` imports this module, and that
+// binary exists because pulling the shared bundle costs ~310ms per invocation;
+// reaching into the models module would drag zod and the whole of it back in.
+// `models/types.ts` carries the same warning about its own closure.
+import { CLIENT_TASK_ID_PATTERN } from "../autonomous/client-profile.js";
 import {
   acquireLock,
   atomicWriteInDir,

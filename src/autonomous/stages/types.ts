@@ -90,6 +90,18 @@ export interface ResolvedRecipe {
 // ---------------------------------------------------------------------------
 
 /**
+ * One entry in the durable deferral queue, taken FROM the session schema
+ * rather than restated, so a field added there cannot drift from what the
+ * merge below reads (ISS-1113).
+ */
+type PendingDeferral = NonNullable<FullSessionState["pendingDeferrals"]>[number];
+
+/** A own-data object, for reading into the passthrough `metadata` bag safely. */
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
  * StageContext is a CLASS, not a plain object. `ctx.state` is a getter that
  * always returns the latest snapshot after any writeState() call.
  * This prevents the walker from writing on a stale snapshot after stages
@@ -202,6 +214,176 @@ export class StageContext {
   }
 
   /**
+   * ISS-1113: how much weight one producer's classification carries.
+   *
+   * Three producers write into this one queue and
+   * the fingerprint deliberately excludes the disposition, so the same
+   * `(ticketId, reviewKind, severity, category, description)` tuple deferred
+   * in one round and blocking in a later one is ONE entry and something has to
+   * decide which classification it carries. Before this it was whichever
+   * producer happened to run first, which at both ceiling sites is the
+   * deferral call -- so a live blocker could be recorded as a deferral, the
+   * exact laundering `queueFindingsAsIssues` below exists to prevent.
+   *
+   * The rank is over EXPLICITNESS, not actionability, and it is strict: an
+   * entry is replaced only by a HIGHER rank, so a producer with nothing to say
+   * can never overwrite one that did.
+   */
+  private static dispositionRank(disposition: string | null | undefined): number {
+    if (disposition === undefined) return 0;   // nothing said (a pre-upgrade entry)
+    if (disposition === null) return 2;        // explicitly actionable (the ceiling)
+    if (disposition === "forced_landing") return 3; // a deliberate override, latest word
+    return 1;                                  // an explicit non-actionable classification
+  }
+
+  /**
+   * True when `incoming` should replace what is already queued.
+   *
+   * `forced_landing` outranks the ceiling's explicit-actionable claim because
+   * forcing a landing is a later, deliberate decision to ship past exactly
+   * that finding. The ceiling's claim outranks a plain deferral because a
+   * finding a session is PARKING on is not out of scope. And absent loses to
+   * everything, including to itself, so a re-queue changes nothing.
+   */
+  private static supersedes(
+    incoming: string | null | undefined,
+    existing: string | null | undefined,
+  ): boolean {
+    return StageContext.dispositionRank(incoming) > StageContext.dispositionRank(existing);
+  }
+
+  /**
+   * Apply one producer's claim to the pending list, mutating the caller's copy.
+   *
+   * New fingerprint: appended. Known fingerprint: replaced only on a strictly
+   * higher rank, which is where "the result does not depend on which producer
+   * ran first" is actually enforced.
+   */
+  private static mergeDeferral(
+    pending: PendingDeferral[],
+    entry: PendingDeferral,
+  ): void {
+    const at = pending.findIndex(d => d.fingerprint === entry.fingerprint);
+    if (at === -1) {
+      pending.push(entry);
+      return;
+    }
+    const existing = pending[at]!;
+    if (!StageContext.supersedes(entry.disposition, existing.disposition)) return;
+    // The classification and its provenance move together: a `forced_landing`
+    // carrying a `reviewer-deferred` origin would be a worse record than
+    // either producer wrote.
+    pending[at] = {
+      ...existing,
+      disposition: entry.disposition,
+      origin: entry.origin,
+      reviewId: entry.reviewId,
+    };
+  }
+
+  /**
+   * ISS-1113: correct the disposition of an issue this session ALREADY filed,
+   * when a later producer makes a higher-ranked claim about the same finding.
+   *
+   * The merge above only settles producers that are both still in the queue.
+   * They frequently are not. `fileDeferredFindings` DRAINS before it returns,
+   * and at both ceiling sites it is called first, so by the time
+   * `queueFindingsAsIssues` runs the fingerprint is in `filedDeferrals` and
+   * the old code simply skipped it -- leaving a live blocker recorded as
+   * `accepted_out_of_scope` while the session parks over it.
+   *
+   * That is not a rare interleaving. `outstandingCeilingFindings` includes a
+   * `deferred` finding when its origin still blocks, and its own comment says
+   * why: the ceiling is deliberately making "a second claim on the same
+   * finding by a path that calls it a blocker". This is where that second
+   * claim gets to land.
+   *
+   * Strictly an UPGRADE, by the same rank as the queue merge, so it can only
+   * ever move an issue toward the more explicit claim and can never demote one
+   * a higher-ranked producer already set. Best-effort throughout: the deferral
+   * queue is best-effort by contract, and a session must not fail to park
+   * because a disposition could not be rewritten.
+   */
+  private async reconcileFiledDisposition(
+    fingerprint: string,
+    incoming: string | null | undefined,
+    origin: string | undefined,
+    reviewId: string | undefined,
+  ): Promise<void> {
+    const filed = (this._state.filedDeferrals ?? []).find(d => d.fingerprint === fingerprint);
+    if (!filed) return;
+    try {
+      const { withProjectLock, writeIssueUnlocked } = await import("../../core/project-loader.js");
+      await withProjectLock(this.root, { strict: false }, async ({ state }) => {
+        const issue = state.issues.find(i => i.id === filed.issueId);
+        if (!issue) return;
+        // An issue whose disposition was never set reads as rank 0 here, the
+        // same as a producer with nothing to say -- so an upgrade from absent
+        // to an explicit claim happens, and nothing downgrades it.
+        const current = "disposition" in issue ? issue.disposition : undefined;
+        if (!StageContext.supersedes(incoming, current)) return;
+        const next = { ...issue } as Record<string, unknown>;
+        // `metadata` is a PASSTHROUGH bag shared with every other writer, so
+        // only the `review` key this code owns may be touched. Replacing the
+        // whole object would silently drop whatever else an integration put
+        // there, and nothing downstream would ever report the loss.
+        const existingMeta = isPlainRecord(next.metadata) ? { ...next.metadata } : undefined;
+        if (incoming == null) {
+          // Explicitly actionable: the FIELD goes away, so the issue is
+          // indistinguishable from one that never carried a disposition. Its
+          // provenance block goes with it, because that block describes a
+          // classification the issue no longer carries -- but only that block.
+          delete next.disposition;
+          if (existingMeta) {
+            delete existingMeta.review;
+            // An empty bag is not the same as no bag to a reader diffing these
+            // files, and this issue is meant to look like one that never had a
+            // disposition, so the key goes away entirely when nothing is left.
+            if (Object.keys(existingMeta).length === 0) delete next.metadata;
+            else next.metadata = existingMeta;
+          }
+        } else {
+          next.disposition = incoming;
+          next.metadata = {
+            ...(existingMeta ?? {}),
+            review: {
+              // Whatever else the previous review block recorded is kept: this
+              // is a correction of the classification, not of everything a
+              // reviewer wrote about the finding.
+              ...(isPlainRecord(existingMeta?.review) ? existingMeta.review : {}),
+              origin: origin ?? "review",
+              findingDisposition: incoming,
+              sessionId: this._state.sessionId,
+              ...(reviewId !== undefined && { reviewId }),
+            },
+          };
+        }
+        await writeIssueUnlocked(next as typeof issue, this.root);
+      });
+    } catch (err) {
+      // Best-effort: a failed correction leaves the issue as filed rather than
+      // taking the round down with it. RECORDED rather than swallowed, though
+      // -- a silent catch here makes lock contention and ledger write failures
+      // undiagnosable, and the whole point of this call is that the issue on
+      // disk currently says the wrong thing.
+      try {
+        this.appendEvent("deferral_disposition_reconcile_failed", {
+          fingerprint,
+          issueId: filed.issueId,
+          incoming: incoming ?? null,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      } catch {
+        // The recorder is itself a write, so it can fail for exactly the
+        // reasons the correction just did (a full disk, a permission change).
+        // Nothing is left to report it TO at that point, and best-effort has
+        // to mean best-effort: the round must not die because a diagnostic
+        // about a non-fatal failure could not be written.
+      }
+    }
+  }
+
+  /**
    * Queue findings as issues WITHOUT requiring a `deferred` disposition
    * (T-470).
    *
@@ -235,9 +417,28 @@ export class StageContext {
       // already filed as a deferral is not filed twice under the ceiling.
       const fp = this.findingFingerprint(f, reviewKind);
       if (!fingerprints.includes(fp)) fingerprints.push(fp);
-      if ((this._state.filedDeferrals ?? []).some(d => d.fingerprint === fp)) continue;
-      if (pending.some(d => d.fingerprint === fp)) continue;
-      pending.push({ fingerprint: fp, severity: f.severity, category: f.category, description: f.description, reviewKind });
+      if ((this._state.filedDeferrals ?? []).some(d => d.fingerprint === fp)) {
+        // Already filed, by this session, almost certainly by the deferral
+        // call that runs immediately before this one at both ceiling sites.
+        // The issue exists; what it says about itself may now be wrong.
+        await this.reconcileFiledDisposition(fp, null, "round-ceiling", undefined);
+        continue;
+      }
+      // ISS-1113: `disposition: null` -- EXPLICITLY actionable, not "no
+      // opinion". It is the claim this function was written to make, and the
+      // merge is what stops a deferral that shares this fingerprint from
+      // overwriting it. An entry already queued by a deferral is upgraded
+      // here rather than skipped, which is the behaviour change: the skip
+      // used to silently leave a blocker classified as out of scope.
+      StageContext.mergeDeferral(pending, {
+        fingerprint: fp,
+        severity: f.severity,
+        category: f.category,
+        description: f.description,
+        reviewKind,
+        disposition: null,
+        origin: "round-ceiling",
+      });
     }
 
     this.writeState({ pendingDeferrals: pending } as Partial<FullSessionState>);
@@ -290,6 +491,25 @@ export class StageContext {
             // Namespaced, because the key space is shared with every other
             // caller and a bare hash could collide with one of theirs.
             dedupeKey: `deferral:${this._state.sessionId}:${entry.fingerprint}`,
+            // ISS-1113: passed through EXACTLY as the producer wrote it, with
+            // no default of any kind. `undefined` and `null` both mean "write
+            // no disposition field", so a ceiling blocker and a pre-upgrade
+            // entry produce the same ordinary, actionable issue -- which for
+            // the pre-upgrade entry is byte-identical to what it produces
+            // today. Defaulting an absent value to a non-actionable one would
+            // reclassify every deferral persisted before this change AND, since
+            // the ceiling shares this queue, mark a live blocker as not-work.
+            ...(entry.disposition != null && { disposition: entry.disposition }),
+            ...(entry.disposition != null && {
+              metadata: {
+                review: {
+                  origin: entry.origin ?? "review",
+                  findingDisposition: entry.disposition,
+                  sessionId: this._state.sessionId,
+                  ...(entry.reviewId !== undefined && { reviewId: entry.reviewId }),
+                },
+              },
+            }),
           },
           "json",
           this.root,
@@ -327,7 +547,21 @@ export class StageContext {
    * Persists to pendingDeferrals (crash-safe), then attempts to drain.
    */
   async fileDeferredFindings(
-    findings: readonly { severity: string; category: string; description: string; disposition: string }[],
+    findings: readonly {
+      severity: string;
+      category: string;
+      description: string;
+      disposition: string;
+      /**
+       * ISS-1113: set by `forcedLandingFilingSet` on the findings a forced
+       * landing is landing PAST. Absent means an ordinary reviewer deferral.
+       * It is separate from `disposition` (which stays the REVIEW's verdict,
+       * "deferred", and is what the filter below reads) because rewriting the
+       * review verdict to carry a filing decision is how a critical becomes a
+       * deferral.
+       */
+      filingDisposition?: string;
+    }[],
     reviewKind: "plan" | "code",
   ): Promise<void> {
     // ISS-726: normalize severity here too so the suggestion-exemption holds
@@ -339,9 +573,31 @@ export class StageContext {
     const pending = [...(this._state.pendingDeferrals ?? [])];
     for (const f of deferred) {
       const fp = this.findingFingerprint(f, reviewKind);
-      if ((this._state.filedDeferrals ?? []).some(d => d.fingerprint === fp)) continue;
-      if (pending.some(d => d.fingerprint === fp)) continue;
-      pending.push({ fingerprint: fp, severity: f.severity, category: f.category, description: f.description, reviewKind });
+      const forcedAlready = f.filingDisposition === "forced_landing";
+      if ((this._state.filedDeferrals ?? []).some(d => d.fingerprint === fp)) {
+        // Same seam as the ceiling's: a forced landing in a later round can
+        // reach a finding an earlier round already filed as a plain deferral.
+        await this.reconcileFiledDisposition(
+          fp,
+          forcedAlready ? "forced_landing" : "accepted_out_of_scope",
+          forcedAlready ? "forced-landing" : "reviewer-deferred",
+          undefined,
+        );
+        continue;
+      }
+      // ISS-1113: an EXPLICIT classification on every entry this path queues.
+      // Both values are non-actionable; which one depends on why the finding
+      // is being cleared, and `mergeDeferral` decides what happens when the
+      // ceiling or a forced landing describes the same fingerprint.
+      StageContext.mergeDeferral(pending, {
+        fingerprint: fp,
+        severity: f.severity,
+        category: f.category,
+        description: f.description,
+        reviewKind,
+        disposition: forcedAlready ? "forced_landing" : "accepted_out_of_scope",
+        origin: forcedAlready ? "forced-landing" : "reviewer-deferred",
+      });
     }
 
     this.writeState({ pendingDeferrals: pending } as Partial<FullSessionState>);

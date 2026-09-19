@@ -7,9 +7,10 @@ import { tmpdir } from "node:os";
 
 import { checkBranchAllocationWarning } from "../../src/core/branch-allocation-warning.js";
 import { makeState, minimalConfig } from "./test-factories.js";
+import { git as fixtureGit } from "../helpers/git-fixture.js";
 
 function git(cwd: string, args: string[]): string {
-  return execFileSync("git", ["-C", cwd, ...args], { encoding: "utf-8" }).trim();
+  return fixtureGit(cwd, args);
 }
 
 function commit(cwd: string, subject: string): string {

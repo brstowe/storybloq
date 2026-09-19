@@ -23,6 +23,7 @@ import { join } from "node:path";
 import type { OwnerTask } from "../autonomous/client-profile.js";
 import { resolveSessionOwnership } from "../autonomous/session-ownership.js";
 import { discoverProjectRootShared } from "../core/project-root-shared.js";
+import { recordRosterSeat } from "./roster-hook.js";
 import {
   LOCK_ACQUIRE_BUDGET_MS,
   acquireLock,
@@ -82,6 +83,14 @@ export function runPresenceHook(input: unknown, now = new Date()): PresenceOutco
   // cost the opt-out exists to avoid. The consumer half is the Mac loader,
   // which suppresses presence when config disables it, so turning this off
   // never leaves rows animating from records written before the change.
+  // ISS-1240: the roster seat, written BEFORE the presence opt-out below.
+  // The two are separate features that happen to share a binary, and gating
+  // the roster on `statusWriter.presence` would mean turning off presence
+  // silently empties the roster for every session on that machine. It cannot
+  // throw and its outcome is deliberately ignored: a non-zero exit on
+  // PreToolUse blocks the tool call.
+  recordRosterSeat(root, event, sessionId, now);
+
   if (!isPresenceEnabled(root)) return "skipped-disabled";
 
   const suppressed = correlatesWithActiveAutonomousSession(root, sessionId);

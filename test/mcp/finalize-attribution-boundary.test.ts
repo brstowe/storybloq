@@ -26,6 +26,7 @@ import { createSession, sessionDir, writeSessionSync } from "../../src/autonomou
 import { deriveWorkspaceId } from "../../src/autonomous/session-types.js";
 import { handleIssueCreate } from "../../src/cli/commands/issue.js";
 import type { FullSessionState } from "../../src/autonomous/session-types.js";
+import { git as fixtureGit } from "../helpers/git-fixture.js";
 
 interface RegisteredTool {
   config: { inputSchema?: unknown };
@@ -43,7 +44,7 @@ function captureTools(root: string): Map<string, RegisteredTool> {
 }
 
 function git(root: string, args: string[]): string {
-  return execFileSync("git", args, { cwd: root }).toString().trim();
+  return fixtureGit(root, args);
 }
 
 const roots: string[] = [];

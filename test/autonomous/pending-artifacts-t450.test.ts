@@ -46,6 +46,7 @@ import { StageContext, type ResolvedRecipe } from "../../src/autonomous/stages/t
 import { PickTicketStage } from "../../src/autonomous/stages/pick-ticket.js";
 import { loadProject } from "../../src/core/project-loader.js";
 import { displayIdOf } from "../../src/core/resolver.js";
+import { git as fixtureGit } from "../helpers/git-fixture.js";
 
 // ---------------------------------------------------------------------------
 // Builders
@@ -2188,7 +2189,7 @@ describe("T-450 step 4: quarantine is a durable record, not a drop", () => {
 // ---------------------------------------------------------------------------
 
 function git(root: string, args: string[]): void {
-  execFileSync("git", args, { cwd: root });
+  fixtureGit(root, args);
 }
 
 function buildRepo(): string {

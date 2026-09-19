@@ -23,6 +23,7 @@ import { tmpdir } from "node:os";
 import { execFileSync } from "node:child_process";
 import { registerMcpServer, clearSelfVouch } from "../../src/autonomous/mcp-registry.js";
 import { STORY_GITIGNORE_ENTRIES } from "../../src/core/init.js";
+import { git as fixtureGit } from "../helpers/git-fixture.js";
 
 let root: string;
 
@@ -78,7 +79,7 @@ describe("registerMcpServer self-heals .story/.gitignore (ISS-947)", () => {
     // problem; that is what this test asserts. The distinct steady-state case
     // (entry already committed, porcelain fully empty) is the next test.
     const git = (...args: string[]): void => {
-      execFileSync("git", args, { cwd: root, stdio: "pipe" });
+      fixtureGit(root, args);
     };
     git("init", "-q");
     fs.mkdirSync(join(root, ".story"), { recursive: true });
@@ -98,13 +99,13 @@ describe("registerMcpServer self-heals .story/.gitignore (ISS-947)", () => {
     const serversLines = content.split("\n").filter((l) => l.trim() === "servers/");
     expect(serversLines).toHaveLength(1);
 
-    const porcelain = execFileSync("git", ["status", "--porcelain", ".story/"], { cwd: root, encoding: "utf-8" });
+    const porcelain = fixtureGit(root, ["status", "--porcelain", ".story/"]);
     expect(porcelain).not.toContain("servers");
   });
 
   it("acceptance criterion 3, literal, steady state: git status --porcelain .story/ is empty when servers/ is already committed-ignored and a server registers", () => {
     const git = (...args: string[]): void => {
-      execFileSync("git", args, { cwd: root, stdio: "pipe" });
+      fixtureGit(root, args);
     };
     git("init", "-q");
     fs.mkdirSync(join(root, ".story"), { recursive: true });
@@ -120,7 +121,7 @@ describe("registerMcpServer self-heals .story/.gitignore (ISS-947)", () => {
     const ok = registerMcpServer(root, null, 12350);
     expect(ok).toBe(true);
 
-    const porcelain = execFileSync("git", ["status", "--porcelain", ".story/"], { cwd: root, encoding: "utf-8" });
+    const porcelain = fixtureGit(root, ["status", "--porcelain", ".story/"]);
     expect(porcelain.trim()).toBe("");
   });
 

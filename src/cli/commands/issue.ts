@@ -3,6 +3,8 @@ import {
   type IssueCreateInput,
   validateIssueCreateSeverity,
   validateIssueCreateDedupeKey,
+  validateIssueCreateDisposition,
+  validateIssueCreateMetadata,
   validateIssueCreatePhase,
 } from "../../core/issue-create-input.js";
 import { inferIssuePhase } from "../../autonomous/issue-create-preparation.js";
@@ -38,6 +40,7 @@ import {
 } from "../../models/types.js";
 import {
   type Issue,
+  type IssueDisposition,
   type IssueSourceRefInput,
 } from "../../models/issue.js";
 import {
@@ -296,6 +299,15 @@ export async function handleIssueCreate(
   const dedupeRefusal = validateIssueCreateDedupeKey(args);
   if (dedupeRefusal) throw new CliValidationError("invalid_input", dedupeRefusal.message);
 
+  // ISS-1113: also pre-lock, and through the shared validator, for the same
+  // reason as severity -- a disposition the schema would refuse must never
+  // reach the write.
+  const dispositionRefusal = validateIssueCreateDisposition(args);
+  if (dispositionRefusal) throw new CliValidationError("invalid_input", dispositionRefusal.message);
+
+  const metadataRefusal = validateIssueCreateMetadata(args);
+  if (metadataRefusal) throw new CliValidationError("invalid_input", metadataRefusal.message);
+
   let createdIssue: Issue | undefined;
   let deduplicated = false;
   let createdInState: ProjectState | undefined;
@@ -371,6 +383,11 @@ export async function handleIssueCreate(
       ...(args.project != null && { project: args.project }),
       ...(citesRulingsResolution.citesRulings !== undefined && citesRulingsResolution.citesRulings.length > 0
         && { citesRulings: citesRulingsResolution.citesRulings }),
+      // ISS-1113: written ONLY when supplied. A create that says nothing about
+      // either must produce the record it produced before this field existed,
+      // so neither key appears rather than appearing as null or {}.
+      ...(args.disposition !== undefined && { disposition: args.disposition as IssueDisposition }),
+      ...(args.metadata !== undefined && { metadata: args.metadata }),
     };
 
     validatePostWriteIssueState(issue, state, true);

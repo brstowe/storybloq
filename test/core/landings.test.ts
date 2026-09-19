@@ -9,9 +9,10 @@ import { buildLandings, type Landing, type LandingsResult } from "../../src/core
 import { writeGateAckUnlocked } from "../../src/core/gate-ack-loader.js";
 import { computeGateAckId, type GateAck, type GateAckPin } from "../../src/models/gate-ack.js";
 import { makeState, makeTicket, makeIssue } from "./test-factories.js";
+import { git as fixtureGit } from "../helpers/git-fixture.js";
 
 function git(cwd: string, args: string[]): string {
-  return execFileSync("git", ["-C", cwd, ...args], { encoding: "utf-8" }).trim();
+  return fixtureGit(cwd, args);
 }
 
 function commit(cwd: string, subject: string): string {
