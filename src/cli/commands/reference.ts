@@ -325,6 +325,26 @@ export const COMMANDS: readonly CommandEntry[] = [
     usage: "storybloq knowledge delete <id> [--format <json|md>]",
     flags: ["--format"],
   },
+  // Fork: the board's shortcode -- a terse handle defaulting to the project
+  // directory name. Identifier only: nothing resolves by it.
+  {
+    name: "shortcode get",
+    description: "Show this project's shortcode and whether it came from config.json or the project directory (fork)",
+    usage: "storybloq shortcode get [--format <json|md>]",
+    flags: ["--format"],
+  },
+  {
+    name: "shortcode set",
+    description: "Set this project's shortcode, overriding the directory-derived default (fork). 2-32 chars of a-z, 0-9 and hyphens",
+    usage: "storybloq shortcode set <value> [--format <json|md>]",
+    flags: ["--format"],
+  },
+  {
+    name: "shortcode clear",
+    description: "Remove the shortcode override, returning to the directory-derived default (fork)",
+    usage: "storybloq shortcode clear [--format <json|md>]",
+    flags: ["--format"],
+  },
   {
     name: "ruling list",
     description: "List owner-ruling attestation records",

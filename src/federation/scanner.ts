@@ -3,6 +3,7 @@ import { join, dirname } from "node:path";
 import type { ResolvedNode } from "./resolver.js";
 import { loadProject, type LoadResult } from "../core/project-loader.js";
 import { findLatestHandover } from "./handover-utils.js";
+import { resolveShortcode } from "../core/shortcode.js";
 
 export interface NodeScanSummary {
   project: string;
@@ -14,6 +15,12 @@ export interface NodeScanSummary {
   openIssues: number;
   lastHandoverDate: string | null;
   lastHandoverTitle: string | null;
+  /**
+   * FORK: the node's own shortcode -- its config override when it has one,
+   * otherwise derived from the node directory. `null` only when the directory
+   * name slugifies to nothing usable.
+   */
+  shortcode: string | null;
 }
 
 export type NodeScanResult =
@@ -91,6 +98,7 @@ export async function scanNodeSummary(
 
   return {
     project: typeof config.project === "string" ? config.project : "unknown",
+    shortcode: resolveShortcode(dirname(storyDir), config)?.shortcode ?? null,
     type: typeof config.type === "string" ? config.type : "unknown",
     ticketCount: ticketResult.total,
     openTickets: ticketResult.counts.get("open") ?? 0,

@@ -6,6 +6,9 @@ import {
   type ValidationResult,
   citingEntitiesOf,
 } from "../../core/validation.js";
+import { shortcodeRefusal, resolveShortcode } from "../../core/shortcode.js";
+import { resolveAllNodes } from "../../federation/resolver.js";
+import { isPlainObject } from "../../core/config-merge.js";
 import { validateIssueSourceRefs } from "../../core/issue-source-ref.js";
 import { loadRulingsSafe, loadUpwardBoardFor } from "../../core/ruling-loader.js";
 import { INTEGRITY_WARNING_TYPES } from "../../core/errors.js";
@@ -26,6 +29,7 @@ import { isFilenameAdmitted } from "../../core/handover-brief.js";
 import { verifyContainment } from "../../core/readdir-safe.js";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { tryReadFile } from "../util/file-io.js";
 
 /** The coding recipe's default. Named here so the fallback is not a literal. */
 const DEFAULT_REVIEW_BACKENDS: readonly string[] = ["codex", "agent"];
@@ -235,9 +239,103 @@ export async function handleValidateWithSourceRefs(
 ): Promise<CommandResult> {
   const withRulings = validateWithRulings(ctx);
   const sourceFindings = await validateIssueSourceRefs(ctx.root, ctx.state.activeIssues);
-  const complete = appendValidationFindings(withRulings, sourceFindings);
+  // FORK: shortcode checks ride the same append seam as the source-ref pass.
+  const withSources = appendValidationFindings(withRulings, sourceFindings);
+  const complete = appendValidationFindings(
+    withSources,
+    shortcodeFindings(ctx.root, ctx.state.config as unknown as Record<string, unknown>),
+  );
   return {
     output: formatValidation(complete, ctx.format),
     exitCode: complete.valid ? ExitCode.OK : ExitCode.VALIDATION_ERROR,
   };
+}
+
+/**
+ * FORK: shortcode findings -- a malformed override, and duplicates inside a
+ * federation.
+ *
+ * Two distinct complaints, deliberately separate codes:
+ *
+ * `invalid_shortcode` is an override `resolveShortcode` is IGNORING. It fails
+ * open to the directory default so a bad character cannot brick a board, which
+ * means nothing else would ever tell the owner their chosen handle is not the
+ * one in use. This is that telling.
+ *
+ * `duplicate_shortcode` compares the orchestrator root against its nodes. A
+ * warning, never an error: the shortcode is an identifier only, so nothing
+ * resolves by it and a collision costs a confusing dashboard label, not a
+ * wrong lookup. Node configs are read directly rather than loaded -- the check
+ * needs one field, and an unreadable or absent node is simply skipped: a board
+ * that cannot be read is not evidence of a duplicate.
+ */
+function shortcodeFindings(root: string, config: Record<string, unknown>): ValidationFinding[] {
+  const findings: ValidationFinding[] = [];
+
+  const configured = config.shortcode;
+  if (typeof configured === "string") {
+    const refusal = shortcodeRefusal(configured);
+    if (refusal !== null) {
+      const fallback = resolveShortcode(root, config)?.shortcode ?? null;
+      findings.push({
+        level: "warning",
+        code: "invalid_shortcode",
+        message:
+          `config.json shortcode "${configured}" is invalid and is being ignored: ${refusal}` +
+          (fallback === null ? "" : ` Using "${fallback}" from the project directory instead.`),
+        entity: null,
+      });
+    }
+  } else if (configured !== undefined) {
+    findings.push({
+      level: "warning",
+      code: "invalid_shortcode",
+      message: `config.json shortcode is ${typeof configured}, not a string; it is being ignored.`,
+      entity: null,
+    });
+  }
+
+  // Duplicates are only observable from the orchestrator, which is the one
+  // board that knows the set.
+  const nodes = config.nodes;
+  if (!nodes || typeof nodes !== "object" || Array.isArray(nodes)) return findings;
+
+  const own = resolveShortcode(root, config)?.shortcode ?? null;
+  const byShortcode = new Map<string, string[]>();
+  if (own !== null) byShortcode.set(own, ["[root]"]);
+
+  const nodeEntries = Object.entries(nodes as Record<string, unknown>).flatMap(([name, value]) => {
+    const path = isPlainObject(value) && typeof value.path === "string" ? value.path : null;
+    return path === null ? [] : [[name, { path }] as const];
+  });
+  const resolved = resolveAllNodes(Object.fromEntries(nodeEntries), root);
+
+  for (const [name, node] of resolved) {
+    if (!node.resolved) continue;
+    const read = tryReadFile(join(node.absolutePath, ".story", "config.json"));
+    if (!read.ok) continue;
+    let nodeConfig: Record<string, unknown>;
+    try {
+      nodeConfig = JSON.parse(read.content) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    const code = resolveShortcode(node.absolutePath, nodeConfig)?.shortcode ?? null;
+    if (code === null) continue;
+    const holders = byShortcode.get(code);
+    if (holders) holders.push(`node ${name}`);
+    else byShortcode.set(code, [`node ${name}`]);
+  }
+
+  for (const [code, holders] of byShortcode) {
+    if (holders.length < 2) continue;
+    findings.push({
+      level: "warning",
+      code: "duplicate_shortcode",
+      message: `shortcode "${code}" is used by ${holders.length} boards in this federation: ${holders.join(", ")}.`,
+      entity: null,
+    });
+  }
+
+  return findings;
 }

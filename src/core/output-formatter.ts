@@ -1,4 +1,5 @@
 import { computeIssueFlow, formatIssueFlow, ISSUE_FLOW_SEMANTICS } from "./issue-flow.js";
+import { resolveShortcode } from "./shortcode.js";
 import type { ArrangementCompactResult, ArrangementRotateResult, DuetRoute, DuetView } from "./duet-coordination.js";
 import { arrangementCapacity, type ArrangementCapacity } from "./arrangement-compaction.js";
 import { assignmentIdOf, isCompactedAssignment } from "../models/duet.js";
@@ -897,6 +898,12 @@ export function formatStatus(
   // is T-320's pinned schema and does not gain a key. Omitted means unknown,
   // not empty, so a bare formatter call carries no `roster` key at all.
   roster?: StatusRoster,
+  // FORK, same APPENDED-LAST discipline as every parameter above: the project
+  // root, used only to derive the shortcode default from the directory name.
+  // Optional because both functions are positional and exported, and because a
+  // formatter called without a root should still render -- it simply reports no
+  // shortcode rather than guessing one.
+  root?: string,
 ): string {
   if (compact) {
     return JSON.stringify(
@@ -917,8 +924,13 @@ export function formatStatus(
     );
   }
   const phases = phasesWithStatus(state);
+  const resolvedShortcode = root === undefined ? null : resolveShortcode(root, state.config);
   const data = {
     project: state.config.project,
+    // FORK: the board's terse handle and where it came from, so a reader can
+    // tell a deliberate override from a directory-derived default.
+    shortcode: resolvedShortcode?.shortcode ?? null,
+    shortcodeSource: resolvedShortcode?.source ?? null,
     totalTickets: state.leafTicketCount,
     completeTickets: state.completeLeafTicketCount,
     openTickets: state.leafTicketCount - state.completeLeafTicketCount,
@@ -1104,6 +1116,12 @@ export function formatFederatedStatus(
   arrangements: StatusArrangements = { items: [], warnings: [] },
   // T-507: appended last, matching `formatStatus`'s placement, same reasons.
   roster?: StatusRoster,
+  // FORK, same APPENDED-LAST discipline as every parameter above: the project
+  // root, used only to derive the shortcode default from the directory name.
+  // Optional because both functions are positional and exported, and because a
+  // formatter called without a root should still render -- it simply reports no
+  // shortcode rather than guessing one.
+  root?: string,
 ): string {
   // NO ISSUE-FLOW LINE HERE, deliberately, and this comment is the plan's
   // "or an explicit comment saying why not".
@@ -1126,9 +1144,14 @@ export function formatFederatedStatus(
     reachable: node.reachable,
     scanSummary: node.scanSummary,
   }));
+  const orchShortcode = root === undefined ? null : resolveShortcode(root, config);
   const data = {
     federation: { ...fedState, nodes: sanitizedNodes },
     project: config.project,
+    // FORK: an orchestrator ROOT is a board in its own right and carries its
+    // own shortcode; each node's is on its own scanSummary.
+    shortcode: orchShortcode?.shortcode ?? null,
+    shortcodeSource: orchShortcode?.source ?? null,
     type: config.type,
     // ISS-891: always present, empty when there are none. Omitting them made
     // "no sessions" and "server too old to report sessions" the same observation,

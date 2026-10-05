@@ -78,6 +78,7 @@ async function runCli(): Promise<void> {
     registerWakerRunCommand,
     registerLimitStatusCommand,
     registerConfigCommand,
+    registerShortcodeCommand,
     registerSessionCommand,
     registerRosterCommand,
     registerRepairCommand,
@@ -257,6 +258,7 @@ async function runCli(): Promise<void> {
   cli = registerWakerRunCommand(cli);
   cli = registerLimitStatusCommand(cli);
   cli = registerConfigCommand(cli);
+  cli = registerShortcodeCommand(cli);
   cli = registerNodeCommand(cli);
   cli = registerSessionCommand(cli);
   cli = registerRosterCommand(cli);

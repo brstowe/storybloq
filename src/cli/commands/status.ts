@@ -296,6 +296,7 @@ export async function handleStatus(
         expiredLeaseSessions,
         arrangements,
         roster,
+        ctx.root,
       ),
     };
   }
@@ -316,6 +317,7 @@ export async function handleStatus(
       arrangements,
       opts.compact ?? false,
       roster,
+      ctx.root,
     ),
   };
 }

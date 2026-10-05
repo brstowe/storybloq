@@ -7,3 +7,6 @@ local/
 
 # codex-claude-bridge drops its SQLite store in whatever cwd it starts in
 reviews.db
+# ...and its SQLite WAL sidecars
+reviews.db-shm
+reviews.db-wal

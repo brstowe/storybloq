@@ -165,6 +165,18 @@ export const ConfigSchema = z
     project: z.string().min(1),
     type: z.string(),
     language: z.string(),
+    // FORK: the board's terse handle (`bia-crm`), overriding the default
+    // derived from the project directory's name. Absent on every board that
+    // has not set one -- nothing is written at init, and the derivation needs
+    // no stored value.
+    //
+    // A BARE optional string on purpose, not a regex. project-loader calls
+    // ConfigSchema.parse (not safeParse), so a schema-level pattern would turn
+    // one stray character here into a throw that breaks every command which
+    // loads the project -- exactly the trap `reviewEffort` below documents.
+    // `resolveShortcode` validates and fails open to the directory default,
+    // and `validate` reports the ignored override.
+    shortcode: z.string().optional(),
     features: FeaturesSchema,
     bus: BusConfigSchema.optional(),
     limitResume: LimitResumeConfigSchema,

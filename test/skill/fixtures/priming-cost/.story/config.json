@@ -3,6 +3,7 @@
   "project": "priming-cost-fixture",
   "type": "coding",
   "language": "typescript",
+  "shortcode": "priming-fixture",
   "features": {
     "tickets": true,
     "issues": true,

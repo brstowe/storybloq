@@ -59,6 +59,9 @@ Run `storybloq <command>`. Positional arguments appear after the command; ? mark
 - **knowledge update <id>** (--title?, --content?, --context?, --tags?, --clear-tags?, --status?, --stdin?, --format?) - Update a knowledge entry (fork)
 - **knowledge reinforce <id>** (--format?) - Reinforce a knowledge entry: increment count and update lastValidated (fork)
 - **knowledge delete <id>** (--format?) - Delete a knowledge entry (fork)
+- **shortcode get** (--format?) - Show this project's shortcode and whether it came from config.json or the project directory (fork)
+- **shortcode set <value>** (--format?) - Set this project's shortcode, overriding the directory-derived default (fork). 2-32 chars of a-z, 0-9 and hyphens
+- **shortcode clear** (--format?) - Remove the shortcode override, returning to the directory-derived default (fork)
 - **ruling list** (--scope-tag?, --superseded?, --format?) - List owner-ruling attestation records
 - **ruling get <id>** (--format?) - Get a ruling by ID
 - **ruling create** (--text, --attribution, --date, --client-task-id?, --scope-tag?, --cites?, --format?) - Record a ruling verbatim and cite it from the tickets or issues it binds

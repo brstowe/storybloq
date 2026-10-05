@@ -9,6 +9,7 @@
 import type { Argv } from "yargs";
 import type { CodexReviewKind } from "./commands/codex-review.js";
 import type { SetupClient } from "./commands/setup-skill.js";
+import type { CommandResult } from "./types.js";
 import { runReadCommand, runReadCommandWithRoot, runDeleteCommand, writeOutput, applyHandlerWarnings } from "./run.js";
 import {
   addFormatOption,
@@ -6543,5 +6544,107 @@ export function registerFeedbackCommand(yargs: Argv): Argv {
         if (result.exitCode) process.exitCode = result.exitCode;
       }
     },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// shortcode (fork)
+// ---------------------------------------------------------------------------
+
+/**
+ * FORK: `storybloq shortcode get|set|clear`.
+ *
+ * Reads `.story/config.json` DIRECTLY rather than through `loadProject`. The
+ * shortcode is identity, and identity is exactly what a caller wants from a
+ * board whose tickets or roadmap will not load -- the dashboard asks for it
+ * precisely when it is trying to label something broken.
+ */
+export function registerShortcodeCommand(yargs: Argv): Argv {
+  const withRoot = async (
+    format: OutputFormat,
+    fn: (root: string, rawConfig: Record<string, unknown>) => Promise<CommandResult> | CommandResult,
+  ): Promise<void> => {
+    const root = (await import("../core/project-root-discovery.js")).discoverProjectRoot();
+    if (!root) {
+      writeOutput(noProjectFoundOutput(format, "envelope"));
+      process.exitCode = ExitCode.USER_ERROR;
+      return;
+    }
+    try {
+      const { join } = await import("node:path");
+      const { tryReadFile } = await import("./util/file-io.js");
+      const read = tryReadFile(join(root, ".story", "config.json"));
+      if (!read.ok) {
+        writeOutput(formatError("io_error", `Cannot read config: ${read.error.message}`, format));
+        process.exitCode = ExitCode.USER_ERROR;
+        return;
+      }
+      const rawConfig = JSON.parse(read.content) as Record<string, unknown>;
+      const result = await fn(root, rawConfig);
+      writeOutput(result.output);
+      process.exitCode = result.exitCode ?? ExitCode.OK;
+    } catch (err: unknown) {
+      const { ProjectLoaderError } = await import("../core/errors.js");
+      if (err instanceof ProjectLoaderError) {
+        writeOutput(formatError(err.code, err.message, format));
+        process.exitCode = ExitCode.USER_ERROR;
+        return;
+      }
+      const message = err instanceof Error ? err.message : String(err);
+      writeOutput(formatError("io_error", message, format));
+      process.exitCode = ExitCode.USER_ERROR;
+    }
+  };
+
+  return yargs.command(
+    "shortcode",
+    "Show or set this project's shortcode (a terse handle; defaults to the project directory name)",
+    (y) =>
+      y
+        .command(
+          "get",
+          "Show this project's shortcode and where it came from",
+          (y2) => addFormatOption(y2),
+          async (argv) => {
+            const format = parseOutputFormat(argv.format);
+            await withRoot(format, async (root, rawConfig) => {
+              const { handleShortcodeGet } = await import("./commands/shortcode.js");
+              return handleShortcodeGet(root, rawConfig, format);
+            });
+          },
+        )
+        .command(
+          "set <value>",
+          "Set this project's shortcode, overriding the directory-derived default",
+          (y2) =>
+            addFormatOption(
+              y2.positional("value", {
+                type: "string",
+                demandOption: true,
+                describe: "Shortcode: 2-32 chars of a-z, 0-9 and hyphens (e.g. bia-crm)",
+              }),
+            ),
+          async (argv) => {
+            const format = parseOutputFormat(argv.format);
+            await withRoot(format, async (root) => {
+              const { handleShortcodeSet } = await import("./commands/shortcode.js");
+              return handleShortcodeSet(root, argv.value as string, format);
+            });
+          },
+        )
+        .command(
+          "clear",
+          "Remove the shortcode override, returning to the directory-derived default",
+          (y2) => addFormatOption(y2),
+          async (argv) => {
+            const format = parseOutputFormat(argv.format);
+            await withRoot(format, async (root) => {
+              const { handleShortcodeClear } = await import("./commands/shortcode.js");
+              return handleShortcodeClear(root, format);
+            });
+          },
+        )
+        .demandCommand(1, "Specify: get, set or clear"),
+    () => {},
   );
 }
