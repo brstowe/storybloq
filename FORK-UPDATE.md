@@ -21,6 +21,19 @@ The reason the fork exists — keep these working through every merge:
 - **Storyknow** knowledge packs (attached `K-NNN` knowledge, `lesson promote`).
 - Project-targeted autonomous/plan flows (`/story auto <project-id>`, project-level plan).
 - Four extra MCP tools: `storybloq_phase_update`, `storybloq_project_list/create/update`.
+- **Shortcode**: every board's terse handle (`storybloq shortcode get|set|clear`),
+  defaulting to the slugified project directory name and overridable by a
+  top-level `shortcode` in `.story/config.json`. Identifier only — nothing
+  resolves by it. Surfaces as `shortcode` + `shortcodeSource` in full
+  `status --format json` (and each node's on its `scanSummary`); the dashboard's
+  header field reads and writes it. Two traps when merging: `ConfigSchema`
+  declares it a BARE optional string (project-loader `.parse`s, so a regex there
+  would throw and break every command that loads a project — resolution fails
+  open to the directory default instead), and it must stay OUT of
+  `status --compact` (T-320's pinned schema gains no keys, and the priming
+  harness hashes two runs from fresh fixture copies in different temp dirs, which
+  a directory-derived value cannot survive). `validate` warns on
+  `invalid_shortcode` and `duplicate_shortcode`.
 
 ## Procedure
 
@@ -76,6 +89,7 @@ timeout 240 npx vitest run \
   test/cli/commands/lesson.test.ts \
   test/federation/inherit.test.ts \
   test/knowledge/storyknow.test.ts \
+  test/core/shortcode.test.ts \
   test/mcp/tools.test.ts \
   test/mcp/tool-contract-cues.test.ts \
   test/core/skill-sync-check.test.ts \
