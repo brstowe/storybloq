@@ -7,6 +7,7 @@ import {
   citingEntitiesOf,
 } from "../../core/validation.js";
 import { shortcodeRefusal, resolveShortcode } from "../../core/shortcode.js";
+import { AUTO_AGENT_DEFAULT } from "../../core/auto-agent.js";
 import { resolveAllNodes } from "../../federation/resolver.js";
 import { isPlainObject } from "../../core/config-merge.js";
 import { validateIssueSourceRefs } from "../../core/issue-source-ref.js";
@@ -271,6 +272,21 @@ export async function handleValidateWithSourceRefs(
  */
 function shortcodeFindings(root: string, config: Record<string, unknown>): ValidationFinding[] {
   const findings: ValidationFinding[] = [];
+
+  // FORK: the auto-agent switch, checked here rather than in its own pass --
+  // same shape of complaint (a stored value the reader is ignoring), same
+  // reason it can only be reported and not refused at the schema boundary.
+  if (Object.hasOwn(config, "autoAgent") && typeof config.autoAgent !== "boolean") {
+    findings.push({
+      level: "warning",
+      code: "invalid_auto_agent",
+      message:
+        `config.json autoAgent is ${config.autoAgent === null ? "null" : typeof config.autoAgent}` +
+        ` (${JSON.stringify(config.autoAgent)}), not a boolean; it is being ignored and the default` +
+        ` (${AUTO_AGENT_DEFAULT}) is in force.`,
+      entity: null,
+    });
+  }
 
   const configured = config.shortcode;
   if (typeof configured === "string") {

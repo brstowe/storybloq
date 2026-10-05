@@ -79,6 +79,7 @@ async function runCli(): Promise<void> {
     registerLimitStatusCommand,
     registerConfigCommand,
     registerShortcodeCommand,
+    registerAutoAgentCommand,
     registerSessionCommand,
     registerRosterCommand,
     registerRepairCommand,
@@ -259,6 +260,7 @@ async function runCli(): Promise<void> {
   cli = registerLimitStatusCommand(cli);
   cli = registerConfigCommand(cli);
   cli = registerShortcodeCommand(cli);
+  cli = registerAutoAgentCommand(cli);
   cli = registerNodeCommand(cli);
   cli = registerSessionCommand(cli);
   cli = registerRosterCommand(cli);

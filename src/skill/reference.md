@@ -62,6 +62,9 @@ Run `storybloq <command>`. Positional arguments appear after the command; ? mark
 - **shortcode get** (--format?) - Show this project's shortcode and whether it came from config.json or the project directory (fork)
 - **shortcode set <value>** (--format?) - Set this project's shortcode, overriding the directory-derived default (fork). 2-32 chars of a-z, 0-9 and hyphens
 - **shortcode clear** (--format?) - Remove the shortcode override, returning to the directory-derived default (fork)
+- **auto-agent get** (--format?) - Show whether the autonomous agent is enabled for this project, and whether that was stored or is the default (fork)
+- **auto-agent set <value>** (--format?) - Enable or disable the autonomous agent for this project (fork). Accepts true/false, 1/0, yes/no, on/off
+- **auto-agent clear** (--format?) - Remove the stored autonomous-agent setting, returning to the default of false (fork)
 - **ruling list** (--scope-tag?, --superseded?, --format?) - List owner-ruling attestation records
 - **ruling get <id>** (--format?) - Get a ruling by ID
 - **ruling create** (--text, --attribution, --date, --client-task-id?, --scope-tag?, --cites?, --format?) - Record a ruling verbatim and cite it from the tickets or issues it binds

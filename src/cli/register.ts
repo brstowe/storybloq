@@ -6648,3 +6648,106 @@ export function registerShortcodeCommand(yargs: Argv): Argv {
     () => {},
   );
 }
+
+
+// ---------------------------------------------------------------------------
+// auto-agent (fork)
+// ---------------------------------------------------------------------------
+
+/**
+ * FORK: `storybloq auto-agent get|set <true|false>|clear`.
+ *
+ * Reads `.story/config.json` DIRECTLY, for the same reason the shortcode group
+ * does: the switch is a property of the board, and a caller asking whether a
+ * board is meant to be auto-driven should get an answer even when that board's
+ * tickets will not load.
+ */
+export function registerAutoAgentCommand(yargs: Argv): Argv {
+  const withRoot = async (
+    format: OutputFormat,
+    fn: (root: string, rawConfig: Record<string, unknown>) => Promise<CommandResult> | CommandResult,
+  ): Promise<void> => {
+    const root = (await import("../core/project-root-discovery.js")).discoverProjectRoot();
+    if (!root) {
+      writeOutput(noProjectFoundOutput(format, "envelope"));
+      process.exitCode = ExitCode.USER_ERROR;
+      return;
+    }
+    try {
+      const { join } = await import("node:path");
+      const { tryReadFile } = await import("./util/file-io.js");
+      const read = tryReadFile(join(root, ".story", "config.json"));
+      if (!read.ok) {
+        writeOutput(formatError("io_error", `Cannot read config: ${read.error.message}`, format));
+        process.exitCode = ExitCode.USER_ERROR;
+        return;
+      }
+      const rawConfig = JSON.parse(read.content) as Record<string, unknown>;
+      const result = await fn(root, rawConfig);
+      writeOutput(result.output);
+      process.exitCode = result.exitCode ?? ExitCode.OK;
+    } catch (err: unknown) {
+      const { ProjectLoaderError } = await import("../core/errors.js");
+      if (err instanceof ProjectLoaderError) {
+        writeOutput(formatError(err.code, err.message, format));
+        process.exitCode = ExitCode.USER_ERROR;
+        return;
+      }
+      const message = err instanceof Error ? err.message : String(err);
+      writeOutput(formatError("io_error", message, format));
+      process.exitCode = ExitCode.USER_ERROR;
+    }
+  };
+
+  return yargs.command(
+    "auto-agent",
+    "Show or set this project's autonomous-agent switch (default false)",
+    (y) =>
+      y
+        .command(
+          "get",
+          "Show whether the autonomous agent is enabled for this project",
+          (y2) => addFormatOption(y2),
+          async (argv) => {
+            const format = parseOutputFormat(argv.format);
+            await withRoot(format, async (_root, rawConfig) => {
+              const { handleAutoAgentGet } = await import("./commands/auto-agent.js");
+              return handleAutoAgentGet(rawConfig, format);
+            });
+          },
+        )
+        .command(
+          "set <value>",
+          "Enable or disable the autonomous agent for this project",
+          (y2) =>
+            addFormatOption(
+              y2.positional("value", {
+                type: "string",
+                demandOption: true,
+                describe: "true or false (1/0, yes/no, on/off also accepted)",
+              }),
+            ),
+          async (argv) => {
+            const format = parseOutputFormat(argv.format);
+            await withRoot(format, async (root) => {
+              const { handleAutoAgentSet } = await import("./commands/auto-agent.js");
+              return handleAutoAgentSet(root, argv.value as string, format);
+            });
+          },
+        )
+        .command(
+          "clear",
+          "Remove the stored setting, returning to the default (false)",
+          (y2) => addFormatOption(y2),
+          async (argv) => {
+            const format = parseOutputFormat(argv.format);
+            await withRoot(format, async (root) => {
+              const { handleAutoAgentClear } = await import("./commands/auto-agent.js");
+              return handleAutoAgentClear(root, format);
+            });
+          },
+        )
+        .demandCommand(1, "Specify: get, set or clear"),
+    () => {},
+  );
+}

@@ -11,10 +11,7 @@
  * the one the dashboard shells out to.
  */
 
-import { join } from "node:path";
-import { tryReadFile } from "../util/file-io.js";
-import { withProjectLock, atomicWrite, guardPath } from "../../core/project-loader.js";
-import { ConfigSchema } from "../../models/config.js";
+import { editConfigField } from "../util/config-edit.js";
 import { ProjectLoaderError } from "../../core/errors.js";
 import {
   resolveShortcode,
@@ -76,42 +73,6 @@ export function handleShortcodeGet(
   return render(readData(root, config), format);
 }
 
-/**
- * Reads config.json as RAW JSON, applies `mutate`, validates and writes
- * atomically under the project lock -- the same discipline as
- * `config set-overrides`, so unknown top-level keys survive a shortcode edit.
- */
-async function writeConfig(
-  root: string,
-  mutate: (raw: Record<string, unknown>) => void,
-): Promise<Record<string, unknown>> {
-  let out: Record<string, unknown> = {};
-  await withProjectLock(root, { strict: false }, async () => {
-    const configPath = join(root, ".story", "config.json");
-    const readResult = tryReadFile(configPath);
-    if (!readResult.ok) {
-      throw new ProjectLoaderError(
-        "io_error",
-        `Cannot read config: ${readResult.error.message}`,
-        readResult.error,
-      );
-    }
-    const raw = JSON.parse(readResult.content) as Record<string, unknown>;
-    mutate(raw);
-
-    const validated = ConfigSchema.safeParse(raw);
-    if (!validated.success) {
-      const message = validated.error.issues.map((i) => i.message).join("; ");
-      throw new ProjectLoaderError("invalid_input", `Invalid config after edit: ${message}`);
-    }
-
-    await guardPath(configPath, root);
-    await atomicWrite(configPath, JSON.stringify(raw, null, 2) + "\n");
-    out = raw;
-  });
-  return out;
-}
-
 /** `storybloq shortcode set <value>`. */
 export async function handleShortcodeSet(
   root: string,
@@ -121,7 +82,7 @@ export async function handleShortcodeSet(
   const refusal = shortcodeRefusal(value);
   if (refusal !== null) throw new ProjectLoaderError("invalid_input", refusal);
 
-  const raw = await writeConfig(root, (r) => {
+  const raw = await editConfigField(root, (r) => {
     r.shortcode = value;
   });
   return render(readData(root, raw), format, `Shortcode set to "${value}".`);
@@ -132,7 +93,7 @@ export async function handleShortcodeClear(
   root: string,
   format: OutputFormat,
 ): Promise<CommandResult> {
-  const raw = await writeConfig(root, (r) => {
+  const raw = await editConfigField(root, (r) => {
     delete r.shortcode;
   });
   const data = readData(root, raw);

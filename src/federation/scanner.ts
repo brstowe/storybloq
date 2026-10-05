@@ -4,6 +4,7 @@ import type { ResolvedNode } from "./resolver.js";
 import { loadProject, type LoadResult } from "../core/project-loader.js";
 import { findLatestHandover } from "./handover-utils.js";
 import { resolveShortcode } from "../core/shortcode.js";
+import { resolveAutoAgent } from "../core/auto-agent.js";
 
 export interface NodeScanSummary {
   project: string;
@@ -21,6 +22,8 @@ export interface NodeScanSummary {
    * name slugifies to nothing usable.
    */
   shortcode: string | null;
+  /** FORK: the node's own autonomous-agent switch. Never inherited from the root. */
+  autoAgent: boolean;
 }
 
 export type NodeScanResult =
@@ -99,6 +102,7 @@ export async function scanNodeSummary(
   return {
     project: typeof config.project === "string" ? config.project : "unknown",
     shortcode: resolveShortcode(dirname(storyDir), config)?.shortcode ?? null,
+    autoAgent: resolveAutoAgent(config).enabled,
     type: typeof config.type === "string" ? config.type : "unknown",
     ticketCount: ticketResult.total,
     openTickets: ticketResult.counts.get("open") ?? 0,

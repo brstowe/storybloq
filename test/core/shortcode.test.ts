@@ -190,6 +190,20 @@ describe("ConfigSchema shortcode field", () => {
     // throw and take every command with it.
     expect(() => ConfigSchema.parse({ ...base, shortcode: "BAD!" })).not.toThrow();
   });
+
+  it("does NOT throw on a NON-STRING shortcode either (regression)", () => {
+    // This shipped broken: the field was declared `z.string().optional()`,
+    // which passes a malformed STRING through and throws on everything else.
+    // `"shortcode": 42` made every command on that board fail with
+    // `Validation failed for .story/config.json: Expected string, received
+    // number`. The field is `z.unknown()` now and the reader does the checking.
+    for (const junk of [42, true, null, {}, []]) {
+      expect(
+        () => ConfigSchema.parse({ ...base, shortcode: junk }),
+        JSON.stringify(junk),
+      ).not.toThrow();
+    }
+  });
 });
 
 describe("shortcode get/set/clear", () => {

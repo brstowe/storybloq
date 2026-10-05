@@ -345,6 +345,26 @@ export const COMMANDS: readonly CommandEntry[] = [
     usage: "storybloq shortcode clear [--format <json|md>]",
     flags: ["--format"],
   },
+  // Fork: the per-board autonomous-agent switch. A flag only -- nothing in the
+  // CLI reads it to change behaviour.
+  {
+    name: "auto-agent get",
+    description: "Show whether the autonomous agent is enabled for this project, and whether that was stored or is the default (fork)",
+    usage: "storybloq auto-agent get [--format <json|md>]",
+    flags: ["--format"],
+  },
+  {
+    name: "auto-agent set",
+    description: "Enable or disable the autonomous agent for this project (fork). Accepts true/false, 1/0, yes/no, on/off",
+    usage: "storybloq auto-agent set <value> [--format <json|md>]",
+    flags: ["--format"],
+  },
+  {
+    name: "auto-agent clear",
+    description: "Remove the stored autonomous-agent setting, returning to the default of false (fork)",
+    usage: "storybloq auto-agent clear [--format <json|md>]",
+    flags: ["--format"],
+  },
   {
     name: "ruling list",
     description: "List owner-ruling attestation records",

@@ -170,13 +170,23 @@ export const ConfigSchema = z
     // has not set one -- nothing is written at init, and the derivation needs
     // no stored value.
     //
-    // A BARE optional string on purpose, not a regex. project-loader calls
-    // ConfigSchema.parse (not safeParse), so a schema-level pattern would turn
-    // one stray character here into a throw that breaks every command which
-    // loads the project -- exactly the trap `reviewEffort` below documents.
-    // `resolveShortcode` validates and fails open to the directory default,
-    // and `validate` reports the ignored override.
-    shortcode: z.string().optional(),
+    // `z.unknown()`, NOT `z.string()`, and this is a bug fix rather than
+    // fussiness. project-loader calls ConfigSchema.parse (not safeParse), so
+    // ANY declared type here is a throw waiting to happen: `z.string()` shipped
+    // first and `"shortcode": 42` duly broke every command that loads the
+    // project, which is the precise trap the `reviewEffort` note below
+    // describes. The type cannot be declared at the boundary that parses
+    // strictly; it has to be checked by the reader. `resolveShortcode` does
+    // that and fails open to the directory default, and `validate` reports the
+    // ignored value. Regression-tested in test/core/shortcode.test.ts.
+    shortcode: z.unknown().optional(),
+    // FORK: per-board autonomous-agent switch. Default false when absent.
+    //
+    // `z.unknown()` for exactly the reason above -- `z.boolean()` would make
+    // `"autoAgent": "yes"` fatal to every command on that board. A flag only:
+    // nothing in the CLI reads it to change behaviour, per the owner's call.
+    // `resolveAutoAgent` coerces and fails closed to false.
+    autoAgent: z.unknown().optional(),
     features: FeaturesSchema,
     bus: BusConfigSchema.optional(),
     limitResume: LimitResumeConfigSchema,

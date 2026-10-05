@@ -34,6 +34,26 @@ The reason the fork exists — keep these working through every merge:
   harness hashes two runs from fresh fixture copies in different temp dirs, which
   a directory-derived value cannot survive). `validate` warns on
   `invalid_shortcode` and `duplicate_shortcode`.
+- **Auto agent**: per-board boolean, DEFAULT FALSE
+  (`storybloq auto-agent get|set <true|false>|clear`), stored as a top-level
+  `autoAgent` in `.story/config.json`. A FLAG ONLY -- nothing in the CLI reads
+  it, `/story auto` is unchanged by it; the dashboard reads it to decide whether
+  to offer a run. Do not quietly promote it to a gate: the default is false, so
+  a flag that became an interlock would stop every existing board being
+  auto-runnable. Surfaces as `autoAgent` + `autoAgentSource` in full
+  `status --format json`, and each node's on its `scanSummary` -- nodes do NOT
+  inherit the root's value. `validate` warns `invalid_auto_agent`.
+
+Both `shortcode` and `autoAgent` are declared `z.unknown().optional()` in
+`ConfigSchema` and that is load-bearing, not laziness: `project-loader` calls
+`.parse`, never `.safeParse`, so ANY declared type is fatal to every command on
+a board whose config holds the wrong one. `shortcode` shipped as
+`z.string().optional()` and `"shortcode": 42` duly broke `status`, `ticket
+list`, everything. The reader checks the type and fails open (shortcode -> the
+directory default; autoAgent -> false), and `validate` reports what is being
+ignored. Regression tests live in test/core/shortcode.test.ts and
+test/core/auto-agent.test.ts -- if a future merge "tightens" either field, those
+are what should stop it.
 
 ## Procedure
 
@@ -90,6 +110,7 @@ timeout 240 npx vitest run \
   test/federation/inherit.test.ts \
   test/knowledge/storyknow.test.ts \
   test/core/shortcode.test.ts \
+  test/core/auto-agent.test.ts \
   test/mcp/tools.test.ts \
   test/mcp/tool-contract-cues.test.ts \
   test/core/skill-sync-check.test.ts \

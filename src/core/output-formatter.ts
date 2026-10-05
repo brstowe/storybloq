@@ -1,5 +1,6 @@
 import { computeIssueFlow, formatIssueFlow, ISSUE_FLOW_SEMANTICS } from "./issue-flow.js";
 import { resolveShortcode } from "./shortcode.js";
+import { resolveAutoAgent } from "./auto-agent.js";
 import type { ArrangementCompactResult, ArrangementRotateResult, DuetRoute, DuetView } from "./duet-coordination.js";
 import { arrangementCapacity, type ArrangementCapacity } from "./arrangement-compaction.js";
 import { assignmentIdOf, isCompactedAssignment } from "../models/duet.js";
@@ -925,12 +926,16 @@ export function formatStatus(
   }
   const phases = phasesWithStatus(state);
   const resolvedShortcode = root === undefined ? null : resolveShortcode(root, state.config);
+  const resolvedAutoAgent = resolveAutoAgent(state.config);
   const data = {
     project: state.config.project,
     // FORK: the board's terse handle and where it came from, so a reader can
     // tell a deliberate override from a directory-derived default.
     shortcode: resolvedShortcode?.shortcode ?? null,
     shortcodeSource: resolvedShortcode?.source ?? null,
+    // FORK: the autonomous-agent switch and whether it was actually stored.
+    autoAgent: resolvedAutoAgent.enabled,
+    autoAgentSource: resolvedAutoAgent.source,
     totalTickets: state.leafTicketCount,
     completeTickets: state.completeLeafTicketCount,
     openTickets: state.leafTicketCount - state.completeLeafTicketCount,
@@ -1145,6 +1150,7 @@ export function formatFederatedStatus(
     scanSummary: node.scanSummary,
   }));
   const orchShortcode = root === undefined ? null : resolveShortcode(root, config);
+  const orchAutoAgent = resolveAutoAgent(config);
   const data = {
     federation: { ...fedState, nodes: sanitizedNodes },
     project: config.project,
@@ -1152,6 +1158,10 @@ export function formatFederatedStatus(
     // own shortcode; each node's is on its own scanSummary.
     shortcode: orchShortcode?.shortcode ?? null,
     shortcodeSource: orchShortcode?.source ?? null,
+    // FORK: the ROOT's own switch. Each node's rides its own scanSummary --
+    // nodes do not inherit this.
+    autoAgent: orchAutoAgent.enabled,
+    autoAgentSource: orchAutoAgent.source,
     type: config.type,
     // ISS-891: always present, empty when there are none. Omitting them made
     // "no sessions" and "server too old to report sessions" the same observation,
