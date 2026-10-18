@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { handleStatus } from "../../../src/cli/commands/status.js";
 import { MAX_PROSE_LENGTH } from "../../../src/core/display-text.js";
-import { formatStatus, formatFederatedStatus } from "../../../src/core/output-formatter.js";
+import { formatStatus, formatFederatedStatus, buildCompactStatusData } from "../../../src/core/output-formatter.js";
 import { makeState, makeTicket, makeRoadmap, makePhase } from "../../core/test-factories.js";
 import { describeAddressableAgedAnomaly } from "../../../src/core/session-age.js";
 import type { CommandContext } from "../../../src/cli/run.js";
@@ -1230,5 +1230,74 @@ describe("handleStatus: compact mode (T-320 commit 3)", () => {
     const parsed = JSON.parse(result.output) as { data: Record<string, unknown> };
     expect(parsed.data.archivedNotes).toBeUndefined();
     expect(parsed.data.deprecatedLessons).toBeUndefined();
+  });
+});
+
+// FORK: status must agree with the selectors about parked phases.
+//
+// `phase.state` decides whether `ticket next`, `recommend` and autonomous
+// PICK_TICKET will touch a phase at all, and `phase list` has reported it
+// since the fork added phase state -- but `status`, the summary an agent reads
+// first, did not. So the payload could show the obvious next phase while the
+// selector silently refused to pick from it.
+describe("status reports phase.state (FORK)", () => {
+  const parkedState = () =>
+    makeState({
+      roadmap: makeRoadmap([
+        makePhase({ id: "p1", name: "Done", state: "archived" }),
+        makePhase({ id: "p2", name: "Live" }),
+      ]),
+      tickets: [makeTicket({ id: "T-001", phase: "p2" })],
+    });
+
+  it("full JSON carries state on every phase, null when live", () => {
+    const data = JSON.parse(formatStatus(parkedState(), "json")).data as {
+      phases: readonly { id: string; state: string | null }[];
+    };
+    expect(data.phases.map((p) => [p.id, p.state])).toEqual([
+      ["p1", "archived"],
+      ["p2", null],
+    ]);
+  });
+
+  it("is present-and-null rather than omitted, so absence means an old server", () => {
+    // Same reasoning as ISS-891's session arrays: if the key vanished for live
+    // phases, a consumer could not distinguish "nothing is parked" from "this
+    // build cannot tell me", and would have to re-verify via `phase list`.
+    const data = JSON.parse(formatStatus(parkedState(), "json")).data as {
+      phases: readonly Record<string, unknown>[];
+    };
+    for (const p of data.phases) expect(Object.hasOwn(p, "state")).toBe(true);
+  });
+
+  it("markdown marks a parked phase and leaves a live one unmarked", () => {
+    const md = formatStatus(parkedState(), "md");
+    expect(md).toContain("[ARCHIVED] **Done**");
+    expect(md).toContain("**Live**");
+    expect(md).not.toContain("[ARCHIVED] **Live**");
+  });
+
+  it("markdown adds nothing for a project with no parked phases", () => {
+    // The marker is why this is byte-free for ordinary boards: it renders only
+    // when a state is set, which keeps it clear of the skill byte ceilings.
+    const plain = makeState({
+      roadmap: makeRoadmap([makePhase({ id: "p1", name: "Only" })]),
+      tickets: [makeTicket({ id: "T-001", phase: "p1" })],
+    });
+    expect(formatStatus(plain, "md")).toContain("**Only**");
+    expect(formatStatus(plain, "md")).not.toMatch(/\[[A-Z]+\] \*\*Only\*\*/);
+  });
+
+  it("COMPACT does not gain the key -- T-320's pinned schema", () => {
+    // The ratchet for the rule the code comment asserts. sidebar-projection
+    // maps compact phases onto a four-key object, which would silently DROP an
+    // added key rather than catch it, so the absence needs saying here.
+    const compact = buildCompactStatusData(parkedState(), [], [], undefined, [], undefined, [], {
+      items: [],
+      warnings: [],
+    });
+    for (const p of compact.phases) {
+      expect(Object.keys(p).sort()).toEqual(["id", "leafCount", "name", "status"]);
+    }
   });
 });

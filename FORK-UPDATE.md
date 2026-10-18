@@ -24,6 +24,13 @@ The reason the fork exists — keep these working through every merge:
   muted but visible. The engine treats all four identically. On merge, check the enum
   in `models/roadmap.ts`, the two `choices` arrays in `register.ts`, and the two state
   enums in `mcp/tools.ts` -- upstream touching any of those will drop `archived`.
+  Phase state is surfaced in **full `status`** (JSON `phases[].state`, always present,
+  null when live; Markdown a `[STATE]` marker emitted only when set) and in
+  `phase list`. It is deliberately NOT in `status --compact` -- that is T-320's
+  pinned schema and gains no keys; `test/cli/commands/status.test.ts` ratchets the
+  compact key set, because `sidebar-projection` maps compact phases onto four keys
+  and would silently drop an added one. Sixth merge-watch site: the `phases:` block
+  in `buildFullStatusData`/`formatStatus` in `core/output-formatter.ts`.
 - **Federation inheritance**: nodes absorb the orchestrator root's lessons/notes.
 - **Storyknow** knowledge packs (attached `K-NNN` knowledge, `lesson promote`).
 - Project-targeted autonomous/plan flows (`/story auto <project-id>`, project-level plan).

@@ -960,11 +960,29 @@ export function formatStatus(
     deprecatedLessons: state.deprecatedLessonCount,
     handovers: state.handoverFilenames.length,
     isEmptyScaffold: state.isEmptyScaffold,
+    // FORK: `state` is the stored phase state (parked: pending/paused/skipped/
+    // archived; null = live), APPENDED LAST within the phase object.
+    //
+    // It belongs here because parking is not cosmetic: a parked phase is
+    // excluded from `ticket next`, `recommend` and autonomous PICK_TICKET, so
+    // an agent reading status could not tell why the phase holding the obvious
+    // next work was being skipped. `phase list` has carried it since the fork
+    // added phase state; status did not, which made the summary payload
+    // disagree with the selector.
+    //
+    // Always present and null when live, following the ISS-891 reasoning
+    // directly below: omitting it would make "no parked phases" and "server
+    // too old to report them" the same observation, forcing a consumer to
+    // re-verify through `phase list`. Presence is the capability signal.
+    //
+    // NOT added to the compact payload above -- that is T-320's pinned schema
+    // and does not gain keys.
     phases: phases.map((p) => ({
       id: p.phase.id,
       name: p.phase.name,
       status: p.status,
       leafCount: p.leafCount,
+      state: p.phase.state ?? null,
     })),
     // ISS-891: always present, empty when there are none. Omitting them made
     // "no sessions" and "server too old to report sessions" the same observation,
@@ -1031,7 +1049,11 @@ export function formatStatus(
   for (const p of phases) {
     const indicator = p.status === "complete" ? "[x]" : p.status === "inprogress" ? "[~]" : "[ ]";
     const summary = p.phase.summary ?? truncate(p.phase.description, 80);
-    lines.push(`${indicator} **${escapeMarkdownInline(p.phase.name)}** (${p.leafCount} tickets) -- ${escapeMarkdownInline(summary)}`);
+    // FORK: same marker `phase list` uses, and emitted ONLY when a state is
+    // set -- a board with no parked phases pays no bytes for this, which keeps
+    // it clear of the skill byte ceilings for every project that has none.
+    const parked = p.phase.state ? ` [${p.phase.state.toUpperCase()}]` : "";
+    lines.push(`${indicator}${parked} **${escapeMarkdownInline(p.phase.name)}** (${p.leafCount} tickets) -- ${escapeMarkdownInline(summary)}`);
   }
 
   const resumableIds = new Set(resumableSessions.map((session) => session.sessionId));
