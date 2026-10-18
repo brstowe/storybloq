@@ -109,8 +109,9 @@ export function nextTicket(
     const leaves = state.phaseTickets(phase.id);
     if (leaves.length === 0) continue; // skip empty/umbrella-only phases
 
-    // Parked phases (state: pending/paused/skipped) are excluded from work
-    // selection unless explicitly requested
+    // A phase with ANY state set is parked and excluded from work selection
+    // unless explicitly requested. Presence, not value -- so a new state value
+    // needs no change here.
     if (phase.state && !options?.includeParked) {
       if (leaves.some((t) => t.status !== "complete")) parkedPhaseIds.push(phase.id);
       continue;
@@ -192,8 +193,9 @@ export function nextTickets(
     const leaves = state.phaseTickets(phase.id);
     if (leaves.length === 0) continue;
 
-    // Parked phases (state: pending/paused/skipped) are excluded from work
-    // selection unless explicitly requested
+    // A phase with ANY state set is parked and excluded from work selection
+    // unless explicitly requested. Presence, not value -- so a new state value
+    // needs no change here.
     if (phase.state && !options?.includeParked) {
       if (leaves.some((t) => t.status !== "complete")) parkedPhaseIds.push(phase.id);
       continue;
@@ -305,6 +307,21 @@ export function currentPhase(state: ProjectState): Phase | null {
   for (const phase of state.roadmap.phases) {
     const leaves = state.phaseTickets(phase.id);
     if (leaves.length === 0) continue;
+    // FORK: a parked phase is never "current". Without this, `currentPhase`
+    // disagreed with every other selector -- nextTicket, nextTickets and
+    // recommend all skip parked phases, but this returned the first
+    // non-complete one whatever its state.
+    //
+    // That mattered because handleTicketCreate defaults a new ticket's phase
+    // to `currentPhase(state)?.id`: a board whose earliest incomplete phase
+    // was parked would file new tickets into it, and a consumer that hides
+    // parked phases (the dashboard hides `archived` by default) would then
+    // never show them. Invisible work -- the exact failure phase-defaulting
+    // was added to prevent.
+    //
+    // Latent until phases EARLY in the order got parked, which is what
+    // archiving a project's completed opening phases does.
+    if (phase.state) continue;
     if (state.phaseStatus(phase.id) !== "complete") return phase;
   }
   return null;
