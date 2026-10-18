@@ -28,7 +28,7 @@ Run `storybloq <command>`. Positional arguments appear after the command; ? mark
 - **phase current** (--format?) - Show current (first non-complete) phase
 - **phase tickets** (--phase, --format?) - List tickets in a specific phase
 - **phase create** (--id, --name, --label, --description, --summary?, --after?, --at-start?, --node?, --format?) - Create a new phase
-- **phase rename <id>** (--name?, --label?, --description?, --summary?, --format?) - Rename/update phase metadata
+- **phase rename <id>** (--name?, --label?, --description?, --summary?, --state?, --format?) - Rename/update phase metadata
 - **phase move <id>** (--after?, --at-start?, --format?) - Move a phase to a new position
 - **phase delete <id>** (--reassign?, --format?) - Delete a phase
 - **handover list** (--format?) - List handover filenames (newest first)

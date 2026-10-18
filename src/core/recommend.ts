@@ -340,7 +340,7 @@ export function recommend(
     }
   }
 
-  // Parked phases (state: pending/paused/skipped) never surface in
+  // Parked phases (any phase with a state set) never surface in
   // recommendations -- that work is deliberately on hold
   const parkedPhaseIds = new Set(
     state.roadmap.phases.filter((p) => p.state).map((p) => p.id),

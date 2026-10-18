@@ -134,8 +134,8 @@ export const COMMANDS: readonly CommandEntry[] = [
   {
     name: "phase rename",
     description: "Rename/update phase metadata",
-    usage: "storybloq phase rename <id> [--name <value>] [--label <value>] [--description <value>] [--summary <value>] [--format <json|md>]",
-    flags: ["--name", "--label", "--description", "--summary", "--format"],
+    usage: "storybloq phase rename <id> [--name <value>] [--label <value>] [--description <value>] [--summary <value>] [--state <pending|paused|skipped|archived|active>] [--format <json|md>]",
+    flags: ["--name", "--label", "--description", "--summary", "--state", "--format"],
   },
   {
     name: "phase move",

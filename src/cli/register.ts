@@ -1328,7 +1328,7 @@ export function registerTicketCommand(yargs: Argv): Argv {
           }).option("include-parked", {
             type: "boolean",
             default: false,
-            describe: "Include tickets in parked phases (state: pending/paused/skipped)",
+            describe: "Include tickets in parked phases (any phase with a state set)",
           }),
           async (argv) => {
             const format = parseOutputFormat(argv.format);
@@ -2445,7 +2445,7 @@ export function registerPhaseCommand(yargs: Argv): Argv {
                 })
                 .option("state", {
                   type: "string",
-                  choices: ["pending", "paused", "skipped", "active"],
+                  choices: ["pending", "paused", "skipped", "archived", "active"],
                   describe: "Phase state (parked states are excluded from work selection; active = default)",
                 })
                 .option("after", {
@@ -2551,7 +2551,7 @@ export function registerPhaseCommand(yargs: Argv): Argv {
                 })
                 .option("state", {
                   type: "string",
-                  choices: ["pending", "paused", "skipped", "active"],
+                  choices: ["pending", "paused", "skipped", "archived", "active"],
                   describe: "Phase state (parked states are excluded from work selection; active clears)",
                 }),
             ),

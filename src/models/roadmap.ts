@@ -19,7 +19,15 @@ export type Blocker = z.infer<typeof BlockerSchema>;
 // Stored phase state, orthogonal to the ticket-derived status: a parked phase
 // (any of these values) is excluded from work selection (ticket next,
 // recommend, autonomous PICK_TICKET). Absent/null = active.
-export const PHASE_STATES = ["pending", "paused", "skipped"] as const;
+//
+// The parking rule tests for the PRESENCE of a state, not its value (see
+// queries.ts), so every value here parks the phase and a new one needs no
+// selection logic. The values differ only in what they tell a reader -- and,
+// for `archived`, in how a consumer is expected to present it: pending/paused/
+// skipped mean "not being worked on, still worth seeing", while `archived`
+// means "done with, hide it by default". That presentation split is the
+// dashboard's to honour; the engine treats all four identically.
+export const PHASE_STATES = ["pending", "paused", "skipped", "archived"] as const;
 
 export const PhaseStateSchema = z.enum(PHASE_STATES);
 

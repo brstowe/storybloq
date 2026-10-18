@@ -627,7 +627,7 @@ export function registerAllTools(rawServer: McpServer, pinnedRoot: string, ctx?:
       count: z.number().int().min(1).max(10).optional()
         .describe("Number of candidates to return (default: 1)"),
       includeParked: z.boolean().optional()
-        .describe("Include tickets in parked phases (state: pending/paused/skipped; default: false)"),
+        .describe("Include tickets in parked phases (any phase with a state set; default: false)"),
       node: nodeParam,
     },
   }, (args) => {
@@ -1623,7 +1623,7 @@ export function registerAllTools(rawServer: McpServer, pinnedRoot: string, ctx?:
       label: z.string().describe("e.g. 'PHASE 1'"),
       description: z.string(),
       summary: z.string().optional().describe("One-line summary for compact display"),
-      state: z.enum(["pending", "paused", "skipped"]).optional().describe("Phase state — parked states are excluded from work selection"),
+      state: z.enum(["pending", "paused", "skipped", "archived"]).optional().describe("Phase state — any value parks the phase (excluded from work selection); archived also means hide by default"),
       after: z.string().optional().describe("Insert after this phase ID"),
       atStart: z.boolean().optional().describe("Insert at beginning of roadmap"),
     },
@@ -1645,14 +1645,14 @@ export function registerAllTools(rawServer: McpServer, pinnedRoot: string, ctx?:
   ));
 
   server.registerTool("storybloq_phase_update", {
-    description: "Update phase metadata or state (pending/paused/skipped park the phase; active clears)",
+    description: "Update phase metadata or state (any state parks the phase; archived also hides it; active clears)",
     inputSchema: {
       id: z.string().describe("Phase ID"),
       name: z.string().optional().describe("New display name"),
       label: z.string().optional().describe("New label"),
       description: z.string().optional().describe("New description"),
       summary: z.string().optional().describe("New one-line summary"),
-      state: z.enum(["pending", "paused", "skipped", "active"]).optional().describe("Phase state — parked states are excluded from work selection; active clears"),
+      state: z.enum(["pending", "paused", "skipped", "archived", "active"]).optional().describe("Phase state — any value parks the phase; archived also means hide by default; active clears"),
     },
   }, (args) => runMcpWriteTool(pinnedRoot, (root, format) =>
     handlePhaseRename(

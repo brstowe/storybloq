@@ -16,7 +16,14 @@ fork's custom features, and deploy. Proven on the 1.13.0 and 1.15.0 merges.
 
 The reason the fork exists — keep these working through every merge:
 
-- Native **projects** + **phase state** (parked phases: pending/paused/skipped).
+- Native **projects** + **phase state** (parked phases: pending/paused/skipped/**archived**).
+  The parking rule in `queries.ts` tests for the PRESENCE of `phase.state`, not its
+  value, so a new state parks the phase with no selection logic. `archived` exists to
+  carry a presentation contract the other three don't: consumers hide it by default
+  (the dashboard has a "show archived" reveal), where pending/paused/skipped render
+  muted but visible. The engine treats all four identically. On merge, check the enum
+  in `models/roadmap.ts`, the two `choices` arrays in `register.ts`, and the two state
+  enums in `mcp/tools.ts` -- upstream touching any of those will drop `archived`.
 - **Federation inheritance**: nodes absorb the orchestrator root's lessons/notes.
 - **Storyknow** knowledge packs (attached `K-NNN` knowledge, `lesson promote`).
 - Project-targeted autonomous/plan flows (`/story auto <project-id>`, project-level plan).
