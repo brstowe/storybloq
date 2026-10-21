@@ -97,6 +97,51 @@ are what should stop it.
 12. Restart the dashboard so it uses the new CLI:
     `cd ~/Apps/storybloq && pm2 restart storybloq`, then
     `curl localhost:3008/api/bloqs/<slug>` to confirm it serves.
+13. Update the second machine — see **Fleet** below. A push that stops at
+    isengard leaves rivendell running last week's engine against this week's
+    ledgers.
+
+## Fleet: isengard and rivendell
+
+Both hosts run the fork the same way: a git checkout at `~/dev/storybloq`,
+built in place, with a launcher on `PATH` pointing into `dist/`. isengard's
+comes from `npm link` (nvm bin); rivendell's is a hand-made symlink in
+`~/.local/bin`. Neither installs from the registry — `@storybloq/storybloq`
+there is UPSTREAM.
+
+After any `git push origin dev`, on rivendell:
+
+    cd ~/dev/storybloq && git pull --ff-only && npm run build
+    storybloq setup --client claude        # if the skill or hooks changed
+    ~/bin/storybloq-agents restart --all   # a live session rereads neither
+
+Add `npm install` if the push touched `package-lock.json` — step 4's reasoning
+applies here too.
+
+Three sharp edges, each of which cost a round on 2026-10-21:
+
+- **`storybloq --version` cannot tell fork from upstream.** Both say `1.15.5`,
+  because the fork merges up to upstream's release number. Test a fork-only
+  feature instead, and pick an OLD one: a three-day-old feature makes a merely
+  STALE fork look exactly like upstream. `storybloq knowledge --help` works
+  anywhere and has been fork-only since 2026-07-25.
+- **`setup` is per home directory, not per project.** It writes
+  `~/.claude/skills/story/` and the hook rows in `~/.claude/settings.json` from
+  `homedir()`, ignoring cwd, so it must run once per MACHINE. rivendell ran the
+  fork for days with no `/story` and no PreCompact/Stop/presence hooks because
+  nothing had ever run it there — the missing slash command was the visible
+  symptom; the missing PreCompact hook was the costly part.
+- **The package declares two bins**, `storybloq` and `storybloq-presence`.
+  `npm link` creates both; a hand-made symlink creates whichever you remembered,
+  and setup then skips the presence hooks behind a one-line notice.
+
+Standing up a NEW machine: clone, `npm ci`, `npm run build`, symlink **both**
+bins onto `PATH`, then `storybloq setup --client claude`. Note that
+`npm i -g git+ssh://git@github.com/brstowe/storybloq.git#dev` does **not** work:
+`dist/` is gitignored and there is no `prepare` script, so npm installs a package
+with no build output and two dangling bins. Add `"prepare": "npm run build"` if
+that install path is ever wanted — at the cost of a full DTS build on every
+`npm install`.
 
 ## Resolving fork-vs-upstream tension
 
