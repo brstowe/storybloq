@@ -118,7 +118,7 @@ After any `git push origin dev`, on rivendell:
 Add `npm install` if the push touched `package-lock.json` — step 4's reasoning
 applies here too.
 
-Three sharp edges, each of which cost a round on 2026-10-21:
+Four sharp edges, each of which cost a round on 2026-10-21:
 
 - **`storybloq --version` cannot tell fork from upstream.** Both say `1.15.5`,
   because the fork merges up to upstream's release number. Test a fork-only
@@ -131,6 +131,12 @@ Three sharp edges, each of which cost a round on 2026-10-21:
   fork for days with no `/story` and no PreCompact/Stop/presence hooks because
   nothing had ever run it there — the missing slash command was the visible
   symptom; the missing PreCompact hook was the costly part.
+- **`setup` turns the ledger-dashboard pane back ON.** It writes
+  `env.CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1`, and the pane defaults on (T-516),
+  so a host that has never been set up gets it. Brett keeps it OFF. The off
+  switch is `pluginConfigs."storybloq@skills-dir".options.sidebar = false` in
+  that machine's `~/.claude/settings.json` — per machine, and durable, because
+  `pluginConfigs` appears nowhere in `src/` so no setup run rewrites it.
 - **The package declares two bins**, `storybloq` and `storybloq-presence`.
   `npm link` creates both; a hand-made symlink creates whichever you remembered,
   and setup then skips the presence hooks behind a one-line notice.
